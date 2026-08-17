@@ -1,0 +1,2 @@
+{"conversations":[{"from":"human","value":"Locate all the instances that match the following description: cropped element."},{"from":"gpt","value":"<ref>cropped element</ref><box><658><58><688><89></box>"}],"image":"ui_cropping_positive.jpg"}
+{"conversations":[{"from":"human","value":"Locate all the instances that match the following description: cropped element."},{"from":"gpt","value":"<box>none</box>"}],"image":"ui_cropping_negative.jpg"}

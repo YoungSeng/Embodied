@@ -1,0 +1,2 @@
+{"conversations":[{"from":"human","value":"Locate all the instances that match the following description: text overflow."},{"from":"gpt","value":"<ref>text overflow</ref><box><388><502><414><522></box><box><389><204><414><226></box>"}],"image":"ui_text_overflow_positive.jpg"}
+{"conversations":[{"from":"human","value":"Locate all the instances that match the following description: text overflow."},{"from":"gpt","value":"<box>none</box>"}],"image":"ui_text_overflow_negative.jpg"}

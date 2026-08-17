@@ -1,0 +1,78 @@
+{
+  "provenance": "real records exported after explicit authorization confirmation",
+  "warning": "No automatic de-identification was performed; manual review is required.",
+  "seed": 20260817,
+  "num_samples": 10,
+  "samples": [
+    {
+      "task": "ui_occlusion",
+      "expected_label": "overlapping elements",
+      "kind": "positive",
+      "image": "ui_occlusion_positive.jpg",
+      "sha256": "4b20e3c114dae0905bebca6a4d2092f92179e355455bde1fa200b2aa58768d69"
+    },
+    {
+      "task": "ui_occlusion",
+      "expected_label": "overlapping elements",
+      "kind": "negative",
+      "image": "ui_occlusion_negative.jpg",
+      "sha256": "bf23587bb2dbc62cb8c0b53b4fb3f435a244734f3c7bbd977dd8eb7f67c0f6a3"
+    },
+    {
+      "task": "ui_cropping",
+      "expected_label": "cropped element",
+      "kind": "positive",
+      "image": "ui_cropping_positive.jpg",
+      "sha256": "1ae3184b22ad8486306747f192f016c8e38a0885c924bce71d6f1287f198be75"
+    },
+    {
+      "task": "ui_cropping",
+      "expected_label": "cropped element",
+      "kind": "negative",
+      "image": "ui_cropping_negative.jpg",
+      "sha256": "b0c5566c407222fcbf8c3147b7326df328dcc9c8a446cd29ebbe8c31c23093cf"
+    },
+    {
+      "task": "ui_text_overflow",
+      "expected_label": "text overflow",
+      "kind": "positive",
+      "image": "ui_text_overflow_positive.jpg",
+      "sha256": "a6f47acdc0163f612f6e53e76b9b208ca743039c1e872a418db92243617a233e"
+    },
+    {
+      "task": "ui_text_overflow",
+      "expected_label": "text overflow",
+      "kind": "negative",
+      "image": "ui_text_overflow_negative.jpg",
+      "sha256": "3de1341a870efb25307b59e178639fccfe063fd1c509e6349589a8764797aef3"
+    },
+    {
+      "task": "ui_text_ellipsis",
+      "expected_label": "abnormal text ellipsis",
+      "kind": "positive",
+      "image": "ui_text_ellipsis_positive.jpg",
+      "sha256": "58e32c8bec5f5b9083fb3e169ec55733c7024a1e45618ebebf43512875b62aec"
+    },
+    {
+      "task": "ui_text_ellipsis",
+      "expected_label": "abnormal text ellipsis",
+      "kind": "negative",
+      "image": "ui_text_ellipsis_negative.jpg",
+      "sha256": "13d34c2fbc4b965a82a81316b3e1f1279074a2a32fc378ca09d4318df8f7b992"
+    },
+    {
+      "task": "ui_content_missing",
+      "expected_label": "missing content",
+      "kind": "positive",
+      "image": "ui_content_missing_positive.jpg",
+      "sha256": "8fc90c4c9f66f4d157e3a54f5519363eb24ad9235af7b656dd229faa7b25629c"
+    },
+    {
+      "task": "ui_content_missing",
+      "expected_label": "missing content",
+      "kind": "negative",
+      "image": "ui_content_missing_negative.jpg",
+      "sha256": "849b6d40da642a3601754bfa53e7f7fab3fac9c6be6826956b3fb141191baad5"
+    }
+  ]
+}

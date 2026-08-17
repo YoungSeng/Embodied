@@ -1,0 +1,2 @@
+{"conversations":[{"from":"human","value":"Locate all the instances that match the following description: abnormal text ellipsis."},{"from":"gpt","value":"<ref>abnormal text ellipsis</ref><box><832><404><920><420></box>"}],"image":"ui_text_ellipsis_positive.jpg"}
+{"conversations":[{"from":"human","value":"Locate all the instances that match the following description: abnormal text ellipsis."},{"from":"gpt","value":"<box>none</box>"}],"image":"ui_text_ellipsis_negative.jpg"}

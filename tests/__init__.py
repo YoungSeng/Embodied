@@ -1,0 +1,2 @@
+"""LocateAnything UI relation tests."""
+

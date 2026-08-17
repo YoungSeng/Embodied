@@ -1,0 +1,2 @@
+{"conversations":[{"from":"human","value":"Locate all the instances that match the following description: missing content."},{"from":"gpt","value":"<ref>missing content</ref><box><603><359><994><652></box>"}],"image":"ui_content_missing_positive.jpg"}
+{"conversations":[{"from":"human","value":"Locate all the instances that match the following description: missing content."},{"from":"gpt","value":"<box>none</box>"}],"image":"ui_content_missing_negative.jpg"}

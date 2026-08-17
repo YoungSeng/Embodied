@@ -1,0 +1,14 @@
+{
+  "ui_defect_5class_smoke_real": {
+    "annotation": [
+      "samples/ui_defect_locany_smoke_real/annotations/ui_occlusion_train.jsonl",
+      "samples/ui_defect_locany_smoke_real/annotations/ui_cropping_train.jsonl",
+      "samples/ui_defect_locany_smoke_real/annotations/ui_text_overflow_train.jsonl",
+      "samples/ui_defect_locany_smoke_real/annotations/ui_text_ellipsis_train.jsonl",
+      "samples/ui_defect_locany_smoke_real/annotations/ui_content_missing_train.jsonl"
+    ],
+    "root": "samples/ui_defect_locany_smoke_real/images",
+    "repeat_time": 1.0,
+    "data_augment": false
+  }
+}
