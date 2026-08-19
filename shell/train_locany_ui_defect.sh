@@ -6,6 +6,8 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+# shellcheck source=shell/bash_error_report.sh
+source "${SCRIPT_DIR}/bash_error_report.sh"
 MODEL_PATH="${MODEL_PATH:-nvidia/LocateAnything-3B}"
 DATA_VERSION="${DATA_VERSION:-v3}"
 DATA_DIR="${DATA_DIR:-${PROJECT_ROOT}/data/ui_defect_locany_${DATA_VERSION}}"
@@ -322,11 +324,11 @@ cleanup_gpu_monitor() {
 trap cleanup_gpu_monitor EXIT INT TERM
 
 start_gpu_monitor
-set +e
 
 export LAUNCHER="${LAUNCHER:-pytorch}"
 
-torchrun \
+TRAIN_PIPESTATUS=()
+if torchrun \
   --nnodes="${NNODES:-1}" \
   --node_rank="${NODE_RANK:-0}" \
   --master_addr="${MASTER_ADDR}" \
@@ -380,9 +382,12 @@ torchrun \
   --report_to "${REPORT_TO}" \
   --run_name "${RUN_NAME}" \
   --save_every_n_hours "${SAVE_EVERY_N_HOURS:-0}" \
-  2>&1 | tee -a "${LOG_FILE}"
-
-TRAIN_EXIT_CODE=${PIPESTATUS[0]}
+  2>&1 | tee -a "${LOG_FILE}"; then
+  TRAIN_PIPESTATUS=("${PIPESTATUS[@]}")
+else
+  TRAIN_PIPESTATUS=("${PIPESTATUS[@]}")
+fi
+TRAIN_EXIT_CODE="${TRAIN_PIPESTATUS[0]}"
 stop_gpu_monitor
 
 {
@@ -396,5 +401,9 @@ stop_gpu_monitor
   fi
 } 2>&1 | tee -a "${LOG_FILE}"
 
-set -e
+if (( TRAIN_EXIT_CODE != 0 )); then
+  echo "[LOCANY FATAL] torchrun failed with exit_code=${TRAIN_EXIT_CODE}; full_log=${LOG_FILE}" >&2
+  echo "[LOCANY FATAL] Last ${ERROR_TAIL_LINES:-200} training log lines:" >&2
+  tail -n "${ERROR_TAIL_LINES:-200}" "${LOG_FILE}" >&2
+fi
 exit "${TRAIN_EXIT_CODE}"

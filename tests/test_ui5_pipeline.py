@@ -351,6 +351,68 @@ class ParallelInferenceTests(unittest.TestCase):
             for task in locany_ui5_common.TASKS:
                 self.assertTrue((output_dir / task / "sample.json").is_file())
 
+    def test_model_load_preflight_failure_is_echoed_and_stops_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "checkpoint"
+            processor = root / "processor"
+            input_dir = root / "data"
+            output_dir = root / "predictions"
+            checkpoint.mkdir()
+            processor.mkdir()
+            input_dir.mkdir()
+            for task, filename in locany_ui5_common.TASK_JSONL.items():
+                (input_dir / filename).write_text(
+                    json.dumps({"images": [f"{task}.png"]}) + "\n",
+                    encoding="utf-8",
+                )
+
+            fake_inference = root / "failing_inference.py"
+            fake_inference.write_text(
+                textwrap.dedent(
+                    """
+                    import sys
+
+                    if '--load-only' in sys.argv:
+                        print('MODEL_LOAD_ROOT_CAUSE_FOR_TEST', file=sys.stderr)
+                        raise SystemExit(17)
+                    raise AssertionError('task worker must not start after failed preflight')
+                    """
+                ),
+                encoding="utf-8",
+            )
+            command = [
+                sys.executable,
+                str(SCRIPTS_DIR / "run_ui5_parallel_inference.py"),
+                "--checkpoint",
+                str(checkpoint),
+                "--processor-path",
+                str(processor),
+                "--input-dir",
+                str(input_dir),
+                "--output-dir",
+                str(output_dir),
+                "--gpu-devices",
+                "0,1,2,3",
+                "--attn-implementation",
+                "sdpa",
+                "--inference-script",
+                str(fake_inference),
+            ]
+            completed = subprocess.run(command, check=False, capture_output=True, text=True)
+            combined_output = completed.stdout + completed.stderr
+            self.assertEqual(completed.returncode, 1, combined_output)
+            self.assertIn("MODEL_LOAD_ROOT_CAUSE_FOR_TEST", combined_output)
+            status = json.loads(
+                (output_dir / "parallel_inference_status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(status["model_load_preflight"]["return_code"], 17)
+            self.assertIn(
+                "MODEL_LOAD_ROOT_CAUSE_FOR_TEST",
+                status["model_load_preflight"]["log_tail"],
+            )
+            self.assertEqual(status["tasks"], {})
+
 
 if __name__ == "__main__":
     unittest.main()

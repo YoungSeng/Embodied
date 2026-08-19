@@ -6,6 +6,8 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+# shellcheck source=shell/bash_error_report.sh
+source "${SCRIPT_DIR}/bash_error_report.sh"
 PIPELINE_PYTHON="${ENV_DIR:-}/bin/python"
 if [[ ! -x "${PIPELINE_PYTHON}" ]]; then
   PIPELINE_PYTHON="$(command -v python || true)"
@@ -134,7 +136,12 @@ test -d "${PROJECT_ROOT}" || { echo "[ERROR] Project root missing: ${PROJECT_ROO
 test -d "${BASE_MODEL}" || { echo "[ERROR] Base model missing: ${BASE_MODEL}" >&2; exit 22; }
 test -x "${ENV_DIR}/bin/python" || { echo "[ERROR] Python environment missing: ${ENV_DIR}" >&2; exit 23; }
 test -f "${PROJECT_ROOT}/shell/train_locany_ui_defect.sh" || { echo "[ERROR] Training entrypoint missing" >&2; exit 24; }
-test -f "${SCORER_ROOT}/qwen3vl_merge_and_score_fixed_5tasks.py" || { echo "[ERROR] Scorer missing under ${SCORER_ROOT}" >&2; exit 25; }
+if [[ "${ENABLE_EVAL}" == "1" || "${PIPELINE_MODE}" == "eval" ]]; then
+  test -f "${SCORER_ROOT}/qwen3vl_merge_and_score_fixed_5tasks.py" || {
+    echo "[ERROR] Scorer missing under ${SCORER_ROOT}" >&2
+    exit 25
+  }
+fi
 
 if command -v nvidia-smi >/dev/null 2>&1; then
   echo "===== GPU inventory ====="

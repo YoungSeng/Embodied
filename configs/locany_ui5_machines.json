@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
   "shared": {
-    "project_relative_path": "code/Eagle/Embodied",
+    "project_relative_path": "code/Eagle_LocateUI5_v4/Embodied",
     "conda_env_relative_path": "conda_envs/LocateAnything",
     "base_model_relative_path": "hf_home/hub/models--nvidia--LocateAnything-3B/snapshots/c32291ca5e996f5a7a485845b4f57a233936bba0",
     "training_data_relative_path": "data/ui_defect_locany_{data_version}",
     "eval_data_relative_path": "data",
-    "scorer_relative_path": "code/Eagle/Embodied",
+    "scorer_relative_path": "code/Eagle_LocateUI5_v4/Embodied",
     "image_url": "hub.byted.org/base/lab.cuda.devel:0ffcd17bfdf8d07a198e6cff167eae26",
     "image_vid": "d8ap37f1enlcr23291ug"
   },

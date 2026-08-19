@@ -388,6 +388,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="只检查数据、断点状态和参数，不加载模型",
     )
+    parser.add_argument(
+        "--load-only",
+        "--load_only",
+        dest="load_only",
+        action="store_true",
+        help=(
+            "只校验并加载 tokenizer、processor 和模型后退出；用于并行推理前预热 "
+            "trust_remote_code 缓存并尽早暴露模型加载错误"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -819,15 +829,13 @@ class LocateAnythingInferencer:
         if args.attn_implementation != "auto":
             model_kwargs["attn_implementation"] = args.attn_implementation
 
-        self.model = AutoModel.from_pretrained(args.checkpoint, **model_kwargs)
-
-        # try:
-        #     self.model = AutoModel.from_pretrained(args.checkpoint, **model_kwargs)
-        # except Exception as exc:
-        #     raise RuntimeError(
-        #         "直接加载全参数 checkpoint 失败。请确认 checkpoint 含 config.json、完整"
-        #         " safetensors 权重及 LocateAnything 自定义代码，且当前在 Embodied 环境中运行。"
-        #     ) from exc
+        try:
+            self.model = AutoModel.from_pretrained(args.checkpoint, **model_kwargs)
+        except Exception as exc:
+            raise RuntimeError(
+                "直接加载全参数 checkpoint 失败。请确认 checkpoint 含 config.json、完整"
+                " safetensors 权重及 LocateAnything 自定义代码，且当前在 Embodied 环境中运行。"
+            ) from exc
 
         self.model = self.model.to(self.device).eval()
         parameter_count = sum(parameter.numel() for parameter in self.model.parameters())
@@ -1506,6 +1514,12 @@ def main() -> int:
         raise FileNotFoundError(f"输入目录不存在：{args.input_dir}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     validate_local_checkpoint(args.checkpoint)
+
+    if args.load_only:
+        print("[MODEL LOAD PREFLIGHT] 开始单进程模型加载检查", flush=True)
+        LocateAnythingInferencer(args)
+        print("[MODEL LOAD PREFLIGHT] 模型加载检查通过", flush=True)
+        return 0
 
     works = prepare_work(args)
     print_preflight(args, works)

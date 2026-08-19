@@ -15,6 +15,8 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+# shellcheck source=shell/bash_error_report.sh
+source "${SCRIPT_DIR}/bash_error_report.sh"
 DATA_VERSION="${DATA_VERSION:-v3}"
 
 count_visible_gpus() {

@@ -27,7 +27,9 @@ def parse_args() -> argparse.Namespace:
         description="Render and submit a LocateAnything UI5 v4 A800/H20 4/8-GPU job"
     )
     parser.add_argument("--machine", choices=("a800", "h20"), required=True)
-    parser.add_argument("--gpus", type=int, choices=(4, 8), required=True)
+    parser.add_argument(
+        "--gpus", "--gpu", dest="gpus", type=int, choices=(4, 8), required=True
+    )
     parser.add_argument("--cuda-devices", default=None)
     parser.add_argument("--eval-gpu-devices", default=None)
     parser.add_argument("--max-num-tokens", type=int, default=None)
