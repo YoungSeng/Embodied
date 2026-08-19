@@ -85,7 +85,7 @@ from typing import Any, Sequence
 
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from transformers import AutoModel, AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoProcessor, AutoTokenizer
 
 
 PROMPT_TEMPLATE = (
@@ -398,6 +398,13 @@ def parse_args() -> argparse.Namespace:
             "trust_remote_code 缓存并尽早暴露模型加载错误"
         ),
     )
+    parser.add_argument(
+        "--preflight-forward",
+        "--preflight_forward",
+        dest="preflight_forward",
+        action="store_true",
+        help="与 --load-only 一起使用：加载后用所选任务的第一张图片执行一次真实 generation",
+    )
 
     args = parser.parse_args()
 
@@ -419,6 +426,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-images-per-task 不能小于 0")
     if args.compat_confidence is not None and not 0 <= args.compat_confidence <= 1:
         parser.error("--compat-confidence 必须位于 [0, 1]")
+    if args.preflight_forward and not args.load_only:
+        parser.error("--preflight-forward 必须与 --load-only 一起使用")
 
     return args
 
@@ -698,6 +707,57 @@ def validate_device(device: str) -> None:
         )
 
 
+def configure_attention_backend(config: Any, requested: str, device: str) -> None:
+    """Apply the requested text backend to both levels of a composite config.
+
+    LocateAnything stores an attention choice on the outer config and its nested
+    Qwen config. Passing ``attn_implementation=`` to ``from_pretrained`` only updates
+    the outer value in some Transformers/custom-code combinations; the old nested
+    ``magi`` value then wins during Qwen layer construction.
+    """
+    if requested == "auto":
+        return
+
+    if requested == "magi" and device.startswith("cuda"):
+        logical_index = int(device.split(":", 1)[1]) if ":" in device else 0
+        capability = torch.cuda.get_device_capability(logical_index)
+        if capability != (9, 0):
+            raise RuntimeError(
+                "ATTN_IMPLEMENTATION=magi requires an sm90 GPU, but "
+                f"{torch.cuda.get_device_name(logical_index)} reports sm{capability[0]}{capability[1]}. "
+                "Use sdpa on A800 (sm80); reserve magi for H20/Hopper (sm90)."
+            )
+
+    targets = [("model", config)]
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        targets.append(("text", text_config))
+    for _, target in targets:
+        # Transformers uses the property backed by _attn_implementation_internal;
+        # older LocateAnything code also reads the public field directly.
+        target._attn_implementation = requested
+        target._attn_implementation_internal = requested
+        target._attn_implementation_autoset = False
+        target.attn_implementation = requested
+
+
+def attention_backend_report(model: Any) -> dict[str, str]:
+    model_config = getattr(model, "config", None)
+    text_config = getattr(model_config, "text_config", None)
+    top_backend = str(getattr(model_config, "_attn_implementation", None))
+    text_backend = str(getattr(text_config, "_attn_implementation", None))
+    attention_class = "<unavailable>"
+    try:
+        attention_class = type(model.language_model.model.layers[0].self_attn).__name__
+    except (AttributeError, IndexError, TypeError):
+        pass
+    return {
+        "top_config": top_backend,
+        "text_config": text_backend,
+        "first_layer_class": attention_class,
+    }
+
+
 def apply_chat_template(processor: Any, messages: list[dict[str, Any]]) -> str:
     """Prefer LocateAnything's custom Python template, with official fallbacks."""
 
@@ -826,10 +886,19 @@ class LocateAnythingInferencer:
             "local_files_only": args.local_files_only,
             "low_cpu_mem_usage": True,
         }
-        if args.attn_implementation != "auto":
-            model_kwargs["attn_implementation"] = args.attn_implementation
 
         try:
+            model_config = AutoConfig.from_pretrained(
+                args.checkpoint,
+                trust_remote_code=args.trust_remote_code,
+                local_files_only=args.local_files_only,
+            )
+            configure_attention_backend(
+                model_config,
+                args.attn_implementation,
+                args.device,
+            )
+            model_kwargs["config"] = model_config
             self.model = AutoModel.from_pretrained(args.checkpoint, **model_kwargs)
         except Exception as exc:
             raise RuntimeError(
@@ -838,6 +907,27 @@ class LocateAnythingInferencer:
             ) from exc
 
         self.model = self.model.to(self.device).eval()
+        backend_report = attention_backend_report(self.model)
+        print(f"attention top config    : {backend_report['top_config']}")
+        print(f"attention text config   : {backend_report['text_config']}")
+        print(f"attention layer class   : {backend_report['first_layer_class']}")
+        requested_backend = args.attn_implementation
+        if (
+            requested_backend != "auto"
+            and backend_report["text_config"] != requested_backend
+        ):
+            raise RuntimeError(
+                "Requested attention backend was not applied to the nested Qwen config: "
+                f"requested={requested_backend}, actual={backend_report['text_config']}, "
+                f"layer={backend_report['first_layer_class']}"
+            )
+        if requested_backend == "sdpa" and "magi" in backend_report[
+            "first_layer_class"
+        ].lower():
+            raise RuntimeError(
+                "Requested sdpa, but LocateAnything instantiated a Magi attention layer: "
+                f"{backend_report['first_layer_class']}"
+            )
         parameter_count = sum(parameter.numel() for parameter in self.model.parameters())
         print(f"parameters              : {parameter_count:,}")
         print("===== 模型加载完成 =====\n")
@@ -1517,7 +1607,27 @@ def main() -> int:
 
     if args.load_only:
         print("[MODEL LOAD PREFLIGHT] 开始单进程模型加载检查", flush=True)
-        LocateAnythingInferencer(args)
+        preflight_works = prepare_work(args) if args.preflight_forward else []
+        inferencer = LocateAnythingInferencer(args)
+        if args.preflight_forward:
+            if not preflight_works or not preflight_works[0].image_paths:
+                raise RuntimeError("forward preflight 找不到可用的任务图片")
+            work = preflight_works[0]
+            image_path = work.image_paths[0]
+            print(
+                f"[MODEL FORWARD PREFLIGHT] task={work.config.task_name} image={image_path}",
+                flush=True,
+            )
+            with Image.open(image_path) as opened:
+                image = opened.convert("RGB")
+            set_sample_seed(
+                stable_sample_seed(args.seed, work.config.task_name, image_path)
+            )
+            answer = inferencer.predict(image=image, question=work.config.prompt)
+            print(
+                f"[MODEL FORWARD PREFLIGHT] generation passed, answer_chars={len(answer)}",
+                flush=True,
+            )
         print("[MODEL LOAD PREFLIGHT] 模型加载检查通过", flush=True)
         return 0
 

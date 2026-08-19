@@ -122,7 +122,7 @@ def build_command(
         "--fail-fast",
     ]
     if load_only:
-        command.append("--load-only")
+        command.extend(["--load-only", "--preflight-forward"])
     if args.max_images_per_task:
         command.extend(["--max-images-per-task", str(args.max_images_per_task)])
     return command

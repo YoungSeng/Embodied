@@ -123,8 +123,8 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 raise ValueError(f'Unsupported vision model type: {config.vision_config.model_type}. Only moonvit is supported.')
 
         text_attn_impl = (
-            getattr(config.text_config, '_attn_implementation', None)
-            or getattr(config, '_attn_implementation', None)
+            getattr(config, '_attn_implementation', None)
+            or getattr(config.text_config, '_attn_implementation', None)
             or 'magi'
         )
         config.text_config._attn_implementation = text_attn_impl
