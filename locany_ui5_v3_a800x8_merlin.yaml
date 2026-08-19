@@ -1,0 +1,310 @@
+# Merlin / Arnold 正式训练任务：LocateAnything-3B，UI 5 类，A800 × 8
+# mlx job submitv2 --path locany_ui5_v3_a800x8_merlin.yaml
+# bash -x shell/train_locany_ui_defect.sh TRAIN_EXIT_CODE=$? set -e echo "TRAIN_EXIT_CODE=${TRAIN_EXIT_CODE}" exit "${TRAIN_EXIT_CODE}"
+
+caption: 'LocateAnything UI5 Formal Training - A800x8'
+
+jobDefVersion:
+  entrypointMode: FULL_SCRIPT
+
+  gitRepo:
+    mnt: /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied
+
+  imageMeta:
+    imageSource: url
+    imageUrl: hub.byted.org/base/lab.cuda.devel:0ffcd17bfdf8d07a198e6cff167eae26
+    imageVid: d8ap37f1enlcr23291ug
+
+  lazyDownloadCode: true
+  name: 'locany-ui5-v4-a800x8'
+
+  resource:
+    arnoldConfig:
+      clusterId: 24
+      elasticTraining: {}
+
+      groupIds:
+        - 1602  # ies_aiai_experience
+
+      bytenasVolumes:
+        - name: intelligent-service-yg
+          accessMode: RW
+          roles:
+            - worker
+          subPath: ""
+
+      keepMins: 1
+      preemptible: false
+      quotaPool: default
+
+      roles:
+        - name: worker
+          num: 1
+          cpu: 116
+          gpu: 8
+          gpuv: A800_SXM_40GB
+          memory: 262144
+          ports: 1
+
+    backend: ARNOLD
+
+  volumes:
+    - volumeId: 19922
+      mountPath: /mnt/bn/intelligent-service-yg
+
+jobRunParams:
+  entrypointFullScript: |
+    echo "===== Begin LocateAnything formal training ====="
+    set -Eeuo pipefail
+
+    # ============================================================
+    # 1. 固定路径和任务参数
+    # ============================================================
+    WORKSPACE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace
+    PROJECT_DIR=${WORKSPACE}/code/Eagle/Embodied
+    ENV_DIR=${WORKSPACE}/conda_envs/LocateAnything
+
+    MACHINE_NAME=a800
+    CUDA_DEVICES=${CUDA_DEVICES:-0,1,2,3,4,5,6,7}
+    DATA_VERSION=${DATA_VERSION:-v3}
+    VERSION=${VERSION:-v4}
+
+    DATA_DIR=${PROJECT_DIR}/data/ui_defect_locany_${DATA_VERSION}
+    META_PATH=${DATA_DIR}/recipe/ui_defect_5class_train.json
+    RUN_NAME=locany-3b-ui5-${MACHINE_NAME}-full-${VERSION}-en
+
+    # A800 固定训练配置
+    ATTN_IMPLEMENTATION=sdpa
+    MAX_SEQ_LENGTH=7268
+    MAX_NUM_TOKENS_PER_SAMPLE=7268
+    MAX_NUM_TOKENS=25600
+    PACKING_BUFFER_SIZE=32
+    DATALOADER_NUM_WORKERS=4
+
+    # 每个正式任务使用独立目录，避免并发任务互相覆盖
+    JOB_ID=${ARNOLD_TRIAL_ID:-${ARNOLD_JOB_ID:-manual-$$}}
+    SHARED_RUNTIME_DIR=${WORKSPACE}/runtime/${JOB_ID}
+    LOCAL_RUNTIME_DIR=/tmp/locany-${JOB_ID}
+
+    # ============================================================
+    # 2. 目录策略
+    #    ByteNAS：模型、数据下载、包缓存、较大的编译产物
+    #    /tmp：高频小文件、Python 临时文件、即时编译缓存
+    # ============================================================
+    mkdir -p \
+      "${WORKSPACE}/cache/huggingface/hub" \
+      "${WORKSPACE}/cache/huggingface/datasets" \
+      "${WORKSPACE}/cache/pip" \
+      "${WORKSPACE}/cache/torch" \
+      "${WORKSPACE}/cache/xdg" \
+      "${WORKSPACE}/conda_pkgs" \
+      "${WORKSPACE}/local/python_user" \
+      "${SHARED_RUNTIME_DIR}/home" \
+      "${SHARED_RUNTIME_DIR}/xdg-data" \
+      "${SHARED_RUNTIME_DIR}/xdg-state" \
+      "${SHARED_RUNTIME_DIR}/xdg-config" \
+      "${SHARED_RUNTIME_DIR}/torch_extensions" \
+      "${LOCAL_RUNTIME_DIR}/tmp" \
+      "${LOCAL_RUNTIME_DIR}/pycache" \
+      "${LOCAL_RUNTIME_DIR}/triton" \
+      "${LOCAL_RUNTIME_DIR}/torchinductor" \
+      "${LOCAL_RUNTIME_DIR}/cuda_cache" \
+      "${LOCAL_RUNTIME_DIR}/numba" \
+      "${LOCAL_RUNTIME_DIR}/cupy" \
+      "${LOCAL_RUNTIME_DIR}/matplotlib"
+
+    # ============================================================
+    # 3. 用户目录和缓存重定向
+    # ============================================================
+    # Hugging Face 网络配置
+    export http_proxy=http://sys-proxy-rd-relay.byted.org:8118
+    export https_proxy=http://sys-proxy-rd-relay.byted.org:8118
+    export HTTP_PROXY=${http_proxy}
+    export HTTPS_PROXY=${https_proxy}
+
+    export HF_ENDPOINT=http://huggingface-proxy-sg.byted.org
+
+    # 不要分两次设置，否则后一次会覆盖前一次
+    export no_proxy="localhost,127.0.0.1,::1,.byted.org,huggingface-proxy-sg.byted.org"
+    export NO_PROXY=${no_proxy}
+
+    # 调大连接超时，避免网络偶发抖动
+    export HF_HUB_ETAG_TIMEOUT=60
+    export HF_HUB_DOWNLOAD_TIMEOUT=600
+
+    export HOME=${SHARED_RUNTIME_DIR}/home
+
+    # 高频临时 I/O 放本机盘
+    export TMPDIR=${LOCAL_RUNTIME_DIR}/tmp
+    export TEMP=${TMPDIR}
+    export TMP=${TMPDIR}
+    export PYTHONPYCACHEPREFIX=${LOCAL_RUNTIME_DIR}/pycache
+    export TRITON_CACHE_DIR=${LOCAL_RUNTIME_DIR}/triton
+    export TORCHINDUCTOR_CACHE_DIR=${LOCAL_RUNTIME_DIR}/torchinductor
+    export CUDA_CACHE_PATH=${LOCAL_RUNTIME_DIR}/cuda_cache
+    export NUMBA_CACHE_DIR=${LOCAL_RUNTIME_DIR}/numba
+    export CUPY_CACHE_DIR=${LOCAL_RUNTIME_DIR}/cupy
+    export MPLCONFIGDIR=${LOCAL_RUNTIME_DIR}/matplotlib
+
+    # 大文件和可复用下载缓存放 ByteNAS
+    export XDG_CACHE_HOME=${WORKSPACE}/cache/xdg
+    export XDG_DATA_HOME=${SHARED_RUNTIME_DIR}/xdg-data
+    export XDG_STATE_HOME=${SHARED_RUNTIME_DIR}/xdg-state
+    export XDG_CONFIG_HOME=${SHARED_RUNTIME_DIR}/xdg-config
+
+    export PYTHONUSERBASE=${WORKSPACE}/local/python_user
+    export PYTHONNOUSERSITE=1
+
+    export CONDA_ENVS_PATH=${WORKSPACE}/conda_envs
+    export CONDA_PKGS_DIRS=${WORKSPACE}/conda_pkgs
+    export PIP_CACHE_DIR=${WORKSPACE}/cache/pip
+
+    export HF_HOME=${WORKSPACE}/cache/huggingface
+    export HF_HUB_CACHE=${WORKSPACE}/cache/huggingface/hub
+    export HUGGINGFACE_HUB_CACHE=${HF_HUB_CACHE}
+    export TRANSFORMERS_CACHE=${HF_HUB_CACHE}
+    export HF_DATASETS_CACHE=${WORKSPACE}/cache/huggingface/datasets
+
+    export TORCH_HOME=${WORKSPACE}/cache/torch
+    export TORCH_EXTENSIONS_DIR=${SHARED_RUNTIME_DIR}/torch_extensions
+
+    # ============================================================
+    # 4. 运行稳定性设置
+    # ============================================================
+    export USER=${USER:-tiger}
+    export LOGNAME=${LOGNAME:-${USER}}
+    export PATH=${ENV_DIR}/bin:${PYTHONUSERBASE}/bin:${PATH}
+    export CONDA_PREFIX=${ENV_DIR}
+    export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
+    export PYTHONPATH=${PROJECT_DIR}:${PYTHONPATH:-}
+
+    export PYTHONUNBUFFERED=1
+    export TOKENIZERS_PARALLELISM=false
+    export HF_HUB_DISABLE_TELEMETRY=1
+    export CUDA_DEVICE_ORDER=PCI_BUS_ID
+    export NCCL_DEBUG=WARN
+    export NCCL_ASYNC_ERROR_HANDLING=1
+    export OMP_NUM_THREADS=8
+
+    hash -r
+    ulimit -n 65535 || true
+
+    # ============================================================
+    # 5. 启动前检查
+    # ============================================================
+    echo "===== Storage configuration ====="
+    echo "JOB_ID=${JOB_ID}"
+    echo "PROJECT_DIR=${PROJECT_DIR}"
+    echo "ENV_DIR=${ENV_DIR}"
+    echo "META_PATH=${META_PATH}"
+    echo "RUN_NAME=${RUN_NAME}"
+    echo "TMPDIR=${TMPDIR}"
+    echo "HF_HOME=${HF_HOME}"
+    echo "HF_ENDPOINT=${HF_ENDPOINT}"
+    echo "http_proxy=${http_proxy}"
+    echo "no_proxy=${no_proxy}"
+    echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR}"
+    echo "TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR}"
+
+    test -d "${PROJECT_DIR}" || {
+      echo "ERROR: Project directory not found: ${PROJECT_DIR}" >&2
+      exit 20
+    }
+
+    test -x "${ENV_DIR}/bin/python" || {
+      echo "ERROR: Python environment not found: ${ENV_DIR}" >&2
+      exit 21
+    }
+
+    test -f "${META_PATH}" || {
+      echo "ERROR: Training metadata not found: ${META_PATH}" >&2
+      exit 22
+    }
+
+    test -f "${PROJECT_DIR}/shell/train_locany_ui_defect.sh" || {
+      echo "ERROR: Training script not found" >&2
+      exit 23
+    }
+
+    cd "${PROJECT_DIR}"
+
+    echo "===== Python environment ====="
+    echo "Python: $(command -v python)"
+    python --version
+    python - <<'PY'
+    import os
+    import tempfile
+    import torch
+    import transformers
+
+    print("torch:", torch.__version__)
+    print("transformers:", transformers.__version__)
+    print("cuda available:", torch.cuda.is_available())
+    print("gpu count:", torch.cuda.device_count())
+    print("TMPDIR:", tempfile.gettempdir())
+    print("HF_HOME:", os.environ.get("HF_HOME"))
+    print("TORCH_HOME:", os.environ.get("TORCH_HOME"))
+    PY
+
+    echo "===== Filesystem ====="
+    df -h /tmp /mnt/bn/intelligent-service-yg || true
+
+    echo "===== GPU ====="
+    nvidia-smi
+
+    # ============================================================
+    # 6. 开始正式训练
+    # ============================================================
+    echo "===== Start training: ${RUN_NAME} ====="
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    TRAIN_SCRIPT="${PROJECT_DIR}/shell/train_locany_ui_defect.sh"
+    LAUNCH_LOG="${SHARED_RUNTIME_DIR}/launcher-${JOB_ID}.log"
+
+    echo "===== Validate training script ====="
+    ls -lh "${TRAIN_SCRIPT}"
+    sha256sum "${TRAIN_SCRIPT}"
+    bash -n "${TRAIN_SCRIPT}" || {
+      echo "ERROR: Training script contains a Bash syntax error" >&2
+      exit 24
+    }
+
+
+    set +e
+    env \
+      LAUNCHER=pytorch \
+      CUDA_VISIBLE_DEVICES=${CUDA_DEVICES} \
+      MODEL_PATH=${WORKSPACE}/models/LocateAnything-3B \
+      META_PATH=${META_PATH} \
+      RUN_NAME=${RUN_NAME} \
+      DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS} \
+      MAX_STEPS=16000 \
+      WARMUP_STEPS=500 \
+      LEARNING_RATE=2e-5 \
+      LOGGING_STEPS=1 \
+      SAVE_STEPS=4000 \
+      ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION} \
+      MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH} \
+      MAX_NUM_TOKENS_PER_SAMPLE=${MAX_NUM_TOKENS_PER_SAMPLE} \
+      MAX_NUM_TOKENS=${MAX_NUM_TOKENS} \
+      PACKING_BUFFER_SIZE=${PACKING_BUFFER_SIZE} \
+      SAVE_TOTAL_LIMIT=1000 \
+      SAMPLE_LOG_INTERVAL=5 \
+      REPORT_TO=tensorboard \
+      SAVE_EVERY_N_HOURS=0 \
+      bash -Eeux -o pipefail "${TRAIN_SCRIPT}" 2>&1 \
+      | tee "${LAUNCH_LOG}"
+
+    TRAIN_EXIT_CODE=${PIPESTATUS[0]}
+
+    set -e
+    echo "TRAIN_EXIT_CODE=${TRAIN_EXIT_CODE}"
+    exit "${TRAIN_EXIT_CODE}"
+
+  envsList:
+    CUDA_DEVICES: "0,1,2,3,4,5,6,7"
+    DATA_VERSION: "v3"
+    VERSION: "v4"
+
+namespace: /user/sicheng.yang
