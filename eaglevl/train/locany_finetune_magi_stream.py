@@ -80,6 +80,18 @@ from transformers.trainer_pt_utils import LabelSmoother
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {value!r}")
+
+
 if version.parse(torch.__version__) >= version.parse("2.4.0"):
     torch.serialization.add_safe_globals(
         [np.core.multiarray._reconstruct, np.ndarray, np.dtype, type(np.dtype(np.uint32))])
@@ -1209,7 +1221,27 @@ class DataloaderStateCallback(TrainerCallback):
                     os.remove(temp_path)
                 except:
                     pass
-        
+        return control
+
+
+class SegmentStopCallback(TrainerCallback):
+    """Stop at an absolute global step and force a fully resumable checkpoint."""
+
+    def __init__(self, stop_after_step: int):
+        super().__init__()
+        if stop_after_step <= 0:
+            raise ValueError("stop_after_step must be positive")
+        self.stop_after_step = stop_after_step
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step >= self.stop_after_step:
+            control.should_save = True
+            control.should_training_stop = True
+            if get_rank() == 0:
+                logger.info(
+                    "Segment boundary reached at global_step=%s; forcing a resumable checkpoint",
+                    state.global_step,
+                )
         return control
 
 
@@ -1649,7 +1681,19 @@ def main():
             initial_interval_hours=model_args.save_every_n_hours, save_interval_minutes=5))
     my_callbacks.append(MemoryLoggerCallback())
     my_callbacks.append(DataloaderStateCallback(train_dataset))
-    my_callbacks.append(MilestoneCheckpointCallback(milestone_interval=2000))
+    stop_after_step = int(os.environ.get("LOCANY_STOP_AFTER_STEP", "0"))
+    if stop_after_step:
+        if stop_after_step > training_args.max_steps:
+            raise ValueError(
+                f"LOCANY_STOP_AFTER_STEP={stop_after_step} exceeds "
+                f"max_steps={training_args.max_steps}"
+            )
+        my_callbacks.append(SegmentStopCallback(stop_after_step=stop_after_step))
+    if _env_flag("LOCANY_ENABLE_MILESTONE_COPIES", default=True):
+        milestone_interval = int(os.environ.get("LOCANY_MILESTONE_INTERVAL", "2000"))
+        my_callbacks.append(
+            MilestoneCheckpointCallback(milestone_interval=milestone_interval)
+        )
     
     CustomTrainer = StreamPackingMTPTrainer
 
@@ -1690,7 +1734,15 @@ def main():
                 logger.warning(f"Rank {rank}: No dataloader state found at {dataloader_state_path}")
 
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        trainer.save_model()
+        segment_mode = _env_flag("LOCANY_SEGMENT_MODE", default=False)
+        final_segment = trainer.state.global_step >= training_args.max_steps
+        if not segment_mode or final_segment:
+            trainer.save_model()
+        elif get_rank() == 0:
+            logger.info(
+                "Segment mode stopped at step %s; skipped duplicate model export to output root",
+                trainer.state.global_step,
+            )
 
         if get_rank() == 0:
             output_dir = training_args.output_dir
@@ -1738,8 +1790,15 @@ def main():
         trainer.save_metrics('train', metrics)
         trainer.save_state()
         
-    with open(osp.join(training_args.output_dir, 'done.txt'), 'w') as f:
-        f.write('done: ' + time.ctime())
+    segment_mode = _env_flag("LOCANY_SEGMENT_MODE", default=False)
+    training_complete = (not training_args.do_train) or (
+        'trainer' in locals() and trainer.state.global_step >= training_args.max_steps
+    )
+    if not segment_mode or training_complete:
+        with open(osp.join(training_args.output_dir, 'done.txt'), 'w') as f:
+            f.write('done: ' + time.ctime())
+    elif get_rank() == 0:
+        logger.info("Segment is resumable but not final; done.txt was not written")
 
 
 if __name__ == '__main__':

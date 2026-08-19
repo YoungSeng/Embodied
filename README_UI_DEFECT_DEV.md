@@ -1,5 +1,9 @@
 # LocateAnything UI 缺陷检测：外网开发与内网训练
 
+> LocateAnything UI5 v4 的统一 A800/H20、4/8 卡训练与自动周期评测入口见
+> [`README_LOCANY_UI5_PIPELINE.md`](README_LOCANY_UI5_PIPELINE.md)。新任务请使用
+> `python scripts/submit_locany_ui5.py ...`；本文件中的旧机器专用 YAML 命令仅保留作历史参考。
+
 这套文件用于把同一份 LocateAnything UI 缺陷代码分成两个运行档位：
 
 - 外网单张 RTX 4090 只做冒烟测试，确认模型加载、样例读取、forward、backward、optimizer step 和日志保存都能运行。

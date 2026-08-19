@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "shared": {
+    "project_relative_path": "code/Eagle/Embodied",
+    "conda_env_relative_path": "conda_envs/LocateAnything",
+    "base_model_relative_path": "hf_home/hub/models--nvidia--LocateAnything-3B/snapshots/c32291ca5e996f5a7a485845b4f57a233936bba0",
+    "training_data_relative_path": "data/ui_defect_locany_{data_version}",
+    "eval_data_relative_path": "data",
+    "scorer_relative_path": "code/Eagle/Embodied",
+    "image_url": "hub.byted.org/base/lab.cuda.devel:0ffcd17bfdf8d07a198e6cff167eae26",
+    "image_vid": "d8ap37f1enlcr23291ug"
+  },
+  "machines": {
+    "a800": {
+      "workspace": "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace",
+      "attention_implementation": "sdpa",
+      "output_base_template": "{project_root}/work_dirs",
+      "hf_home_template": "{workspace}/cache/huggingface",
+      "max_seq_length": 7268,
+      "max_num_tokens_per_sample": 7268,
+      "gpu_defaults": {
+        "4": {
+          "max_num_tokens": 12800
+        },
+        "8": {
+          "max_num_tokens": 25600
+        }
+      },
+      "merlin": {
+        "cluster_id": 24,
+        "group_id": 1602,
+        "bytenas_name": "intelligent-service-yg",
+        "volume_id": 19922,
+        "mount_path": "/mnt/bn/intelligent-service-yg",
+        "gpuv": "A800_SXM_40GB",
+        "cpu": 116,
+        "memory": 262144,
+        "queue_name": ""
+      }
+    },
+    "h20": {
+      "workspace": "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace",
+      "attention_implementation": "magi",
+      "output_base_template": "{workspace}/gui_models",
+      "hf_home_template": "{workspace}/cache/huggingface",
+      "max_seq_length": 8192,
+      "max_num_tokens_per_sample": 8192,
+      "gpu_defaults": {
+        "4": {
+          "max_num_tokens": 25600
+        },
+        "8": {
+          "max_num_tokens": 25600
+        }
+      },
+      "merlin": {
+        "cluster_id": 20,
+        "group_id": 1000,
+        "bytenas_name": "intelligent-service-arnold-hl",
+        "volume_id": 18834,
+        "mount_path": "/mnt/bn/intelligent-service-arnold-hl",
+        "gpuv": "NVIDIA_H20",
+        "cpu": 80,
+        "memory": 921600,
+        "queue_name": "compute-329-hl-cloudnative-ai-iesqa.llm4se-guarantee"
+      }
+    }
+  }
+}

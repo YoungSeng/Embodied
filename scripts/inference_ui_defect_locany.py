@@ -210,6 +210,16 @@ def parse_args() -> argparse.Namespace:
         help="总输出目录；每类任务写入独立子目录",
     )
     parser.add_argument(
+        "--summary-path",
+        "--summary_path",
+        dest="summary_path",
+        default=None,
+        help=(
+            "推理汇总 JSON 路径；默认写入 OUTPUT_DIR/_summary.json。并行运行单任务时"
+            "应为每个 worker 指定不同路径，避免并发覆盖"
+        ),
+    )
+    parser.add_argument(
         "--cuda-visible-devices",
         "--cuda_visible_devices",
         dest="cuda_visible_devices",
@@ -1486,6 +1496,11 @@ def main() -> int:
         args.processor_path = normalize_local_or_hub_path(args.processor_path)
     args.input_dir = Path(args.input_dir).expanduser().resolve()
     args.output_dir = Path(args.output_dir).expanduser().resolve()
+    args.summary_path = (
+        Path(args.summary_path).expanduser().resolve()
+        if args.summary_path
+        else args.output_dir / "_summary.json"
+    )
 
     if not args.input_dir.is_dir():
         raise FileNotFoundError(f"输入目录不存在：{args.input_dir}")
@@ -1533,7 +1548,7 @@ def main() -> int:
         "wall_elapsed_seconds": round(time.time() - wall_start, 6),
         "finished_at": datetime.now(timezone.utc).isoformat(),
     }
-    atomic_write_json(args.output_dir / "_summary.json", summary)
+    atomic_write_json(args.summary_path, summary)
 
     totals = summary["totals"]
     print("\n" + "=" * 88)
@@ -1544,7 +1559,7 @@ def main() -> int:
     print(f"推理异常             : {totals['inference_error']}")
     print(f"预测框总数           : {totals['boxes']}")
     print(f"输出目录             : {args.output_dir}")
-    print(f"汇总                 : {args.output_dir / '_summary.json'}")
+    print(f"汇总                 : {args.summary_path}")
     print("=" * 88)
 
     return 2 if totals["inference_error"] else 0
