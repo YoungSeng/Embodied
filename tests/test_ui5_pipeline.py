@@ -407,6 +407,7 @@ class ParallelInferenceTests(unittest.TestCase):
                 "sdpa",
                 "--inference-script",
                 str(fake_inference),
+                "--model-load-preflight",
             ]
             completed = subprocess.run(command, check=False, capture_output=True, text=True)
             combined_output = completed.stdout + completed.stderr

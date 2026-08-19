@@ -247,6 +247,12 @@ def parse_args() -> argparse.Namespace:
         help="auto 时沿用 checkpoint/模型默认设置",
     )
     parser.add_argument(
+        "--vision-attn-implementation",
+        choices=("sdpa", "flash_attention_2", "eager"),
+        default="flash_attention_2",
+        help="MoonViT attention 后端；A800/H20 默认均使用普通 FlashAttention 2",
+    )
+    parser.add_argument(
         "--generation-mode",
         "--generation_mode",
         choices=("fast", "slow", "hybrid"),
@@ -707,7 +713,12 @@ def validate_device(device: str) -> None:
         )
 
 
-def configure_attention_backend(config: Any, requested: str, device: str) -> None:
+def configure_attention_backend(
+    config: Any,
+    requested: str,
+    vision_requested: str,
+    device: str,
+) -> None:
     """Apply the requested text backend to both levels of a composite config.
 
     LocateAnything stores an attention choice on the outer config and its nested
@@ -715,9 +726,6 @@ def configure_attention_backend(config: Any, requested: str, device: str) -> Non
     the outer value in some Transformers/custom-code combinations; the old nested
     ``magi`` value then wins during Qwen layer construction.
     """
-    if requested == "auto":
-        return
-
     if requested == "magi" and device.startswith("cuda"):
         logical_index = int(device.split(":", 1)[1]) if ":" in device else 0
         capability = torch.cuda.get_device_capability(logical_index)
@@ -728,33 +736,73 @@ def configure_attention_backend(config: Any, requested: str, device: str) -> Non
                 "Use sdpa on A800 (sm80); reserve magi for H20/Hopper (sm90)."
             )
 
-    targets = [("model", config)]
-    text_config = getattr(config, "text_config", None)
-    if text_config is not None:
-        targets.append(("text", text_config))
-    for _, target in targets:
-        # Transformers uses the property backed by _attn_implementation_internal;
-        # older LocateAnything code also reads the public field directly.
-        target._attn_implementation = requested
-        target._attn_implementation_internal = requested
-        target._attn_implementation_autoset = False
-        target.attn_implementation = requested
+    if requested != "auto":
+        targets = [("model", config)]
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None:
+            targets.append(("text", text_config))
+        for _, target in targets:
+            # Transformers uses the property backed by _attn_implementation_internal;
+            # older LocateAnything code also reads the public field directly.
+            target._attn_implementation = requested
+            target._attn_implementation_internal = requested
+            target._attn_implementation_autoset = False
+            target.attn_implementation = requested
+
+    # Composite-config propagation may copy the outer text choice to every
+    # sub-config. Apply the MoonViT choice last so text=sdpa does not turn the
+    # quadratic vision path into SDPA for high-resolution UI screenshots.
+    vision_config = getattr(config, "vision_config", None)
+    if vision_config is not None:
+        vision_config._attn_implementation = vision_requested
+        vision_config._attn_implementation_internal = vision_requested
+        vision_config._attn_implementation_autoset = False
+        vision_config.attn_implementation = vision_requested
+
+
+def enforce_vision_runtime_backend(model: Any, requested: str) -> int:
+    """Set the already-instantiated MoonViT blocks to the requested backend."""
+    vision_model = getattr(model, "vision_model", None)
+    vision_config = getattr(getattr(model, "config", None), "vision_config", None)
+    if vision_config is not None:
+        vision_config._attn_implementation = requested
+        vision_config._attn_implementation_internal = requested
+        vision_config._attn_implementation_autoset = False
+        vision_config.attn_implementation = requested
+    blocks = getattr(getattr(vision_model, "encoder", None), "blocks", ())
+    changed = 0
+    for block in blocks:
+        if hasattr(block, "attn_implementation"):
+            block.attn_implementation = requested
+            changed += 1
+    return changed
 
 
 def attention_backend_report(model: Any) -> dict[str, str]:
     model_config = getattr(model, "config", None)
     text_config = getattr(model_config, "text_config", None)
+    vision_config = getattr(model_config, "vision_config", None)
     top_backend = str(getattr(model_config, "_attn_implementation", None))
     text_backend = str(getattr(text_config, "_attn_implementation", None))
     attention_class = "<unavailable>"
+    vision_backend = str(getattr(vision_config, "_attn_implementation", None))
+    vision_layer_backend = "<unavailable>"
     try:
         attention_class = type(model.language_model.model.layers[0].self_attn).__name__
+    except (AttributeError, IndexError, TypeError):
+        pass
+    try:
+        vision_layer_backend = str(
+            model.vision_model.encoder.blocks[0].attn_implementation
+        )
     except (AttributeError, IndexError, TypeError):
         pass
     return {
         "top_config": top_backend,
         "text_config": text_backend,
         "first_layer_class": attention_class,
+        "vision_config": vision_backend,
+        "vision_first_layer": vision_layer_backend,
     }
 
 
@@ -896,6 +944,7 @@ class LocateAnythingInferencer:
             configure_attention_backend(
                 model_config,
                 args.attn_implementation,
+                args.vision_attn_implementation,
                 args.device,
             )
             model_kwargs["config"] = model_config
@@ -906,11 +955,18 @@ class LocateAnythingInferencer:
                 " safetensors 权重及 LocateAnything 自定义代码，且当前在 Embodied 环境中运行。"
             ) from exc
 
+        changed_vision_blocks = enforce_vision_runtime_backend(
+            self.model,
+            args.vision_attn_implementation,
+        )
         self.model = self.model.to(self.device).eval()
         backend_report = attention_backend_report(self.model)
         print(f"attention top config    : {backend_report['top_config']}")
         print(f"attention text config   : {backend_report['text_config']}")
         print(f"attention layer class   : {backend_report['first_layer_class']}")
+        print(f"vision attention config : {backend_report['vision_config']}")
+        print(f"vision layer backend    : {backend_report['vision_first_layer']}")
+        print(f"vision blocks configured: {changed_vision_blocks}")
         requested_backend = args.attn_implementation
         if (
             requested_backend != "auto"
@@ -927,6 +983,12 @@ class LocateAnythingInferencer:
             raise RuntimeError(
                 "Requested sdpa, but LocateAnything instantiated a Magi attention layer: "
                 f"{backend_report['first_layer_class']}"
+            )
+        if backend_report["vision_first_layer"] != args.vision_attn_implementation:
+            raise RuntimeError(
+                "Requested MoonViT attention backend was not applied: "
+                f"requested={args.vision_attn_implementation}, "
+                f"actual={backend_report['vision_first_layer']}"
             )
         parameter_count = sum(parameter.numel() for parameter in self.model.parameters())
         print(f"parameters              : {parameter_count:,}")

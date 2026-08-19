@@ -39,10 +39,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-load-preflight",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
-            "并行 worker 启动前先在第一张 GPU 上单进程加载一次模型。这样可预热 "
-            "trust_remote_code 缓存，并在模型加载失败时直接输出 traceback"
+            "可选：并行 worker 启动前先在第一张 GPU 上单进程加载一次模型；默认关闭，"
+            "直接启动任务 worker"
         ),
     )
     parser.add_argument(
@@ -114,6 +114,8 @@ def build_command(
         "cuda:0",
         "--attn-implementation",
         args.attn_implementation,
+        "--vision-attn-implementation",
+        "flash_attention_2",
         "--generation-mode",
         "hybrid",
         "--tasks",
@@ -122,7 +124,7 @@ def build_command(
         "--fail-fast",
     ]
     if load_only:
-        command.extend(["--load-only", "--preflight-forward"])
+        command.append("--load-only")
     if args.max_images_per_task:
         command.extend(["--max-images-per-task", str(args.max_images_per_task)])
     return command
