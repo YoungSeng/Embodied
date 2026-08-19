@@ -152,6 +152,16 @@ def resolve_runtime_config(
     training_data_dir = str(
         _env_value(env, "TRAINING_DATA_DIR", join_runtime_path(project_root, training_data_rel))
     )
+    training_data_source_rel = shared["training_data_source_relative_path"].format(
+        data_version=data_version
+    )
+    training_data_source_dir = str(
+        _env_value(
+            env,
+            "TRAINING_DATA_SOURCE_DIR",
+            join_runtime_path(workspace, training_data_source_rel),
+        )
+    )
     meta_path = str(
         _env_value(
             env,
@@ -223,6 +233,7 @@ def resolve_runtime_config(
         "DATA_VERSION": data_version,
         "VERSION": version,
         "TRAINING_DATA_DIR": training_data_dir,
+        "TRAINING_DATA_SOURCE_DIR": training_data_source_dir,
         "META_PATH": meta_path,
         "EVAL_INPUT_DIR": eval_input_dir,
         "OUTPUT_BASE": output_base,

@@ -53,6 +53,25 @@ mkdir -p \
   "${LOCAL_RUNTIME_DIR}/torchinductor" \
   "${LOCAL_RUNTIME_DIR}/cuda_cache"
 
+# Preserve everything needed for post-mortem debugging on the shared volume. Normal
+# stdout/stderr goes both to Merlin and the combined log; xtrace is intentionally kept
+# in a separate file so the main job log remains readable.
+PIPELINE_RUN_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+PIPELINE_LOG_DIR="${OUTPUT_DIR}/logs"
+PIPELINE_LOG="${PIPELINE_LOG_DIR}/pipeline-${PIPELINE_RUN_STAMP}-${BASHPID}.log"
+PIPELINE_TRACE_LOG="${PIPELINE_LOG_DIR}/pipeline-${PIPELINE_RUN_STAMP}-${BASHPID}.trace.log"
+mkdir -p "${PIPELINE_LOG_DIR}"
+touch "${PIPELINE_LOG}" "${PIPELINE_TRACE_LOG}"
+export PIPELINE_LOG PIPELINE_TRACE_LOG
+exec > >(tee -a "${PIPELINE_LOG}") 2>&1
+exec 19>>"${PIPELINE_TRACE_LOG}"
+export BASH_XTRACEFD=19
+PS4='+ ${EPOCHREALTIME:-?} ${BASH_SOURCE[0]:-$0}:${LINENO}:${FUNCNAME[0]:-main}: '
+export PS4
+if [[ "${PIPELINE_TRACE:-1}" == "1" ]]; then
+  set -x
+fi
+
 export TMPDIR="${LOCAL_RUNTIME_DIR}/tmp"
 export TEMP="${TMPDIR}"
 export TMP="${TMPDIR}"
@@ -113,9 +132,13 @@ printf '%-28s: %s\n' \
   "PROJECT_ROOT" "${PROJECT_ROOT}" \
   "ENV_DIR" "${ENV_DIR}" \
   "BASE_MODEL" "${BASE_MODEL}" \
+  "TRAINING_DATA_DIR" "${TRAINING_DATA_DIR}" \
+  "TRAINING_DATA_SOURCE_DIR" "${TRAINING_DATA_SOURCE_DIR}" \
   "META_PATH" "${META_PATH}" \
+  "EVAL_INPUT_DIR" "${EVAL_INPUT_DIR}" \
   "OUTPUT_DIR" "${OUTPUT_DIR}" \
   "SCORER_ROOT" "${SCORER_ROOT}" \
+  "CPU_COUNT (nproc)" "$(nproc)" \
   "MAX_SEQ_LENGTH" "${MAX_SEQ_LENGTH}" \
   "MAX_NUM_TOKENS_PER_SAMPLE" "${MAX_NUM_TOKENS_PER_SAMPLE}" \
   "MAX_NUM_TOKENS" "${MAX_NUM_TOKENS}" \
@@ -126,21 +149,22 @@ printf '%-28s: %s\n' \
   "EVAL_AT_START" "${EVAL_AT_START}" \
   "EVAL_INTERVAL_STEPS" "${EVAL_INTERVAL_STEPS}" \
   "EVAL_FAIL_POLICY" "${EVAL_FAIL_POLICY}" \
-  "PIPELINE_MODE" "${PIPELINE_MODE}"
+  "PIPELINE_MODE" "${PIPELINE_MODE}" \
+  "PIPELINE_LOG" "${PIPELINE_LOG}" \
+  "PIPELINE_TRACE_LOG" "${PIPELINE_TRACE_LOG}"
 echo "============================================="
 
 "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/resolve_locany_ui5_config.py" \
   --format json > "${OUTPUT_DIR}/effective_config.json"
 
-test -d "${PROJECT_ROOT}" || { echo "[ERROR] Project root missing: ${PROJECT_ROOT}" >&2; exit 21; }
-test -d "${BASE_MODEL}" || { echo "[ERROR] Base model missing: ${BASE_MODEL}" >&2; exit 22; }
-test -x "${ENV_DIR}/bin/python" || { echo "[ERROR] Python environment missing: ${ENV_DIR}" >&2; exit 23; }
-test -f "${PROJECT_ROOT}/shell/train_locany_ui_defect.sh" || { echo "[ERROR] Training entrypoint missing" >&2; exit 24; }
+[[ -d "${PROJECT_ROOT}" ]] || locany_die 21 "Project root missing: ${PROJECT_ROOT}"
+[[ -d "${BASE_MODEL}" ]] || locany_die 22 "Base model missing: ${BASE_MODEL}"
+[[ -x "${ENV_DIR}/bin/python" ]] || locany_die 23 "Python environment missing: ${ENV_DIR}"
+[[ -f "${PROJECT_ROOT}/shell/train_locany_ui_defect.sh" ]] || \
+  locany_die 24 "Training entrypoint missing: ${PROJECT_ROOT}/shell/train_locany_ui_defect.sh"
 if [[ "${ENABLE_EVAL}" == "1" || "${PIPELINE_MODE}" == "eval" ]]; then
-  test -f "${SCORER_ROOT}/qwen3vl_merge_and_score_fixed_5tasks.py" || {
-    echo "[ERROR] Scorer missing under ${SCORER_ROOT}" >&2
-    exit 25
-  }
+  [[ -f "${SCORER_ROOT}/qwen3vl_merge_and_score_fixed_5tasks.py" ]] || \
+    locany_die 25 "Scorer missing: ${SCORER_ROOT}/qwen3vl_merge_and_score_fixed_5tasks.py"
 fi
 
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -202,7 +226,77 @@ if [[ "${PIPELINE_MODE}" == "eval" ]]; then
   exit $?
 fi
 
-test -f "${META_PATH}" || { echo "[ERROR] Training metadata missing: ${META_PATH}" >&2; exit 26; }
+if [[ ! -f "${META_PATH}" ]]; then
+  source_meta_path="${TRAINING_DATA_SOURCE_DIR}/recipe/ui_defect_5class_train.json"
+  echo "===== Training data bootstrap ====="
+  echo "reason      : target metadata is missing"
+  echo "source      : ${TRAINING_DATA_SOURCE_DIR}"
+  echo "destination : ${TRAINING_DATA_DIR}"
+  if [[ "${TRAINING_DATA_SOURCE_DIR}" == "${TRAINING_DATA_DIR}" ]]; then
+    locany_die 26 \
+      "Training data source and destination are identical, but metadata is missing: ${META_PATH}"
+  fi
+  if [[ ! -f "${source_meta_path}" ]]; then
+    echo "source metadata is also missing: ${source_meta_path}" >&2
+  else
+    mkdir -p "${TRAINING_DATA_DIR}"
+    copy_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if command -v rsync >/dev/null 2>&1; then
+      echo "copy_method : rsync -av --progress"
+      if rsync -av --progress \
+          "${TRAINING_DATA_SOURCE_DIR}/" "${TRAINING_DATA_DIR}/"; then
+        :
+      else
+        code=$?
+        locany_die "${code}" \
+          "Failed to copy training data with rsync: source=${TRAINING_DATA_SOURCE_DIR}, destination=${TRAINING_DATA_DIR}"
+      fi
+    else
+      echo "copy_method : cp -a (rsync is unavailable)"
+      if cp -a "${TRAINING_DATA_SOURCE_DIR}/." "${TRAINING_DATA_DIR}/"; then
+        :
+      else
+        code=$?
+        locany_die "${code}" \
+          "Failed to copy training data with cp: source=${TRAINING_DATA_SOURCE_DIR}, destination=${TRAINING_DATA_DIR}"
+      fi
+    fi
+    echo "copy_started: ${copy_started}"
+    echo "copy_ended  : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  fi
+  echo "==================================="
+fi
+
+if [[ ! -f "${META_PATH}" ]]; then
+  meta_parent="$(dirname "${META_PATH}")"
+  echo "===== Training metadata diagnostic =====" >&2
+  echo "expected_file : ${META_PATH}" >&2
+  echo "parent_dir    : ${meta_parent}" >&2
+  if [[ -d "${meta_parent}" ]]; then
+    echo "parent_status : exists" >&2
+    ls -la "${meta_parent}" >&2 || true
+  else
+    echo "parent_status : MISSING" >&2
+  fi
+  echo "matching recipes under project/workspace data roots:" >&2
+  found_recipe=0
+  for candidate_root in "${PROJECT_ROOT}/data" "${WORKSPACE}/data"; do
+    if [[ -d "${candidate_root}" ]]; then
+      while IFS= read -r candidate; do
+        echo "  ${candidate}" >&2
+        found_recipe=1
+      done < <(
+        find "${candidate_root}" -maxdepth 6 -type f \
+          -name 'ui_defect_5class_train.json' -print 2>/dev/null || true
+      )
+    fi
+  done
+  if (( found_recipe == 0 )); then
+    echo "  <none found>" >&2
+  fi
+  echo "========================================" >&2
+  locany_die 26 "Training metadata missing: ${META_PATH}"
+fi
 
 if [[ "${ENABLE_EVAL}" == "0" ]]; then
   echo "[PIPELINE] ENABLE_EVAL=0: starting uninterrupted training; no step-0 or periodic evaluation"
@@ -225,13 +319,12 @@ current_step="$("${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/locany_ui5_checkpo
   latest --output-dir "${OUTPUT_DIR}" --require-resume --expected-ranks "${GPU_COUNT}" --field step)"
 
 if [[ ! "${current_step}" =~ ^[0-9]+$ ]]; then
-  echo "[ERROR] Could not resolve latest checkpoint step: ${current_step}" >&2
-  exit 27
+  locany_die 27 "Could not resolve latest checkpoint step: ${current_step}"
 fi
 
 if (( current_step == 0 )) && compgen -G "${OUTPUT_DIR}/checkpoint-*" >/dev/null; then
-  echo "[ERROR] Checkpoint directories exist, but none passed resume validation. Refusing to restart from zero." >&2
-  exit 28
+  locany_die 28 \
+    "Checkpoint directories exist, but none passed resume validation; refusing to restart from zero: ${OUTPUT_DIR}"
 fi
 
 if (( current_step > 0 )) && ! has_successful_evaluation "${current_step}"; then
@@ -264,15 +357,15 @@ while (( current_step < MAX_STEPS )); do
     :
   else
     code=$?
-    echo "[ERROR] Training segment failed: from=${current_step}, target=${next_step}, exit_code=${code}" >&2
-    exit "${code}"
+    locany_die "${code}" \
+      "Training segment failed: from=${current_step}, target=${next_step}, exit_code=${code}"
   fi
 
   checkpoint="${OUTPUT_DIR}/checkpoint-${next_step}"
   if ! "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/locany_ui5_checkpoint.py" validate \
       --checkpoint "${checkpoint}" --mode resume --expected-ranks "${GPU_COUNT}"; then
-    echo "[ERROR] Segment checkpoint is incomplete: step=${next_step}, checkpoint=${checkpoint}" >&2
-    exit 29
+    locany_die 29 \
+      "Segment checkpoint is incomplete: step=${next_step}, checkpoint=${checkpoint}"
   fi
 
   eval_succeeded=0

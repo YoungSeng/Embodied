@@ -2,6 +2,7 @@
   "schema_version": 1,
   "shared": {
     "project_relative_path": "code/Eagle_LocateUI5_v4/Embodied",
+    "training_data_source_relative_path": "code/Eagle/Embodied/data/ui_defect_locany_{data_version}",
     "conda_env_relative_path": "conda_envs/LocateAnything",
     "base_model_relative_path": "hf_home/hub/models--nvidia--LocateAnything-3B/snapshots/c32291ca5e996f5a7a485845b4f57a233936bba0",
     "training_data_relative_path": "data/ui_defect_locany_{data_version}",
@@ -33,7 +34,7 @@
         "volume_id": 19922,
         "mount_path": "/mnt/bn/intelligent-service-yg",
         "gpuv": "A800_SXM_40GB",
-        "cpu": 116,
+        "cpu": 58,
         "memory": 262144,
         "queue_name": ""
       }

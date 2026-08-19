@@ -38,6 +38,11 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(four["MAX_NUM_TOKENS"], 12800)
         self.assertEqual(eight["MAX_NUM_TOKENS"], 25600)
         self.assertEqual(four["MAX_NUM_TOKENS_SCOPE"], "per_rank_packed_batch")
+        self.assertEqual(
+            four["TRAINING_DATA_SOURCE_DIR"],
+            "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/"
+            "code/Eagle/Embodied/data/ui_defect_locany_v3",
+        )
 
     def test_explicit_max_num_tokens_wins(self) -> None:
         config = locany_ui5_common.resolve_runtime_config(
@@ -80,6 +85,8 @@ class RuntimeConfigTests(unittest.TestCase):
             data_version="v3",
             run_name=None,
             scorer_root=None,
+            training_data_source_dir=None,
+            training_data_dir=None,
             eval_checkpoint=None,
             eval_step=None,
             eval_skip_patch=False,
@@ -113,6 +120,8 @@ class RuntimeConfigTests(unittest.TestCase):
             data_version="v3",
             run_name=None,
             scorer_root=None,
+            training_data_source_dir=None,
+            training_data_dir=None,
             eval_checkpoint=None,
             eval_step=None,
             eval_skip_patch=False,

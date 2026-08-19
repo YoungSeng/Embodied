@@ -45,6 +45,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--scorer-root", default=None)
     parser.add_argument(
+        "--training-data-source-dir",
+        default=None,
+        help=(
+            "Existing UI5 training-data directory used to bootstrap a new project when its "
+            "META_PATH is missing"
+        ),
+    )
+    parser.add_argument(
+        "--training-data-dir",
+        default=None,
+        help="Training-data destination; defaults to PROJECT_ROOT/data/ui_defect_locany_<version>",
+    )
+    parser.add_argument(
         "--eval-checkpoint",
         default=None,
         help="Submit an evaluation-only job for this checkpoint instead of training",
@@ -122,6 +135,8 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "MAX_NUM_TOKENS_PER_SAMPLE": args.max_num_tokens_per_sample,
         "RUN_NAME": args.run_name,
         "SCORER_ROOT": args.scorer_root,
+        "TRAINING_DATA_SOURCE_DIR": args.training_data_source_dir,
+        "TRAINING_DATA_DIR": args.training_data_dir,
     }
     env.update(explicit)
     env.update({key: str(value) for key, value in optional.items() if value is not None})
@@ -171,6 +186,10 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
     )
     if args.scorer_root:
         env_keys = (*env_keys, "SCORER_ROOT")
+    if args.training_data_source_dir:
+        env_keys = (*env_keys, "TRAINING_DATA_SOURCE_DIR")
+    if args.training_data_dir:
+        env_keys = (*env_keys, "TRAINING_DATA_DIR")
     if args.eval_checkpoint is not None:
         env_keys = (*env_keys, "EVAL_CHECKPOINT", "EVAL_STEP", "EVAL_SKIP_PATCH")
     envs_list = "\n".join(
