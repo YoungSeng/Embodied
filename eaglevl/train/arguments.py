@@ -70,8 +70,9 @@ class ModelArguments:
         default=False,
         metadata={'help': 'Set to True to use gradient checkpointing.'},
     )
-    save_every_n_hours: int = field(
-        default=4,
+    save_every_n_hours: float = field(
+        default=4.0,
+        metadata={'help': 'Request a checkpoint after each complete wall-clock interval; 0 disables it.'},
     )
     freeze_backbones: Optional[str] = field(
         default=None

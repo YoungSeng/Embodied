@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+"""Normalize the raw UI v4.1 mixture into LocateAnything CPT JSONL files.
+
+The converter is streaming: it never loads a source JSONL into memory.  Each
+task family becomes one recipe entry with an explicit, equal sampling weight.
+Grounding targets are rewritten to LocateAnything's ``<ref>/<box>`` grammar;
+captioning, VQA, action prediction, and region description keep natural text.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import tempfile
+from collections import OrderedDict
+from dataclasses import asdict, dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Iterator, Sequence
+
+
+DEFAULT_SOURCE_ROOT = Path(
+    "/mnt/bn/intelligent-service-arnold-hl/dataset/gui/gui_base/sample/"
+    "raw_data_v4.1_hl_norm1k/raw_data_v4.1_hl"
+)
+DEFAULT_OUTPUT_DIR = Path(
+    "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/"
+    "data/locany_cpt_v4"
+)
+
+SOURCE_GLOBS = (
+    "caption/captions/category_8_dy1_washed.jsonl",
+    "grounding/agent/*.jsonl",
+    "grounding/multi/*.jsonl",
+    "grounding/single/*.jsonl",
+    "ocr/*.jsonl",
+    "referring/category_2_dy1_397k_n.jsonl",
+    "referring/category_3_dy1_297k_n.jsonl",
+    "vqa/*.jsonl",
+)
+
+KNOWN_TASK_ORDER = (
+    "ui_caption",
+    "agent_action",
+    "agent_grounding",
+    "ui_defect",
+    "all_ui_elements",
+    "single_grounding",
+    "ocr",
+    "referring_kg",
+    "referring",
+    "vqa",
+)
+GROUNDING_TASKS = {
+    "agent_grounding",
+    "ui_defect",
+    "all_ui_elements",
+    "single_grounding",
+    "ocr",
+    "agent_other",
+    "multi_grounding_other",
+}
+
+QWEN_BOX_RE = re.compile(
+    r"<\|box_start\|>\s*\(?\s*(-?\d+(?:\.\d+)?)\s*,\s*"
+    r"(-?\d+(?:\.\d+)?)\s*\)?\s*,\s*\(?\s*"
+    r"(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)?"
+    r"\s*<\|box_end\|>",
+    re.IGNORECASE,
+)
+QWEN_REF_RE = re.compile(
+    r"<\|object_ref_start\|>(.*?)<\|object_ref_end\|>", re.DOTALL
+)
+LOCANY_BOX_RE = re.compile(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>")
+FORBIDDEN_MARKERS = ("<|box_start|>", "<|box_end|>", "<|object_ref_start|>", "<|object_ref_end|>")
+
+
+@dataclass
+class TaskStats:
+    source_records: int = 0
+    written_records: int = 0
+    rejected_records: int = 0
+    grounding_records: int = 0
+    natural_language_records: int = 0
+
+
+class NormalizeError(ValueError):
+    pass
+
+
+def classify_source(relative_path: Path) -> str:
+    path = relative_path.as_posix()
+    name = relative_path.name
+    if path.startswith("caption/captions/"):
+        return "ui_caption"
+    if path.startswith("grounding/agent/"):
+        if name.startswith("category_1_"):
+            return "agent_action"
+        if name.startswith("category_5_"):
+            return "agent_grounding"
+        return "agent_other"
+    if path.startswith("grounding/multi/"):
+        if name.startswith("category_6_"):
+            return "ui_defect"
+        if name.startswith("category_9_"):
+            return "all_ui_elements"
+        return "multi_grounding_other"
+    if path.startswith("grounding/single/"):
+        return "single_grounding"
+    if path.startswith("ocr/"):
+        return "ocr"
+    if name.startswith("category_2_") and path.startswith("referring/"):
+        return "referring_kg"
+    if name.startswith("category_3_") and path.startswith("referring/"):
+        return "referring"
+    if path.startswith("vqa/"):
+        return "vqa"
+    raise NormalizeError(f"cannot classify source path: {relative_path}")
+
+
+def discover_sources(source_root: Path) -> OrderedDict[str, list[Path]]:
+    grouped: dict[str, list[Path]] = {}
+    seen: set[Path] = set()
+    for pattern in SOURCE_GLOBS:
+        for path in sorted(source_root.glob(pattern)):
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            task = classify_source(path.relative_to(source_root))
+            grouped.setdefault(task, []).append(path)
+
+    order = list(KNOWN_TASK_ORDER)
+    order.extend(sorted(set(grouped) - set(order)))
+    return OrderedDict((name, grouped[name]) for name in order if grouped.get(name))
+
+
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        pieces = []
+        for item in content:
+            if isinstance(item, str):
+                pieces.append(item)
+            elif isinstance(item, dict) and item.get("type") in {None, "text"}:
+                pieces.append(str(item.get("text", item.get("value", ""))))
+        return "\n".join(piece for piece in pieces if piece)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def normalize_conversations(record: dict[str, Any]) -> list[dict[str, str]]:
+    raw_turns = record.get("conversations") or record.get("messages")
+    if not isinstance(raw_turns, list) or not raw_turns:
+        raise NormalizeError("missing conversations/messages")
+
+    turns: list[dict[str, str]] = []
+    system_prefix: list[str] = []
+    for raw in raw_turns:
+        if not isinstance(raw, dict):
+            raise NormalizeError("conversation turn is not an object")
+        role = str(raw.get("from", raw.get("role", ""))).lower()
+        value = _content_to_text(raw.get("value", raw.get("content"))).strip()
+        if role == "system":
+            if value:
+                system_prefix.append(value)
+            continue
+        if role in {"human", "user"}:
+            role = "human"
+        elif role in {"gpt", "assistant"}:
+            role = "gpt"
+        else:
+            raise NormalizeError(f"unsupported conversation role: {role!r}")
+        if not value:
+            raise NormalizeError(f"empty {role} turn")
+        if turns and turns[-1]["from"] == role:
+            turns[-1]["value"] += "\n" + value
+        else:
+            turns.append({"from": role, "value": value})
+
+    if system_prefix:
+        prefix = "\n".join(system_prefix)
+        if turns and turns[0]["from"] == "human":
+            turns[0]["value"] = prefix + "\n" + turns[0]["value"]
+        else:
+            turns.insert(0, {"from": "human", "value": prefix})
+    if len(turns) < 2 or turns[0]["from"] != "human" or turns[-1]["from"] != "gpt":
+        raise NormalizeError("conversation must start with human and end with gpt")
+    if any(turns[i]["from"] == turns[i - 1]["from"] for i in range(1, len(turns))):
+        raise NormalizeError("conversation roles do not alternate")
+    return turns
+
+
+def _flatten_image_values(value: Any) -> Iterator[str]:
+    if isinstance(value, str):
+        if value:
+            yield value
+    elif isinstance(value, dict):
+        candidate = value.get("path") or value.get("image") or value.get("file")
+        if isinstance(candidate, str) and candidate:
+            yield candidate
+    elif isinstance(value, list):
+        for item in value:
+            yield from _flatten_image_values(item)
+
+
+def extract_image_values(record: dict[str, Any]) -> list[str]:
+    # Prefer fields that usually contain canonical absolute paths.
+    for key in ("images", "original_images", "image", "image_list"):
+        values = list(_flatten_image_values(record.get(key)))
+        if values:
+            return values
+    return []
+
+
+@lru_cache(maxsize=200000)
+def _resolve_image_path_cached(
+    raw_path: str,
+    source_parent: str,
+    source_root: str,
+    check_exists: bool,
+) -> str:
+    expanded = Path(os.path.expandvars(os.path.expanduser(raw_path)))
+    candidates = [expanded] if expanded.is_absolute() else [
+        Path(source_root) / expanded,
+        Path(source_parent) / expanded,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+    if check_exists:
+        raise NormalizeError(
+            f"image does not exist: {raw_path!r}; tried "
+            + ", ".join(str(path) for path in candidates)
+        )
+    return str(candidates[0].resolve())
+
+
+def resolve_image_path(
+    raw_path: str,
+    source_file: Path,
+    source_root: Path,
+    check_exists: bool,
+) -> Path:
+    return Path(
+        _resolve_image_path_cached(
+            raw_path,
+            str(source_file.parent.resolve()),
+            str(source_root.resolve()),
+            check_exists,
+        )
+    )
+
+
+def extract_image_size(record: dict[str, Any], image_path: Path | None) -> tuple[float, float] | None:
+    infos = record.get("infos")
+    candidates: list[Any] = []
+    if isinstance(infos, dict):
+        candidates.extend([infos.get("image_size"), infos.get("input_size")])
+    candidates.extend([record.get("image_size"), record.get("width_height")])
+    for value in candidates:
+        if isinstance(value, dict):
+            width = value.get("width", value.get("w"))
+            height = value.get("height", value.get("h"))
+            if width and height:
+                return float(width), float(height)
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            width, height = float(value[0]), float(value[1])
+            if width > 0 and height > 0:
+                return width, height
+    if image_path is not None and image_path.exists():
+        try:
+            from PIL import Image
+
+            with Image.open(image_path) as image:
+                return float(image.width), float(image.height)
+        except Exception:
+            return None
+    return None
+
+
+def _coerce_one_box(value: Any) -> tuple[float, float, float, float] | None:
+    if isinstance(value, dict):
+        for keys in (
+            ("x1", "y1", "x2", "y2"),
+            ("xmin", "ymin", "xmax", "ymax"),
+            ("left", "top", "right", "bottom"),
+        ):
+            if all(key in value for key in keys):
+                return tuple(float(value[key]) for key in keys)  # type: ignore[return-value]
+        for key in ("bbox_2d", "bbox", "box"):
+            if key in value:
+                return _coerce_one_box(value[key])
+    if isinstance(value, (list, tuple)):
+        if len(value) == 4 and all(isinstance(item, (int, float)) for item in value):
+            return tuple(float(item) for item in value)  # type: ignore[return-value]
+        if (
+            len(value) == 2
+            and all(isinstance(point, (list, tuple)) and len(point) >= 2 for point in value)
+        ):
+            return float(value[0][0]), float(value[0][1]), float(value[1][0]), float(value[1][1])
+    return None
+
+
+def _coerce_boxes(value: Any) -> list[tuple[float, float, float, float]]:
+    one = _coerce_one_box(value)
+    if one is not None:
+        return [one]
+    if isinstance(value, list):
+        boxes = []
+        for item in value:
+            box = _coerce_one_box(item)
+            if box is not None:
+                boxes.append(box)
+        return boxes
+    return []
+
+
+def normalize_box(
+    box: Sequence[float],
+    bbox_type: str | None,
+    image_size: tuple[float, float] | None,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = (float(value) for value in box)
+    kind = (bbox_type or "").lower()
+    maximum = max(abs(x1), abs(y1), abs(x2), abs(y2))
+    if maximum <= 1.0:
+        x1, y1, x2, y2 = (value * 1000.0 for value in (x1, y1, x2, y2))
+    elif kind in {"real", "pixel", "pixels", "absolute", "abs"} or maximum > 1000.0:
+        if image_size is None:
+            raise NormalizeError(f"pixel bbox requires image size: {box}")
+        width, height = image_size
+        x1, x2 = x1 / width * 1000.0, x2 / width * 1000.0
+        y1, y2 = y1 / height * 1000.0, y2 / height * 1000.0
+    result = tuple(max(0, min(1000, int(round(value)))) for value in (x1, y1, x2, y2))
+    if result[0] >= result[2] or result[1] >= result[3]:
+        raise NormalizeError(f"invalid or degenerate bbox after normalization: {box} -> {result}")
+    return result  # type: ignore[return-value]
+
+
+def format_ref(value: Any, fallback: str = "UI element") -> str:
+    if isinstance(value, dict):
+        label = value.get("label") or value.get("text") or value.get("ref") or fallback
+        element_type = value.get("type")
+        text = f"{label} | type={element_type}" if element_type else str(label)
+    elif isinstance(value, list):
+        text = " / ".join(str(item) for item in value)
+    else:
+        text = str(value or fallback)
+    return text.replace("<ref>", "").replace("</ref>", "").strip() or fallback
+
+
+def format_locany_target(refs: Sequence[Any], boxes: Sequence[tuple[int, int, int, int]]) -> str:
+    lines = []
+    for index, box in enumerate(boxes):
+        ref = format_ref(refs[index] if index < len(refs) else "UI element")
+        lines.append(
+            f"<ref>{ref}</ref><box><{box[0]}><{box[1]}><{box[2]}><{box[3]}></box>"
+        )
+    return "\n".join(lines)
+
+
+def structured_grounding_target(
+    record: dict[str, Any], image_size: tuple[float, float] | None
+) -> str | None:
+    objects = record.get("objects")
+    if not isinstance(objects, dict):
+        return None
+    raw_boxes = objects.get("bbox")
+    if raw_boxes is None:
+        raw_boxes = objects.get("bboxes", objects.get("bbox_2d"))
+    boxes = _coerce_boxes(raw_boxes)
+    if not boxes:
+        return None
+    bbox_type = objects.get("bbox_type") or record.get("bbox_type")
+    normalized = [normalize_box(box, str(bbox_type or ""), image_size) for box in boxes]
+    refs = objects.get("ref", objects.get("label", objects.get("labels", [])))
+    if not isinstance(refs, list):
+        refs = [refs]
+    return format_locany_target(refs, normalized)
+
+
+def _walk_json_boxes(value: Any) -> Iterator[tuple[Any, Any]]:
+    if isinstance(value, dict):
+        raw_box = value.get("bbox_2d", value.get("bbox", value.get("box")))
+        if raw_box is not None and _coerce_one_box(raw_box) is not None:
+            ref = value.get("label", value.get("text", value.get("ref", value.get("type"))))
+            yield ref, raw_box
+        for child in value.values():
+            yield from _walk_json_boxes(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_json_boxes(child)
+
+
+def json_grounding_target(
+    text: str, image_size: tuple[float, float] | None
+) -> str | None:
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\s*```$", "", candidate)
+    try:
+        parsed = json.loads(candidate)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    pairs = list(_walk_json_boxes(parsed))
+    if not pairs:
+        return None
+    refs, boxes = zip(*pairs)
+    normalized = [normalize_box(_coerce_one_box(box) or (), None, image_size) for box in boxes]
+    return format_locany_target(refs, normalized)
+
+
+def convert_qwen_markup(text: str) -> str:
+    text = QWEN_REF_RE.sub(lambda match: f"<ref>{format_ref(match.group(1))}</ref>", text)
+
+    def replace_box(match: re.Match[str]) -> str:
+        box = normalize_box(tuple(float(match.group(i)) for i in range(1, 5)), "norm1000", None)
+        return f"<box><{box[0]}><{box[1]}><{box[2]}><{box[3]}></box>"
+
+    return QWEN_BOX_RE.sub(replace_box, text)
+
+
+def validate_locany_text(text: str, role: str) -> None:
+    if any(marker in text for marker in FORBIDDEN_MARKERS):
+        raise NormalizeError(f"unconverted Qwen marker remains in {role} text")
+    for match in LOCANY_BOX_RE.finditer(text):
+        x1, y1, x2, y2 = (int(value) for value in match.groups())
+        if not (0 <= x1 < x2 <= 1000 and 0 <= y1 < y2 <= 1000):
+            raise NormalizeError(f"invalid LocateAnything bbox in {role} text: {match.group(0)}")
+
+
+def normalize_record(
+    record: dict[str, Any],
+    task: str,
+    source_file: Path,
+    source_root: Path,
+    check_images: bool,
+) -> tuple[dict[str, Any], bool]:
+    turns = normalize_conversations(record)
+    raw_images = extract_image_values(record)
+    if not raw_images:
+        raise NormalizeError("missing image path")
+    images = [
+        resolve_image_path(path, source_file, source_root, check_exists=check_images)
+        for path in raw_images
+    ]
+    if not any(re.search(r"<image(?:-\d+)?>", turn["value"]) for turn in turns if turn["from"] == "human"):
+        turns[0]["value"] = "<image>" * len(images) + turns[0]["value"]
+
+    image_size = extract_image_size(record, images[0] if images else None)
+    is_grounding = False
+    for turn in turns:
+        turn["value"] = convert_qwen_markup(turn["value"])
+    if task in GROUNDING_TASKS:
+        target = structured_grounding_target(record, image_size)
+        if target is None:
+            target = json_grounding_target(turns[-1]["value"], image_size)
+        if target is not None:
+            turns[-1]["value"] = target
+            is_grounding = True
+        elif LOCANY_BOX_RE.search(turns[-1]["value"]):
+            is_grounding = True
+
+    for turn in turns:
+        validate_locany_text(turn["value"], turn["from"])
+
+    normalized: dict[str, Any] = {
+        "conversations": turns,
+        "image": str(images[0]) if len(images) == 1 else [str(path) for path in images],
+        "cpt_task": task,
+    }
+    if record.get("id") is not None:
+        normalized["id"] = record["id"]
+    return normalized, is_grounding
+
+
+def portable_image_path(source: Path, images_dir: Path) -> Path:
+    digest = hashlib.sha1(str(source).encode("utf-8")).hexdigest()[:12]
+    suffix = source.suffix.lower() or ".img"
+    destination = images_dir / f"{digest}-{source.stem}{suffix}"
+    if not destination.exists():
+        images_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    return destination.resolve()
+
+
+def make_portable(record: dict[str, Any], images_dir: Path, output_dir: Path) -> None:
+    values = record["image"] if isinstance(record["image"], list) else [record["image"]]
+    copied = [portable_image_path(Path(value), images_dir) for value in values]
+    relative = [path.relative_to(output_dir) for path in copied]
+    record["image"] = str(relative[0]) if len(relative) == 1 else [str(path) for path in relative]
+
+
+def atomic_text_writer(destination: Path):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=destination.parent, prefix=destination.name + ".", delete=False
+    )
+    return handle, Path(handle.name)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-root", type=Path, default=DEFAULT_SOURCE_ROOT)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--recipe-name", default="locany_cpt_train.json")
+    parser.add_argument(
+        "--max-records-per-task",
+        type=int,
+        default=0,
+        help="0 keeps all rows; a small positive value creates a smoke set",
+    )
+    parser.add_argument("--copy-images", action="store_true", help="Copy images for a portable smoke set")
+    parser.add_argument("--skip-image-check", action="store_true")
+    parser.add_argument("--max-error-rate", type=float, default=0.001)
+    parser.add_argument("--progress-every", type=int, default=10000)
+    parser.add_argument("--overwrite", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    source_root = args.source_root.expanduser().resolve()
+    output_dir = args.output_dir.expanduser().resolve()
+    if args.max_records_per_task < 0:
+        raise SystemExit("--max-records-per-task cannot be negative")
+    if not 0.0 <= args.max_error_rate < 1.0:
+        raise SystemExit("--max-error-rate must be in [0, 1)")
+    if not source_root.is_dir():
+        raise SystemExit(f"source root does not exist: {source_root}")
+
+    sources = discover_sources(source_root)
+    missing_known = [task for task in KNOWN_TASK_ORDER if task not in sources]
+    if missing_known:
+        raise SystemExit(f"missing required CPT task sources: {missing_known}")
+
+    annotations_dir = output_dir / "annotations"
+    recipe_dir = output_dir / "recipe"
+    images_dir = output_dir / "images"
+    rejected_path = output_dir / "rejected.jsonl"
+    destinations = {task: annotations_dir / f"{task}.jsonl" for task in sources}
+    protected = [*destinations.values(), recipe_dir / args.recipe_name, output_dir / "manifest.json"]
+    if not args.overwrite and any(path.exists() for path in protected):
+        raise SystemExit(f"output exists; pass --overwrite to replace files under {output_dir}")
+
+    rejected_handle, rejected_tmp = atomic_text_writer(rejected_path)
+    stats = {task: TaskStats() for task in sources}
+    temp_outputs: dict[str, tuple[Any, Path]] = {}
+    try:
+        for task, destination in destinations.items():
+            temp_outputs[task] = atomic_text_writer(destination)
+
+        for task, task_sources in sources.items():
+            output_handle = temp_outputs[task][0]
+            stop_task = False
+            for source_file in task_sources:
+                with source_file.open("r", encoding="utf-8") as source_handle:
+                    for line_number, line in enumerate(source_handle, start=1):
+                        if args.max_records_per_task and stats[task].written_records >= args.max_records_per_task:
+                            stop_task = True
+                            break
+                        if not line.strip():
+                            continue
+                        stats[task].source_records += 1
+                        raw: Any = None
+                        try:
+                            raw = json.loads(line)
+                            if not isinstance(raw, dict):
+                                raise NormalizeError("JSONL row is not an object")
+                            normalized, is_grounding = normalize_record(
+                                raw,
+                                task=task,
+                                source_file=source_file,
+                                source_root=source_root,
+                                check_images=not args.skip_image_check,
+                            )
+                            if args.copy_images:
+                                make_portable(normalized, images_dir, output_dir)
+                            output_handle.write(json.dumps(normalized, ensure_ascii=False, separators=(",", ":")) + "\n")
+                            stats[task].written_records += 1
+                            if is_grounding:
+                                stats[task].grounding_records += 1
+                            else:
+                                stats[task].natural_language_records += 1
+                        except Exception as exc:
+                            stats[task].rejected_records += 1
+                            rejected_handle.write(
+                                json.dumps(
+                                    {
+                                        "task": task,
+                                        "source": str(source_file),
+                                        "line": line_number,
+                                        "id": raw.get("id") if isinstance(raw, dict) else None,
+                                        "reason": f"{type(exc).__name__}: {exc}",
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            )
+                        if args.progress_every and stats[task].source_records % args.progress_every == 0:
+                            print(
+                                f"[{task}] read={stats[task].source_records:,} "
+                                f"written={stats[task].written_records:,} rejected={stats[task].rejected_records:,}",
+                                flush=True,
+                            )
+                if stop_task:
+                    break
+
+        for handle, _ in temp_outputs.values():
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+        rejected_handle.flush()
+        os.fsync(rejected_handle.fileno())
+        rejected_handle.close()
+
+        for task, destination in destinations.items():
+            os.replace(temp_outputs[task][1], destination)
+        os.replace(rejected_tmp, rejected_path)
+    except Exception:
+        for handle, temporary in [*temp_outputs.values(), (rejected_handle, rejected_tmp)]:
+            try:
+                handle.close()
+            except Exception:
+                pass
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+    total_source = sum(item.source_records for item in stats.values())
+    total_rejected = sum(item.rejected_records for item in stats.values())
+    empty = [task for task, item in stats.items() if item.written_records == 0]
+    if empty:
+        raise SystemExit(f"no valid records for tasks: {empty}")
+    error_rate = total_rejected / max(total_source, 1)
+    if error_rate > args.max_error_rate:
+        raise SystemExit(
+            f"rejected rate {error_rate:.6%} exceeds --max-error-rate={args.max_error_rate:.6%}; "
+            f"inspect {rejected_path}"
+        )
+
+    recipe = OrderedDict()
+    for task in sources:
+        recipe[f"locany_cpt_{task}"] = {
+            "annotation": [f"../annotations/{destinations[task].name}"],
+            "root": ".." if args.copy_images else "",
+            "paths_relative_to_meta": True,
+            "repeat_time": 1.0,
+            "sampling_weight": 1.0,
+            "data_augment": False,
+        }
+    recipe_path = recipe_dir / args.recipe_name
+    recipe_dir.mkdir(parents=True, exist_ok=True)
+    recipe_path.write_text(json.dumps(recipe, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    manifest = {
+        "format": "LocateAnything conversations/image with <ref>/<box> coordinates in [0,1000]",
+        "sampling": "equal task-family sampling via sampling_weight=1.0",
+        "source_root": str(source_root),
+        "recipe": str(recipe_path),
+        "portable_images": bool(args.copy_images),
+        "max_records_per_task": args.max_records_per_task,
+        "tasks": {task: asdict(item) for task, item in stats.items()},
+        "total_written": sum(item.written_records for item in stats.values()),
+        "total_rejected": total_rejected,
+        "rejected_rate": error_rate,
+    }
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    print(f"recipe={recipe_path}")
+    print(f"manifest={manifest_path}")
+    for task, item in stats.items():
+        print(
+            f"{task:24s} written={item.written_records:9,d} "
+            f"rejected={item.rejected_records:6,d} weight=1.0"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

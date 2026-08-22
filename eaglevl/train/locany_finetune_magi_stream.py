@@ -56,6 +56,10 @@ from eaglevl.train.constants import (
 )
 from eaglevl.train.arguments import ModelArguments, DataTrainingArguments
 from eaglevl.train.trainer_monkey_patch import replace_create_optimizer_with_various_lr
+from eaglevl.train.dataset_sampling import (
+    resolve_dataset_sampling_weight,
+    resolve_recipe_entry_paths,
+)
 from PIL import Image, ImageFile, PngImagePlugin
 from torch.utils.data import Dataset, IterableDataset, DataLoader
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
@@ -1809,6 +1813,7 @@ def build_stream_packed_dataset_mtp(
     dataset_weights = []
     
     for ds_name, meta in ds_collections.items():
+        meta = resolve_recipe_entry_paths(meta, data_args.meta_path)
         repeat_time = meta.get('repeat_time', 1)
         try:
             ds = LazySupervisedDatasetMTP(
@@ -1829,11 +1834,14 @@ def build_stream_packed_dataset_mtp(
             
             datasets.append(ds)
             
-            weight = repeat_time * len(ds) if repeat_time >= 1 else len(ds)
+            weight = resolve_dataset_sampling_weight(meta, len(ds))
             dataset_weights.append(weight)
             
-            logger.info(f'Added dataset: {ds_name}, length={len(ds)}, '
-                       f'repeat_time={repeat_time}, weight={weight:.0f}')
+            logger.info(
+                f'Added dataset: {ds_name}, length={len(ds)}, '
+                f'repeat_time={repeat_time}, sampling_weight={weight:g}, '
+                f'explicit_sampling_weight={meta.get("sampling_weight")!r}'
+            )
             
         except Exception as e:
             traceback.print_exc()
@@ -2172,8 +2180,9 @@ def main():
     # Callbacks
     my_callbacks = []
     if model_args.save_every_n_hours > 0:
-        my_callbacks.append(SaveCheckpointCallback(
-            initial_interval_hours=model_args.save_every_n_hours, save_interval_minutes=5))
+        my_callbacks.append(
+            SaveCheckpointCallback(interval_hours=model_args.save_every_n_hours)
+        )
     my_callbacks.append(MemoryLoggerCallback())
     my_callbacks.append(DataloaderStateCallback(train_dataset))
     stop_after_step = int(os.environ.get("LOCANY_STOP_AFTER_STEP", "0"))

@@ -38,6 +38,7 @@ from PIL import Image
 from transformers import TrainerCallback
 from transformers.trainer_utils import get_last_checkpoint
 from .fastseek.draw_marker import DRAW_FUNCTIONS
+from .checkpoint_schedule import PeriodicCheckpointSchedule
 
 logger = logging.getLogger(__name__)
 
@@ -62,32 +63,38 @@ def get_last_checkpoint_guard(folder):
     return last_checkpoint
 
 class SaveCheckpointCallback(TrainerCallback):
-    def __init__(self, initial_interval_hours, save_interval_minutes):
+    """Request a Trainer checkpoint after each wall-clock interval.
+
+    Checkpoint naming remains Trainer-native (checkpoint-<global_step>).
+    The legacy initial_interval_hours/save_interval_minutes signature is
+    accepted for compatibility, but the five-minute burst behavior is not.
+    """
+
+    def __init__(
+        self,
+        initial_interval_hours=None,
+        save_interval_minutes=None,
+        *,
+        interval_hours=None,
+    ):
         super().__init__()
-        self.initial_interval_seconds = initial_interval_hours * 3600 - 15 * 60
-        self.save_interval_seconds = save_interval_minutes * 60
-        self.start_time = None
-        self.first_save_time = None
+        del save_interval_minutes
+        hours = interval_hours if interval_hours is not None else initial_interval_hours
+        if hours is None:
+            raise ValueError("interval_hours is required")
+        self.schedule = PeriodicCheckpointSchedule(float(hours))
 
     def on_train_begin(self, args, state, control, **kwargs):
-        self.start_time = time.time()
+        self.schedule.start(time.time())
+        return control
 
     def on_step_end(self, args, state, control, **kwargs):
-        if self.start_time is None:
-            return control
-
-        current_time = time.time()
-        elapsed_time = current_time - self.start_time
-
-        # Check if the initial interval has passed
-        if self.first_save_time is None and elapsed_time >= self.initial_interval_seconds:
-            self.first_save_time = current_time
+        if state.global_step > 0 and self.schedule.is_due(time.time()):
             control.should_save = True
-        # Check if the subsequent save interval has passed
-        elif self.first_save_time is not None and (current_time - self.first_save_time) >= self.save_interval_seconds:
-            self.first_save_time = current_time
-            control.should_save = True
+        return control
 
+    def on_save(self, args, state, control, **kwargs):
+        self.schedule.mark_saved(time.time())
         return control
 
 
