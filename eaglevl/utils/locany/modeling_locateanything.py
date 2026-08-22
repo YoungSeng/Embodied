@@ -35,6 +35,7 @@ from .relation_modules import (
     RelationConditionedDetailPyramid,
     RelationToPBD,
     match_ui_relation_prompt,
+    pbd_active_delta_norm,
     relation_gate_output_override,
 )
 
@@ -483,6 +484,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                     "box_anchor_hidden": None,
                     "coordinate_logits": None,
                     "pbd_delta_norm": relation_output.p_defect.new_zeros(()),
+                    "pbd_active_positions": 0,
                     "global_visual_cache": global_visual_cache,
                 }
                 if verbose:
@@ -510,13 +512,23 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         switch_to_ar_count = 0
         box_anchor_hidden = None
         coordinate_logits = None
-        pbd_delta_norm = None
+        pbd_delta_sum = 0.0
+        pbd_active_positions = 0
+
+        text_config = self.config.text_config
+        pbd_block_size = int(text_config.block_size)
+        text_mask_token_id = int(text_config.text_mask_token_id)
+        if use_mtp and int(n_future_tokens) != pbd_block_size:
+            raise ValueError(
+                "Generation n_future_tokens must match the configured MTP "
+                f"block_size: n_future_tokens={n_future_tokens}, "
+                f"block_size={pbd_block_size}"
+            )
 
         # Pre-allocate mask tokens and position ids
-        default_mask_token_id = self.token_ids['default_mask_token_id']
         pre_mask_tokens = torch.full(
-            (batch_size, n_future_tokens - 1),
-            default_mask_token_id,
+            (batch_size, pbd_block_size - 1),
+            text_mask_token_id,
             dtype=generated.dtype,
             device=generated.device
         )
@@ -636,35 +648,60 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                     prepare_inputs['output_hidden_states'] = True
                 outputs = self.language_model(**prepare_inputs)
 
-                # The PBD block starts from the <box> anchor.  Recompute only
-                # its small prediction block after adding relation evidence;
-                # no relation or visual tokens are appended to the sequence.
-                if (
-                    relation_output is not None
-                    and generated[0, -1].item() == int(self.config.box_start_token_id)
-                    and outputs.hidden_states is not None
-                ):
-                    pbd_width = n_future_tokens if use_mtp else 1
+                # Training and generation use the same packed-boundary-aware
+                # position selector and the same best relation token.  This is
+                # anchor-only for AR and the full configured block for MTP.
+                if relation_output is not None and outputs.hidden_states is not None:
+                    pbd_input_ids = prepare_inputs.get("input_ids")
+                    if pbd_input_ids is None:
+                        raise RuntimeError(
+                            "PBD generation requires input_ids from prepare_inputs_for_generation"
+                        )
                     last_hidden = outputs.hidden_states[-1]
-                    pbd_hidden = last_hidden[:, -pbd_width:, :].clone()
-                    pbd_input = pbd_hidden.clone()
-                    pbd_hidden = self.relation_pbd.enhance_prediction_hidden(
-                        pbd_hidden,
-                        relation_output.relation_summary,
-                        relation_output.best_relation_token,
+                    pbd_output = self.relation_pbd(
+                        hidden_states=last_hidden,
+                        input_ids=pbd_input_ids,
+                        sub_sample_lengths=torch.tensor(
+                            [pbd_input_ids.numel()],
+                            device=pbd_input_ids.device,
+                            dtype=torch.long,
+                        ),
+                        relation_summary=relation_output.relation_summary,
+                        best_relation_token=relation_output.best_relation_token,
+                        box_start_token_id=int(self.config.box_start_token_id),
+                        text_mask_token_id=text_mask_token_id,
+                        block_size=pbd_block_size,
                     )
-                    pbd_delta_norm = (
-                        (pbd_hidden - pbd_input).float().norm(dim=-1).mean()
-                    )
-                    replacement_logits = F.linear(pbd_hidden, self.language_model.lm_head.weight)
-                    outputs.logits[:, -pbd_width:, :] = replacement_logits
-                    box_anchor_hidden = pbd_hidden[:, 0, :]
-                    coord_start = int(self.config.coord_start_token_id)
-                    coord_end = int(self.config.coord_end_token_id) + 1
-                    coordinate_logits = F.linear(
-                        box_anchor_hidden,
-                        self.language_model.lm_head.weight[coord_start:coord_end],
-                    )
+                    if pbd_output.active_positions.numel() > 0:
+                        active_count = int(pbd_output.active_positions.numel())
+                        batch_delta_norm = pbd_active_delta_norm(
+                            last_hidden,
+                            pbd_output.hidden_states,
+                            pbd_output.active_positions,
+                        )
+                        pbd_delta_sum += float(batch_delta_norm.item()) * active_count
+                        pbd_active_positions += active_count
+                        replacement_logits = F.linear(
+                            pbd_output.hidden_states,
+                            self.language_model.lm_head.weight,
+                        )
+                        outputs.logits = outputs.logits.clone()
+                        flat_logits = outputs.logits.reshape(
+                            -1, outputs.logits.shape[-1]
+                        )
+                        flat_replacement = replacement_logits.reshape(
+                            -1, replacement_logits.shape[-1]
+                        )
+                        flat_logits[pbd_output.active_positions] = flat_replacement[
+                            pbd_output.active_positions
+                        ]
+                        box_anchor_hidden = pbd_output.box_anchor_hidden
+                        coord_start = int(self.config.coord_start_token_id)
+                        coord_end = int(self.config.coord_end_token_id) + 1
+                        coordinate_logits = F.linear(
+                            box_anchor_hidden,
+                            self.language_model.lm_head.weight[coord_start:coord_end],
+                        )
 
             past_key_values = tuple(
                 (kv[0][:, :, :generated.shape[1], :], kv[1][:, :, :generated.shape[1], :])
@@ -719,7 +756,12 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 "query_attention": relation_output.query_attention,
                 "box_anchor_hidden": box_anchor_hidden,
                 "coordinate_logits": coordinate_logits,
-                "pbd_delta_norm": pbd_delta_norm,
+                "pbd_delta_norm": (
+                    pbd_delta_sum / pbd_active_positions
+                    if pbd_active_positions
+                    else None
+                ),
+                "pbd_active_positions": pbd_active_positions,
                 "global_visual_cache": global_visual_cache,
             }
         else:

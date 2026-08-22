@@ -9,6 +9,7 @@ from openpyxl import load_workbook
 
 from eaglevl.train.ui5_excel_logger import (
     EXPECTED_SHEETS,
+    TRAIN_TASKS,
     UI5ExcelLogger,
     build_eval_rows,
 )
@@ -21,7 +22,16 @@ def training_metrics(step: int) -> dict:
         "max_num_tokens": 12800,
         "learning_rate": 2e-5,
         "loss_total": 1.0,
-        "tasks": {},
+        "pbd_delta_norm": 0.25,
+        "pbd_active_positions": 6,
+        "tasks": {
+            task: {
+                "detail_weight_l5": 0.2,
+                "detail_weight_l15": 0.3,
+                "detail_weight_l26": 0.5,
+            }
+            for task in TRAIN_TASKS
+        },
     }
 
 
@@ -72,6 +82,17 @@ class UI5ExcelLoggerTest(unittest.TestCase):
             self.assertTrue(logger.update_train(100, training_metrics(100)))
             self.assertTrue(logger.update_train(200, training_metrics(200)))
             self.assertFalse(logger.update_train(100, training_metrics(100)))
+            workbook = load_workbook(path, read_only=True)
+            try:
+                steps_at_250 = [
+                    row[0]
+                    for row in workbook["train_100steps"].iter_rows(
+                        min_row=2, values_only=True
+                    )
+                ]
+                self.assertEqual(steps_at_250, [100, 200])
+            finally:
+                workbook.close()
             # A run ending at 250 writes no partial window; resume adds only 300.
             self.assertTrue(logger.update_train(300, training_metrics(300)))
             workbook = load_workbook(path, read_only=True)
@@ -92,6 +113,30 @@ class UI5ExcelLoggerTest(unittest.TestCase):
                         for cell in row
                     )
                 )
+            finally:
+                workbook.close()
+
+    def test_five_task_detail_weights_and_active_pbd_are_written(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "ui5_training_evaluation.xlsx"
+            logger = UI5ExcelLogger(path)
+            logger.update_train(100, training_metrics(100))
+            workbook = load_workbook(path, read_only=True)
+            try:
+                self.assertEqual(tuple(workbook.sheetnames), EXPECTED_SHEETS)
+                sheet = workbook["train_100steps"]
+                headers = [cell.value for cell in sheet[1]]
+                values = next(sheet.iter_rows(min_row=2, values_only=True))
+                row = dict(zip(headers, values))
+                for task in TRAIN_TASKS:
+                    weights = [
+                        row[f"{task}_detail_weight_l5"],
+                        row[f"{task}_detail_weight_l15"],
+                        row[f"{task}_detail_weight_l26"],
+                    ]
+                    self.assertAlmostEqual(sum(weights), 1.0, places=7)
+                self.assertEqual(row["pbd_active_positions"], 6)
+                self.assertAlmostEqual(row["pbd_delta_norm"], 0.25)
             finally:
                 workbook.close()
 

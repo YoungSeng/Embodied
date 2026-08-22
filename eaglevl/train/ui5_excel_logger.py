@@ -55,6 +55,9 @@ TRAIN_TASK_SUFFIXES = (
     "gate_precision",
     "gate_recall",
     "gate_f1",
+    "detail_weight_l5",
+    "detail_weight_l15",
+    "detail_weight_l26",
 )
 TRAIN_MODULE_COLUMNS = (
     "detail_layer5_norm",
@@ -64,6 +67,7 @@ TRAIN_MODULE_COLUMNS = (
     "relation_context_norm",
     "relation_gate_prob_mean",
     "pbd_delta_norm",
+    "pbd_active_positions",
     "relation_grad_norm",
     "gate_grad_norm",
     "pbd_grad_norm",

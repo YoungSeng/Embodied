@@ -263,6 +263,24 @@ class CheckpointTests(unittest.TestCase):
             "relation_pyramid.gate_heads.", report["missing_groups"]
         )
 
+    def test_pbd_checkpoint_config_validation_requires_saved_selector_ids(self) -> None:
+        report = patch_locany_checkpoint.validate_pbd_config(
+            {
+                "box_start_token_id": 151668,
+                "text_config": {
+                    "block_size": 6,
+                    "text_mask_token_id": 151666,
+                },
+            }
+        )
+        self.assertTrue(report["valid"], report)
+        self.assertEqual(report["block_size"], 6)
+        invalid = patch_locany_checkpoint.validate_pbd_config(
+            {"box_start_token_id": 151668, "text_config": {}}
+        )
+        self.assertFalse(invalid["valid"])
+        self.assertIn("text_config.block_size", invalid["missing"])
+
     def test_cleanup_keeps_latest_and_formal_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)

@@ -1092,6 +1092,9 @@ class LocateAnythingInferencer:
             "gate_filtered": bool(interface.get("gate_filtered")),
             "final_has_bbox": bool(interface.get("final_has_bbox")),
             "pbd_delta_norm": self._scalar(interface.get("pbd_delta_norm")),
+            "pbd_active_positions": self._scalar(
+                interface.get("pbd_active_positions")
+            ),
         }
 
     @torch.inference_mode()

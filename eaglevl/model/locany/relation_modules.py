@@ -590,6 +590,113 @@ class RelationConditionedDetailPyramid(nn.Module):
         return sum(parameter.numel() for parameter in self.parameters())
 
 
+def pbd_prediction_positions(
+    input_ids: torch.Tensor,
+    sub_sample_lengths: torch.Tensor,
+    box_start_token_id: int,
+    text_mask_token_id: int,
+    block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Select PBD prediction positions without crossing packed samples.
+
+    A normal autoregressive ``<box>`` contributes its anchor only.  A complete
+    MTP block ``[<box>, <text_mask> * (block_size - 1)]`` contributes every
+    position in that block.  Returned indices address the flattened input and
+    are paired with their packed-sample indices.
+    """
+
+    if int(block_size) <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    flat_ids = input_ids.reshape(-1)
+    lengths = torch.as_tensor(
+        sub_sample_lengths,
+        device=flat_ids.device,
+        dtype=torch.long,
+    ).reshape(-1)
+    if bool((lengths < 0).any()):
+        raise ValueError("sub_sample_lengths cannot contain negative values")
+    if int(lengths.sum().item()) != flat_ids.numel():
+        raise ValueError(
+            "PBD packed length mismatch: "
+            f"input_tokens={flat_ids.numel()}, "
+            f"sub_sample_lengths={lengths.tolist()}"
+        )
+
+    positions: List[torch.Tensor] = []
+    sample_indices: List[torch.Tensor] = []
+    sample_start = 0
+    for sample_index, raw_length in enumerate(lengths.tolist()):
+        sample_end = sample_start + int(raw_length)
+        local_anchors = (
+            flat_ids[sample_start:sample_end] == int(box_start_token_id)
+        ).nonzero(as_tuple=False).flatten()
+        mtp_anchors = set()
+        for raw_local_anchor in local_anchors.tolist():
+            candidate = sample_start + int(raw_local_anchor)
+            candidate_end = candidate + int(block_size)
+            if candidate_end > sample_end:
+                continue
+            following = flat_ids[candidate + 1 : candidate_end]
+            if following.numel() == int(block_size) - 1 and bool(
+                (following == int(text_mask_token_id)).all()
+            ):
+                mtp_anchors.add(candidate)
+        for local_anchor in local_anchors.tolist():
+            anchor = sample_start + int(local_anchor)
+            # Generation keeps the newly emitted token in history and copies
+            # it once as the MTP anchor.  For ``[..., <box>, <box>, mask...]``
+            # the first box is history, not a seventh prediction position.
+            if anchor + 1 in mtp_anchors:
+                continue
+            width = int(block_size) if anchor in mtp_anchors else 1
+            selected = torch.arange(
+                anchor,
+                anchor + width,
+                device=flat_ids.device,
+                dtype=torch.long,
+            )
+            positions.append(selected)
+            sample_indices.append(
+                torch.full_like(selected, sample_index, dtype=torch.long)
+            )
+        sample_start = sample_end
+
+    if not positions:
+        empty = torch.zeros(0, device=flat_ids.device, dtype=torch.long)
+        return empty, empty
+    return torch.cat(positions), torch.cat(sample_indices)
+
+
+def pbd_active_delta_norm(
+    hidden_before: torch.Tensor,
+    hidden_after: torch.Tensor,
+    active_positions: torch.Tensor,
+) -> torch.Tensor:
+    """Mean PBD delta norm over modified positions only."""
+
+    if hidden_before.shape != hidden_after.shape:
+        raise ValueError(
+            "PBD hidden shapes disagree: "
+            f"before={tuple(hidden_before.shape)}, after={tuple(hidden_after.shape)}"
+        )
+    flat_before = hidden_before.reshape(-1, hidden_before.shape[-1])
+    flat_after = hidden_after.reshape(-1, hidden_after.shape[-1])
+    active_positions = active_positions.reshape(-1).long()
+    if active_positions.numel() == 0:
+        return flat_before.new_zeros((), dtype=torch.float32)
+    delta = flat_after[active_positions] - flat_before[active_positions]
+    return delta.float().norm(dim=-1).mean()
+
+
+@dataclass
+class PBDForwardOutput:
+    hidden_states: torch.Tensor
+    box_anchor_hidden: torch.Tensor
+    box_anchor_samples: torch.Tensor
+    active_positions: torch.Tensor
+    active_samples: torch.Tensor
+
+
 class RelationToPBD(nn.Module):
     """Inject relation evidence into semantic/negative and box anchor states."""
 
@@ -643,73 +750,64 @@ class RelationToPBD(nn.Module):
         relation_summary: torch.Tensor,
         best_relation_token: torch.Tensor,
         box_start_token_id: int,
-        slot_relation_tokens: Optional[torch.Tensor] = None,
-        slot_counts: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        text_mask_token_id: int,
+        block_size: int,
+    ) -> PBDForwardOutput:
         enhanced = hidden_states.clone()
         flat_hidden = enhanced.reshape(-1, enhanced.shape[-1])
         flat_ids = input_ids.reshape(-1)
-        anchor_states: List[torch.Tensor] = []
-        anchor_samples: List[int] = []
-        start = 0
-        for sample_index, raw_length in enumerate(sub_sample_lengths.tolist()):
-            end = start + int(raw_length)
-            local_anchor = (flat_ids[start:end] == box_start_token_id).nonzero(as_tuple=False).flatten()
-            if local_anchor.numel() > 0:
-                indices = local_anchor + start
-                safe_summary = torch.nan_to_num(
-                    relation_summary[sample_index],
-                    nan=0.0,
-                    posinf=32.0,
-                    neginf=-32.0,
-                ).clamp(-32.0, 32.0)
-                if slot_relation_tokens is not None:
-                    requested_slots = (
-                        int(slot_counts[sample_index].item())
-                        if slot_counts is not None
-                        else slot_relation_tokens.shape[1]
-                    )
-                    num_specific = min(
-                        indices.numel(), slot_relation_tokens.shape[1], requested_slots
-                    )
-                    selected_tokens = best_relation_token[sample_index].unsqueeze(0).expand(
-                        indices.numel(), -1
-                    ).clone()
-                    selected_tokens[:num_specific] = slot_relation_tokens[
-                        sample_index, :num_specific
-                    ]
-                    selected_tokens = torch.nan_to_num(
-                        selected_tokens,
-                        nan=0.0,
-                        posinf=32.0,
-                        neginf=-32.0,
-                    ).clamp(-32.0, 32.0)
-                else:
-                    safe_best = torch.nan_to_num(
-                        best_relation_token[sample_index],
-                        nan=0.0,
-                        posinf=32.0,
-                        neginf=-32.0,
-                    ).clamp(-32.0, 32.0)
-                    selected_tokens = safe_best.unsqueeze(0).expand(
-                        indices.numel(), -1
-                    )
-                sample_summaries = safe_summary.unsqueeze(0).expand(
-                    indices.numel(), -1
-                )
-                flat_hidden[indices] = self.enhance_prediction_hidden(
-                    flat_hidden[indices], sample_summaries, selected_tokens
-                )
-                anchor_states.extend(flat_hidden[index] for index in indices.tolist())
-                anchor_samples.extend([sample_index] * indices.numel())
-            start = end
-
-        if anchor_states:
-            box_anchor_hidden = torch.stack(anchor_states, dim=0)
-            box_anchor_samples = torch.tensor(
-                anchor_samples, device=hidden_states.device, dtype=torch.long
+        if flat_hidden.shape[0] != flat_ids.numel():
+            raise ValueError(
+                "PBD hidden/input token counts disagree: "
+                f"hidden_tokens={flat_hidden.shape[0]}, input_tokens={flat_ids.numel()}"
             )
+        active_positions, active_samples = pbd_prediction_positions(
+            input_ids=input_ids,
+            sub_sample_lengths=sub_sample_lengths,
+            box_start_token_id=box_start_token_id,
+            text_mask_token_id=text_mask_token_id,
+            block_size=block_size,
+        )
+        if active_positions.numel() > 0:
+            required_samples = int(active_samples.max().item()) + 1
+            if relation_summary.shape[0] < required_samples:
+                raise ValueError(
+                    "relation_summary has fewer samples than the packed PBD selection"
+                )
+            if best_relation_token.shape[0] < required_samples:
+                raise ValueError(
+                    "best_relation_token has fewer samples than the packed PBD selection"
+                )
+            safe_summaries = torch.nan_to_num(
+                relation_summary[active_samples],
+                nan=0.0,
+                posinf=32.0,
+                neginf=-32.0,
+            ).clamp(-32.0, 32.0)
+            # Training and generation intentionally use the same best relation
+            # token for every active prediction position in the sample.
+            safe_best_tokens = torch.nan_to_num(
+                best_relation_token[active_samples],
+                nan=0.0,
+                posinf=32.0,
+                neginf=-32.0,
+            ).clamp(-32.0, 32.0)
+            flat_hidden[active_positions] = self.enhance_prediction_hidden(
+                flat_hidden[active_positions], safe_summaries, safe_best_tokens
+            )
+
+        anchor_mask = flat_ids[active_positions] == int(box_start_token_id)
+        anchor_positions = active_positions[anchor_mask]
+        if anchor_positions.numel() > 0:
+            box_anchor_hidden = flat_hidden[anchor_positions]
+            box_anchor_samples = active_samples[anchor_mask]
         else:
             box_anchor_hidden = hidden_states.new_zeros((0, hidden_states.shape[-1]))
             box_anchor_samples = torch.zeros(0, device=hidden_states.device, dtype=torch.long)
-        return enhanced, box_anchor_hidden, box_anchor_samples
+        return PBDForwardOutput(
+            hidden_states=enhanced,
+            box_anchor_hidden=box_anchor_hidden,
+            box_anchor_samples=box_anchor_samples,
+            active_positions=active_positions,
+            active_samples=active_samples,
+        )

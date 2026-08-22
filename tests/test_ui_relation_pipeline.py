@@ -13,12 +13,18 @@ from eaglevl.model.locany.relation_modules import (
     RelationConditionedDetailPyramid,
     RelationToPBD,
     match_ui_relation_prompt,
+    pbd_active_delta_norm,
+    pbd_prediction_positions,
     passes_relation_gate,
     relation_gate_output_override,
 )
 
 
 class UIRelationPipelineTest(unittest.TestCase):
+    BOX = 101
+    MASK = 102
+    BLOCK_SIZE = 6
+
     def test_detail_pyramid_uses_fixed_moonvit_layers(self):
         self.assertEqual(DEFAULT_UI_DETAIL_LAYERS, (5, 15, 26))
 
@@ -139,19 +145,170 @@ class UIRelationPipelineTest(unittest.TestCase):
         enabled_logits = torch.nn.functional.linear(enabled, head)
         self.assertFalse(torch.allclose(disabled_logits, enabled_logits))
 
+    def _run_pbd(self, input_ids, sub_sample_lengths, num_samples=1):
+        torch.manual_seed(29)
+        pbd = RelationToPBD(8, 10)
+        hidden = torch.randn(1, len(input_ids), 10)
+        relation_summary = torch.randn(num_samples, 8)
+        best_relation = torch.randn(num_samples, 8)
+        output = pbd(
+            hidden_states=hidden,
+            input_ids=torch.tensor([input_ids]),
+            sub_sample_lengths=torch.tensor(sub_sample_lengths),
+            relation_summary=relation_summary,
+            best_relation_token=best_relation,
+            box_start_token_id=self.BOX,
+            text_mask_token_id=self.MASK,
+            block_size=self.BLOCK_SIZE,
+        )
+        return pbd, hidden, relation_summary, best_relation, output
+
+    def test_ar_pbd_enhances_anchor_only(self):
+        _, hidden, _, _, output = self._run_pbd(
+            [17, self.BOX, 201, 202, 203, 204, 18], [7]
+        )
+        delta = (output.hidden_states - hidden).norm(dim=-1).reshape(-1)
+        self.assertEqual(output.active_positions.tolist(), [1])
+        self.assertGreater(float(delta[1]), 0.0)
+        torch.testing.assert_close(
+            torch.cat((delta[:1], delta[2:])), torch.zeros(6)
+        )
+
+    def test_mtp_pbd_enhances_all_six_positions(self):
+        ids = [17, self.BOX, *([self.MASK] * 5), 18]
+        _, hidden, _, _, output = self._run_pbd(ids, [8])
+        delta = (output.hidden_states - hidden).norm(dim=-1).reshape(-1)
+        self.assertEqual(output.active_positions.tolist(), list(range(1, 7)))
+        self.assertTrue(bool((delta[1:7] > 0).all()))
+        torch.testing.assert_close(delta[[0, 7]], torch.zeros(2))
+
+    def test_mtp_duplicate_history_anchor_is_not_a_seventh_position(self):
+        ids = [17, self.BOX, self.BOX, *([self.MASK] * 5)]
+        _, hidden, _, _, output = self._run_pbd(ids, [8])
+        delta = (output.hidden_states - hidden).norm(dim=-1).reshape(-1)
+        self.assertEqual(output.active_positions.tolist(), list(range(2, 8)))
+        torch.testing.assert_close(delta[:2], torch.zeros(2))
+        self.assertTrue(bool((delta[2:] > 0).all()))
+
+    def test_pbd_does_not_cross_packed_sample_boundary(self):
+        ids = [17, self.BOX, *([self.MASK] * 5), 18]
+        _, hidden, _, _, output = self._run_pbd(ids, [2, 6], num_samples=2)
+        delta = (output.hidden_states - hidden).norm(dim=-1).reshape(-1)
+        self.assertEqual(output.active_positions.tolist(), [1])
+        self.assertEqual(output.active_samples.tolist(), [0])
+        self.assertGreater(float(delta[1]), 0.0)
+        torch.testing.assert_close(delta[2:], torch.zeros(6))
+
+    def test_training_inference_pbd_logits_are_numerically_equal(self):
+        torch.manual_seed(41)
+        training_pbd = RelationToPBD(8, 10)
+        inference_pbd = RelationToPBD(8, 10)
+        inference_pbd.load_state_dict(training_pbd.state_dict(), strict=True)
+        training_ids = torch.tensor([[self.BOX, *([self.MASK] * 5)]])
+        training_hidden = torch.randn(1, 6, 10)
+        # MTP generation retains the emitted <box> in history and then copies
+        # it as the six-position prediction block anchor.
+        inference_ids = torch.tensor(
+            [[self.BOX, self.BOX, *([self.MASK] * 5)]]
+        )
+        history_hidden = torch.randn(1, 1, 10)
+        inference_hidden = torch.cat((history_hidden, training_hidden), dim=1)
+        relation_summary = torch.randn(1, 8)
+        best_relation = torch.randn(1, 8)
+        lm_head = torch.randn(23, 10)
+
+        shared_kwargs = {
+            "relation_summary": relation_summary,
+            "best_relation_token": best_relation,
+            "box_start_token_id": self.BOX,
+            "text_mask_token_id": self.MASK,
+            "block_size": self.BLOCK_SIZE,
+        }
+        training_output = training_pbd(
+            hidden_states=training_hidden.clone(),
+            input_ids=training_ids,
+            sub_sample_lengths=torch.tensor([6]),
+            **shared_kwargs,
+        )
+        inference_output = inference_pbd(
+            hidden_states=inference_hidden.clone(),
+            input_ids=inference_ids,
+            sub_sample_lengths=torch.tensor([7]),
+            **shared_kwargs,
+        )
+        training_logits = torch.nn.functional.linear(
+            training_output.hidden_states, lm_head
+        )
+        inference_logits = torch.nn.functional.linear(
+            inference_output.hidden_states[:, 1:, :], lm_head
+        )
+        torch.testing.assert_close(
+            training_output.hidden_states,
+            inference_output.hidden_states[:, 1:, :],
+        )
+        torch.testing.assert_close(training_logits, inference_logits)
+        torch.testing.assert_close(
+            inference_output.hidden_states[:, :1, :], history_hidden
+        )
+        baseline_logits = torch.nn.functional.linear(training_hidden, lm_head)
+        changed = (training_logits - baseline_logits).abs().sum(dim=-1)
+        self.assertTrue(bool((changed > 0).all()))
+
+    def test_pbd_delta_norm_uses_active_positions_only(self):
+        ids = [17] * 1000 + [self.BOX, *([self.MASK] * 5)]
+        _, hidden, _, _, output = self._run_pbd(ids, [1006])
+        measured = pbd_active_delta_norm(
+            hidden, output.hidden_states, output.active_positions
+        )
+        manual = (
+            output.hidden_states[:, -6:, :] - hidden[:, -6:, :]
+        ).float().norm(dim=-1).mean()
+        self.assertEqual(output.active_positions.numel(), 6)
+        torch.testing.assert_close(measured, manual)
+
+    def test_position_selector_reports_ar_and_mtp_blocks(self):
+        positions, samples = pbd_prediction_positions(
+            torch.tensor(
+                [[self.BOX, 201, self.BOX, *([self.MASK] * 5)]]
+            ),
+            torch.tensor([8]),
+            self.BOX,
+            self.MASK,
+            self.BLOCK_SIZE,
+        )
+        self.assertEqual(positions.tolist(), [0, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(samples.tolist(), [0] * 7)
+
+    def test_position_selector_uses_configured_block_size(self):
+        positions, _ = pbd_prediction_positions(
+            torch.tensor([[self.BOX, self.MASK, self.MASK, self.MASK, 17]]),
+            torch.tensor([5]),
+            self.BOX,
+            self.MASK,
+            block_size=4,
+        )
+        self.assertEqual(positions.tolist(), [0, 1, 2, 3])
+
     def test_all_detail_levels_and_pbd_receive_nonzero_gradients(self):
         module, features, output = self.make_pyramid()
         pbd = RelationToPBD(8, 10)
-        hidden = torch.randn(1, 3, 10, requires_grad=True)
-        enhanced = pbd.enhance_prediction_hidden(
-            hidden,
-            output.relation_summary,
-            output.best_relation_token,
+        hidden = torch.randn(1, self.BLOCK_SIZE, 10, requires_grad=True)
+        pbd_output = pbd(
+            hidden_states=hidden,
+            input_ids=torch.tensor(
+                [[self.BOX, *([self.MASK] * (self.BLOCK_SIZE - 1))]]
+            ),
+            sub_sample_lengths=torch.tensor([self.BLOCK_SIZE]),
+            relation_summary=output.relation_summary,
+            best_relation_token=output.best_relation_token,
+            box_start_token_id=self.BOX,
+            text_mask_token_id=self.MASK,
+            block_size=self.BLOCK_SIZE,
         )
         loss = (
             output.gate_loss
             + output.attention_loss
-            + enhanced.square().mean()
+            + pbd_output.hidden_states.square().mean()
             + output.relation_tokens.square().mean()
         )
         loss.backward()

@@ -138,6 +138,44 @@ def validate_relation_weight_keys(keys: set[str]) -> dict[str, Any]:
     }
 
 
+def validate_pbd_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Validate the token-driven PBD selector settings saved by training."""
+
+    text_config = config.get("text_config")
+    missing: list[str] = []
+    if not isinstance(text_config, dict):
+        missing.extend(("text_config.block_size", "text_config.text_mask_token_id"))
+        text_config = {}
+    else:
+        for name in ("block_size", "text_mask_token_id"):
+            if name not in text_config:
+                missing.append(f"text_config.{name}")
+    if "box_start_token_id" not in config:
+        missing.append("box_start_token_id")
+    if missing:
+        return {"valid": False, "missing": missing}
+
+    try:
+        block_size = int(text_config["block_size"])
+        text_mask_token_id = int(text_config["text_mask_token_id"])
+        box_start_token_id = int(config["box_start_token_id"])
+    except (TypeError, ValueError) as exc:
+        return {"valid": False, "missing": [], "error": str(exc)}
+    if block_size <= 0:
+        return {
+            "valid": False,
+            "missing": [],
+            "error": f"text_config.block_size must be positive, got {block_size}",
+        }
+    return {
+        "valid": True,
+        "missing": [],
+        "block_size": block_size,
+        "text_mask_token_id": text_mask_token_id,
+        "box_start_token_id": box_start_token_id,
+    }
+
+
 def patch_checkpoint(
     *,
     base_model: Path,
@@ -217,6 +255,14 @@ def patch_checkpoint(
             raise RuntimeError(
                 "Checkpoint config is missing relation_gate_threshold"
             )
+        pbd_config_report = validate_pbd_config(config)
+        if not pbd_config_report["valid"]:
+            raise RuntimeError(
+                "Checkpoint config is missing or has invalid PBD selector settings: "
+                + json.dumps(pbd_config_report, ensure_ascii=False, sort_keys=True)
+            )
+    else:
+        pbd_config_report = None
     config_changed = config.get("auto_map") != AUTO_MAP
     if config_changed:
         config["auto_map"] = AUTO_MAP
@@ -233,6 +279,7 @@ def patch_checkpoint(
         "stale_skipped": stale,
         "config_auto_map_updated": config_changed,
         "relation_weight_validation": relation_weight_report,
+        "pbd_config_validation": pbd_config_report,
         "files": {
             name: {"source": str(source), "sha256": sha256(source)}
             for name, source in sorted(selected_sources.items())

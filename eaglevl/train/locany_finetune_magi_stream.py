@@ -1265,6 +1265,7 @@ class StreamPackingMTPTrainer(Trainer):
         "relation_context_norm",
         "relation_gate_prob_mean",
         "pbd_delta_norm",
+        "pbd_active_positions",
         "relation_grad_norm",
         "gate_grad_norm",
         "pbd_grad_norm",
@@ -1385,6 +1386,23 @@ class StreamPackingMTPTrainer(Trainer):
         state["min"] = min(state["min"], value)
         state["max"] = max(state["max"], value)
 
+    def _add_ui5_weighted_scalar(self, name, value, weight):
+        value = self._tensor_float(value)
+        weight = self._tensor_float(weight)
+        if (
+            value is None
+            or weight is None
+            or weight <= 0
+            or not np.isfinite(value)
+            or not np.isfinite(weight)
+        ):
+            return
+        state = self._ui5_scalar[name]
+        state["sum"] += value * weight
+        state["count"] += weight
+        state["min"] = min(state["min"], value)
+        state["max"] = max(state["max"], value)
+
     def _capture_ui5_batch(self, outputs, inputs):
         if outputs is None:
             return
@@ -1426,9 +1444,15 @@ class StreamPackingMTPTrainer(Trainer):
             ("detail_fused_norm", "detail_fused_norm"),
             ("relation_context_norm", "relation_context_norm"),
             ("relation_gate_prob_mean", "relation_gate_prob_mean"),
-            ("pbd_delta_norm", "pbd_delta_norm"),
         ):
             self._add_ui5_scalar(metric_name, getattr(outputs, output_name, None))
+        pbd_active_positions = getattr(outputs, "pbd_active_positions", None)
+        self._add_ui5_weighted_scalar(
+            "pbd_delta_norm",
+            getattr(outputs, "pbd_delta_norm", None),
+            pbd_active_positions,
+        )
+        self._add_ui5_scalar("pbd_active_positions", pbd_active_positions)
 
         defect_type = inputs.get("defect_type")
         target_mask = inputs.get("target_box_mask")
@@ -1446,6 +1470,17 @@ class StreamPackingMTPTrainer(Trainer):
         defect_type = defect_type[:count]
         positive = positive[:count]
         probabilities = probabilities[:count]
+        detail_weights = getattr(outputs, "detail_layer_weights", None)
+        if torch.is_tensor(detail_weights) and detail_weights.shape[-1] == 3:
+            detail_weights = detail_weights.detach().float().reshape(-1, 3)
+            if detail_weights.shape[0] < count:
+                count = detail_weights.shape[0]
+                defect_type = defect_type[:count]
+                positive = positive[:count]
+                probabilities = probabilities[:count]
+            detail_weights = detail_weights[:count]
+        else:
+            detail_weights = None
         threshold = float(getattr(config, "relation_gate_threshold", 0.5))
         predicted = probabilities >= threshold
         for defect_id, task in self._DEFECT_TO_DIAGNOSTIC_TASK.items():
@@ -1465,6 +1500,20 @@ class StreamPackingMTPTrainer(Trainer):
             values["tp"] += float((mask & positive & predicted).sum().item())
             values["fp"] += float((mask & ~positive & predicted).sum().item())
             values["fn"] += float((mask & positive & ~predicted).sum().item())
+            if detail_weights is not None:
+                task_count = float(mask.sum().item())
+                if task_count:
+                    task_weights = detail_weights[mask]
+                    values["detail_weight_l5_sum"] += float(
+                        task_weights[:, 0].sum().item()
+                    )
+                    values["detail_weight_l15_sum"] += float(
+                        task_weights[:, 1].sum().item()
+                    )
+                    values["detail_weight_l26_sum"] += float(
+                        task_weights[:, 2].sum().item()
+                    )
+                    values["detail_weight_count"] += task_count
 
         for output_name, prefix in (
             ("per_task_gate_loss", "gate_loss"),
@@ -1557,6 +1606,8 @@ class StreamPackingMTPTrainer(Trainer):
             "tp", "fp", "fn",
             "gate_loss_sum", "gate_loss_count",
             "attention_loss_sum", "attention_loss_count",
+            "detail_weight_l5_sum", "detail_weight_l15_sum",
+            "detail_weight_l26_sum", "detail_weight_count",
         )
         sums = []
         minima = []
@@ -1644,6 +1695,7 @@ class StreamPackingMTPTrainer(Trainer):
             "relation_context_norm": self._average(scalars["relation_context_norm"]),
             "relation_gate_prob_mean": self._average(scalars["relation_gate_prob_mean"]),
             "pbd_delta_norm": self._average(scalars["pbd_delta_norm"]),
+            "pbd_active_positions": scalars["pbd_active_positions"]["sum"],
             "relation_grad_norm": self._average(scalars["relation_grad_norm"]),
             "gate_grad_norm": self._average(scalars["gate_grad_norm"]),
             "pbd_grad_norm": self._average(scalars["pbd_grad_norm"]),
@@ -1677,6 +1729,18 @@ class StreamPackingMTPTrainer(Trainer):
                 "gate_precision": precision,
                 "gate_recall": recall,
                 "gate_f1": f1,
+                "detail_weight_l5": (
+                    values["detail_weight_l5_sum"] / values["detail_weight_count"]
+                    if values["detail_weight_count"] else None
+                ),
+                "detail_weight_l15": (
+                    values["detail_weight_l15_sum"] / values["detail_weight_count"]
+                    if values["detail_weight_count"] else None
+                ),
+                "detail_weight_l26": (
+                    values["detail_weight_l26_sum"] / values["detail_weight_count"]
+                    if values["detail_weight_count"] else None
+                ),
             }
         if self.is_world_process_zero():
             written = self._ui5_excel.update_train(step, metrics)

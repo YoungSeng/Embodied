@@ -33,6 +33,7 @@ from .relation_modules import (
     RelationConditionedDetailPyramid,
     RelationPyramidOutput,
     RelationToPBD,
+    pbd_active_delta_norm,
 )
 
 
@@ -111,6 +112,7 @@ class UIDefectModelOutput(CausalLMOutputWithPast):
     relation_context_norm: Optional[torch.Tensor] = None
     relation_gate_prob_mean: Optional[torch.Tensor] = None
     pbd_delta_norm: Optional[torch.Tensor] = None
+    pbd_active_positions: Optional[torch.Tensor] = None
     global_visual_cache: Optional[Any] = None
 
 
@@ -352,6 +354,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         box_anchor_samples = None
         coordinate_logits = None
         pbd_delta_norm = None
+        pbd_active_positions = None
 
         if relation_output is not None:
             if isinstance(ssl, torch.Tensor):
@@ -372,26 +375,29 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                     device=hidden_states.device,
                     dtype=torch.long,
                 )
-            hidden_states, box_anchor_hidden, box_anchor_samples = self.relation_pbd(
+            text_config = self.config.text_config
+            pbd_output = self.relation_pbd(
                 hidden_states=hidden_states,
                 input_ids=model_input_ids,
                 sub_sample_lengths=ssl_for_fusion,
                 relation_summary=relation_output.relation_summary,
                 best_relation_token=relation_output.best_relation_token,
                 box_start_token_id=int(self.config.box_start_token_id),
-                slot_relation_tokens=relation_output.relation_tokens,
-                slot_counts=(
-                    target_box_mask.sum(dim=-1)
-                    if target_box_mask is not None
-                    else None
-                ),
+                text_mask_token_id=int(text_config.text_mask_token_id),
+                block_size=int(text_config.block_size),
             )
-            pbd_delta_norm = (
-                (hidden_states - decoder_hidden_states)
-                .detach()
-                .float()
-                .norm(dim=-1)
-                .mean()
+            hidden_states = pbd_output.hidden_states
+            box_anchor_hidden = pbd_output.box_anchor_hidden
+            box_anchor_samples = pbd_output.box_anchor_samples
+            pbd_delta_norm = pbd_active_delta_norm(
+                decoder_hidden_states.detach(),
+                hidden_states.detach(),
+                pbd_output.active_positions,
+            )
+            pbd_active_positions = torch.tensor(
+                pbd_output.active_positions.numel(),
+                device=hidden_states.device,
+                dtype=torch.long,
             )
             coord_start = int(self.config.coord_start_token_id)
             coord_end = int(self.config.coord_end_token_id) + 1
@@ -510,6 +516,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 else None
             ),
             pbd_delta_norm=pbd_delta_norm,
+            pbd_active_positions=pbd_active_positions,
             global_visual_cache=global_visual_cache,
         )
 

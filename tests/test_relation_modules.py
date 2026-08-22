@@ -48,18 +48,23 @@ class RelationModulesTest(unittest.TestCase):
         module = RelationToPBD(relation_hidden_size=8, language_hidden_size=12)
         hidden = torch.randn(1, 7, 12)
         input_ids = torch.tensor([[1, 5, 2, 5, 3, 4, 6]])
-        enhanced, anchors, samples = module(
+        output = module(
             hidden,
             input_ids,
             torch.tensor([7]),
             torch.randn(1, 8),
             torch.randn(1, 8),
             box_start_token_id=5,
+            text_mask_token_id=99,
+            block_size=6,
         )
-        self.assertEqual(anchors.shape, (2, 12))
-        self.assertEqual(samples.tolist(), [0, 0])
+        self.assertEqual(output.box_anchor_hidden.shape, (2, 12))
+        self.assertEqual(output.box_anchor_samples.tolist(), [0, 0])
+        self.assertEqual(output.active_positions.tolist(), [1, 3])
         unchanged = torch.tensor([0, 2, 4, 5, 6])
-        self.assertTrue(torch.equal(enhanced[0, unchanged], hidden[0, unchanged]))
+        self.assertTrue(
+            torch.equal(output.hidden_states[0, unchanged], hidden[0, unchanged])
+        )
 
     def test_bfloat_relation_path_contains_nonfinite_values(self):
         module = RelationConditionedDetailPyramid(
@@ -83,15 +88,17 @@ class RelationModulesTest(unittest.TestCase):
 
         pbd = RelationToPBD(8, 12).to(dtype=torch.bfloat16)
         hidden = torch.randn(1, 3, 12, dtype=torch.bfloat16)
-        enhanced, _, _ = pbd(
+        pbd_output = pbd(
             hidden,
             torch.tensor([[1, 5, 2]]),
             torch.tensor([3]),
             torch.full((1, 8), float("nan"), dtype=torch.bfloat16),
             torch.full((1, 8), float("nan"), dtype=torch.bfloat16),
             box_start_token_id=5,
+            text_mask_token_id=99,
+            block_size=6,
         )
-        self.assertTrue(torch.isfinite(enhanced).all())
+        self.assertTrue(torch.isfinite(pbd_output.hidden_states).all())
 
     def test_default_parameter_budget_is_far_below_five_percent(self):
         pyramid = RelationConditionedDetailPyramid(1152, 256, 8, 64)
