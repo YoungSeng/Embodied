@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import tempfile
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
@@ -258,30 +259,127 @@ def resolve_image_path(
     )
 
 
-def extract_image_size(record: dict[str, Any], image_path: Path | None) -> tuple[float, float] | None:
-    infos = record.get("infos")
-    candidates: list[Any] = []
-    if isinstance(infos, dict):
-        candidates.extend([infos.get("image_size"), infos.get("input_size")])
-    candidates.extend([record.get("image_size"), record.get("width_height")])
-    for value in candidates:
-        if isinstance(value, dict):
-            width = value.get("width", value.get("w"))
-            height = value.get("height", value.get("h"))
-            if width and height:
-                return float(width), float(height)
-        if isinstance(value, (list, tuple)) and len(value) >= 2:
-            width, height = float(value[0]), float(value[1])
-            if width > 0 and height > 0:
-                return width, height
-    if image_path is not None and image_path.exists():
-        try:
-            from PIL import Image
+def _positive_image_size(width: Any, height: Any) -> tuple[float, float] | None:
+    try:
+        result = float(width), float(height)
+    except (TypeError, ValueError):
+        return None
+    return result if result[0] > 0 and result[1] > 0 else None
 
-            with Image.open(image_path) as image:
-                return float(image.width), float(image.height)
-        except Exception:
-            return None
+
+def _image_size_from_value(value: Any) -> tuple[float, float] | None:
+    if isinstance(value, dict):
+        for width_key, height_key in (
+            ("width", "height"),
+            ("image_width", "image_height"),
+            ("img_width", "img_height"),
+            ("w", "h"),
+        ):
+            if width_key in value and height_key in value:
+                size = _positive_image_size(value[width_key], value[height_key])
+                if size is not None:
+                    return size
+    elif isinstance(value, (list, tuple)) and len(value) >= 2:
+        return _positive_image_size(value[0], value[1])
+    elif isinstance(value, str):
+        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*[xX,]\s*(\d+(?:\.\d+)?)\s*", value)
+        if match:
+            return _positive_image_size(match.group(1), match.group(2))
+    return None
+
+
+@lru_cache(maxsize=200000)
+def _image_size_from_file(path_value: str) -> tuple[float, float] | None:
+    """Read dimensions with Pillow when available, then use dependency-free headers."""
+    path = Path(path_value)
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            size = _positive_image_size(image.width, image.height)
+            if size is not None:
+                return size
+    except (ImportError, OSError, ValueError):
+        pass
+
+    # Data preparation is often launched from the minimal base environment.
+    # PNG/JPEG/GIF/BMP headers are sufficient for obtaining dimensions and do
+    # not require decoding or copying the whole screenshot.
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(32)
+            if header.startswith(b"\x89PNG\r\n\x1a\n") and len(header) >= 24:
+                width, height = struct.unpack(">II", header[16:24])
+                return _positive_image_size(width, height)
+            if header[:6] in {b"GIF87a", b"GIF89a"} and len(header) >= 10:
+                width, height = struct.unpack("<HH", header[6:10])
+                return _positive_image_size(width, height)
+            if header.startswith(b"BM") and len(header) >= 26:
+                width, height = struct.unpack("<ii", header[18:26])
+                return _positive_image_size(abs(width), abs(height))
+            if header.startswith(b"\xff\xd8"):
+                handle.seek(2)
+                start_of_frame = {
+                    0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                    0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+                }
+                while True:
+                    byte = handle.read(1)
+                    while byte and byte != b"\xff":
+                        byte = handle.read(1)
+                    if not byte:
+                        break
+                    marker = handle.read(1)
+                    while marker == b"\xff":
+                        marker = handle.read(1)
+                    if not marker:
+                        break
+                    marker_value = marker[0]
+                    if marker_value in {0x01, *range(0xD0, 0xD9)}:
+                        continue
+                    length_raw = handle.read(2)
+                    if len(length_raw) != 2:
+                        break
+                    segment_length = int.from_bytes(length_raw, "big")
+                    if segment_length < 2:
+                        break
+                    if marker_value in start_of_frame:
+                        frame = handle.read(5)
+                        if len(frame) != 5:
+                            break
+                        height = int.from_bytes(frame[1:3], "big")
+                        width = int.from_bytes(frame[3:5], "big")
+                        return _positive_image_size(width, height)
+                    handle.seek(segment_length - 2, os.SEEK_CUR)
+    except OSError:
+        pass
+    return None
+
+
+def extract_image_size(record: dict[str, Any], image_path: Path | None) -> tuple[float, float] | None:
+    containers = [record]
+    containers.extend(
+        value
+        for key in ("infos", "info", "metadata", "meta", "image_info")
+        if isinstance((value := record.get(key)), dict)
+    )
+    for container in containers:
+        direct = _image_size_from_value(container)
+        if direct is not None:
+            return direct
+        for key in (
+            "image_size",
+            "input_size",
+            "original_size",
+            "ori_size",
+            "width_height",
+            "resolution",
+        ):
+            size = _image_size_from_value(container.get(key))
+            if size is not None:
+                return size
+    if image_path is not None and image_path.is_file():
+        return _image_size_from_file(str(image_path.resolve()))
     return None
 
 
@@ -367,7 +465,9 @@ def format_locany_target(refs: Sequence[Any], boxes: Sequence[tuple[int, int, in
 
 
 def structured_grounding_target(
-    record: dict[str, Any], image_size: tuple[float, float] | None
+    record: dict[str, Any],
+    image_size: tuple[float, float] | None,
+    default_bbox_type: str | None = None,
 ) -> str | None:
     objects = record.get("objects")
     if not isinstance(objects, dict):
@@ -378,7 +478,12 @@ def structured_grounding_target(
     boxes = _coerce_boxes(raw_boxes)
     if not boxes:
         return None
-    bbox_type = objects.get("bbox_type") or record.get("bbox_type")
+    bbox_type = objects.get("bbox_type") or record.get("bbox_type") or default_bbox_type
+    if not bbox_type and any(max(abs(value) for value in box) > 1000.0 for box in boxes):
+        # A single pixel-space box identifies the coordinate system for every
+        # object in the record.  Do not normalize different objects using
+        # different coordinate systems merely because some happen to be <1000.
+        bbox_type = "pixel"
     normalized = [normalize_box(box, str(bbox_type or ""), image_size) for box in boxes]
     refs = objects.get("ref", objects.get("label", objects.get("labels", [])))
     if not isinstance(refs, list):
@@ -400,7 +505,9 @@ def _walk_json_boxes(value: Any) -> Iterator[tuple[Any, Any]]:
 
 
 def json_grounding_target(
-    text: str, image_size: tuple[float, float] | None
+    text: str,
+    image_size: tuple[float, float] | None,
+    bbox_type: str | None = None,
 ) -> str | None:
     candidate = text.strip()
     if candidate.startswith("```"):
@@ -414,7 +521,10 @@ def json_grounding_target(
     if not pairs:
         return None
     refs, boxes = zip(*pairs)
-    normalized = [normalize_box(_coerce_one_box(box) or (), None, image_size) for box in boxes]
+    coerced_boxes = [_coerce_one_box(box) or () for box in boxes]
+    if not bbox_type and any(max(abs(value) for value in box) > 1000.0 for box in coerced_boxes):
+        bbox_type = "pixel"
+    normalized = [normalize_box(box, bbox_type, image_size) for box in coerced_boxes]
     return format_locany_target(refs, normalized)
 
 
@@ -460,9 +570,13 @@ def normalize_record(
     for turn in turns:
         turn["value"] = convert_qwen_markup(turn["value"])
     if task in GROUNDING_TASKS:
-        target = structured_grounding_target(record, image_size)
+        # category_7 OCR annotations use absolute screenshot pixels.  Mark the
+        # complete record as pixel-space so small boxes below coordinate 1000
+        # are not accidentally treated as norm1000 boxes.
+        default_bbox_type = "pixel" if task == "ocr" else None
+        target = structured_grounding_target(record, image_size, default_bbox_type)
         if target is None:
-            target = json_grounding_target(turns[-1]["value"], image_size)
+            target = json_grounding_target(turns[-1]["value"], image_size, default_bbox_type)
         if target is not None:
             turns[-1]["value"] = target
             is_grounding = True

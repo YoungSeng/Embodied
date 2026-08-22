@@ -14,7 +14,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from eaglevl.train.dataset_sampling import resolve_dataset_sampling_weight, resolve_recipe_entry_paths
 from eaglevl.train.checkpoint_schedule import PeriodicCheckpointSchedule
-from prepare_locany_cpt import normalize_box, normalize_record
+from prepare_locany_cpt import extract_image_size, normalize_box, normalize_record
 
 
 def _record(image: Path, prompt: str, answer: str, *, objects=None, record_id="sample"):
@@ -68,6 +68,50 @@ class LocateAnythingCPTTest(unittest.TestCase):
             normalize_box((10, 20, 30, 40), "real", (100, 200)),
             (100, 100, 300, 200),
         )
+
+    def test_png_size_fallback_without_pillow_decode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            image = Path(temporary) / "screen.png"
+            # A PNG signature and IHDR prefix are enough for the dependency-free
+            # size reader; the test intentionally has no image payload.
+            image.write_bytes(
+                b"\x89PNG\r\n\x1a\n"
+                + b"\x00\x00\x00\rIHDR"
+                + (400).to_bytes(4, "big")
+                + (1200).to_bytes(4, "big")
+            )
+            self.assertEqual(extract_image_size({}, image), (400.0, 1200.0))
+
+    def test_ocr_pixel_boxes_use_dimensions_read_from_image(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / "screen.png"
+            image.write_bytes(
+                b"\x89PNG\r\n\x1a\n"
+                + b"\x00\x00\x00\rIHDR"
+                + (400).to_bytes(4, "big")
+                + (1200).to_bytes(4, "big")
+            )
+            record = _record(
+                image,
+                "<image>请识别屏幕上的全部文字，以及文字的位置。",
+                json.dumps(
+                    [{"text": "测试", "bbox_2d": [40, 600, 80, 720]}],
+                    ensure_ascii=False,
+                ),
+            )
+            normalized, is_grounding = normalize_record(
+                record,
+                task="ocr",
+                source_file=root / "ocr.jsonl",
+                source_root=root,
+                check_images=True,
+            )
+            self.assertTrue(is_grounding)
+            self.assertEqual(
+                normalized["conversations"][-1]["value"],
+                "<ref>测试</ref><box><100><500><200><600></box>",
+            )
 
     def test_periodic_checkpoint_schedule_is_not_five_minutes(self):
         schedule = PeriodicCheckpointSchedule(interval_hours=12)
