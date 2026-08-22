@@ -101,9 +101,16 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export PACKING_BUFFER_SIZE="${PACKING_BUFFER_SIZE:-32}"
 export DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 export TARGET_GLOBAL_RANK_BATCH="${TARGET_GLOBAL_RANK_BATCH:-8}"
-export LOGGING_STEPS="${LOGGING_STEPS:-$([[ "${MACHINE_TYPE}" == "a800" ]] && echo 1 || echo 5)}"
+if [[ -z "${GRADIENT_ACCUMULATION_STEPS:-}" ]]; then
+  if [[ "${GPU_COUNT}" == "4" ]]; then
+    export GRADIENT_ACCUMULATION_STEPS=2
+  else
+    export GRADIENT_ACCUMULATION_STEPS=1
+  fi
+fi
+export LOGGING_STEPS="${LOGGING_STEPS:-1}"
 export SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-1000}"
-export SAMPLE_LOG_INTERVAL="${SAMPLE_LOG_INTERVAL:-5}"
+export SAMPLE_LOG_INTERVAL="${SAMPLE_LOG_INTERVAL:-100}"
 export REPORT_TO="${REPORT_TO:-tensorboard}"
 export SAVE_EVERY_N_HOURS="${SAVE_EVERY_N_HOURS:-0}"
 export FREEZE_LLM="${FREEZE_LLM:-False}"
@@ -118,6 +125,9 @@ export RELATION_NUM_SLOTS="${RELATION_NUM_SLOTS:-8}"
 export RELATION_ADAPTER_BOTTLENECK="${RELATION_ADAPTER_BOTTLENECK:-64}"
 export RELATION_GATE_LOSS_WEIGHT="${RELATION_GATE_LOSS_WEIGHT:-1.0}"
 export RELATION_ATTENTION_LOSS_WEIGHT="${RELATION_ATTENTION_LOSS_WEIGHT:-0.1}"
+export RELATION_GATE_THRESHOLD="${RELATION_GATE_THRESHOLD:-0.5}"
+export RELATION_FOCAL_BETA="${RELATION_FOCAL_BETA:-0.999}"
+export RELATION_FOCAL_GAMMA="${RELATION_FOCAL_GAMMA:-2.0}"
 export CHECK_MAGI_IMPORT="${CHECK_MAGI_IMPORT:-$([[ "${ATTN_IMPLEMENTATION}" == "magi" ]] && echo 1 || echo 0)}"
 export LOCANY_ENABLE_MILESTONE_COPIES=0
 
@@ -145,6 +155,13 @@ printf '%-28s: %s\n' \
   "MAX_NUM_TOKENS_SCOPE" "${MAX_NUM_TOKENS_SCOPE}" \
   "MAX_STEPS" "${MAX_STEPS}" \
   "SAVE_STEPS" "${SAVE_STEPS}" \
+  "GRADIENT_ACCUMULATION_STEPS" "${GRADIENT_ACCUMULATION_STEPS}" \
+  "RELATION_GATE_LOSS_WEIGHT" "${RELATION_GATE_LOSS_WEIGHT}" \
+  "RELATION_ATTENTION_LOSS_WEIGHT" "${RELATION_ATTENTION_LOSS_WEIGHT}" \
+  "RELATION_GATE_THRESHOLD" "${RELATION_GATE_THRESHOLD}" \
+  "RELATION_FOCAL_BETA" "${RELATION_FOCAL_BETA}" \
+  "RELATION_FOCAL_GAMMA" "${RELATION_FOCAL_GAMMA}" \
+  "RELATION_NUM_SLOTS" "${RELATION_NUM_SLOTS}" \
   "ENABLE_EVAL" "${ENABLE_EVAL}" \
   "EVAL_AT_START" "${EVAL_AT_START}" \
   "EVAL_INTERVAL_STEPS" "${EVAL_INTERVAL_STEPS}" \
@@ -160,6 +177,10 @@ echo "============================================="
 [[ -d "${PROJECT_ROOT}" ]] || locany_die 21 "Project root missing: ${PROJECT_ROOT}"
 [[ -d "${BASE_MODEL}" ]] || locany_die 22 "Base model missing: ${BASE_MODEL}"
 [[ -x "${ENV_DIR}/bin/python" ]] || locany_die 23 "Python environment missing: ${ENV_DIR}"
+if ! "${PIPELINE_PYTHON}" -c 'import openpyxl; assert tuple(map(int, openpyxl.__version__.split(".")[:2])) >= (3, 1)' >/dev/null 2>&1; then
+  locany_die 30 \
+    "openpyxl>=3.1 is required for diagnostics/ui5_training_evaluation.xlsx in ${ENV_DIR}"
+fi
 [[ -f "${PROJECT_ROOT}/shell/train_locany_ui_defect.sh" ]] || \
   locany_die 24 "Training entrypoint missing: ${PROJECT_ROOT}/shell/train_locany_ui_defect.sh"
 if [[ "${ENABLE_EVAL}" == "1" || "${PIPELINE_MODE}" == "eval" ]]; then

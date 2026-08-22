@@ -87,10 +87,15 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 from transformers import AutoConfig, AutoModel, AutoProcessor, AutoTokenizer
 
+from eaglevl.model.locany.relation_modules import UI_RELATION_PROMPT_SPECS
+
 
 PROMPT_TEMPLATE = (
     "Locate all the instances that match the following description: {label}."
 )
+RELATION_SPEC_BY_TASK = {
+    spec.task_name: spec for spec in UI_RELATION_PROMPT_SPECS
+}
 
 
 @dataclass(frozen=True)
@@ -114,35 +119,35 @@ TASK_CONFIGS = [
         jsonl_name="test_ui_text_overflow_wcnt_no_figma.jsonl",
         class_id=2,
         output_label="文字溢出",
-        prompt_label="text overflow",
+        prompt_label=RELATION_SPEC_BY_TASK["text_overflow"].prompt_label,
     ),
     TaskConfig(
         task_name="text_ellipsis",
         jsonl_name="test_ui_text_ellipsis_wcnt_no_figma.jsonl",
         class_id=3,
         output_label="文本省略",
-        prompt_label="abnormal text ellipsis",
+        prompt_label=RELATION_SPEC_BY_TASK["text_ellipsis"].prompt_label,
     ),
     TaskConfig(
         task_name="occlusion",
         jsonl_name="test_ui_occlusion_wcnt_no_figma.jsonl",
         class_id=0,
         output_label="元素遮挡",
-        prompt_label="overlapping elements",
+        prompt_label=RELATION_SPEC_BY_TASK["occlusion"].prompt_label,
     ),
     TaskConfig(
         task_name="cropping",
         jsonl_name="test_ui_cropping_wcnt_no_figma.jsonl",
         class_id=1,
         output_label="元素裁切",
-        prompt_label="cropped element",
+        prompt_label=RELATION_SPEC_BY_TASK["cropping"].prompt_label,
     ),
     TaskConfig(
         task_name="content_missing",
         jsonl_name="test_ui_content_missing_wcnt_no_figma.jsonl",
         class_id=4,
         output_label="内容缺失",
-        prompt_label="missing content",
+        prompt_label=RELATION_SPEC_BY_TASK["content_missing"].prompt_label,
     ),
 ]
 
@@ -167,6 +172,17 @@ class ParsedAnswer:
     refs: list[str]
     has_none_token: bool
     warnings: list[str]
+
+
+def parse_optional_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"expected true/false, got {value!r}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -366,6 +382,24 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="LocateAnything 自定义模型代码需要开启",
+    )
+    parser.add_argument(
+        "--enable-ui-relation",
+        nargs="?",
+        const=True,
+        type=parse_optional_bool,
+        default=None,
+        help=(
+            "覆盖 checkpoint 中的 enable_ui_relation；未指定时读取模型配置。"
+            "使用 --enable-ui-relation false 可保留原始无 Gate 生成路径。"
+        ),
+    )
+    parser.add_argument(
+        "--no-enable-ui-relation",
+        dest="enable_ui_relation",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--use-fast-processor",
@@ -629,6 +663,7 @@ def remove_old_artifacts(task_output_dir: Path, stem: str) -> None:
     suffixes = ("", "_defect", "_ok", "_parse_error")
     for suffix in suffixes:
         (task_output_dir / "raw" / f"{stem}{suffix}.json").unlink(missing_ok=True)
+        (task_output_dir / "gate" / f"{stem}{suffix}.json").unlink(missing_ok=True)
         (task_output_dir / "visualizations" / f"{stem}{suffix}.jpg").unlink(
             missing_ok=True
         )
@@ -947,8 +982,36 @@ class LocateAnythingInferencer:
                 args.vision_attn_implementation,
                 args.device,
             )
+            if args.enable_ui_relation is not None:
+                model_config.enable_ui_relation = bool(args.enable_ui_relation)
             model_kwargs["config"] = model_config
-            self.model = AutoModel.from_pretrained(args.checkpoint, **model_kwargs)
+            model_kwargs["output_loading_info"] = True
+            loaded = AutoModel.from_pretrained(args.checkpoint, **model_kwargs)
+            if isinstance(loaded, tuple) and len(loaded) == 2:
+                self.model, loading_info = loaded
+            else:
+                # Keep compatibility with older custom Transformers loaders,
+                # although current LocateAnything/Transformers returns a pair.
+                self.model, loading_info = loaded, {}
+            relation_missing_keys = [
+                key
+                for key in loading_info.get("missing_keys", ())
+                if "relation_pyramid" in key or "relation_pbd" in key
+            ]
+            relation_unexpected_keys = [
+                key
+                for key in loading_info.get("unexpected_keys", ())
+                if "relation_pyramid" in key or "relation_pbd" in key
+            ]
+            if (
+                bool(getattr(model_config, "enable_ui_relation", False))
+                and (relation_missing_keys or relation_unexpected_keys)
+            ):
+                raise RuntimeError(
+                    "Checkpoint Relation/Gate/PBD weights are incompatible; "
+                    f"missing_keys={relation_missing_keys}, "
+                    f"unexpected_keys={relation_unexpected_keys}"
+                )
         except Exception as exc:
             raise RuntimeError(
                 "直接加载全参数 checkpoint 失败。请确认 checkpoint 含 config.json、完整"
@@ -993,6 +1056,43 @@ class LocateAnythingInferencer:
         parameter_count = sum(parameter.numel() for parameter in self.model.parameters())
         print(f"parameters              : {parameter_count:,}")
         print("===== 模型加载完成 =====\n")
+        self.last_ui_diagnostics: dict[str, Any] = {
+            "available": False,
+            "enable_ui_relation": bool(
+                getattr(self.model.config, "enable_ui_relation", False)
+            ),
+        }
+
+    @staticmethod
+    def _scalar(value: Any) -> Any:
+        if torch.is_tensor(value):
+            if value.numel() == 1:
+                return value.detach().float().cpu().item()
+            return value.detach().float().cpu().tolist()
+        return value
+
+    def _capture_ui_diagnostics(self) -> None:
+        getter = getattr(self.model, "get_last_ui_defect_interface", None)
+        interface = getter() if callable(getter) else None
+        if not isinstance(interface, dict):
+            self.last_ui_diagnostics = {
+                "available": False,
+                "enable_ui_relation": bool(
+                    getattr(self.model.config, "enable_ui_relation", False)
+                ),
+            }
+            return
+        self.last_ui_diagnostics = {
+            "available": True,
+            "enable_ui_relation": True,
+            "relation_family": self._scalar(interface.get("relation_family")),
+            "p_defect": self._scalar(interface.get("p_defect")),
+            "gate_threshold": self._scalar(interface.get("gate_threshold")),
+            "gate_passed": bool(interface.get("gate_passed")),
+            "gate_filtered": bool(interface.get("gate_filtered")),
+            "final_has_bbox": bool(interface.get("final_has_bbox")),
+            "pbd_delta_norm": self._scalar(interface.get("pbd_delta_norm")),
+        }
 
     @torch.inference_mode()
     def predict(self, image: Image.Image, question: str) -> str:
@@ -1063,6 +1163,7 @@ class LocateAnythingInferencer:
             key: value for key, value in generate_kwargs.items() if value is not None
         }
         raw_output = self.model.generate(**generate_kwargs)
+        self._capture_ui_diagnostics()
         return decode_generation_output(
             raw_output=raw_output,
             input_ids=input_ids,
@@ -1297,6 +1398,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "seed": args.seed,
             "dtype": args.dtype,
             "attn_implementation": args.attn_implementation,
+            "enable_ui_relation": args.enable_ui_relation,
         },
         "output": {
             "tag_filename": args.tag_filename,
@@ -1333,6 +1435,9 @@ def collect_existing_task_artifacts(output_dir: Path) -> list[Path]:
         artifacts.extend(path for path in task_dir.glob("*.json") if path.is_file())
         artifacts.extend(
             path for path in (task_dir / "raw").glob("*.json") if path.is_file()
+        )
+        artifacts.extend(
+            path for path in (task_dir / "gate").glob("*.json") if path.is_file()
         )
         artifacts.extend(
             path
@@ -1404,6 +1509,7 @@ def build_raw_record(
     pixel_boxes: list[list[int]],
     elapsed_seconds: float,
     sample_seed: int,
+    gate_diagnostics: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "task_name": task.task_name,
@@ -1435,6 +1541,7 @@ def build_raw_record(
             "pixel_boxes_xyxy": pixel_boxes,
             "warnings": parsed.warnings,
         },
+        "gate": gate_diagnostics,
         "elapsed_seconds": round(elapsed_seconds, 6),
     }
 
@@ -1484,6 +1591,9 @@ def run_one_task(
         "parse_error": 0,
         "inference_error": 0,
         "boxes": 0,
+        "gate_available": 0,
+        "gate_positive": 0,
+        "gate_filtered": 0,
         "elapsed_seconds": 0.0,
     }
     if not work.pending_paths:
@@ -1519,6 +1629,7 @@ def run_one_task(
             inference_start = time.time()
             answer = inferencer.predict(image=image, question=config.prompt)
             inference_elapsed = time.time() - inference_start
+            gate_diagnostics = dict(inferencer.last_ui_diagnostics)
 
             if args.print_raw_answer:
                 print(f"[RAW] {answer}")
@@ -1556,8 +1667,21 @@ def run_one_task(
                         pixel_boxes=pixel_boxes,
                         elapsed_seconds=inference_elapsed,
                         sample_seed=sample_seed,
+                        gate_diagnostics=gate_diagnostics,
                     ),
                 )
+
+            gate_path = work.output_dir / "gate" / f"{stem}{suffix}.json"
+            atomic_write_json(
+                gate_path,
+                {
+                    "task_name": config.task_name,
+                    "image_path": image_path,
+                    "prediction_status": parsed.status,
+                    "prediction_boxes": len(detections),
+                    **gate_diagnostics,
+                },
+            )
 
             if args.save_visualization:
                 visualization_path = (
@@ -1583,6 +1707,14 @@ def run_one_task(
             counts["processed"] += 1
             counts[parsed.status] += 1
             counts["boxes"] += len(detections)
+            if gate_diagnostics.get("available"):
+                counts["gate_available"] += 1
+                counts["gate_positive"] += int(
+                    bool(gate_diagnostics.get("gate_passed"))
+                )
+                counts["gate_filtered"] += int(
+                    bool(gate_diagnostics.get("gate_filtered"))
+                )
             warning_text = (
                 f" | warnings={len(parsed.warnings)}" if parsed.warnings else ""
             )
@@ -1729,6 +1861,9 @@ def main() -> int:
                 "parse_error",
                 "inference_error",
                 "boxes",
+                "gate_available",
+                "gate_positive",
+                "gate_filtered",
             )
         },
         "wall_elapsed_seconds": round(time.time() - wall_start, 6),

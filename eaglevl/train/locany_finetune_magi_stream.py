@@ -34,6 +34,7 @@ import torch.distributed as dist
 import transformers
 import traceback
 import socket
+from collections import defaultdict
 from eaglevl.dist_utils import init_dist
 
 import packaging.version as version
@@ -73,6 +74,7 @@ from eaglevl.train.ui_defect_data import (
     identify_ui_defect_task,
     is_positive_ui_defect,
 )
+from eaglevl.train.ui5_excel_logger import UI5ExcelLogger, TRAIN_TASKS
 from dotenv import load_dotenv
 load_dotenv()
 from transformers.trainer_pt_utils import LabelSmoother
@@ -1247,13 +1249,269 @@ class SegmentStopCallback(TrainerCallback):
 
 class StreamPackingMTPTrainer(Trainer):
     """Trainer with StreamPackedDatasetMTP support."""
-    
-    def __init__(self, *args, sample_log_interval: int = 100, **kwargs):
+
+    _UI5_SCALARS = (
+        "loss_total",
+        "loss_lm",
+        "loss_gate",
+        "loss_attention",
+        "weighted_gate_loss",
+        "weighted_attention_loss",
+        "grad_norm",
+        "detail_layer5_norm",
+        "detail_layer15_norm",
+        "detail_layer26_norm",
+        "detail_fused_norm",
+        "relation_context_norm",
+        "relation_gate_prob_mean",
+        "pbd_delta_norm",
+        "relation_grad_norm",
+        "gate_grad_norm",
+        "pbd_grad_norm",
+    )
+    _DEFECT_TO_DIAGNOSTIC_TASK = {
+        0: "text_overflow",
+        1: "element_cropping",
+        2: "element_overlap",
+        3: "text_ellipsis",
+        4: "content_missing",
+    }
+
+    def __init__(
+        self,
+        *args,
+        sample_log_interval: int = 100,
+        max_num_tokens: int = 0,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self._total_samples = 0
         self._sample_log_interval = sample_log_interval
+        self._max_num_tokens = int(max_num_tokens)
         self._start_step = None  # 记录开始的step，用于resume时正确计算平均值
-    
+        self._ui5_excel = UI5ExcelLogger(
+            osp.join(
+                self.args.output_dir,
+                "diagnostics",
+                "ui5_training_evaluation.xlsx",
+            )
+        )
+        self._ui5_last_flushed_step = 0
+        self._reset_ui5_window()
+        self._ui5_window_path = osp.join(
+            self.args.output_dir,
+            "diagnostics",
+            f".ui5_train_window_rank{get_rank()}.json",
+        )
+        self._load_ui5_window_state()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def _reset_ui5_window(self):
+        self._ui5_scalar = {
+            name: {"sum": 0.0, "count": 0.0, "min": float("inf"), "max": float("-inf")}
+            for name in self._UI5_SCALARS
+        }
+        self._ui5_tasks = {
+            task: defaultdict(float) for task in TRAIN_TASKS
+        }
+        self._ui5_peak_gpu_memory_mb = 0.0
+
+    def _load_ui5_window_state(self):
+        if not osp.isfile(self._ui5_window_path):
+            return
+        try:
+            with open(self._ui5_window_path, "r", encoding="utf-8") as handle:
+                state = json.load(handle)
+            for name in self._UI5_SCALARS:
+                if name in state.get("scalars", {}):
+                    self._ui5_scalar[name].update(state["scalars"][name])
+            for task in TRAIN_TASKS:
+                self._ui5_tasks[task].update(state.get("tasks", {}).get(task, {}))
+            self._ui5_peak_gpu_memory_mb = float(state.get("peak_gpu_memory_mb", 0.0))
+            self._ui5_last_flushed_step = int(state.get("last_flushed_step", 0))
+            logger.info(
+                "[UI5Excel] restored partial rank window from %s",
+                self._ui5_window_path,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to restore UI5 diagnostic window: {self._ui5_window_path}"
+            ) from exc
+
+    def _save_ui5_window_state(self):
+        os.makedirs(osp.dirname(self._ui5_window_path), exist_ok=True)
+        temporary = f"{self._ui5_window_path}.tmp-{os.getpid()}"
+        state = {
+            "schema_version": 1,
+            "last_seen_step": int(self.state.global_step),
+            "last_flushed_step": int(self._ui5_last_flushed_step),
+            "scalars": self._ui5_scalar,
+            "tasks": {
+                task: dict(values) for task, values in self._ui5_tasks.items()
+            },
+            "peak_gpu_memory_mb": self._ui5_peak_gpu_memory_mb,
+        }
+        try:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(state, handle, ensure_ascii=False, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self._ui5_window_path)
+        finally:
+            if osp.exists(temporary):
+                os.remove(temporary)
+
+    @staticmethod
+    def _tensor_float(value):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            if value.numel() != 1:
+                return None
+            return float(value.detach().float().item())
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _add_ui5_scalar(self, name, value):
+        value = self._tensor_float(value)
+        if value is None or not np.isfinite(value):
+            return
+        state = self._ui5_scalar[name]
+        state["sum"] += value
+        state["count"] += 1.0
+        state["min"] = min(state["min"], value)
+        state["max"] = max(state["max"], value)
+
+    def _capture_ui5_batch(self, outputs, inputs):
+        if outputs is None:
+            return
+        config = self.model.config
+        gate_weight = float(getattr(config, "relation_gate_loss_weight", 1.0))
+        attention_weight = float(
+            getattr(config, "relation_attention_loss_weight", 0.1)
+        )
+        self._add_ui5_scalar("loss_total", getattr(outputs, "loss", None))
+        self._add_ui5_scalar("loss_lm", getattr(outputs, "lm_loss", None))
+        self._add_ui5_scalar("loss_gate", getattr(outputs, "gate_loss", None))
+        self._add_ui5_scalar(
+            "loss_attention", getattr(outputs, "attention_loss", None)
+        )
+        gate_loss_value = self._tensor_float(getattr(outputs, "gate_loss", None))
+        if gate_loss_value is not None:
+            self._add_ui5_scalar("weighted_gate_loss", gate_weight * gate_loss_value)
+        attention_loss_value = self._tensor_float(
+            getattr(outputs, "attention_loss", None)
+        )
+        if attention_loss_value is not None:
+            self._add_ui5_scalar(
+                "weighted_attention_loss",
+                attention_weight * attention_loss_value,
+            )
+
+        detail_norm = getattr(outputs, "detail_feature_norm", None)
+        if torch.is_tensor(detail_norm) and detail_norm.numel() == 3:
+            for name, value in zip(
+                (
+                    "detail_layer5_norm",
+                    "detail_layer15_norm",
+                    "detail_layer26_norm",
+                ),
+                detail_norm.reshape(-1),
+            ):
+                self._add_ui5_scalar(name, value)
+        for output_name, metric_name in (
+            ("detail_fused_norm", "detail_fused_norm"),
+            ("relation_context_norm", "relation_context_norm"),
+            ("relation_gate_prob_mean", "relation_gate_prob_mean"),
+            ("pbd_delta_norm", "pbd_delta_norm"),
+        ):
+            self._add_ui5_scalar(metric_name, getattr(outputs, output_name, None))
+
+        defect_type = inputs.get("defect_type")
+        target_mask = inputs.get("target_box_mask")
+        p_defect = getattr(outputs, "p_defect", None)
+        if not (
+            torch.is_tensor(defect_type)
+            and torch.is_tensor(target_mask)
+            and torch.is_tensor(p_defect)
+        ):
+            return
+        defect_type = defect_type.detach().reshape(-1).long()
+        positive = target_mask.detach().reshape(target_mask.shape[0], -1).any(dim=-1)
+        probabilities = p_defect.detach().float().reshape(-1)
+        count = min(defect_type.numel(), positive.numel(), probabilities.numel())
+        defect_type = defect_type[:count]
+        positive = positive[:count]
+        probabilities = probabilities[:count]
+        threshold = float(getattr(config, "relation_gate_threshold", 0.5))
+        predicted = probabilities >= threshold
+        for defect_id, task in self._DEFECT_TO_DIAGNOSTIC_TASK.items():
+            mask = defect_type == defect_id
+            values = self._ui5_tasks[task]
+            values["samples"] += float(mask.sum().item())
+            values["positive"] += float((mask & positive).sum().item())
+            values["negative"] += float((mask & ~positive).sum().item())
+            values["p_defect_pos_sum"] += float(
+                probabilities[mask & positive].sum().item()
+            )
+            values["p_defect_pos_count"] += float((mask & positive).sum().item())
+            values["p_defect_neg_sum"] += float(
+                probabilities[mask & ~positive].sum().item()
+            )
+            values["p_defect_neg_count"] += float((mask & ~positive).sum().item())
+            values["tp"] += float((mask & positive & predicted).sum().item())
+            values["fp"] += float((mask & ~positive & predicted).sum().item())
+            values["fn"] += float((mask & positive & ~predicted).sum().item())
+
+        for output_name, prefix in (
+            ("per_task_gate_loss", "gate_loss"),
+            ("per_task_attention_loss", "attention_loss"),
+        ):
+            task_losses = getattr(outputs, output_name, None) or {}
+            for raw_defect_id, loss_value in task_losses.items():
+                task = self._DEFECT_TO_DIAGNOSTIC_TASK.get(int(raw_defect_id))
+                loss_float = self._tensor_float(loss_value)
+                if task is not None and loss_float is not None:
+                    self._ui5_tasks[task][f"{prefix}_sum"] += loss_float
+                    self._ui5_tasks[task][f"{prefix}_count"] += 1.0
+
+    def _capture_ui5_gradient_groups(self, model):
+        squares = {"relation": 0.0, "gate": 0.0, "pbd": 0.0}
+        for name, parameter in model.named_parameters():
+            if parameter.grad is None:
+                continue
+            if "relation_pbd" in name:
+                group = "pbd"
+            elif "relation_pyramid.gate_heads" in name:
+                group = "gate"
+            elif "relation_pyramid" in name:
+                group = "relation"
+            else:
+                continue
+            grad = parameter.grad.detach().float()
+            squares[group] += float(grad.square().sum().item())
+        for group, value in squares.items():
+            self._add_ui5_scalar(f"{group}_grad_norm", value ** 0.5)
+
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs=False,
+        num_items_in_batch=None,
+    ):
+        loss, outputs = super().compute_loss(
+            model,
+            inputs,
+            return_outputs=True,
+            num_items_in_batch=num_items_in_batch,
+        )
+        self._capture_ui5_batch(outputs, inputs)
+        return (loss, outputs) if return_outputs else loss
+
     def training_step(self, model, inputs, num_items_in_batch=None):
         # 记录开始的step（用于resume时正确计算平均值）
         if self._start_step is None:
@@ -1281,7 +1539,174 @@ class StreamPackingMTPTrainer(Trainer):
                                f"Total samples (this run) = {self._total_samples}, "
                                f"Avg samples/step = {avg_samples_per_step:.2f}")
         
-        return super().training_step(model, inputs, num_items_in_batch)
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        self._capture_ui5_gradient_groups(model)
+        if torch.cuda.is_available():
+            self._ui5_peak_gpu_memory_mb = max(
+                self._ui5_peak_gpu_memory_mb,
+                torch.cuda.max_memory_allocated() / (1024.0 ** 2),
+            )
+        return loss
+
+    def _reduce_ui5_window(self):
+        scalar_names = list(self._UI5_SCALARS)
+        task_keys = (
+            "samples", "positive", "negative",
+            "p_defect_pos_sum", "p_defect_pos_count",
+            "p_defect_neg_sum", "p_defect_neg_count",
+            "tp", "fp", "fn",
+            "gate_loss_sum", "gate_loss_count",
+            "attention_loss_sum", "attention_loss_count",
+        )
+        sums = []
+        minima = []
+        maxima = []
+        for name in scalar_names:
+            state = self._ui5_scalar[name]
+            sums.extend((state["sum"], state["count"]))
+            minima.append(state["min"])
+            maxima.append(state["max"])
+        for task in TRAIN_TASKS:
+            sums.extend(self._ui5_tasks[task][key] for key in task_keys)
+        sums.append(self._ui5_peak_gpu_memory_mb)
+
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        sum_tensor = torch.tensor(sums, dtype=torch.float64, device=device)
+        min_tensor = torch.tensor(minima, dtype=torch.float64, device=device)
+        max_tensor = torch.tensor(maxima, dtype=torch.float64, device=device)
+        peak_tensor = sum_tensor[-1:].clone()
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(sum_tensor[:-1], op=dist.ReduceOp.SUM)
+            dist.all_reduce(min_tensor, op=dist.ReduceOp.MIN)
+            dist.all_reduce(max_tensor, op=dist.ReduceOp.MAX)
+            dist.all_reduce(peak_tensor, op=dist.ReduceOp.MAX)
+        sum_tensor[-1] = peak_tensor[0]
+        values = sum_tensor.cpu().tolist()
+        minima = min_tensor.cpu().tolist()
+        maxima = max_tensor.cpu().tolist()
+        cursor = 0
+        reduced_scalars = {}
+        for index, name in enumerate(scalar_names):
+            reduced_scalars[name] = {
+                "sum": values[cursor],
+                "count": values[cursor + 1],
+                "min": minima[index],
+                "max": maxima[index],
+            }
+            cursor += 2
+        reduced_tasks = {}
+        for task in TRAIN_TASKS:
+            reduced_tasks[task] = dict(zip(task_keys, values[cursor:cursor + len(task_keys)]))
+            cursor += len(task_keys)
+        return reduced_scalars, reduced_tasks, values[-1]
+
+    @staticmethod
+    def _average(state):
+        return state["sum"] / state["count"] if state["count"] else None
+
+    def _flush_ui5_excel(self, step, logs):
+        scalars, tasks, peak_memory = self._reduce_ui5_window()
+        config = self.model.config
+        metrics = {
+            "step": step,
+            "epoch": self.state.epoch,
+            "gpu_num": self.args.world_size,
+            "max_num_tokens": self._max_num_tokens,
+            "learning_rate": logs.get("learning_rate"),
+            "gate_loss_weight": float(getattr(config, "relation_gate_loss_weight", 1.0)),
+            "attention_loss_weight": float(getattr(config, "relation_attention_loss_weight", 0.1)),
+            "gate_threshold": float(getattr(config, "relation_gate_threshold", 0.5)),
+            "focal_beta": float(getattr(config, "relation_focal_beta", 0.999)),
+            "focal_gamma": float(getattr(config, "relation_focal_gamma", 2.0)),
+            "relation_num_slots": int(getattr(config, "relation_num_slots", 8)),
+            "loss_total": self._average(scalars["loss_total"]),
+            "loss_total_min": scalars["loss_total"]["min"],
+            "loss_total_max": scalars["loss_total"]["max"],
+            "loss_lm": self._average(scalars["loss_lm"]),
+            "loss_gate": self._average(scalars["loss_gate"]),
+            "loss_attention": self._average(scalars["loss_attention"]),
+            "weighted_gate_loss": self._average(scalars["weighted_gate_loss"]),
+            "weighted_attention_loss": self._average(scalars["weighted_attention_loss"]),
+            "grad_norm": self._average(scalars["grad_norm"]),
+            "grad_norm_max": scalars["grad_norm"]["max"],
+            "samples": sum(values["samples"] for values in tasks.values()),
+            "positive_samples": sum(values["positive"] for values in tasks.values()),
+            "negative_samples": sum(values["negative"] for values in tasks.values()),
+            "peak_gpu_memory_mb": peak_memory,
+            "detail_layer5_norm": self._average(scalars["detail_layer5_norm"]),
+            "detail_layer15_norm": self._average(scalars["detail_layer15_norm"]),
+            "detail_layer26_norm": self._average(scalars["detail_layer26_norm"]),
+            "detail_fused_norm": self._average(scalars["detail_fused_norm"]),
+            "relation_context_norm": self._average(scalars["relation_context_norm"]),
+            "relation_gate_prob_mean": self._average(scalars["relation_gate_prob_mean"]),
+            "pbd_delta_norm": self._average(scalars["pbd_delta_norm"]),
+            "relation_grad_norm": self._average(scalars["relation_grad_norm"]),
+            "gate_grad_norm": self._average(scalars["gate_grad_norm"]),
+            "pbd_grad_norm": self._average(scalars["pbd_grad_norm"]),
+            "tasks": {},
+        }
+        for task, values in tasks.items():
+            tp, fp, fn = values["tp"], values["fp"], values["fn"]
+            precision = tp / (tp + fp) if tp + fp else 0.0
+            recall = tp / (tp + fn) if tp + fn else 0.0
+            f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+            metrics["tasks"][task] = {
+                "samples": values["samples"],
+                "positive": values["positive"],
+                "negative": values["negative"],
+                "gate_loss": (
+                    values["gate_loss_sum"] / values["gate_loss_count"]
+                    if values["gate_loss_count"] else None
+                ),
+                "attention_loss": (
+                    values["attention_loss_sum"] / values["attention_loss_count"]
+                    if values["attention_loss_count"] else None
+                ),
+                "p_defect_pos": (
+                    values["p_defect_pos_sum"] / values["p_defect_pos_count"]
+                    if values["p_defect_pos_count"] else None
+                ),
+                "p_defect_neg": (
+                    values["p_defect_neg_sum"] / values["p_defect_neg_count"]
+                    if values["p_defect_neg_count"] else None
+                ),
+                "gate_precision": precision,
+                "gate_recall": recall,
+                "gate_f1": f1,
+            }
+        if self.is_world_process_zero():
+            written = self._ui5_excel.update_train(step, metrics)
+            logger.info(
+                "[UI5Excel] step=%s written=%s path=%s",
+                step,
+                written,
+                self._ui5_excel.path,
+            )
+        self._reset_ui5_window()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def log(self, logs, start_time=None):
+        if "grad_norm" in logs:
+            self._add_ui5_scalar("grad_norm", logs["grad_norm"])
+        result = super().log(logs, start_time)
+        step = int(self.state.global_step)
+        if (
+            step > 0
+            and step % 100 == 0
+            and step != self._ui5_last_flushed_step
+        ):
+            self._flush_ui5_excel(step, logs)
+            self._ui5_last_flushed_step = step
+            self._save_ui5_window_state()
+        elif "train_runtime" in logs:
+            # Persist a partial 100-step window at a clean segment/final stop.
+            self._save_ui5_window_state()
+        return result
     
     def get_train_dataloader(self):
         if self.train_dataset is None:
@@ -1487,6 +1912,9 @@ def main():
             config.relation_detail_layers = relation_detail_layers
         config.relation_gate_loss_weight = model_args.relation_gate_loss_weight
         config.relation_attention_loss_weight = model_args.relation_attention_loss_weight
+        config.relation_gate_threshold = model_args.relation_gate_threshold
+        config.relation_focal_beta = model_args.relation_focal_beta
+        config.relation_focal_gamma = model_args.relation_focal_gamma
 
         model = LocateAnythingForConditionalGeneration.from_pretrained(
             model_args.model_name_or_path, 
@@ -1547,7 +1975,10 @@ def main():
             relation_adapter_bottleneck=model_args.relation_adapter_bottleneck,
             relation_detail_layers=relation_detail_layers,
             relation_gate_loss_weight=model_args.relation_gate_loss_weight,
-            relation_attention_loss_weight=model_args.relation_attention_loss_weight)
+            relation_attention_loss_weight=model_args.relation_attention_loss_weight,
+            relation_gate_threshold=model_args.relation_gate_threshold,
+            relation_focal_beta=model_args.relation_focal_beta,
+            relation_focal_gamma=model_args.relation_focal_gamma)
         locateanything_config._attn_implementation = 'magi'
         model = LocateAnythingForConditionalGeneration(locateanything_config, vision_model, llm)
 
@@ -1709,6 +2140,7 @@ def main():
         callbacks=my_callbacks,
         processing_class=processor,
         sample_log_interval=getattr(data_args, 'sample_log_interval', 100),
+        max_num_tokens=getattr(data_args, 'max_num_tokens', 0),
     )
 
     # Training

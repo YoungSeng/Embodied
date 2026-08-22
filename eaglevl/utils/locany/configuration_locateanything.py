@@ -10,6 +10,7 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
+from .relation_modules import DEFAULT_UI_DETAIL_LAYERS
 logger = logging.get_logger(__name__)
 
 class MoonViTConfig(PretrainedConfig):
@@ -116,20 +117,22 @@ class LocateAnythingConfig(PretrainedConfig):
         self.relation_num_slots = relation_num_slots
         self.relation_adapter_bottleneck = relation_adapter_bottleneck
         if relation_detail_layers is None:
-            num_layers = self.vision_config.num_hidden_layers
-            relation_detail_layers = [
-                max(0, num_layers // 4 - 1),
-                max(0, (3 * num_layers) // 5 - 1),
-                num_layers - 1,
-            ]
+            relation_detail_layers = DEFAULT_UI_DETAIL_LAYERS
         if len(relation_detail_layers) != 3:
             raise ValueError("relation_detail_layers must contain early, middle, and final layer indices")
         self.relation_detail_layers = [int(index) for index in relation_detail_layers]
+        if min(self.relation_detail_layers) < 0 or max(self.relation_detail_layers) >= self.vision_config.num_hidden_layers:
+            raise ValueError(
+                "relation_detail_layers must be valid MoonViT block indices; "
+                f"layers={self.relation_detail_layers}, num_layers={self.vision_config.num_hidden_layers}"
+            )
         self.relation_gate_loss_weight = relation_gate_loss_weight
         self.relation_attention_loss_weight = relation_attention_loss_weight
         self.relation_focal_gamma = relation_focal_gamma
         self.relation_focal_beta = relation_focal_beta
         self.relation_gate_threshold = relation_gate_threshold
+        if not 0.0 <= float(self.relation_gate_threshold) <= 1.0:
+            raise ValueError("relation_gate_threshold must be in [0, 1]")
 
     def to_dict(self):
         """

@@ -7,16 +7,26 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
+from eaglevl.model.locany.relation_modules import UI_RELATION_PROMPT_SPECS
+
 
 BOX_PATTERN = re.compile(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>", re.IGNORECASE)
 
-# defect_type, relation_family.  boundary is shared by overflow and cropping.
-TASK_SPECS = (
-    ("text_overflow", 0, 0, ("text overflow", "文字溢出")),
-    ("cropping", 1, 0, ("cropped element", "element cropping", "元素裁切")),
-    ("overlap", 2, 1, ("overlapping elements", "element overlap", "元素重叠")),
-    ("ellipsis", 3, 2, ("abnormal text ellipsis", "ellipsis anomaly", "省略异常")),
-    ("missing", 4, 3, ("missing content", "content missing", "内容缺失")),
+# defect_type, relation_family. Boundary is shared by overflow and cropping.
+# The routing table itself is shared with trust_remote_code inference.
+_TRAIN_TASK_NAMES = {
+    "occlusion": "overlap",
+    "text_ellipsis": "ellipsis",
+    "content_missing": "missing",
+}
+TASK_SPECS = tuple(
+    (
+        _TRAIN_TASK_NAMES.get(spec.task_name, spec.task_name),
+        spec.defect_type,
+        spec.relation_family,
+        spec.aliases,
+    )
+    for spec in UI_RELATION_PROMPT_SPECS
 )
 
 

@@ -30,6 +30,11 @@ def parse_args() -> argparse.Namespace:
         "--project-root", type=Path, default=Path(__file__).resolve().parents[1]
     )
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--validate-relation-weights",
+        action="store_true",
+        help="Fail unless checkpoint weights contain every Relation/Gate/PBD group",
+    )
     return parser.parse_args()
 
 
@@ -70,12 +75,76 @@ def checkpoint_has_weights(checkpoint: Path) -> bool:
     )
 
 
+REQUIRED_RELATION_WEIGHT_GROUPS = (
+    "relation_pyramid.level_projections.",
+    "relation_pyramid.scale_logits",
+    "relation_pyramid.evidence_queries",
+    "relation_pyramid.context_queries",
+    "relation_pyramid.family_adapters.",
+    "relation_pyramid.gate_heads.",
+    "relation_pbd.semantic_projection.",
+    "relation_pbd.box_projection.",
+    "relation_pbd.semantic_scale",
+    "relation_pbd.box_scale",
+)
+
+
+def checkpoint_weight_keys(checkpoint: Path) -> set[str]:
+    for name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        index_path = checkpoint / name
+        if index_path.is_file():
+            value = json.loads(index_path.read_text(encoding="utf-8"))
+            return set(value.get("weight_map", {}))
+
+    safetensor_files = list(checkpoint.glob("model*.safetensors"))
+    if safetensor_files:
+        try:
+            from safetensors import safe_open
+        except ImportError as exc:
+            raise RuntimeError(
+                "safetensors is required to validate relation checkpoint keys"
+            ) from exc
+        keys: set[str] = set()
+        for path in safetensor_files:
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                keys.update(handle.keys())
+        return keys
+
+    bin_files = list(checkpoint.glob("pytorch_model*.bin"))
+    if bin_files:
+        import torch
+
+        keys: set[str] = set()
+        for path in bin_files:
+            value = torch.load(path, map_location="cpu", weights_only=True)
+            if isinstance(value, dict):
+                keys.update(value)
+        return keys
+    return set()
+
+
+def validate_relation_weight_keys(keys: set[str]) -> dict[str, Any]:
+    missing = [
+        group
+        for group in REQUIRED_RELATION_WEIGHT_GROUPS
+        if not any(group in key for key in keys)
+    ]
+    return {
+        "valid": not missing,
+        "missing_groups": missing,
+        "relation_key_count": sum(
+            "relation_pyramid" in key or "relation_pbd" in key for key in keys
+        ),
+    }
+
+
 def patch_checkpoint(
     *,
     base_model: Path,
     checkpoint: Path,
     project_root: Path,
     force: bool = False,
+    validate_relation_weights: bool = False,
 ) -> dict[str, Any]:
     base_model = base_model.expanduser().resolve()
     checkpoint = checkpoint.expanduser().resolve()
@@ -88,6 +157,17 @@ def patch_checkpoint(
         raise FileNotFoundError(f"Checkpoint is missing config.json: {checkpoint}")
     if not checkpoint_has_weights(checkpoint):
         raise FileNotFoundError(f"Checkpoint is missing model weights: {checkpoint}")
+
+    relation_weight_report = None
+    if validate_relation_weights:
+        relation_weight_report = validate_relation_weight_keys(
+            checkpoint_weight_keys(checkpoint)
+        )
+        if not relation_weight_report["valid"]:
+            raise RuntimeError(
+                "Checkpoint is missing trained UI relation weights: "
+                + ", ".join(relation_weight_report["missing_groups"])
+            )
 
     selected_sources: dict[str, Path] = {
         source.name: source for source in sorted(base_model.glob("*.py"))
@@ -123,6 +203,20 @@ def patch_checkpoint(
 
     config_path = checkpoint / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    if validate_relation_weights:
+        if not bool(config.get("enable_ui_relation", False)):
+            raise RuntimeError(
+                "Checkpoint config does not enable the UI relation generation path"
+            )
+        if config.get("relation_detail_layers") != [5, 15, 26]:
+            raise RuntimeError(
+                "Checkpoint config must use MoonViT detail layers [5, 15, 26], got "
+                f"{config.get('relation_detail_layers')}"
+            )
+        if "relation_gate_threshold" not in config:
+            raise RuntimeError(
+                "Checkpoint config is missing relation_gate_threshold"
+            )
     config_changed = config.get("auto_map") != AUTO_MAP
     if config_changed:
         config["auto_map"] = AUTO_MAP
@@ -138,6 +232,7 @@ def patch_checkpoint(
         "skipped": skipped,
         "stale_skipped": stale,
         "config_auto_map_updated": config_changed,
+        "relation_weight_validation": relation_weight_report,
         "files": {
             name: {"source": str(source), "sha256": sha256(source)}
             for name, source in sorted(selected_sources.items())
@@ -154,6 +249,7 @@ def main() -> int:
         checkpoint=args.checkpoint,
         project_root=args.project_root,
         force=args.force,
+        validate_relation_weights=args.validate_relation_weights,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if report["stale_skipped"]:

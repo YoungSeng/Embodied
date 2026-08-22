@@ -31,7 +31,12 @@ from .generate_utils import (
     handle_pattern,
     get_token_ids_from_config,
 )
-from .relation_modules import RelationConditionedDetailPyramid, RelationToPBD
+from .relation_modules import (
+    RelationConditionedDetailPyramid,
+    RelationToPBD,
+    match_ui_relation_prompt,
+    relation_gate_output_override,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -337,19 +342,14 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
     @staticmethod
     def _infer_ui_relation(input_ids, tokenizer, device):
         text = tokenizer.decode(input_ids[0], skip_special_tokens=False).lower()
-        mappings = (
-            (("text overflow", "文字溢出"), 0, 0),
-            (("cropped element", "element cropping", "元素裁切"), 0, 1),
-            (("overlapping elements", "element overlap", "元素重叠"), 1, 2),
-            (("abnormal text ellipsis", "ellipsis anomaly", "省略异常"), 2, 3),
-            (("missing content", "content missing", "内容缺失"), 3, 4),
-        )
-        for aliases, family, defect_type in mappings:
-            if any(alias in text for alias in aliases):
-                return (
-                    torch.tensor([family], device=device, dtype=torch.long),
-                    torch.tensor([defect_type], device=device, dtype=torch.long),
-                )
+        spec = match_ui_relation_prompt(text)
+        if spec is not None:
+            return (
+                torch.tensor(
+                    [spec.relation_family], device=device, dtype=torch.long
+                ),
+                torch.tensor([spec.defect_type], device=device, dtype=torch.long),
+            )
         return None, None
 
     def get_last_ui_defect_interface(self):
@@ -409,6 +409,8 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         verbose = generate_kwargs.pop('verbose', False)
         start_time = time.time()
         prefill_time = None
+        # Release the previous screenshot cache before encoding the next sample.
+        self._last_ui_defect_interface = None
 
         pixel_values = pixel_values.to(self.language_model.dtype)
         # Convert numpy array to tensor if needed
@@ -457,6 +459,42 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             vit_embeds = torch.cat(vit_embeds, dim=0)
             vit_embeds = self.mlp1(vit_embeds)
 
+        gate_threshold = float(
+            getattr(self.config, "relation_gate_threshold", 0.5)
+        )
+        gate_passed = None
+        if relation_output is not None:
+            gate_override = relation_gate_output_override(
+                relation_output.p_defect[0], gate_threshold
+            )
+            gate_passed = gate_override is None
+            if gate_override is not None:
+                response = gate_override
+                self._last_ui_defect_interface = {
+                    "relation_tokens": relation_output.relation_tokens,
+                    "relation_family": relation_output.relation_family,
+                    "p_defect": relation_output.p_defect,
+                    "gate_threshold": gate_threshold,
+                    "gate_passed": False,
+                    "gate_filtered": True,
+                    "final_has_bbox": False,
+                    "coarse_boxes": relation_output.coarse_boxes,
+                    "query_attention": relation_output.query_attention,
+                    "box_anchor_hidden": None,
+                    "coordinate_logits": None,
+                    "pbd_delta_norm": relation_output.p_defect.new_zeros(()),
+                    "global_visual_cache": global_visual_cache,
+                }
+                if verbose:
+                    return response, [], (
+                        "\nStatistic Info, gate_filtered=1; "
+                        f"p_defect={relation_output.p_defect[0].float().item():.6f}; "
+                        f"threshold={gate_threshold:.6f}\n"
+                    )
+                if return_ui_defect_interface:
+                    return response, self._last_ui_defect_interface
+                return response
+
         # ==================== Generation Mode ====================
         # 'fast'   : MTP only, never fall back to AR
         # 'slow'   : AR only, pure auto-regressive decoding
@@ -472,6 +510,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         switch_to_ar_count = 0
         box_anchor_hidden = None
         coordinate_logits = None
+        pbd_delta_norm = None
 
         # Pre-allocate mask tokens and position ids
         default_mask_token_id = self.token_ids['default_mask_token_id']
@@ -608,16 +647,14 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                     pbd_width = n_future_tokens if use_mtp else 1
                     last_hidden = outputs.hidden_states[-1]
                     pbd_hidden = last_hidden[:, -pbd_width:, :].clone()
-                    semantic_delta = self.relation_pbd.semantic_projection(
-                        relation_output.relation_summary
-                    ).unsqueeze(1)
-                    box_delta = self.relation_pbd.box_projection(
-                        relation_output.best_relation_token
-                    ).unsqueeze(1)
-                    pbd_hidden = (
-                        pbd_hidden
-                        + self.relation_pbd.semantic_scale.tanh() * semantic_delta
-                        + self.relation_pbd.box_scale.tanh() * box_delta
+                    pbd_input = pbd_hidden.clone()
+                    pbd_hidden = self.relation_pbd.enhance_prediction_hidden(
+                        pbd_hidden,
+                        relation_output.relation_summary,
+                        relation_output.best_relation_token,
+                    )
+                    pbd_delta_norm = (
+                        (pbd_hidden - pbd_input).float().norm(dim=-1).mean()
                     )
                     replacement_logits = F.linear(pbd_hidden, self.language_model.lm_head.weight)
                     outputs.logits[:, -pbd_width:, :] = replacement_logits
@@ -666,14 +703,23 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         response = tokenizer.batch_decode(generated_ids, skip_special_tokens=False)
 
         if relation_output is not None:
+            compact_response = "".join(response[0].lower().split())
             self._last_ui_defect_interface = {
                 "relation_tokens": relation_output.relation_tokens,
                 "relation_family": relation_output.relation_family,
                 "p_defect": relation_output.p_defect,
+                "gate_threshold": gate_threshold,
+                "gate_passed": gate_passed,
+                "gate_filtered": False,
+                "final_has_bbox": (
+                    "<box>none</box>" not in compact_response
+                    and "<box>" in compact_response
+                ),
                 "coarse_boxes": relation_output.coarse_boxes,
                 "query_attention": relation_output.query_attention,
                 "box_anchor_hidden": box_anchor_hidden,
                 "coordinate_logits": coordinate_logits,
+                "pbd_delta_norm": pbd_delta_norm,
                 "global_visual_cache": global_visual_cache,
             }
         else:

@@ -1,6 +1,6 @@
 # LocateAnything UI5 v4 统一训练—评测框架
 
-本框架只改训练、checkpoint 和评测基础设施，不修改 LocateAnything UI5 v4 的模型结构、Relation 模块或五类任务定义。
+本分支同时保证 UI5 v4 的 Detail Pyramid、Relation Query、Defectness Gate、PBD 与训练/推理基础设施使用同一条可诊断链路；不引入新的多任务算法，也不改变五类任务定义。
 
 统一入口为：
 
@@ -58,6 +58,28 @@ python scripts/submit_locany_ui5.py \
 
 该模式不会执行 step 0 或周期评测，直接调用原训练入口。
 
+本轮 Relation/Gate/PBD 修复建议先跑 20-step 和 250-step 两级 smoke：
+
+```bash
+# 4 卡 20-step forward/backward 与保存加载基础检查
+python scripts/submit_locany_ui5.py \
+  --machine a800 --gpus 4 --max-num-tokens 12800 \
+  --max-steps 20 --save-steps 20 --disable-eval \
+  --run-name locany-ui5-v4-relationfix-a800x4-smoke20
+
+# 4 卡 250-step Excel 检查；train_100steps 应只出现 100、200
+python scripts/submit_locany_ui5.py \
+  --machine a800 --gpus 4 --max-num-tokens 12800 \
+  --max-steps 250 --save-steps 250 --disable-eval \
+  --run-name locany-ui5-v4-relationfix-a800x4-smoke250
+
+# 8 卡 20-step 使用同一 pipeline，仅 GPU 数和 token budget 不同
+python scripts/submit_locany_ui5.py \
+  --machine a800 --gpus 8 --max-num-tokens 25600 \
+  --max-steps 20 --save-steps 20 --disable-eval \
+  --run-name locany-ui5-v4-relationfix-a800x8-smoke20
+```
+
 只渲染和检查 YAML，不提交：
 
 ```bash
@@ -77,8 +99,11 @@ python scripts/submit_locany_ui5.py \
   --machine a800 \
   --gpus 4 \
   --eval-checkpoint /path/to/checkpoint-4000 \
-  --eval-step 4000
+  --eval-step 4000 \
+  --eval-max-images-per-task 10
 ```
+
+`--eval-max-images-per-task` 只用于小样本 smoke；省略或设置为 0 时仍跑完整的每任务 1,555 条评测。
 
 如果已经处于分配好四张 GPU 的节点，也可以直接执行 pipeline：
 
@@ -270,6 +295,33 @@ ${OUTPUT_DIR}/evaluation/evaluation_history.csv
 
 history 包含：step、机器类型、训练 GPU 数、`MAX_NUM_TOKENS`、checkpoint、五类 image/bbox 指标、image/bbox macro precision/recall/F1、起止时间和状态。`macro_precision/recall/F1` 列默认对应主要的 Image Macro 指标，同时保留明确的 `image_macro_*` 与 `bbox_macro_*` 列。
 
+## 两-sheet 训练/评测诊断
+
+唯一诊断工作簿为：
+
+```text
+${OUTPUT_DIR}/diagnostics/ui5_training_evaluation.xlsx
+```
+
+它严格只包含：
+
+```text
+train_100steps：每 100 optimizer global step 的窗口 loss、五任务 Gate 指标、三层 Detail/Relation/PBD 输出与梯度
+eval_1000steps：checkpoint-0 及每次周期评测的五任务 image/bbox 与两行 macro
+```
+
+rank 0 使用临时 `.xlsx` 保存并重新打开校验，成功后才以 `os.replace` 覆盖正式文件；各 rank 的隐藏窗口状态文件用于在 100-step 窗口中途 resume，已有 step 不会重复追加。每图 Gate 诊断写入预测任务目录下的 `gate/`，汇总写入 `_gate_metrics.json`，包括 `p_defect`、Gate precision/recall/F1、过滤数量及 Gate 后 FP。
+
+运行环境需要 `openpyxl>=3.1`（已加入 `pyproject.toml`）；pipeline 会在加载模型前检查并给出明确错误。
+
+推理时阈值只读取 checkpoint 的 `relation_gate_threshold`（默认 0.5）：低于阈值直接返回 `<box>none</box>`，否则进入原 bbox 生成。对照旧路径可运行：
+
+```bash
+python scripts/inference_ui_defect_locany.py ... --enable-ui-relation false
+```
+
+4 卡和 8 卡使用同一 pipeline，并保留原训练设置：四卡 `GRADIENT_ACCUMULATION_STEPS=2`，八卡为 `1`；其余训练参数由提交器做一致性检查。默认输出目录包含 `a800x4/a800x8`，避免两种运行互相覆盖。
+
 ## Checkpoint patch
 
 单独调用：
@@ -292,6 +344,7 @@ python scripts/patch_locany_checkpoint.py \
 ```
 
 自动评测使用 `--force`，保证 checkpoint 中的 `modeling_locateanything.py` 和 `relation_modules.py` 与本次代码快照一致。
+同时使用 `--validate-relation-weights` 检查 Relation Pyramid、Gate Heads 和 PBD 的权重组确实存在；缺失时在加载推理模型前直接失败。
 
 ## Fail-fast 检查
 

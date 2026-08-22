@@ -14,6 +14,7 @@ from typing import Any
 from locany_ui5_common import (
     DEFAULT_CONFIG_PATH,
     PROJECT_ROOT,
+    assert_gpu_mode_consistency,
     machine_resource_config,
     resolve_runtime_config,
 )
@@ -38,6 +39,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=16000)
     parser.add_argument("--save-steps", type=int, default=4000)
     parser.add_argument("--eval-interval-steps", type=int, default=1000)
+    parser.add_argument(
+        "--eval-max-images-per-task",
+        type=int,
+        default=None,
+        help="Smoke evaluation limit per UI5 task; omitted/0 keeps the full set",
+    )
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--learning-rate", default="2e-5")
     parser.add_argument("--version", default="v4")
@@ -133,12 +140,18 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "MAX_NUM_TOKENS": args.max_num_tokens,
         "MAX_SEQ_LENGTH": args.max_seq_length,
         "MAX_NUM_TOKENS_PER_SAMPLE": args.max_num_tokens_per_sample,
+        "EVAL_MAX_IMAGES_PER_TASK": getattr(
+            args, "eval_max_images_per_task", None
+        ),
         "RUN_NAME": args.run_name,
         "SCORER_ROOT": args.scorer_root,
         "TRAINING_DATA_SOURCE_DIR": args.training_data_source_dir,
         "TRAINING_DATA_DIR": args.training_data_dir,
     }
     env.update(explicit)
+    eval_max_images = optional["EVAL_MAX_IMAGES_PER_TASK"]
+    if eval_max_images is not None and int(eval_max_images) < 0:
+        raise ValueError("--eval-max-images-per-task cannot be negative")
     env.update({key: str(value) for key, value in optional.items() if value is not None})
     if (args.eval_checkpoint is None) != (args.eval_step is None):
         raise ValueError("--eval-checkpoint and --eval-step must be provided together")
@@ -156,6 +169,31 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
 
 def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
     submission_env = build_submission_environment(args)
+    parity_base = dict(submission_env)
+    for key in (
+        "GPU_COUNT",
+        "CUDA_DEVICES",
+        "MAX_NUM_TOKENS",
+        "RUN_NAME",
+        "OUTPUT_DIR",
+    ):
+        parity_base.pop(key, None)
+    four_env = {
+        **parity_base,
+        "GPU_COUNT": "4",
+        "CUDA_DEVICES": "0,1,2,3",
+        "EVAL_GPU_DEVICES": "0,1,2,3",
+    }
+    eight_env = {
+        **parity_base,
+        "GPU_COUNT": "8",
+        "CUDA_DEVICES": "0,1,2,3,4,5,6,7",
+        "EVAL_GPU_DEVICES": "0,1,2,3",
+    }
+    assert_gpu_mode_consistency(
+        resolve_runtime_config(four_env, config_path=args.config),
+        resolve_runtime_config(eight_env, config_path=args.config),
+    )
     runtime = resolve_runtime_config(submission_env, config_path=args.config)
     if re.fullmatch(r"[A-Za-z0-9._-]+", str(runtime["VERSION"])) is None:
         raise ValueError("VERSION may contain only letters, digits, '.', '_', and '-'")
@@ -173,6 +211,13 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "MAX_STEPS",
         "WARMUP_STEPS",
         "LEARNING_RATE",
+        "GRADIENT_ACCUMULATION_STEPS",
+        "RELATION_GATE_LOSS_WEIGHT",
+        "RELATION_ATTENTION_LOSS_WEIGHT",
+        "RELATION_GATE_THRESHOLD",
+        "RELATION_FOCAL_BETA",
+        "RELATION_FOCAL_GAMMA",
+        "RELATION_NUM_SLOTS",
         "MAX_SEQ_LENGTH",
         "MAX_NUM_TOKENS_PER_SAMPLE",
         "MAX_NUM_TOKENS",
@@ -180,6 +225,7 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "ENABLE_EVAL",
         "EVAL_AT_START",
         "EVAL_INTERVAL_STEPS",
+        "EVAL_MAX_IMAGES_PER_TASK",
         "EVAL_FAIL_POLICY",
         "RUN_NAME",
         "PIPELINE_MODE",
@@ -251,11 +297,19 @@ def main() -> int:
         "MAX_NUM_TOKENS_PER_SAMPLE",
         "MAX_NUM_TOKENS",
         "MAX_NUM_TOKENS_SCOPE",
+        "GRADIENT_ACCUMULATION_STEPS",
+        "RELATION_GATE_LOSS_WEIGHT",
+        "RELATION_ATTENTION_LOSS_WEIGHT",
+        "RELATION_GATE_THRESHOLD",
+        "RELATION_FOCAL_BETA",
+        "RELATION_FOCAL_GAMMA",
+        "RELATION_NUM_SLOTS",
         "MAX_STEPS",
         "SAVE_STEPS",
         "ENABLE_EVAL",
         "EVAL_AT_START",
         "EVAL_INTERVAL_STEPS",
+        "EVAL_MAX_IMAGES_PER_TASK",
     ):
         print(f"{key:28s}: {runtime[key]}")
     print(f"rendered_yaml               : {output_yaml}")

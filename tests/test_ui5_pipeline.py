@@ -37,12 +37,54 @@ class RuntimeConfigTests(unittest.TestCase):
         )
         self.assertEqual(four["MAX_NUM_TOKENS"], 12800)
         self.assertEqual(eight["MAX_NUM_TOKENS"], 25600)
+        self.assertEqual(four["GRADIENT_ACCUMULATION_STEPS"], 2)
+        self.assertEqual(eight["GRADIENT_ACCUMULATION_STEPS"], 1)
+        self.assertNotEqual(four["OUTPUT_DIR"], eight["OUTPUT_DIR"])
+        locany_ui5_common.assert_gpu_mode_consistency(four, eight)
         self.assertEqual(four["MAX_NUM_TOKENS_SCOPE"], "per_rank_packed_batch")
         self.assertEqual(
             four["TRAINING_DATA_SOURCE_DIR"],
             "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/"
             "code/Eagle/Embodied/data/ui_defect_locany_v3",
         )
+
+    def test_gpu_parity_check_rejects_training_hyperparameter_drift(self) -> None:
+        four = locany_ui5_common.resolve_runtime_config(
+            {
+                "MACHINE_TYPE": "a800",
+                "GPU_COUNT": "4",
+                "CUDA_DEVICES": "0,1,2,3",
+            }
+        )
+        eight = locany_ui5_common.resolve_runtime_config(
+            {
+                "MACHINE_TYPE": "a800",
+                "GPU_COUNT": "8",
+                "CUDA_DEVICES": "0,1,2,3,4,5,6,7",
+            }
+        )
+        eight["LEARNING_RATE"] = "3e-5"
+        with self.assertRaisesRegex(ValueError, "LEARNING_RATE"):
+            locany_ui5_common.assert_gpu_mode_consistency(four, eight)
+
+    def test_gpu_parity_check_rejects_wrong_accumulation_schedule(self) -> None:
+        four = locany_ui5_common.resolve_runtime_config(
+            {
+                "MACHINE_TYPE": "a800",
+                "GPU_COUNT": "4",
+                "CUDA_DEVICES": "0,1,2,3",
+                "GRADIENT_ACCUMULATION_STEPS": "1",
+            }
+        )
+        eight = locany_ui5_common.resolve_runtime_config(
+            {
+                "MACHINE_TYPE": "a800",
+                "GPU_COUNT": "8",
+                "CUDA_DEVICES": "0,1,2,3,4,5,6,7",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "original 2/1"):
+            locany_ui5_common.assert_gpu_mode_consistency(four, eight)
 
     def test_explicit_max_num_tokens_wins(self) -> None:
         config = locany_ui5_common.resolve_runtime_config(
@@ -79,6 +121,7 @@ class RuntimeConfigTests(unittest.TestCase):
             max_steps=2,
             save_steps=4000,
             eval_interval_steps=1000,
+            eval_max_images_per_task=10,
             warmup_steps=0,
             learning_rate="2e-5",
             version="v4",
@@ -99,6 +142,7 @@ class RuntimeConfigTests(unittest.TestCase):
         rendered, runtime = submit_locany_ui5.render_job(args)
         self.assertIn("mnt: /mnt/bn/intelligent-service-yg/", rendered)
         self.assertIn('MAX_NUM_TOKENS: "12800"', rendered)
+        self.assertIn('EVAL_MAX_IMAGES_PER_TASK: "10"', rendered)
         self.assertNotIn("@@", rendered)
         self.assertEqual(runtime["ENABLE_EVAL"], 0)
 
@@ -204,6 +248,20 @@ class CheckpointTests(unittest.TestCase):
                 (checkpoint / "modeling_locateanything.py").read_text(encoding="utf-8"),
                 "PROJECT = 2\n",
             )
+
+    def test_relation_weight_validation_covers_relation_gate_and_pbd(self) -> None:
+        keys = {
+            f"model.{group}weight"
+            for group in patch_locany_checkpoint.REQUIRED_RELATION_WEIGHT_GROUPS
+        }
+        report = patch_locany_checkpoint.validate_relation_weight_keys(keys)
+        self.assertTrue(report["valid"], report)
+        keys = {key for key in keys if "gate_heads" not in key}
+        report = patch_locany_checkpoint.validate_relation_weight_keys(keys)
+        self.assertFalse(report["valid"])
+        self.assertIn(
+            "relation_pyramid.gate_heads.", report["missing_groups"]
+        )
 
     def test_cleanup_keeps_latest_and_formal_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

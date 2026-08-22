@@ -99,8 +99,18 @@ class UIDefectModelOutput(CausalLMOutputWithPast):
     box_anchor_hidden: Optional[torch.Tensor] = None
     box_anchor_samples: Optional[torch.Tensor] = None
     coordinate_logits: Optional[torch.Tensor] = None
+    lm_loss: Optional[torch.Tensor] = None
     gate_loss: Optional[torch.Tensor] = None
     attention_loss: Optional[torch.Tensor] = None
+    per_task_gate_loss: Optional[Dict[int, torch.Tensor]] = None
+    per_task_attention_loss: Optional[Dict[int, torch.Tensor]] = None
+    gate_targets: Optional[torch.Tensor] = None
+    detail_layer_weights: Optional[torch.Tensor] = None
+    detail_feature_norm: Optional[torch.Tensor] = None
+    detail_fused_norm: Optional[torch.Tensor] = None
+    relation_context_norm: Optional[torch.Tensor] = None
+    relation_gate_prob_mean: Optional[torch.Tensor] = None
+    pbd_delta_norm: Optional[torch.Tensor] = None
     global_visual_cache: Optional[Any] = None
 
 
@@ -341,11 +351,27 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         box_anchor_hidden = None
         box_anchor_samples = None
         coordinate_logits = None
+        pbd_delta_norm = None
 
         if relation_output is not None:
-            ssl_for_fusion = ssl if isinstance(ssl, torch.Tensor) else torch.as_tensor(
-                ssl, device=hidden_states.device, dtype=torch.long
-            )
+            if isinstance(ssl, torch.Tensor):
+                ssl_for_fusion = ssl.to(
+                    device=hidden_states.device, dtype=torch.long
+                )
+            elif ssl is not None:
+                ssl_for_fusion = torch.as_tensor(
+                    ssl, device=hidden_states.device, dtype=torch.long
+                )
+            else:
+                # The stream trainer always supplies packed lengths, while
+                # unit/single-sample callers may not.  Preserve the identical
+                # PBD path by treating each batch row as one complete sample.
+                ssl_for_fusion = torch.full(
+                    (model_input_ids.shape[0],),
+                    model_input_ids.shape[1],
+                    device=hidden_states.device,
+                    dtype=torch.long,
+                )
             hidden_states, box_anchor_hidden, box_anchor_samples = self.relation_pbd(
                 hidden_states=hidden_states,
                 input_ids=model_input_ids,
@@ -360,6 +386,13 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                     else None
                 ),
             )
+            pbd_delta_norm = (
+                (hidden_states - decoder_hidden_states)
+                .detach()
+                .float()
+                .norm(dim=-1)
+                .mean()
+            )
             coord_start = int(self.config.coord_start_token_id)
             coord_end = int(self.config.coord_end_token_id) + 1
             coordinate_logits = F.linear(
@@ -370,6 +403,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         hidden_dim = hidden_states.shape[-1]
 
         loss = None
+        lm_loss = None
         logits = None
         if labels is not None:
             shift_hidden_states = hidden_states[..., :-1, :].contiguous()
@@ -446,8 +480,36 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             box_anchor_hidden=box_anchor_hidden,
             box_anchor_samples=box_anchor_samples,
             coordinate_logits=coordinate_logits,
+            lm_loss=lm_loss,
             gate_loss=relation_output.gate_loss if relation_output is not None else None,
             attention_loss=relation_output.attention_loss if relation_output is not None else None,
+            per_task_gate_loss=(
+                relation_output.per_task_gate_loss if relation_output is not None else None
+            ),
+            per_task_attention_loss=(
+                relation_output.per_task_attention_loss if relation_output is not None else None
+            ),
+            gate_targets=(
+                relation_output.gate_targets if relation_output is not None else None
+            ),
+            detail_layer_weights=(
+                relation_output.scale_weights if relation_output is not None else None
+            ),
+            detail_feature_norm=(
+                relation_output.projected_level_norms if relation_output is not None else None
+            ),
+            detail_fused_norm=(
+                relation_output.fused_feature_norm if relation_output is not None else None
+            ),
+            relation_context_norm=(
+                relation_output.relation_context_norm if relation_output is not None else None
+            ),
+            relation_gate_prob_mean=(
+                torch.sigmoid(relation_output.gate_logits.detach()).float().mean()
+                if relation_output is not None
+                else None
+            ),
+            pbd_delta_norm=pbd_delta_norm,
             global_visual_cache=global_visual_cache,
         )
 

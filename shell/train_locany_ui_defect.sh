@@ -147,8 +147,11 @@ fi
 
 TARGET_GLOBAL_RANK_BATCH="${TARGET_GLOBAL_RANK_BATCH:-8}"
 if [[ -z "${GRADIENT_ACCUMULATION_STEPS:-}" ]]; then
-  GRADIENT_ACCUMULATION_STEPS=$(( TARGET_GLOBAL_RANK_BATCH / GPUS ))
-  (( GRADIENT_ACCUMULATION_STEPS < 1 )) && GRADIENT_ACCUMULATION_STEPS=1
+  if [[ "${GPU_COUNT:-8}" == "4" ]]; then
+    GRADIENT_ACCUMULATION_STEPS=2
+  else
+    GRADIENT_ACCUMULATION_STEPS=1
+  fi
 fi
 
 MAX_STEPS="${MAX_STEPS:-25000}"
@@ -353,6 +356,9 @@ if torchrun \
   --relation_adapter_bottleneck "${RELATION_ADAPTER_BOTTLENECK:-64}" \
   --relation_gate_loss_weight "${RELATION_GATE_LOSS_WEIGHT:-1.0}" \
   --relation_attention_loss_weight "${RELATION_ATTENTION_LOSS_WEIGHT:-0.1}" \
+  --relation_gate_threshold "${RELATION_GATE_THRESHOLD:-0.5}" \
+  --relation_focal_beta "${RELATION_FOCAL_BETA:-0.999}" \
+  --relation_focal_gamma "${RELATION_FOCAL_GAMMA:-2.0}" \
   --balance_ui_defects "${BALANCE_UI_DEFECTS:-True}" \
   --ui_records_per_class "${UI_RECORDS_PER_CLASS:-17604}" \
   --ui_negative_to_positive_ratio "${UI_NEGATIVE_TO_POSITIVE_RATIO:-2.0}" \

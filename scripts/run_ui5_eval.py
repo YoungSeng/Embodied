@@ -101,6 +101,10 @@ def record_history(
         status,
         "--prediction-dir",
         str(prediction_dir),
+        "--gt-dir",
+        str(args.input_dir),
+        "--scorer-root",
+        str(args.scorer_root),
         "--error",
         error,
     ]
@@ -173,6 +177,7 @@ def main() -> int:
                 "--project-root",
                 str(args.project_root),
                 "--force",
+                "--validate-relation-weights",
             ]
             if not args.dry_run:
                 run_checked(current_command, cwd=args.project_root, stage=current_stage)

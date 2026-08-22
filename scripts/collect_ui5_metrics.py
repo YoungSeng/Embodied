@@ -5,12 +5,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import json
 import os
 from pathlib import Path
 from typing import Any
 
 from locany_ui5_common import TASK_ISSUE_NAMES, TASKS
+from eaglevl.train.ui5_excel_logger import (
+    UI5ExcelLogger,
+    build_eval_rows,
+)
 
 
 BASE_COLUMNS = [
@@ -73,6 +78,132 @@ def load_metrics(path: Path | None) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"Invalid metric summary: {path}")
     return value
+
+
+def _sample_image_path(sample: dict[str, Any], jsonl_dir: Path) -> str | None:
+    images = sample.get("images", sample.get("image"))
+    if isinstance(images, list):
+        images = images[0] if images else None
+    if isinstance(images, dict):
+        images = images.get("path")
+    if not isinstance(images, str):
+        return None
+    path = Path(images).expanduser()
+    if not path.is_absolute():
+        path = jsonl_dir / path
+    return str(path.resolve(strict=False))
+
+
+def collect_gate_metrics(
+    prediction_dir: Path | None,
+    gt_dir: Path | None,
+    scorer_root: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Join per-image gate sidecars with the same GT parser used by scoring."""
+
+    if prediction_dir is None or not prediction_dir.is_dir():
+        return {}
+    ground_truth: dict[str, dict[str, bool]] = {}
+    if gt_dir is not None and gt_dir.is_dir():
+        scorer_file = (
+            scorer_root / "qwen3vl_merge_and_score_fixed_5tasks.py"
+            if scorer_root is not None
+            else Path(__file__).resolve().parents[1]
+            / "qwen3vl_merge_and_score_fixed_5tasks.py"
+        )
+        extract_bboxes_for_issue = None
+        get_gt_payload = None
+        if scorer_file.is_file():
+            spec = importlib.util.spec_from_file_location(
+                "ui5_qwen_scorer_for_gate_metrics", scorer_file
+            )
+            if spec is not None and spec.loader is not None:
+                scorer_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(scorer_module)
+                extract_bboxes_for_issue = getattr(
+                    scorer_module, "extract_bboxes_for_issue", None
+                )
+                get_gt_payload = getattr(scorer_module, "get_gt_payload", None)
+        if extract_bboxes_for_issue is not None and get_gt_payload is not None:
+            from locany_ui5_common import TASK_JSONL
+
+            for task in TASKS:
+                source = gt_dir / TASK_JSONL[task]
+                labels: dict[str, bool] = {}
+                if source.is_file():
+                    with source.open("r", encoding="utf-8") as handle:
+                        for line in handle:
+                            if not line.strip():
+                                continue
+                            sample = json.loads(line)
+                            image_path = _sample_image_path(sample, source.parent)
+                            if image_path is None:
+                                continue
+                            positive = bool(
+                                extract_bboxes_for_issue(
+                                    get_gt_payload(sample), TASK_ISSUE_NAMES[task]
+                                )
+                            )
+                            labels[image_path] = positive
+                            labels[Path(image_path).name] = positive
+                ground_truth[task] = labels
+
+    result: dict[str, dict[str, Any]] = {}
+    for task in TASKS:
+        gate_dir = prediction_dir / task / "gate"
+        records = []
+        if gate_dir.is_dir():
+            for path in gate_dir.glob("*.json"):
+                try:
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if isinstance(value, dict):
+                    records.append(value)
+        positives: list[float] = []
+        negatives: list[float] = []
+        gate_tp = gate_fp = gate_fn = 0
+        labels = ground_truth.get(task, {})
+        for record in records:
+            p_defect = record.get("p_defect")
+            image_path = str(record.get("image_path", ""))
+            label = labels.get(image_path, labels.get(Path(image_path).name))
+            if isinstance(p_defect, (int, float)) and label is not None:
+                (positives if label else negatives).append(float(p_defect))
+                predicted = bool(record.get("gate_passed"))
+                gate_tp += int(label and predicted)
+                gate_fp += int(not label and predicted)
+                gate_fn += int(label and not predicted)
+        gate_precision = gate_tp / (gate_tp + gate_fp) if gate_tp + gate_fp else 0.0
+        gate_recall = gate_tp / (gate_tp + gate_fn) if gate_tp + gate_fn else 0.0
+        gate_f1 = (
+            2 * gate_precision * gate_recall / (gate_precision + gate_recall)
+            if gate_precision + gate_recall
+            else 0.0
+        )
+        result[task] = {
+            "samples": len(records),
+            "gate_positive": sum(bool(row.get("gate_passed")) for row in records),
+            "gate_filtered": sum(bool(row.get("gate_filtered")) for row in records),
+            "p_defect_pos": (
+                sum(positives) / len(positives) if positives else None
+            ),
+            "positive_count": len(positives),
+            "p_defect_neg": (
+                sum(negatives) / len(negatives) if negatives else None
+            ),
+            "negative_count": len(negatives),
+            "parse_error": sum(
+                row.get("prediction_status") == "parse_error" for row in records
+            ),
+            "gate_tp": gate_tp,
+            "gate_fp": gate_fp,
+            "gate_fn": gate_fn,
+            "gate_precision": gate_precision,
+            "gate_recall": gate_recall,
+            "gate_f1": gate_f1,
+        }
+    return result
 
 
 def parse_markdown_report(path: Path) -> dict[str, Any]:
@@ -167,6 +298,44 @@ def build_row(args: argparse.Namespace) -> dict[str, Any]:
     return row
 
 
+def append_excel_evaluation(
+    args: argparse.Namespace,
+    metrics: dict[str, Any],
+) -> Path:
+    diagnostics_path = (
+        args.diagnostics_xlsx.expanduser().resolve()
+        if args.diagnostics_xlsx is not None
+        else args.history_dir.expanduser().resolve().parent
+        / "diagnostics"
+        / "ui5_training_evaluation.xlsx"
+    )
+    gate_metrics = collect_gate_metrics(
+        args.prediction_dir, args.gt_dir, args.scorer_root
+    )
+    for task, values in gate_metrics.items():
+        image_metrics = metrics.get("tasks", {}).get(task, {}).get("image", {})
+        values["post_gate_fp"] = image_metrics.get("fp")
+        tp = image_metrics.get("tp")
+        fp = image_metrics.get("fp")
+        values["final_predicted_positive"] = (
+            int(tp) + int(fp) if tp is not None and fp is not None else None
+        )
+    if args.prediction_dir is not None:
+        atomic_write_text(
+            args.prediction_dir / "_gate_metrics.json",
+            json.dumps(gate_metrics, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+        )
+    rows = build_eval_rows(
+        step=args.step,
+        checkpoint=str(args.checkpoint),
+        metrics=metrics,
+        gate_metrics=gate_metrics,
+    )
+    UI5ExcelLogger(diagnostics_path).append_eval(args.step, rows)
+    return diagnostics_path
+
+
 def write_history(history_dir: Path, rows: list[dict[str, Any]]) -> None:
     history_dir.mkdir(parents=True, exist_ok=True)
     rows.sort(key=lambda row: int(row.get("step", 0)))
@@ -213,6 +382,9 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--end-time", required=True)
     record.add_argument("--status", choices=("success", "failed"), required=True)
     record.add_argument("--prediction-dir", type=Path, default=None)
+    record.add_argument("--gt-dir", type=Path, default=None)
+    record.add_argument("--scorer-root", type=Path, default=None)
+    record.add_argument("--diagnostics-xlsx", type=Path, default=None)
     record.add_argument("--evaluation-run-dir", type=Path, default=None)
     record.add_argument("--error", default="")
 
@@ -243,6 +415,13 @@ def main() -> int:
             and row.get("evaluation_status") == "success"
             for row in rows
         )
+        if found:
+            diagnostics_path = (
+                args.history_dir.expanduser().resolve().parent
+                / "diagnostics"
+                / "ui5_training_evaluation.xlsx"
+            )
+            found = UI5ExcelLogger(diagnostics_path).has_eval_step(args.step)
         return 0 if found else 1
 
     row = build_row(args)
@@ -263,6 +442,10 @@ def main() -> int:
         return 0
     rows = [existing for existing in rows if int(existing.get("step", -1)) != args.step]
     rows.append(row)
+    diagnostics_xlsx = None
+    if args.status == "success":
+        metrics = load_metrics(args.metrics_json)
+        diagnostics_xlsx = append_excel_evaluation(args, metrics)
     write_history(args.history_dir.expanduser().resolve(), rows)
     print(
         json.dumps(
@@ -271,6 +454,9 @@ def main() -> int:
                 "history_csv": str(history_path.with_suffix(".csv")),
                 "recorded_step": args.step,
                 "status": args.status,
+                "diagnostics_xlsx": (
+                    str(diagnostics_xlsx) if diagnostics_xlsx is not None else None
+                ),
             },
             ensure_ascii=False,
             indent=2,

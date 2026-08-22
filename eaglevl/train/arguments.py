@@ -144,6 +144,18 @@ class ModelArguments:
         default=0.1,
         metadata={'help': 'Weight of evidence/context weak-supervision loss.'},
     )
+    relation_gate_threshold: float = field(
+        default=0.5,
+        metadata={'help': 'Inference defectness threshold stored in the checkpoint config.'},
+    )
+    relation_focal_beta: float = field(
+        default=0.999,
+        metadata={'help': 'Effective-number beta for the class-balanced focal gate loss.'},
+    )
+    relation_focal_gamma: float = field(
+        default=2.0,
+        metadata={'help': 'Focusing gamma for the class-balanced focal gate loss.'},
+    )
 
 
 @dataclass

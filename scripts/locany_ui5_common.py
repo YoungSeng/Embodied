@@ -139,7 +139,7 @@ def resolve_runtime_config(
         _env_value(
             env,
             "RUN_NAME",
-            f"locany-3b-ui5-{machine_type}-full-{version}-en",
+            f"locany-3b-ui5-{machine_type}x{gpu_count}-full-{version}-en",
         )
     )
     output_dir = str(
@@ -259,6 +259,31 @@ def resolve_runtime_config(
         "MAX_STEPS": max_steps,
         "WARMUP_STEPS": int(_env_value(env, "WARMUP_STEPS", 500)),
         "LEARNING_RATE": str(_env_value(env, "LEARNING_RATE", "2e-5")),
+        "GRADIENT_ACCUMULATION_STEPS": int(
+            _env_value(
+                env,
+                "GRADIENT_ACCUMULATION_STEPS",
+                2 if gpu_count == 4 else 1,
+            )
+        ),
+        "RELATION_GATE_LOSS_WEIGHT": float(
+            _env_value(env, "RELATION_GATE_LOSS_WEIGHT", 1.0)
+        ),
+        "RELATION_ATTENTION_LOSS_WEIGHT": float(
+            _env_value(env, "RELATION_ATTENTION_LOSS_WEIGHT", 0.1)
+        ),
+        "RELATION_GATE_THRESHOLD": float(
+            _env_value(env, "RELATION_GATE_THRESHOLD", 0.5)
+        ),
+        "RELATION_FOCAL_BETA": float(
+            _env_value(env, "RELATION_FOCAL_BETA", 0.999)
+        ),
+        "RELATION_FOCAL_GAMMA": float(
+            _env_value(env, "RELATION_FOCAL_GAMMA", 2.0)
+        ),
+        "RELATION_NUM_SLOTS": int(
+            _env_value(env, "RELATION_NUM_SLOTS", 8)
+        ),
         "SAVE_STEPS": save_steps,
         "ENABLE_EVAL": int(enable_eval),
         "EVAL_AT_START": int(eval_at_start),
@@ -276,7 +301,63 @@ def resolve_runtime_config(
             "MAX_NUM_TOKENS cannot be smaller than MAX_NUM_TOKENS_PER_SAMPLE; "
             "otherwise some accepted samples can never fit in a packed batch"
         )
+    if resolved["GRADIENT_ACCUMULATION_STEPS"] < 1:
+        raise ValueError("GRADIENT_ACCUMULATION_STEPS must be positive")
+    if not 0.0 <= resolved["RELATION_GATE_THRESHOLD"] <= 1.0:
+        raise ValueError("RELATION_GATE_THRESHOLD must be in [0, 1]")
+    if not 0.0 <= resolved["RELATION_FOCAL_BETA"] < 1.0:
+        raise ValueError("RELATION_FOCAL_BETA must be in [0, 1)")
+    if resolved["RELATION_FOCAL_GAMMA"] < 0.0:
+        raise ValueError("RELATION_FOCAL_GAMMA cannot be negative")
+    if resolved["RELATION_NUM_SLOTS"] < 1:
+        raise ValueError("RELATION_NUM_SLOTS must be positive")
     return resolved
+
+
+GPU_PARITY_ALLOWED_DIFFERENCES = frozenset(
+    {
+        "GPU_COUNT",
+        "CUDA_DEVICES",
+        "MAX_NUM_TOKENS",
+        "GRADIENT_ACCUMULATION_STEPS",
+        "RUN_NAME",
+        "OUTPUT_DIR",
+    }
+)
+
+
+def assert_gpu_mode_consistency(
+    four_gpu: Mapping[str, Any],
+    eight_gpu: Mapping[str, Any],
+) -> None:
+    """Fail if a 4/8-GPU pair differs in any training/eval setting not allowed."""
+
+    accumulation_pair = (
+        int(four_gpu.get("GRADIENT_ACCUMULATION_STEPS", -1)),
+        int(eight_gpu.get("GRADIENT_ACCUMULATION_STEPS", -1)),
+    )
+    if accumulation_pair != (2, 1):
+        raise ValueError(
+            "4/8-GPU gradient accumulation must preserve the original 2/1 "
+            f"schedule, got {accumulation_pair[0]}/{accumulation_pair[1]}"
+        )
+
+    keys = set(four_gpu) | set(eight_gpu)
+    unexpected = {
+        key: (four_gpu.get(key), eight_gpu.get(key))
+        for key in sorted(keys - GPU_PARITY_ALLOWED_DIFFERENCES)
+        if four_gpu.get(key) != eight_gpu.get(key)
+    }
+    if unexpected:
+        details = ", ".join(
+            f"{key}={values[0]!r}/{values[1]!r}"
+            for key, values in unexpected.items()
+        )
+        raise ValueError(
+            "4/8-GPU pipeline parity violation; only GPU count, visible devices, "
+            "MAX_NUM_TOKENS, gradient accumulation 2/1 and output naming may "
+            f"differ: {details}"
+        )
 
 
 def machine_resource_config(

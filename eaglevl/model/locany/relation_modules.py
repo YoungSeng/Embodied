@@ -22,6 +22,82 @@ DEFECT_TYPES = (
     "ellipsis",
     "missing",
 )
+DEFAULT_UI_DETAIL_LAYERS = (5, 15, 26)
+
+
+@dataclass(frozen=True)
+class UIRelationPromptSpec:
+    """One of the five fixed UI5 prompts and its relation routing target."""
+
+    task_name: str
+    diagnostic_name: str
+    relation_family: int
+    defect_type: int
+    prompt_label: str
+    aliases: Tuple[str, ...]
+
+    @property
+    def prompt(self) -> str:
+        return (
+            "Locate all the instances that match the following description: "
+            f"{self.prompt_label}."
+        )
+
+
+UI_RELATION_PROMPT_SPECS = (
+    UIRelationPromptSpec(
+        "text_overflow", "text_overflow", 0, 0, "text overflow",
+        ("text overflow", "文字溢出"),
+    ),
+    UIRelationPromptSpec(
+        "cropping", "element_cropping", 0, 1, "cropped element",
+        ("cropped element", "element cropping", "元素裁切"),
+    ),
+    UIRelationPromptSpec(
+        "occlusion", "element_overlap", 1, 2, "overlapping elements",
+        ("overlapping elements", "element overlap", "元素重叠"),
+    ),
+    UIRelationPromptSpec(
+        "text_ellipsis", "text_ellipsis", 2, 3, "abnormal text ellipsis",
+        ("abnormal text ellipsis", "ellipsis anomaly", "省略异常"),
+    ),
+    UIRelationPromptSpec(
+        "content_missing", "content_missing", 3, 4, "missing content",
+        ("missing content", "content missing", "内容缺失"),
+    ),
+)
+
+
+def match_ui_relation_prompt(text: str) -> Optional[UIRelationPromptSpec]:
+    """Route the fixed UI5 prompts through one shared training/inference table."""
+
+    normalized = str(text).lower()
+    for spec in UI_RELATION_PROMPT_SPECS:
+        if any(alias.lower() in normalized for alias in spec.aliases):
+            return spec
+    return None
+
+
+def passes_relation_gate(p_defect: torch.Tensor | float, threshold: float) -> bool:
+    """Single inference decision used before the bbox generation block."""
+
+    if not 0.0 <= float(threshold) <= 1.0:
+        raise ValueError(f"relation gate threshold must be in [0, 1], got {threshold}")
+    if torch.is_tensor(p_defect):
+        if p_defect.numel() != 1:
+            raise ValueError("passes_relation_gate expects one sample")
+        probability = float(p_defect.detach().float().item())
+    else:
+        probability = float(p_defect)
+    return probability >= float(threshold)
+
+
+def relation_gate_output_override(
+    p_defect: torch.Tensor | float, threshold: float
+) -> Optional[str]:
+    """Return the forced negative answer, or None when bbox generation may run."""
+
+    return None if passes_relation_gate(p_defect, threshold) else "<box>none</box>"
 
 
 @dataclass
@@ -35,6 +111,12 @@ class RelationPyramidOutput:
     relation_summary: torch.Tensor
     best_relation_token: torch.Tensor
     scale_weights: torch.Tensor
+    gate_targets: Optional[torch.Tensor] = None
+    projected_level_norms: Optional[torch.Tensor] = None
+    fused_feature_norm: Optional[torch.Tensor] = None
+    relation_context_norm: Optional[torch.Tensor] = None
+    per_task_gate_loss: Optional[Dict[int, torch.Tensor]] = None
+    per_task_attention_loss: Optional[Dict[int, torch.Tensor]] = None
     gate_loss: Optional[torch.Tensor] = None
     attention_loss: Optional[torch.Tensor] = None
 
@@ -311,6 +393,11 @@ class RelationConditionedDetailPyramid(nn.Module):
         scale_weights_list: List[torch.Tensor] = []
         gate_targets_list: List[torch.Tensor] = []
         evidence_losses: List[torch.Tensor] = []
+        attention_losses_by_task: Dict[int, List[torch.Tensor]] = {
+            task: [] for task in range(self.num_defect_types)
+        }
+        fused_norms: List[torch.Tensor] = []
+        relation_context_norms: List[torch.Tensor] = []
 
         image_index = 0
         parameter_zero = self.evidence_queries.sum() * 0.0
@@ -332,6 +419,8 @@ class RelationConditionedDetailPyramid(nn.Module):
                 attention_list.append(torch.zeros(2, self.num_slots, 1, device=empty_tokens.device, dtype=empty_tokens.dtype))
                 scale_weights_list.append(scale_weights_all[family])
                 gate_targets_list.append(torch.zeros(self.num_slots, device=empty_tokens.device, dtype=empty_tokens.dtype))
+                fused_norms.append(parameter_zero.detach().float())
+                relation_context_norms.append(parameter_zero.detach().float())
                 # Even text-only samples carry one dummy 2x2 grid in the base
                 # pipeline, so keep the image cursor aligned with grid_hws.
                 image_index += max(num_images, 1)
@@ -345,6 +434,7 @@ class RelationConditionedDetailPyramid(nn.Module):
             weights = scale_weights_all[family]
             fused = sum(weights[level] * levels[level] for level in range(3))
             fused = self._sanitize(self.token_norm(self._sanitize(fused)))
+            fused_norms.append(fused.detach().float().norm(dim=-1).mean())
             keys = self._sanitize(self.key_projection(fused))
             values = self._sanitize(self.value_projection(fused))
 
@@ -386,6 +476,9 @@ class RelationConditionedDetailPyramid(nn.Module):
                 [self._sanitize(adapter(base_relation), limit=32.0) for adapter in self.family_adapters], dim=0
             )
             adapted_relation = adapted_all[family]
+            relation_context_norms.append(
+                adapted_relation.detach().float().norm(dim=-1).mean()
+            )
             logits_all = torch.stack(
                 [head(adapted_relation).squeeze(-1) for head in self.gate_heads], dim=0
             )
@@ -418,7 +511,9 @@ class RelationConditionedDetailPyramid(nn.Module):
                     context_ce = -(
                         context_target[active] * context_attention[active].float().clamp_min(1e-7).log()
                     ).sum(dim=-1)
-                    evidence_losses.append((evidence_ce + context_ce).mean())
+                    sample_attention_loss = (evidence_ce + context_ce).mean()
+                    evidence_losses.append(sample_attention_loss)
+                    attention_losses_by_task[task].append(sample_attention_loss)
             gate_targets_list.append(gate_targets)
 
         relation_tokens = torch.stack(relation_tokens_list, dim=0)
@@ -435,7 +530,9 @@ class RelationConditionedDetailPyramid(nn.Module):
             torch.arange(num_samples, device=relation_tokens.device), best_indices
         ]
 
+        gate_targets = None
         gate_loss = None
+        per_task_gate_loss: Dict[int, torch.Tensor] = {}
         if target_boxes is not None and target_box_mask is not None:
             gate_targets = torch.stack(gate_targets_list, dim=0).to(dtype=gate_logits.dtype)
             valid_samples = relation_family >= 0
@@ -447,7 +544,27 @@ class RelationConditionedDetailPyramid(nn.Module):
                     gamma=self.focal_gamma,
                     beta=self.focal_beta,
                 )
+                for task in range(self.num_defect_types):
+                    task_mask = valid_samples & (defect_type == task)
+                    if bool(task_mask.any()):
+                        per_task_gate_loss[task] = class_balanced_focal_loss(
+                            gate_logits[task_mask],
+                            gate_targets[task_mask],
+                            defect_type[task_mask],
+                            gamma=self.focal_gamma,
+                            beta=self.focal_beta,
+                        )
         attention_loss = torch.stack(evidence_losses).mean() if evidence_losses else None
+        per_task_attention_loss = {
+            task: torch.stack(values).mean()
+            for task, values in attention_losses_by_task.items()
+            if values
+        }
+        projected_level_norms = torch.stack(
+            [level.detach().float().norm(dim=-1).mean() for level in projected_levels]
+        )
+        fused_feature_norm = torch.stack(fused_norms).mean()
+        relation_context_norm = torch.stack(relation_context_norms).mean()
 
         return RelationPyramidOutput(
             relation_tokens=relation_tokens,
@@ -459,6 +576,12 @@ class RelationConditionedDetailPyramid(nn.Module):
             relation_summary=relation_summary,
             best_relation_token=best_relation,
             scale_weights=scale_weights,
+            gate_targets=gate_targets,
+            projected_level_norms=projected_level_norms,
+            fused_feature_norm=fused_feature_norm,
+            relation_context_norm=relation_context_norm,
+            per_task_gate_loss=per_task_gate_loss,
+            per_task_attention_loss=per_task_attention_loss,
             gate_loss=gate_loss,
             attention_loss=attention_loss,
         )
@@ -484,6 +607,33 @@ class RelationToPBD(nn.Module):
         # the pretrained decoder distribution at step zero.
         self.semantic_scale = nn.Parameter(torch.tensor(0.01))
         self.box_scale = nn.Parameter(torch.tensor(0.01))
+
+    def enhance_prediction_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        relation_summary: torch.Tensor,
+        best_relation_token: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the same semantic/box PBD delta used by training and generation."""
+
+        semantic_delta = self.semantic_projection(
+            torch.nan_to_num(
+                relation_summary, nan=0.0, posinf=32.0, neginf=-32.0
+            ).clamp(-32.0, 32.0)
+        )
+        box_delta = self.box_projection(
+            torch.nan_to_num(
+                best_relation_token, nan=0.0, posinf=32.0, neginf=-32.0
+            ).clamp(-32.0, 32.0)
+        )
+        while semantic_delta.ndim < hidden_states.ndim:
+            semantic_delta = semantic_delta.unsqueeze(1)
+            box_delta = box_delta.unsqueeze(1)
+        return (
+            hidden_states
+            + torch.nan_to_num(self.semantic_scale.tanh(), nan=0.0) * semantic_delta
+            + torch.nan_to_num(self.box_scale.tanh(), nan=0.0) * box_delta
+        )
 
     def forward(
         self,
@@ -513,14 +663,6 @@ class RelationToPBD(nn.Module):
                     posinf=32.0,
                     neginf=-32.0,
                 ).clamp(-32.0, 32.0)
-                semantic_delta = torch.nan_to_num(
-                    self.semantic_projection(
-                        safe_summary
-                    ),
-                    nan=0.0,
-                    posinf=32.0,
-                    neginf=-32.0,
-                ).clamp(-32.0, 32.0)
                 if slot_relation_tokens is not None:
                     requested_slots = (
                         int(slot_counts[sample_index].item())
@@ -542,7 +684,6 @@ class RelationToPBD(nn.Module):
                         posinf=32.0,
                         neginf=-32.0,
                     ).clamp(-32.0, 32.0)
-                    box_delta = self.box_projection(selected_tokens)
                 else:
                     safe_best = torch.nan_to_num(
                         best_relation_token[sample_index],
@@ -550,19 +691,14 @@ class RelationToPBD(nn.Module):
                         posinf=32.0,
                         neginf=-32.0,
                     ).clamp(-32.0, 32.0)
-                    box_delta = self.box_projection(
-                        safe_best
+                    selected_tokens = safe_best.unsqueeze(0).expand(
+                        indices.numel(), -1
                     )
-                box_delta = torch.nan_to_num(
-                    box_delta,
-                    nan=0.0,
-                    posinf=32.0,
-                    neginf=-32.0,
-                ).clamp(-32.0, 32.0)
-                flat_hidden[indices] = (
-                    flat_hidden[indices]
-                    + torch.nan_to_num(self.semantic_scale.tanh(), nan=0.0) * semantic_delta
-                    + torch.nan_to_num(self.box_scale.tanh(), nan=0.0) * box_delta
+                sample_summaries = safe_summary.unsqueeze(0).expand(
+                    indices.numel(), -1
+                )
+                flat_hidden[indices] = self.enhance_prediction_hidden(
+                    flat_hidden[indices], sample_summaries, selected_tokens
                 )
                 anchor_states.extend(flat_hidden[index] for index in indices.tolist())
                 anchor_samples.extend([sample_index] * indices.numel())
