@@ -77,6 +77,15 @@ QWEN_REF_RE = re.compile(
     r"<\|object_ref_start\|>(.*?)<\|object_ref_end\|>", re.DOTALL
 )
 LOCANY_BOX_RE = re.compile(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>")
+OCR_LOCANY_LINE_RE = re.compile(
+    r"^\s*text\t(.*?)\t\s*(<box><\d+><\d+><\d+><\d+></box>)\s*$"
+)
+TABULAR_GROUNDING_LINE_RE = re.compile(
+    r"^\s*(.*?)\s*\t+\s*(<box><\d+><\d+><\d+><\d+></box>)\s*$"
+)
+LOCANY_REF_BOX_RE = re.compile(
+    r"<ref>[^\n]*?</ref>\s*<box><\d+><\d+><\d+><\d+></box>"
+)
 FORBIDDEN_MARKERS = ("<|box_start|>", "<|box_end|>", "<|object_ref_start|>", "<|object_ref_end|>")
 
 
@@ -279,8 +288,12 @@ def _image_size_from_value(value: Any) -> tuple[float, float] | None:
                 size = _positive_image_size(value[width_key], value[height_key])
                 if size is not None:
                     return size
-    elif isinstance(value, (list, tuple)) and len(value) >= 2:
-        return _positive_image_size(value[0], value[1])
+    elif isinstance(value, (list, tuple)):
+        # The v4.1 records store sizes as [[width, height]] even for one image.
+        if value and isinstance(value[0], (dict, list, tuple)):
+            return _image_size_from_value(value[0])
+        if len(value) >= 2:
+            return _positive_image_size(value[0], value[1])
     elif isinstance(value, str):
         match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*[xX,]\s*(\d+(?:\.\d+)?)\s*", value)
         if match:
@@ -369,7 +382,6 @@ def extract_image_size(record: dict[str, Any], image_path: Path | None) -> tuple
             return direct
         for key in (
             "image_size",
-            "input_size",
             "original_size",
             "ori_size",
             "width_height",
@@ -380,6 +392,22 @@ def extract_image_size(record: dict[str, Any], image_path: Path | None) -> tuple
                 return size
     if image_path is not None and image_path.is_file():
         return _image_size_from_file(str(image_path.resolve()))
+    return None
+
+
+def extract_input_size(record: dict[str, Any]) -> tuple[float, float] | None:
+    """Return the resized canvas used to produce model-space annotations."""
+    containers = [record]
+    containers.extend(
+        value
+        for key in ("infos", "info", "metadata", "meta", "image_info")
+        if isinstance((value := record.get(key)), dict)
+    )
+    for container in containers:
+        for key in ("input_size", "resized_size", "processed_size"):
+            size = _image_size_from_value(container.get(key))
+            if size is not None:
+                return size
     return None
 
 
@@ -528,14 +556,54 @@ def json_grounding_target(
     return format_locany_target(refs, normalized)
 
 
-def convert_qwen_markup(text: str) -> str:
+def convert_qwen_markup(
+    text: str,
+    bbox_type: str = "norm1000",
+    coordinate_size: tuple[float, float] | None = None,
+) -> str:
     text = QWEN_REF_RE.sub(lambda match: f"<ref>{format_ref(match.group(1))}</ref>", text)
 
     def replace_box(match: re.Match[str]) -> str:
-        box = normalize_box(tuple(float(match.group(i)) for i in range(1, 5)), "norm1000", None)
+        box = normalize_box(
+            tuple(float(match.group(i)) for i in range(1, 5)),
+            bbox_type,
+            coordinate_size,
+        )
         return f"<box><{box[0]}><{box[1]}><{box[2]}><{box[3]}></box>"
 
     return QWEN_BOX_RE.sub(replace_box, text)
+
+
+def convert_ocr_markup(text: str, coordinate_size: tuple[float, float] | None) -> str:
+    converted = convert_qwen_markup(text, bbox_type="pixel", coordinate_size=coordinate_size)
+    output_lines = []
+    for line in converted.splitlines():
+        match = OCR_LOCANY_LINE_RE.fullmatch(line)
+        if match:
+            output_lines.append(f"<ref>{format_ref(match.group(1), 'text')}</ref>{match.group(2)}")
+        else:
+            output_lines.append(line)
+    return "\n".join(output_lines)
+
+
+def canonicalize_tabular_grounding(text: str) -> str:
+    """Convert ``label<TAB><box>`` rows to LocateAnything ref/box pairs."""
+    output_lines = []
+    for line in text.splitlines():
+        match = TABULAR_GROUNDING_LINE_RE.fullmatch(line)
+        if match and "<ref>" not in match.group(1):
+            output_lines.append(
+                f"<ref>{format_ref(match.group(1), 'UI element')}</ref>{match.group(2)}"
+            )
+        else:
+            output_lines.append(line)
+    return "\n".join(output_lines)
+
+
+def validate_grounding_target(text: str) -> None:
+    box_count = len(LOCANY_BOX_RE.findall(text))
+    if box_count and len(LOCANY_REF_BOX_RE.findall(text)) != box_count:
+        raise NormalizeError("grounding answer contains a box without a canonical <ref>...</ref> pair")
 
 
 def validate_locany_text(text: str, role: str) -> None:
@@ -566,22 +634,33 @@ def normalize_record(
         turns[0]["value"] = "<image>" * len(images) + turns[0]["value"]
 
     image_size = extract_image_size(record, images[0] if images else None)
+    # OCR annotations were generated on infos.input_size, e.g. 672x1456,
+    # while the stored screenshot is image_size, e.g. 1080x2340.
+    annotation_size = (extract_input_size(record) or image_size) if task == "ocr" else image_size
     is_grounding = False
     for turn in turns:
-        turn["value"] = convert_qwen_markup(turn["value"])
+        if task == "ocr":
+            turn["value"] = convert_ocr_markup(turn["value"], annotation_size)
+        else:
+            turn["value"] = convert_qwen_markup(turn["value"])
+        if task in GROUNDING_TASKS and turn["from"] == "gpt":
+            turn["value"] = canonicalize_tabular_grounding(turn["value"])
     if task in GROUNDING_TASKS:
         # category_7 OCR annotations use absolute screenshot pixels.  Mark the
         # complete record as pixel-space so small boxes below coordinate 1000
         # are not accidentally treated as norm1000 boxes.
         default_bbox_type = "pixel" if task == "ocr" else None
-        target = structured_grounding_target(record, image_size, default_bbox_type)
+        target = structured_grounding_target(record, annotation_size, default_bbox_type)
         if target is None:
-            target = json_grounding_target(turns[-1]["value"], image_size, default_bbox_type)
+            target = json_grounding_target(turns[-1]["value"], annotation_size, default_bbox_type)
         if target is not None:
             turns[-1]["value"] = target
             is_grounding = True
         elif LOCANY_BOX_RE.search(turns[-1]["value"]):
             is_grounding = True
+
+    if is_grounding:
+        validate_grounding_target(turns[-1]["value"])
 
     for turn in turns:
         validate_locany_text(turn["value"], turn["from"])

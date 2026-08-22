@@ -14,7 +14,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from eaglevl.train.dataset_sampling import resolve_dataset_sampling_weight, resolve_recipe_entry_paths
 from eaglevl.train.checkpoint_schedule import PeriodicCheckpointSchedule
-from prepare_locany_cpt import extract_image_size, normalize_box, normalize_record
+from prepare_locany_cpt import extract_image_size, extract_input_size, normalize_box, normalize_record
 
 
 def _record(image: Path, prompt: str, answer: str, *, objects=None, record_id="sample"):
@@ -111,6 +111,88 @@ class LocateAnythingCPTTest(unittest.TestCase):
             self.assertEqual(
                 normalized["conversations"][-1]["value"],
                 "<ref>测试</ref><box><100><500><200><600></box>",
+            )
+
+    def test_ocr_qwen_boxes_use_nested_input_size_not_original_size(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / "screen.jpg"
+            image.write_bytes(b"placeholder")
+            record = _record(
+                image,
+                "<image>请识别屏幕上的全部文字，以及文字的位置。",
+                "text\t15:00\t<|box_start|>(44,24),(113,48)<|box_end|>\n"
+                "text\t弹\t<|box_start|>(31,1073),(69,1109)<|box_end|>",
+            )
+            record["infos"] = {
+                "image_size": [[1080, 2340]],
+                "input_size": [[672, 1456]],
+            }
+            self.assertEqual(extract_image_size(record, image), (1080.0, 2340.0))
+            self.assertEqual(extract_input_size(record), (672.0, 1456.0))
+
+            normalized, is_grounding = normalize_record(
+                record,
+                task="ocr",
+                source_file=root / "ocr.jsonl",
+                source_root=root,
+                check_images=True,
+            )
+            self.assertTrue(is_grounding)
+            self.assertEqual(
+                normalized["conversations"][-1]["value"],
+                "<ref>15:00</ref><box><65><16><168><33></box>\n"
+                "<ref>弹</ref><box><46><737><103><762></box>",
+            )
+
+    def test_vqa_is_preserved_and_ui_defect_is_canonical_norm1000(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = root / "screen.jpg"
+            image.write_bytes(b"placeholder")
+            infos = {
+                "image_size": [[828, 1792]],
+                "input_size": [[672, 1456]],
+            }
+
+            vqa = _record(
+                image,
+                "<image>根据给定的指令，判断基于图片的断言是否正确：断言：屏幕中存在文字“置顶聊天”。",
+                "断言结果是否正确: 正确",
+            )
+            vqa["infos"] = infos
+            normalized_vqa, vqa_is_grounding = normalize_record(
+                vqa,
+                task="vqa",
+                source_file=root / "vqa.jsonl",
+                source_root=root,
+                check_images=True,
+            )
+            self.assertFalse(vqa_is_grounding)
+            self.assertEqual(
+                normalized_vqa["conversations"][-1]["value"],
+                "断言结果是否正确: 正确",
+            )
+
+            defect = _record(
+                image,
+                "<image>请发现所有的交互体验问题。",
+                "元素被裁切\t<|box_start|>(216,122),(579,154)<|box_end|>\n"
+                "\t元素重叠\t<|box_start|>(659,259),(707,275)<|box_end|>",
+            )
+            defect["infos"] = infos
+            normalized_defect, defect_is_grounding = normalize_record(
+                defect,
+                task="ui_defect",
+                source_file=root / "grounding.jsonl",
+                source_root=root,
+                check_images=True,
+            )
+            self.assertTrue(defect_is_grounding)
+            self.assertEqual(
+                normalized_defect["conversations"][-1]["value"],
+                "<ref>元素被裁切</ref><box><216><122><579><154></box>\n"
+                "<ref>元素重叠</ref><box><659><259><707><275></box>",
             )
 
     def test_periodic_checkpoint_schedule_is_not_five_minutes(self):
