@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 # Usage:
 #   bash shell/run_locany_cpt.sh a100 smoke
+#   bash shell/run_locany_cpt.sh a100 formal
 #   bash shell/run_locany_cpt.sh h20 formal
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

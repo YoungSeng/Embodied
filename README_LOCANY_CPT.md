@@ -47,7 +47,7 @@ reshuffles when exhausted.
 Run this once on the HL cluster:
 
 ```bash
-cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied
+cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
 
 python scripts/prepare_locany_cpt.py \
   --source-root /mnt/bn/intelligent-service-arnold-hl/dataset/gui/gui_base/sample/raw_data_v4.1_hl_norm1k/raw_data_v4.1_hl \
@@ -81,30 +81,42 @@ Copy the complete `locany_cpt_v4_smoke` directory to:
 Because copied image paths are root-relative, no JSONL rewriting is needed
 after the directory moves.
 
-## Four-card launch commands
+## Four-card Merlin submissions
 
-A100/A800-compatible SDPA smoke test on YG:
+A100-profile smoke test on YG (the current YG Arnold resource enum is
+`A800_SXM_40GB`, four cards, SDPA):
 
 ```bash
-cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied
-bash shell/run_locany_cpt.sh a100 smoke
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+mlx job submitv2 --path locany_cpt_v4_a100x4_smoke_merlin.yaml
 ```
 
 The default smoke run performs two optimizer steps and saves
 `checkpoint-2`.
 
+A100-profile formal training on YG:
+
+The complete prepared directory must exist at
+`/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4`
+before submission.
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+mlx job submitv2 --path locany_cpt_v4_a100x4_formal_merlin.yaml
+```
+
 H20 Magi formal training on HL:
 
 ```bash
-cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied
-bash shell/run_locany_cpt.sh h20 formal
+cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+mlx job submitv2 --path locany_cpt_v4_h20x4_formal_merlin.yaml
 ```
 
 Formal defaults are full-parameter training, four GPUs, gradient accumulation
-2, learning rate `5e-6`, 20,000 optimizer steps, H20 `8192/25600` per-sample
-and per-rank packed-token limits, and a checkpoint approximately every 12
-hours.  Trainer checkpoint directories always include the current optimizer
-global step, for example `checkpoint-4372`.
+2, learning rate `5e-6`, 20,000 optimizer steps, A100-profile `7268/12800`
+and H20 `8192/25600` per-sample/per-rank packed-token limits, and a checkpoint
+approximately every 12 hours. Trainer checkpoint directories always include
+the current optimizer global step, for example `checkpoint-4372`.
 
 All defaults can be overridden without editing code:
 
@@ -115,6 +127,13 @@ LEARNING_RATE=3e-6 \
 SAVE_EVERY_N_HOURS=12 \
 bash shell/run_locany_cpt.sh h20 formal
 ```
+
+The direct `bash shell/run_locany_cpt.sh ...` commands are retained for an
+already allocated interactive worker.  Normal smoke and formal runs should be
+submitted through the Merlin YAML files above.  All three YAMLs use
+`shell/run_locany_cpt_merlin.sh` for cache isolation, four-GPU preflight,
+logging, and exit-code propagation, then delegate training parameters to
+`shell/run_locany_cpt.sh`.
 
 An interrupted run resumes from the newest complete checkpoint in the same
 `OUTPUT_DIR`, including optimizer, scheduler, random state, and packed

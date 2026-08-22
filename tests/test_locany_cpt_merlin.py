@@ -1,0 +1,72 @@
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class LocateAnythingCPTMerlinTest(unittest.TestCase):
+    PROFILES = {
+        "locany_cpt_v4_a100x4_smoke_merlin.yaml": (
+            "shell/run_locany_cpt_merlin.sh a100 smoke",
+            "gpuv: A800_SXM_40GB",
+            "clusterId: 24",
+        ),
+        "locany_cpt_v4_a100x4_formal_merlin.yaml": (
+            "shell/run_locany_cpt_merlin.sh a100 formal",
+            "gpuv: A800_SXM_40GB",
+            "clusterId: 24",
+        ),
+        "locany_cpt_v4_h20x4_formal_merlin.yaml": (
+            "shell/run_locany_cpt_merlin.sh h20 formal",
+            "gpuv: NVIDIA_H20",
+            "clusterId: 20",
+        ),
+    }
+
+    def test_merlin_profiles_have_expected_resources_and_commands(self):
+        for filename, expected in self.PROFILES.items():
+            with self.subTest(filename=filename):
+                text = (REPO_ROOT / filename).read_text(encoding="utf-8")
+                for value in expected:
+                    self.assertIn(value, text)
+                self.assertIn("gpu: 4", text)
+                self.assertIn("Embodied-CPT", text)
+                self.assertIn("CUDA_DEVICES: \"0,1,2,3\"", text)
+
+    def test_yaml_pins_smoke_and_formal_training_parameters(self):
+        smoke = (REPO_ROOT / "locany_cpt_v4_a100x4_smoke_merlin.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('MAX_STEPS: "2"', smoke)
+        self.assertIn('SAVE_STEPS: "2"', smoke)
+        self.assertIn('MAX_NUM_TOKENS: "12800"', smoke)
+
+        a100 = (REPO_ROOT / "locany_cpt_v4_a100x4_formal_merlin.yaml").read_text(
+            encoding="utf-8"
+        )
+        h20 = (REPO_ROOT / "locany_cpt_v4_h20x4_formal_merlin.yaml").read_text(
+            encoding="utf-8"
+        )
+        for text in (a100, h20):
+            self.assertIn('GRADIENT_ACCUMULATION_STEPS: "2"', text)
+            self.assertIn('MAX_STEPS: "20000"', text)
+            self.assertIn('LEARNING_RATE: "5e-6"', text)
+            self.assertIn('SAVE_EVERY_N_HOURS: "12"', text)
+            self.assertIn('SAVE_STEPS: "1000000000"', text)
+        self.assertIn('MAX_NUM_TOKENS: "12800"', a100)
+        self.assertIn('ATTN_IMPLEMENTATION: "sdpa"', a100)
+        self.assertIn('MAX_NUM_TOKENS: "25600"', h20)
+        self.assertIn('ATTN_IMPLEMENTATION: "magi"', h20)
+
+    def test_formal_defaults_keep_four_card_rank_batch_and_twelve_hour_saves(self):
+        launcher = (REPO_ROOT / "shell" / "run_locany_cpt.sh").read_text(encoding="utf-8")
+        self.assertIn('GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"', launcher)
+        self.assertIn('SAVE_EVERY_N_HOURS="${SAVE_EVERY_N_HOURS:-12}"', launcher)
+        self.assertIn('MAX_STEPS="${MAX_STEPS:-20000}"', launcher)
+
+
+if __name__ == "__main__":
+    unittest.main()

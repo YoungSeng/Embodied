@@ -1,0 +1,79 @@
+# Merlin formal training: LocateAnything-3B UI CPT, YG four-card SDPA profile.
+# Submit: mlx job submitv2 --path locany_cpt_v4_a100x4_formal_merlin.yaml
+
+caption: 'LocateAnything UI CPT Formal - A100 profile x4'
+
+jobDefVersion:
+  entrypointMode: FULL_SCRIPT
+
+  gitRepo:
+    mnt: /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+
+  imageMeta:
+    imageSource: url
+    imageUrl: hub.byted.org/base/lab.cuda.devel:0ffcd17bfdf8d07a198e6cff167eae26
+    imageVid: d8ap37f1enlcr23291ug
+
+  lazyDownloadCode: true
+  name: 'locany-cpt-v4-a100x4-formal'
+
+  resource:
+    arnoldConfig:
+      clusterId: 24
+      elasticTraining: {}
+      groupIds:
+        - 1602
+      bytenasVolumes:
+        - name: intelligent-service-yg
+          accessMode: RW
+          roles:
+            - worker
+          subPath: ""
+      keepMins: 1
+      preemptible: false
+      quotaPool: default
+      roles:
+        - name: worker
+          num: 1
+          cpu: 58
+          gpu: 4
+          gpuv: A800_SXM_40GB
+          memory: 262144
+          ports: 1
+    backend: ARNOLD
+
+  volumes:
+    - volumeId: 19922
+      mountPath: /mnt/bn/intelligent-service-yg
+
+jobRunParams:
+  entrypointFullScript: |
+    set -Eeuo pipefail
+    PROJECT_ROOT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+    test -f "${PROJECT_ROOT}/shell/run_locany_cpt_merlin.sh"
+    cd "${PROJECT_ROOT}"
+    export PROJECT_ROOT
+    export WORKSPACE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace
+    export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES:-0,1,2,3}"
+    exec bash shell/run_locany_cpt_merlin.sh a100 formal
+
+  envsList:
+    CUDA_DEVICES: "0,1,2,3"
+    DATA_DIR: "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4"
+    RECIPE_NAME: "locany_cpt_train.json"
+    RUN_NAME: "locany-3b-ui-cpt-v4-a100x4-formal"
+    ATTN_IMPLEMENTATION: "sdpa"
+    MAX_SEQ_LENGTH: "7268"
+    MAX_NUM_TOKENS_PER_SAMPLE: "7268"
+    MAX_NUM_TOKENS: "12800"
+    PACKING_BUFFER_SIZE: "16"
+    GRADIENT_ACCUMULATION_STEPS: "2"
+    MAX_STEPS: "20000"
+    WARMUP_STEPS: "500"
+    LEARNING_RATE: "5e-6"
+    SAVE_STEPS: "1000000000"
+    SAVE_EVERY_N_HOURS: "12"
+    SAVE_TOTAL_LIMIT: "20"
+    REPORT_TO: "tensorboard"
+
+namespace: /user/sicheng.yang
