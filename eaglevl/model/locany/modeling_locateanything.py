@@ -7,7 +7,7 @@
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from torch import nn
@@ -320,6 +320,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         else:
             language_model_forward = self.language_model.model.forward
         
+        ssl = None
         ssl_tensor = None
         if sub_sample_lengths is not None:
             ssl = sub_sample_lengths[0] if isinstance(sub_sample_lengths, list) else sub_sample_lengths
