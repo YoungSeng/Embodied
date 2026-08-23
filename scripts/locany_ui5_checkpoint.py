@@ -31,6 +31,18 @@ def list_checkpoints(output_dir: Path) -> list[tuple[int, Path]]:
     return sorted(result)
 
 
+def list_training_checkpoints(output_dir: Path) -> list[tuple[int, Path]]:
+    """Return optimizer-step checkpoints, excluding the model-only checkpoint-0.
+
+    UI5 exports ``checkpoint-0`` before training so step-0 evaluation uses the
+    same architecture as later checkpoints.  It deliberately has no Trainer,
+    optimizer, scheduler, RNG, or dataloader state and must therefore never be
+    treated as a failed/resumable training checkpoint.
+    """
+
+    return [(step, path) for step, path in list_checkpoints(output_dir) if step > 0]
+
+
 def has_model_weights(checkpoint: Path) -> bool:
     names = (
         "model.safetensors",
@@ -123,6 +135,12 @@ def build_parser() -> argparse.ArgumentParser:
     latest.add_argument("--expected-ranks", type=int, default=None)
     latest.add_argument("--field", choices=("json", "path", "step"), default="json")
 
+    training_candidates = subparsers.add_parser("training-candidates")
+    training_candidates.add_argument("--output-dir", type=Path, required=True)
+    training_candidates.add_argument(
+        "--field", choices=("json", "count", "paths"), default="json"
+    )
+
     cleanup = subparsers.add_parser("cleanup")
     cleanup.add_argument("--output-dir", type=Path, required=True)
     cleanup.add_argument("--formal-interval", type=int, required=True)
@@ -159,6 +177,22 @@ def main() -> int:
             print(payload["path"])
         elif args.field == "step":
             print(payload["step"])
+        else:
+            print(json.dumps(payload, ensure_ascii=False))
+        return 0
+
+    if args.command == "training-candidates":
+        candidates = list_training_checkpoints(args.output_dir)
+        payload = {
+            "output_dir": str(args.output_dir.expanduser().resolve()),
+            "count": len(candidates),
+            "steps": [step for step, _ in candidates],
+            "paths": [str(path) for _, path in candidates],
+        }
+        if args.field == "count":
+            print(payload["count"])
+        elif args.field == "paths":
+            print("\n".join(payload["paths"]))
         else:
             print(json.dumps(payload, ensure_ascii=False))
         return 0

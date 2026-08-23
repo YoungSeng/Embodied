@@ -52,6 +52,18 @@ def get_last_checkpoint_guard(folder):
         last_checkpoint = get_last_checkpoint(folder)
         if last_checkpoint is None:
             break
+
+        # UI5 exports a model-only checkpoint-0 for architecture-identical
+        # step-0 evaluation.  It intentionally lacks optimizer/Trainer state
+        # and must not be resumed from or removed as an incomplete checkpoint.
+        # Returning None lets a fresh run initialize from model_name_or_path;
+        # later checkpoint-N directories still retain the existing guard.
+        if osp.basename(osp.normpath(last_checkpoint)) == "checkpoint-0":
+            logger.info(
+                "Ignoring evaluation-only checkpoint-0 during training resume detection: %s",
+                last_checkpoint,
+            )
+            return None
         
         world_size = dist.get_world_size()
         if len(glob.glob(os.path.join(last_checkpoint, "*.pth"))) != world_size:

@@ -204,6 +204,49 @@ class CheckpointTests(unittest.TestCase):
         (state_dir / "mp_rank_00_model_states.pt").write_bytes(b"state")
         return checkpoint
 
+    def test_checkpoint_zero_is_not_a_training_resume_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            checkpoint_zero = self.make_eval_checkpoint(output, 0)
+
+            self.assertEqual(
+                locany_ui5_checkpoint.list_training_checkpoints(output), []
+            )
+            self.assertTrue(checkpoint_zero.is_dir())
+
+            broken_nonzero = self.make_eval_checkpoint(output, 1000)
+            candidates = locany_ui5_checkpoint.list_training_checkpoints(output)
+            self.assertEqual(
+                [(step, path.name) for step, path in candidates],
+                [(1000, "checkpoint-1000")],
+            )
+            self.assertFalse(
+                locany_ui5_checkpoint.validate_checkpoint(
+                    broken_nonzero, mode="resume"
+                )["valid"]
+            )
+
+    def test_training_candidates_cli_excludes_checkpoint_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            self.make_eval_checkpoint(output, 0)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "locany_ui5_checkpoint.py"),
+                    "training-candidates",
+                    "--output-dir",
+                    str(output),
+                    "--field",
+                    "count",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "0")
+
     def test_patch_is_idempotent_and_force_refreshes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

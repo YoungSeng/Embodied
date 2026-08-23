@@ -1330,6 +1330,12 @@ class StreamPackingMTPTrainer(Trainer):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        # CPT explicitly disables the optional UI Relation/Gate/PBD path.  In
+        # that mode the modules do not exist and no UI update is expected, so
+        # UI5-only audits must not turn a healthy CPT run into a failure.
+        self._ui5_enabled = bool(
+            getattr(self.model, "enable_ui_relation", False)
+        )
         self._total_samples = 0
         self._sample_log_interval = sample_log_interval
         self._max_num_tokens = int(max_num_tokens)
@@ -1348,15 +1354,17 @@ class StreamPackingMTPTrainer(Trainer):
             "diagnostics",
             f".ui5_train_window_rank{get_rank()}.json",
         )
-        self._load_ui5_window_state()
+        if self._ui5_enabled:
+            self._load_ui5_window_state()
         self._ui5_hook_squares = {}
         self._ui5_hook_seen = set()
         self._ui5_hook_handles = []
         self._ui5_last_grad_seen_global = {}
         self._ui5_parameter_baseline = {}
         self._ui5_real_data_audit_logged = False
-        self._register_ui5_gradient_hooks()
-        self._snapshot_ui5_parameters()
+        if self._ui5_enabled:
+            self._register_ui5_gradient_hooks()
+            self._snapshot_ui5_parameters()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
@@ -1540,6 +1548,8 @@ class StreamPackingMTPTrainer(Trainer):
 
     def create_optimizer(self):
         optimizer = super().create_optimizer()
+        if not self._ui5_enabled:
+            return optimizer
         audited_parameters = optimizer_parameters(self.optimizer)
         optimizer_ids = {id(parameter) for parameter in audited_parameters}
         optimizer_ds_ids = {
@@ -1902,7 +1912,8 @@ class StreamPackingMTPTrainer(Trainer):
             return_outputs=True,
             num_items_in_batch=num_items_in_batch,
         )
-        self._capture_ui5_batch(outputs, inputs)
+        if self._ui5_enabled:
+            self._capture_ui5_batch(outputs, inputs)
         return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):
@@ -1933,8 +1944,9 @@ class StreamPackingMTPTrainer(Trainer):
                                f"Avg samples/step = {avg_samples_per_step:.2f}")
         
         loss = super().training_step(model, inputs, num_items_in_batch)
-        self._capture_ui5_gradient_groups(model)
-        if torch.cuda.is_available():
+        if self._ui5_enabled:
+            self._capture_ui5_gradient_groups(model)
+        if self._ui5_enabled and torch.cuda.is_available():
             self._ui5_peak_gpu_memory_mb = max(
                 self._ui5_peak_gpu_memory_mb,
                 torch.cuda.max_memory_allocated() / (1024.0 ** 2),
@@ -2190,6 +2202,8 @@ class StreamPackingMTPTrainer(Trainer):
             torch.cuda.reset_peak_memory_stats()
 
     def log(self, logs, start_time=None):
+        if not self._ui5_enabled:
+            return super().log(logs, start_time)
         if "grad_norm" in logs:
             self._add_ui5_scalar("grad_norm", logs["grad_norm"])
         result = super().log(logs, start_time)

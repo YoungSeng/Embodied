@@ -97,6 +97,25 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn('expected_gpu_count = int(os.environ.get("GPU_COUNT", "4"))', merlin)
         self.assertIn('x${GPU_COUNT}-formal', merlin)
 
+    def test_disabled_ui_relation_skips_ui5_only_trainer_audits(self):
+        launcher = (REPO_ROOT / "shell" / "run_locany_cpt.sh").read_text(
+            encoding="utf-8"
+        )
+        trainer = (
+            REPO_ROOT / "eaglevl" / "train" / "locany_finetune_magi_stream.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("export ENABLE_UI_RELATION=False", launcher)
+        self.assertIn(
+            'getattr(self.model, "enable_ui_relation", False)', trainer
+        )
+        self.assertIn(
+            "if not self._ui5_enabled:\n            return optimizer", trainer
+        )
+        self.assertIn(
+            "if not self._ui5_enabled:\n            return super().log", trainer
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

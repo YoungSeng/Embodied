@@ -367,9 +367,20 @@ if [[ ! "${current_step}" =~ ^[0-9]+$ ]]; then
   locany_die 27 "Could not resolve latest checkpoint step: ${current_step}"
 fi
 
-if (( current_step == 0 )) && compgen -G "${OUTPUT_DIR}/checkpoint-*" >/dev/null; then
+training_checkpoint_count="$("${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/locany_ui5_checkpoint.py" \
+  training-candidates --output-dir "${OUTPUT_DIR}" --field count)"
+if [[ ! "${training_checkpoint_count}" =~ ^[0-9]+$ ]]; then
+  locany_die 27 "Could not count training checkpoint candidates: ${training_checkpoint_count}"
+fi
+
+# checkpoint-0 is a deterministic, full-model evaluation artifact.  It has no
+# optimizer/scheduler/Trainer state by design, so it is neither corrupt nor a
+# resume candidate.  Keep the fail-fast guard for every checkpoint-N, N > 0.
+if (( current_step == 0 && training_checkpoint_count > 0 )); then
+  invalid_training_checkpoints="$("${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/locany_ui5_checkpoint.py" \
+    training-candidates --output-dir "${OUTPUT_DIR}" --field paths)"
   locany_die 28 \
-    "Checkpoint directories exist, but none passed resume validation; refusing to restart from zero: ${OUTPUT_DIR}"
+    "Nonzero checkpoint directories exist, but none passed resume validation; refusing to restart from zero: ${invalid_training_checkpoints}"
 fi
 
 # Evaluation-only observe mode may deliberately load a legacy checkpoint whose
