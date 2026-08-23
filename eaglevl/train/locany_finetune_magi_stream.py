@@ -65,6 +65,7 @@ from eaglevl.train.dataset_sampling import (
     resolve_dataset_sampling_weight,
     resolve_recipe_entry_paths,
 )
+from eaglevl.train.optimizer_utils import optimizer_parameters
 from PIL import Image, ImageFile, PngImagePlugin
 from torch.utils.data import Dataset, IterableDataset, DataLoader
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
@@ -1539,15 +1540,11 @@ class StreamPackingMTPTrainer(Trainer):
 
     def create_optimizer(self):
         optimizer = super().create_optimizer()
-        optimizer_ids = {
-            id(parameter)
-            for group in self.optimizer.param_groups
-            for parameter in group["params"]
-        }
+        audited_parameters = optimizer_parameters(self.optimizer)
+        optimizer_ids = {id(parameter) for parameter in audited_parameters}
         optimizer_ds_ids = {
             int(parameter.ds_id)
-            for group in self.optimizer.param_groups
-            for parameter in group["params"]
+            for parameter in audited_parameters
             if hasattr(parameter, "ds_id")
         }
         def in_optimizer(parameter):
