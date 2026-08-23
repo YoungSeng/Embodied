@@ -32,6 +32,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scorer-root", type=Path, required=True)
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     parser.add_argument("--max-images-per-task", type=int, default=0)
+    parser.add_argument(
+        "--relation-gate-mode", choices=("observe", "hard"), default="observe"
+    )
+    parser.add_argument("--relation-gate-threshold", type=float, default=None)
     parser.add_argument("--skip-patch", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -91,6 +95,8 @@ def record_history(
         str(args.max_num_tokens),
         "--max-num-tokens-scope",
         "per_rank_packed_batch",
+        "--relation-gate-mode",
+        args.relation_gate_mode,
         "--checkpoint",
         str(args.checkpoint),
         "--start-time",
@@ -147,6 +153,7 @@ def main() -> int:
         "gpu_count": args.gpu_count,
         "max_num_tokens": args.max_num_tokens,
         "max_num_tokens_scope": "per_rank_packed_batch",
+        "relation_gate_mode": args.relation_gate_mode,
         "checkpoint": str(args.checkpoint),
         "prediction_dir": str(prediction_dir),
         "evaluation_run_dir": str(evaluation_run_dir),
@@ -179,6 +186,8 @@ def main() -> int:
                 "--force",
                 "--validate-relation-weights",
             ]
+            if args.relation_gate_mode == "observe":
+                current_command.append("--allow-legacy-slot-gate")
             if not args.dry_run:
                 run_checked(current_command, cwd=args.project_root, stage=current_stage)
             else:
@@ -204,7 +213,26 @@ def main() -> int:
             str(args.project_root / "scripts" / "inference_ui_defect_locany.py"),
             "--runtime-profile",
             str(runtime_profile),
+            "--relation-gate-mode",
+            args.relation_gate_mode,
         ]
+        existing_manifest = prediction_dir / "_run_manifest.json"
+        overwrite_for_gate_mode_change = False
+        if existing_manifest.is_file():
+            try:
+                previous_manifest = json.loads(existing_manifest.read_text(encoding="utf-8"))
+                previous_mode = previous_manifest.get("generation", {}).get(
+                    "relation_gate_mode"
+                )
+                overwrite_for_gate_mode_change = previous_mode != args.relation_gate_mode
+            except (OSError, json.JSONDecodeError):
+                overwrite_for_gate_mode_change = True
+        if overwrite_for_gate_mode_change:
+            current_command.append("--overwrite")
+        if args.relation_gate_threshold is not None:
+            current_command.extend(
+                ["--relation-gate-threshold", str(args.relation_gate_threshold)]
+            )
         if args.max_images_per_task:
             current_command.extend(
                 ["--max-images-per-task", str(args.max_images_per_task)]

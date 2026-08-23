@@ -48,7 +48,7 @@
       "max_num_tokens_per_sample": 8192,
       "gpu_defaults": {
         "4": {
-          "max_num_tokens": 25600
+          "max_num_tokens": 12800
         },
         "8": {
           "max_num_tokens": 25600

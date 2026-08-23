@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import unittest
+from types import SimpleNamespace
 
 import torch
 from torch import nn
@@ -12,11 +13,16 @@ from eaglevl.model.locany.relation_modules import (
     UI_RELATION_PROMPT_SPECS,
     RelationConditionedDetailPyramid,
     RelationToPBD,
+    class_balanced_focal_loss,
     match_ui_relation_prompt,
     pbd_active_delta_norm,
     pbd_prediction_positions,
     passes_relation_gate,
     relation_gate_output_override,
+)
+from eaglevl.model.locany.ui_relation_setup import (
+    configure_ui5_model_config,
+    initialize_or_validate_ui_relation,
 )
 
 
@@ -24,6 +30,70 @@ class UIRelationPipelineTest(unittest.TestCase):
     BOX = 101
     MASK = 102
     BLOCK_SIZE = 6
+
+    def test_training_and_checkpoint0_share_ui5_config_builder(self):
+        config = SimpleNamespace(
+            text_config=SimpleNamespace(),
+            vision_config=SimpleNamespace(),
+            relation_gate_thresholds={"text_overflow": 0.23},
+        )
+        configure_ui5_model_config(
+            config,
+            attn_implementation="sdpa",
+            image_token_index=11,
+            block_size=6,
+            causal_attn=False,
+            text_mask_token_id=12,
+            null_token_id=13,
+            box_start_token_id=14,
+            box_end_token_id=15,
+            coord_start_token_id=16,
+            coord_end_token_id=17,
+            ref_start_token_id=18,
+            ref_end_token_id=19,
+            none_token_id=20,
+            enable_ui_relation=True,
+            relation_detail_hidden_size=256,
+            relation_num_slots=8,
+            relation_adapter_bottleneck=64,
+            relation_detail_layers=(5, 15, 26),
+            relation_gate_loss_weight=1.0,
+            relation_slot_gate_loss_weight=0.1,
+            relation_attention_loss_weight=0.1,
+            relation_gate_threshold=0.5,
+            relation_focal_beta=0.999,
+            relation_focal_gamma=2.0,
+        )
+        self.assertEqual(config.text_config.block_size, 6)
+        self.assertFalse(config.text_config.causal_attn)
+        self.assertEqual(config.text_config.text_mask_token_id, 12)
+        self.assertEqual(config.relation_detail_layers, [5, 15, 26])
+        self.assertEqual(config.relation_gate_mode, "observe")
+        self.assertEqual(config.relation_gate_thresholds["text_overflow"], 0.23)
+
+    def test_partial_ui_checkpoint_is_rejected(self):
+        class FakeModel:
+            def named_parameters(self):
+                return iter(
+                    (
+                        ("relation_pyramid.scale_logits", object()),
+                        ("relation_pbd.box_scale", object()),
+                    )
+                )
+
+            def initialize_ui_relation_modules(self, seed, reason):
+                return {"seed": seed, "reason": reason}
+
+            def validate_ui_relation_parameters(self):
+                return {"valid": True}
+
+        with self.assertRaisesRegex(RuntimeError, "Partial UI"):
+            initialize_or_validate_ui_relation(
+                FakeModel(),
+                {"missing_keys": ["relation_pbd.box_scale"]},
+                seed=42,
+                all_missing_reason="test",
+            )
 
     def test_detail_pyramid_uses_fixed_moonvit_layers(self):
         self.assertEqual(DEFAULT_UI_DETAIL_LAYERS, (5, 15, 26))
@@ -93,6 +163,40 @@ class UIRelationPipelineTest(unittest.TestCase):
             training_output.relation_summary.shape,
             inference_output.relation_summary.shape,
         )
+        self.assertEqual(training_output.image_gate_logits.shape, (1,))
+        self.assertEqual(training_output.slot_gate_logits.shape, (1, 2))
+        self.assertEqual(training_output.p_defect.shape, (1,))
+        self.assertIsNotNone(training_output.image_gate_loss)
+        self.assertIsNotNone(training_output.slot_gate_loss)
+
+    def test_detail_scale_weights_start_as_exact_thirds(self):
+        module, _, output = self.make_pyramid()
+        torch.testing.assert_close(
+            module.scale_logits,
+            torch.zeros_like(module.scale_logits),
+        )
+        torch.testing.assert_close(
+            output.scale_weights.sum(dim=-1),
+            torch.ones(output.scale_weights.shape[0]),
+        )
+        torch.testing.assert_close(
+            output.scale_weights,
+            torch.full_like(output.scale_weights, 1.0 / 3.0),
+        )
+        for head in (*module.gate_heads, *module.image_gate_heads):
+            torch.testing.assert_close(
+                head[-1].bias,
+                torch.full_like(head[-1].bias, -2.0),
+            )
+
+    def test_image_focal_loss_does_not_broadcast_batch_to_square(self):
+        logits = torch.tensor([-2.0, 1.0], requires_grad=True)
+        targets = torch.tensor([0.0, 1.0])
+        defect_type = torch.tensor([0, 1])
+        loss = class_balanced_focal_loss(logits, targets, defect_type)
+        self.assertEqual(loss.ndim, 0)
+        loss.backward()
+        self.assertEqual(logits.grad.shape, logits.shape)
 
     def test_relation_gate_and_pbd_checkpoint_roundtrip_is_strict(self):
         modules = nn.ModuleDict(

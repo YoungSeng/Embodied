@@ -81,6 +81,10 @@ def parse_args() -> argparse.Namespace:
         help="Evaluation-only mode: do not patch the checkpoint (used for base-model step 0)",
     )
     parser.add_argument("--eval-fail-policy", choices=("stop", "warn"), default="stop")
+    parser.add_argument(
+        "--relation-gate-mode", choices=("observe", "hard"), default="observe"
+    )
+    parser.add_argument("--relation-gate-threshold", type=float, default=None)
     eval_group = parser.add_mutually_exclusive_group()
     eval_group.add_argument("--enable-eval", dest="enable_eval", action="store_true")
     eval_group.add_argument("--disable-eval", dest="enable_eval", action="store_false")
@@ -135,6 +139,7 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "ENABLE_EVAL": "1" if args.enable_eval else "0",
         "EVAL_AT_START": "1" if args.eval_at_start else "0",
         "EVAL_FAIL_POLICY": args.eval_fail_policy,
+        "RELATION_GATE_MODE": getattr(args, "relation_gate_mode", "observe"),
     }
     optional = {
         "MAX_NUM_TOKENS": args.max_num_tokens,
@@ -145,6 +150,7 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         ),
         "RUN_NAME": args.run_name,
         "SCORER_ROOT": args.scorer_root,
+        "RELATION_GATE_THRESHOLD": getattr(args, "relation_gate_threshold", None),
         "TRAINING_DATA_SOURCE_DIR": args.training_data_source_dir,
         "TRAINING_DATA_DIR": args.training_data_dir,
     }
@@ -213,8 +219,10 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "LEARNING_RATE",
         "GRADIENT_ACCUMULATION_STEPS",
         "RELATION_GATE_LOSS_WEIGHT",
+        "RELATION_SLOT_GATE_LOSS_WEIGHT",
         "RELATION_ATTENTION_LOSS_WEIGHT",
         "RELATION_GATE_THRESHOLD",
+        "RELATION_GATE_MODE",
         "RELATION_FOCAL_BETA",
         "RELATION_FOCAL_GAMMA",
         "RELATION_NUM_SLOTS",

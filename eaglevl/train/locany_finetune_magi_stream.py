@@ -17,6 +17,7 @@ import logging
 import random
 import sys
 import warnings
+from contextlib import nullcontext
 import numpy as np
 from typing import Dict, Optional, List, Tuple, Any
 from dataclasses import dataclass, field
@@ -46,6 +47,10 @@ from eaglevl.patch import (
 )
 from eaglevl.model.locany.modeling_locateanything import LocateAnythingForConditionalGeneration
 from eaglevl.model.locany.configuration_locateanything import LocateAnythingConfig
+from eaglevl.model.locany.ui_relation_setup import (
+    configure_ui5_model_config,
+    initialize_or_validate_ui_relation,
+)
 from eaglevl.utils.locany.processing_locateanything import LocateAnythingProcessor
 from eaglevl.utils.locany.image_processing_locateanything import LocateAnythingImageProcessor
 from eaglevl.sp_utils import set_pg_manager, get_pg_manager
@@ -1258,21 +1263,55 @@ class StreamPackingMTPTrainer(Trainer):
         "loss_total",
         "loss_lm",
         "loss_gate",
+        "loss_image_gate",
+        "loss_slot_gate",
         "loss_attention",
         "weighted_gate_loss",
+        "weighted_slot_gate_loss",
         "weighted_attention_loss",
+        "loss_lm_contribution",
+        "loss_image_gate_contribution",
+        "loss_slot_gate_contribution",
+        "loss_attention_contribution",
+        "loss_reconstructed",
+        "loss_reconstruction_error",
+        "attention_active_batch_rate",
         "grad_norm",
         "detail_layer5_norm",
         "detail_layer15_norm",
         "detail_layer26_norm",
+        "detail_layer5_abs_max",
+        "detail_layer15_abs_max",
+        "detail_layer26_abs_max",
+        "detail_layer5_saturation_fraction",
+        "detail_layer15_saturation_fraction",
+        "detail_layer26_saturation_fraction",
+        "detail_norm_ratio",
         "detail_fused_norm",
         "relation_context_norm",
         "relation_gate_prob_mean",
         "pbd_delta_norm",
         "pbd_active_positions",
         "relation_grad_norm",
-        "gate_grad_norm",
+        "image_gate_grad_norm",
+        "slot_gate_grad_norm",
         "pbd_grad_norm",
+        "relation_grad_seen_steps",
+        "image_gate_grad_seen_steps",
+        "slot_gate_grad_seen_steps",
+        "pbd_grad_seen_steps",
+        "relation_absolute_update_norm",
+        "relation_relative_update_norm",
+        "relation_changed_element_count",
+        "image_gate_absolute_update_norm",
+        "image_gate_relative_update_norm",
+        "image_gate_changed_element_count",
+        "slot_gate_absolute_update_norm",
+        "slot_gate_relative_update_norm",
+        "slot_gate_changed_element_count",
+        "pbd_absolute_update_norm",
+        "pbd_relative_update_norm",
+        "pbd_changed_element_count",
     )
     _DEFECT_TO_DIAGNOSTIC_TASK = {
         0: "text_overflow",
@@ -1309,6 +1348,14 @@ class StreamPackingMTPTrainer(Trainer):
             f".ui5_train_window_rank{get_rank()}.json",
         )
         self._load_ui5_window_state()
+        self._ui5_hook_squares = {}
+        self._ui5_hook_seen = set()
+        self._ui5_hook_handles = []
+        self._ui5_last_grad_seen_global = {}
+        self._ui5_parameter_baseline = {}
+        self._ui5_real_data_audit_logged = False
+        self._register_ui5_gradient_hooks()
+        self._snapshot_ui5_parameters()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
@@ -1320,6 +1367,14 @@ class StreamPackingMTPTrainer(Trainer):
         self._ui5_tasks = {
             task: defaultdict(float) for task in TRAIN_TASKS
         }
+        for values in self._ui5_tasks.values():
+            # Keep the raw image-Gate observations for this optimizer-step
+            # window.  PR-AUC/AP must be computed once over the complete
+            # 100-step, all-rank population; averaging per-micro-batch AP is
+            # not the same metric and is especially misleading for rare UI
+            # defects.
+            values["pr_scores"] = []
+            values["pr_labels"] = []
         self._ui5_peak_gpu_memory_mb = 0.0
 
     def _load_ui5_window_state(self):
@@ -1390,6 +1445,158 @@ class StreamPackingMTPTrainer(Trainer):
         state["min"] = min(state["min"], value)
         state["max"] = max(state["max"], value)
 
+    def _set_ui5_scalar(self, name, value):
+        value = self._tensor_float(value)
+        if value is None or not np.isfinite(value):
+            return
+        self._ui5_scalar[name] = {
+            "sum": value,
+            "count": 1.0,
+            "min": value,
+            "max": value,
+        }
+
+    @staticmethod
+    def _ui5_parameter_group(name):
+        if "relation_pbd" in name:
+            return "pbd"
+        if "relation_pyramid.image_gate_heads" in name:
+            return "image_gate"
+        if "relation_pyramid.gate_heads" in name:
+            return "slot_gate"
+        if "relation_pyramid" in name:
+            return "relation"
+        return None
+
+    def _register_ui5_gradient_hooks(self):
+        for name, parameter in self.model.named_parameters():
+            group = self._ui5_parameter_group(name)
+            if group is None or not parameter.requires_grad:
+                continue
+
+            def capture(gradient, group=group):
+                square = gradient.detach().float().square().sum()
+                previous = self._ui5_hook_squares.get(group)
+                self._ui5_hook_squares[group] = square if previous is None else previous + square
+                self._ui5_hook_seen.add(group)
+                return gradient
+
+            self._ui5_hook_handles.append(parameter.register_hook(capture))
+
+    def _snapshot_ui5_parameters(self):
+        tracked = [
+            (name, parameter)
+            for name, parameter in self.model.named_parameters()
+            if self._ui5_parameter_group(name) is not None and parameter.requires_grad
+        ]
+        gather_context = nullcontext()
+        if tracked and any(hasattr(parameter, "ds_id") for _, parameter in tracked):
+            import deepspeed
+
+            gather_context = deepspeed.zero.GatheredParameters(
+                [parameter for _, parameter in tracked], modifier_rank=None
+            )
+        with gather_context:
+            for name, parameter in tracked:
+                self._ui5_parameter_baseline[name] = (
+                    parameter.detach().float().cpu().clone()
+                )
+
+    def _capture_ui5_parameter_updates(self):
+        sums = defaultdict(float)
+        bases = defaultdict(float)
+        changed = defaultdict(int)
+        current_parameters = dict(self.model.named_parameters())
+        tracked = [
+            current_parameters[name]
+            for name in self._ui5_parameter_baseline
+            if name in current_parameters
+        ]
+        gather_context = nullcontext()
+        if tracked and any(hasattr(parameter, "ds_id") for parameter in tracked):
+            import deepspeed
+
+            gather_context = deepspeed.zero.GatheredParameters(
+                tracked, modifier_rank=None
+            )
+        with gather_context:
+            for name, baseline in self._ui5_parameter_baseline.items():
+                current_parameter = current_parameters.get(name)
+                if current_parameter is None or current_parameter.numel() != baseline.numel():
+                    continue
+                current = current_parameter.detach().float().cpu().reshape_as(baseline)
+                delta = current - baseline
+                group = self._ui5_parameter_group(name)
+                sums[group] += float(delta.square().sum().item())
+                bases[group] += float(baseline.square().sum().item())
+                changed[group] += int(delta.ne(0).sum().item())
+        for group in ("relation", "image_gate", "slot_gate", "pbd"):
+            absolute = sums[group] ** 0.5
+            relative = absolute / (bases[group] ** 0.5 + 1.0e-12)
+            self._set_ui5_scalar(f"{group}_absolute_update_norm", absolute)
+            self._set_ui5_scalar(f"{group}_relative_update_norm", relative)
+            self._set_ui5_scalar(f"{group}_changed_element_count", changed[group])
+
+    def create_optimizer(self):
+        optimizer = super().create_optimizer()
+        optimizer_ids = {
+            id(parameter)
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+        }
+        optimizer_ds_ids = {
+            int(parameter.ds_id)
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+            if hasattr(parameter, "ds_id")
+        }
+        def in_optimizer(parameter):
+            return id(parameter) in optimizer_ids or (
+                hasattr(parameter, "ds_id")
+                and int(parameter.ds_id) in optimizer_ds_ids
+            )
+        report = {}
+        missing = []
+        frozen = []
+        for group_name in ("relation", "image_gate", "slot_gate", "pbd"):
+            parameters = [
+                (name, parameter)
+                for name, parameter in self.model.named_parameters()
+                if self._ui5_parameter_group(name) == group_name
+            ]
+            trainable = [(name, parameter) for name, parameter in parameters if parameter.requires_grad]
+            group_missing = [name for name, parameter in trainable if not in_optimizer(parameter)]
+            group_frozen = [name for name, parameter in parameters if not parameter.requires_grad]
+            report[group_name] = {
+                "parameter_count": sum(parameter.numel() for _, parameter in parameters),
+                "trainable_parameter_count": sum(parameter.numel() for _, parameter in trainable),
+                "optimizer_parameter_count": sum(
+                    parameter.numel() for _, parameter in trainable if in_optimizer(parameter)
+                ),
+                "missing_from_optimizer": group_missing,
+                "unexpected_frozen_parameters": group_frozen,
+            }
+            missing.extend(group_missing)
+            frozen.extend(group_frozen)
+        logger.warning("[UI5 optimizer audit] %s", json.dumps(report, ensure_ascii=False))
+        if self.is_world_process_zero():
+            audit_path = osp.join(
+                self.args.output_dir, "diagnostics", "ui_relation_optimizer_audit.json"
+            )
+            os.makedirs(osp.dirname(audit_path), exist_ok=True)
+            temporary = f"{audit_path}.tmp-{os.getpid()}"
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, audit_path)
+        if missing:
+            raise RuntimeError(f"Trainable UI parameters missing from optimizer: {missing}")
+        if frozen:
+            raise RuntimeError(f"Unexpected frozen UI parameters: {frozen}")
+        return optimizer
+
     def _add_ui5_weighted_scalar(self, name, value, weight):
         value = self._tensor_float(value)
         weight = self._tensor_float(weight)
@@ -1412,18 +1619,30 @@ class StreamPackingMTPTrainer(Trainer):
             return
         config = self.model.config
         gate_weight = float(getattr(config, "relation_gate_loss_weight", 1.0))
+        slot_gate_weight = float(
+            getattr(config, "relation_slot_gate_loss_weight", 0.1)
+        )
         attention_weight = float(
             getattr(config, "relation_attention_loss_weight", 0.1)
         )
         self._add_ui5_scalar("loss_total", getattr(outputs, "loss", None))
         self._add_ui5_scalar("loss_lm", getattr(outputs, "lm_loss", None))
         self._add_ui5_scalar("loss_gate", getattr(outputs, "gate_loss", None))
+        self._add_ui5_scalar("loss_image_gate", getattr(outputs, "image_gate_loss", None))
+        self._add_ui5_scalar("loss_slot_gate", getattr(outputs, "slot_gate_loss", None))
         self._add_ui5_scalar(
             "loss_attention", getattr(outputs, "attention_loss", None)
         )
         gate_loss_value = self._tensor_float(getattr(outputs, "gate_loss", None))
         if gate_loss_value is not None:
             self._add_ui5_scalar("weighted_gate_loss", gate_weight * gate_loss_value)
+        else:
+            self._add_ui5_scalar("weighted_gate_loss", 0.0)
+        slot_gate_loss_value = self._tensor_float(getattr(outputs, "slot_gate_loss", None))
+        self._add_ui5_scalar(
+            "weighted_slot_gate_loss",
+            slot_gate_weight * slot_gate_loss_value if slot_gate_loss_value is not None else 0.0,
+        )
         attention_loss_value = self._tensor_float(
             getattr(outputs, "attention_loss", None)
         )
@@ -1432,6 +1651,19 @@ class StreamPackingMTPTrainer(Trainer):
                 "weighted_attention_loss",
                 attention_weight * attention_loss_value,
             )
+        else:
+            self._add_ui5_scalar("weighted_attention_loss", 0.0)
+
+        for output_name, metric_name in (
+            ("loss_lm_contribution", "loss_lm_contribution"),
+            ("loss_image_gate_contribution", "loss_image_gate_contribution"),
+            ("loss_slot_gate_contribution", "loss_slot_gate_contribution"),
+            ("loss_attention_contribution", "loss_attention_contribution"),
+            ("loss_reconstructed", "loss_reconstructed"),
+            ("loss_reconstruction_error", "loss_reconstruction_error"),
+            ("attention_active", "attention_active_batch_rate"),
+        ):
+            self._add_ui5_scalar(metric_name, getattr(outputs, output_name, None))
 
         detail_norm = getattr(outputs, "detail_feature_norm", None)
         if torch.is_tensor(detail_norm) and detail_norm.numel() == 3:
@@ -1444,6 +1676,37 @@ class StreamPackingMTPTrainer(Trainer):
                 detail_norm.reshape(-1),
             ):
                 self._add_ui5_scalar(name, value)
+            if not bool(torch.isfinite(detail_norm).all()):
+                raise FloatingPointError("Detail Pyramid projected norm is non-finite")
+            if bool((detail_norm < 1.0e-4).any()):
+                raise RuntimeError(f"Detail Pyramid projected norm below 1e-4: {detail_norm.tolist()}")
+        detail_abs_max = getattr(outputs, "detail_feature_abs_max", None)
+        if torch.is_tensor(detail_abs_max) and detail_abs_max.numel() == 3:
+            for name, value in zip(
+                ("detail_layer5_abs_max", "detail_layer15_abs_max", "detail_layer26_abs_max"),
+                detail_abs_max.reshape(-1),
+            ):
+                self._add_ui5_scalar(name, value)
+        detail_saturation = getattr(outputs, "detail_saturation_fraction", None)
+        if torch.is_tensor(detail_saturation) and detail_saturation.numel() == 3:
+            for name, value in zip(
+                (
+                    "detail_layer5_saturation_fraction",
+                    "detail_layer15_saturation_fraction",
+                    "detail_layer26_saturation_fraction",
+                ),
+                detail_saturation.reshape(-1),
+            ):
+                self._add_ui5_scalar(name, value)
+            if float(detail_saturation.detach().float().max().item()) > 0.001:
+                raise RuntimeError(
+                    f"Detail Pyramid saturation_fraction exceeds 0.001: {detail_saturation.tolist()}"
+                )
+        detail_norm_ratio = getattr(outputs, "detail_norm_ratio", None)
+        self._add_ui5_scalar("detail_norm_ratio", detail_norm_ratio)
+        ratio_value = self._tensor_float(detail_norm_ratio)
+        if ratio_value is not None and ratio_value > 20.0:
+            raise RuntimeError(f"Detail Pyramid norm ratio exceeds 20: {ratio_value}")
         for output_name, metric_name in (
             ("detail_fused_norm", "detail_fused_norm"),
             ("relation_context_norm", "relation_context_norm"),
@@ -1457,6 +1720,69 @@ class StreamPackingMTPTrainer(Trainer):
             pbd_active_positions,
         )
         self._add_ui5_scalar("pbd_active_positions", pbd_active_positions)
+
+        if not self._ui5_real_data_audit_logged and torch.is_tensor(detail_norm):
+            detail_weights_for_audit = getattr(outputs, "detail_layer_weights", None)
+            if torch.is_tensor(detail_weights_for_audit):
+                weight_sums = detail_weights_for_audit.detach().float().sum(dim=-1)
+                if not bool(torch.allclose(weight_sums, torch.ones_like(weight_sums), atol=1.0e-5)):
+                    raise RuntimeError(
+                        f"Detail Pyramid scale weights do not sum to one: {weight_sums.tolist()}"
+                    )
+                if int(self.state.global_step) == 0 and not bool(
+                    torch.allclose(
+                        detail_weights_for_audit.detach().float(),
+                        torch.full_like(detail_weights_for_audit.detach().float(), 1.0 / 3.0),
+                        atol=1.0e-4,
+                    )
+                ):
+                    raise RuntimeError(
+                        "Initial Detail Pyramid scale weights are not thirds: "
+                        f"{detail_weights_for_audit.detach().float().cpu().tolist()}"
+                    )
+            audit = {
+                "rank": get_rank(),
+                "projected_norm": detail_norm.detach().float().cpu().tolist(),
+                "projected_abs_max": (
+                    detail_abs_max.detach().float().cpu().tolist()
+                    if torch.is_tensor(detail_abs_max)
+                    else None
+                ),
+                "saturation_fraction": (
+                    detail_saturation.detach().float().cpu().tolist()
+                    if torch.is_tensor(detail_saturation)
+                    else None
+                ),
+                "norm_ratio": self._tensor_float(detail_norm_ratio),
+                "scale_weights": (
+                    detail_weights_for_audit.detach().float().cpu().tolist()
+                    if torch.is_tensor(detail_weights_for_audit)
+                    else None
+                ),
+                "relation_context_norm": self._tensor_float(
+                    getattr(outputs, "relation_context_norm", None)
+                ),
+                "pbd_delta_norm": self._tensor_float(
+                    getattr(outputs, "pbd_delta_norm", None)
+                ),
+                "pbd_active_positions": self._tensor_float(pbd_active_positions),
+            }
+            logger.warning(
+                "[UI5 first-real-batch audit] %s",
+                json.dumps(audit, ensure_ascii=False),
+            )
+            audit_path = osp.join(
+                self.args.output_dir,
+                "diagnostics",
+                f"first_real_batch_audit_rank{get_rank()}.json",
+            )
+            os.makedirs(osp.dirname(audit_path), exist_ok=True)
+            temporary = f"{audit_path}.tmp-{os.getpid()}"
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(audit, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(temporary, audit_path)
+            self._ui5_real_data_audit_logged = True
 
         defect_type = inputs.get("defect_type")
         target_mask = inputs.get("target_box_mask")
@@ -1487,6 +1813,7 @@ class StreamPackingMTPTrainer(Trainer):
             detail_weights = None
         threshold = float(getattr(config, "relation_gate_threshold", 0.5))
         predicted = probabilities >= threshold
+        slot_targets = getattr(outputs, "gate_targets", None)
         for defect_id, task in self._DEFECT_TO_DIAGNOSTIC_TASK.items():
             mask = defect_type == defect_id
             values = self._ui5_tasks[task]
@@ -1504,6 +1831,21 @@ class StreamPackingMTPTrainer(Trainer):
             values["tp"] += float((mask & positive & predicted).sum().item())
             values["fp"] += float((mask & ~positive & predicted).sum().item())
             values["fn"] += float((mask & positive & ~predicted).sum().item())
+            task_probability = probabilities[mask]
+            task_positive = positive[mask]
+            if task_probability.numel():
+                values["pr_scores"].extend(
+                    task_probability.detach().float().cpu().tolist()
+                )
+                values["pr_labels"].extend(
+                    task_positive.detach().bool().cpu().tolist()
+                )
+            if torch.is_tensor(slot_targets) and slot_targets.shape[0] >= count:
+                task_slot_targets = (
+                    slot_targets.detach().float().reshape(slot_targets.shape[0], -1)[:count][mask]
+                )
+                values["slot_positive"] += float(task_slot_targets.sum().item())
+                values["slot_negative"] += float(task_slot_targets.numel() - task_slot_targets.sum().item())
             if detail_weights is not None:
                 task_count = float(mask.sum().item())
                 if task_count:
@@ -1520,7 +1862,8 @@ class StreamPackingMTPTrainer(Trainer):
                     values["detail_weight_count"] += task_count
 
         for output_name, prefix in (
-            ("per_task_gate_loss", "gate_loss"),
+            ("per_task_image_gate_loss", "gate_loss"),
+            ("per_task_slot_gate_loss", "slot_gate_loss"),
             ("per_task_attention_loss", "attention_loss"),
         ):
             task_losses = getattr(outputs, output_name, None) or {}
@@ -1532,22 +1875,22 @@ class StreamPackingMTPTrainer(Trainer):
                     self._ui5_tasks[task][f"{prefix}_count"] += 1.0
 
     def _capture_ui5_gradient_groups(self, model):
-        squares = {"relation": 0.0, "gate": 0.0, "pbd": 0.0}
-        for name, parameter in model.named_parameters():
-            if parameter.grad is None:
-                continue
-            if "relation_pbd" in name:
-                group = "pbd"
-            elif "relation_pyramid.gate_heads" in name:
-                group = "gate"
-            elif "relation_pyramid" in name:
-                group = "relation"
-            else:
-                continue
-            grad = parameter.grad.detach().float()
-            squares[group] += float(grad.square().sum().item())
-        for group, value in squares.items():
-            self._add_ui5_scalar(f"{group}_grad_norm", value ** 0.5)
+        # Hooks run at gradient creation time, before DeepSpeed/MAGI can clear
+        # parameter.grad. One seen-step means at least one parameter hook in
+        # that group fired during this local-rank training_step.
+        for group in ("relation", "image_gate", "slot_gate", "pbd"):
+            square = self._ui5_hook_squares.get(group)
+            if square is not None:
+                self._add_ui5_scalar(
+                    f"{group}_grad_norm", float(square.detach().item())
+                )
+            if group in self._ui5_hook_seen:
+                global_step = int(self.state.global_step)
+                if self._ui5_last_grad_seen_global.get(group) != global_step:
+                    self._add_ui5_scalar(f"{group}_grad_seen_steps", 1.0)
+                    self._ui5_last_grad_seen_global[group] = global_step
+        self._ui5_hook_squares = {}
+        self._ui5_hook_seen = set()
 
     def compute_loss(
         self,
@@ -1609,6 +1952,8 @@ class StreamPackingMTPTrainer(Trainer):
             "p_defect_neg_sum", "p_defect_neg_count",
             "tp", "fp", "fn",
             "gate_loss_sum", "gate_loss_count",
+            "slot_gate_loss_sum", "slot_gate_loss_count",
+            "slot_positive", "slot_negative",
             "attention_loss_sum", "attention_loss_count",
             "detail_weight_l5_sum", "detail_weight_l15_sum",
             "detail_weight_l26_sum", "detail_weight_count",
@@ -1640,6 +1985,30 @@ class StreamPackingMTPTrainer(Trainer):
             dist.all_reduce(max_tensor, op=dist.ReduceOp.MAX)
             dist.all_reduce(peak_tensor, op=dist.ReduceOp.MAX)
         sum_tensor[-1] = peak_tensor[0]
+
+        local_pr_observations = {
+            task: {
+                "scores": list(self._ui5_tasks[task]["pr_scores"]),
+                "labels": list(self._ui5_tasks[task]["pr_labels"]),
+            }
+            for task in TRAIN_TASKS
+        }
+        gathered_pr_observations = [local_pr_observations]
+        if dist.is_available() and dist.is_initialized():
+            gathered_pr_observations = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered_pr_observations, local_pr_observations)
+        task_pr_auc = {}
+        for task in TRAIN_TASKS:
+            scores = []
+            labels = []
+            for rank_observations in gathered_pr_observations:
+                if not rank_observations:
+                    continue
+                task_observations = rank_observations.get(task, {})
+                scores.extend(task_observations.get("scores", ()))
+                labels.extend(task_observations.get("labels", ()))
+            task_pr_auc[task] = self._average_precision(scores, labels)
+
         values = sum_tensor.cpu().tolist()
         minima = min_tensor.cpu().tolist()
         maxima = max_tensor.cpu().tolist()
@@ -1657,15 +2026,44 @@ class StreamPackingMTPTrainer(Trainer):
         for task in TRAIN_TASKS:
             reduced_tasks[task] = dict(zip(task_keys, values[cursor:cursor + len(task_keys)]))
             cursor += len(task_keys)
-        return reduced_scalars, reduced_tasks, values[-1]
+        return reduced_scalars, reduced_tasks, values[-1], task_pr_auc
+
+    @staticmethod
+    def _average_precision(scores, labels):
+        """Exact average precision over one complete diagnostic window."""
+
+        if not scores or len(scores) != len(labels):
+            return None
+        paired = sorted(
+            zip(scores, labels),
+            key=lambda item: float(item[0]),
+            reverse=True,
+        )
+        positive_count = sum(bool(label) for _, label in paired)
+        if positive_count == 0:
+            return None
+        true_positives = 0
+        precision_sum = 0.0
+        for rank, (_, label) in enumerate(paired, start=1):
+            if bool(label):
+                true_positives += 1
+                precision_sum += true_positives / rank
+        return precision_sum / positive_count
 
     @staticmethod
     def _average(state):
         return state["sum"] / state["count"] if state["count"] else None
 
     def _flush_ui5_excel(self, step, logs):
-        scalars, tasks, peak_memory = self._reduce_ui5_window()
+        scalars, tasks, peak_memory, task_pr_auc = self._reduce_ui5_window()
         config = self.model.config
+        def global_grad_rms(group):
+            state = scalars[f"{group}_grad_norm"]
+            if not state["count"]:
+                return None
+            return (
+                state["sum"] * max(1, int(self.args.world_size)) / state["count"]
+            ) ** 0.5
         metrics = {
             "step": step,
             "epoch": self.state.epoch,
@@ -1673,6 +2071,7 @@ class StreamPackingMTPTrainer(Trainer):
             "max_num_tokens": self._max_num_tokens,
             "learning_rate": logs.get("learning_rate"),
             "gate_loss_weight": float(getattr(config, "relation_gate_loss_weight", 1.0)),
+            "slot_gate_loss_weight": float(getattr(config, "relation_slot_gate_loss_weight", 0.1)),
             "attention_loss_weight": float(getattr(config, "relation_attention_loss_weight", 0.1)),
             "gate_threshold": float(getattr(config, "relation_gate_threshold", 0.5)),
             "focal_beta": float(getattr(config, "relation_focal_beta", 0.999)),
@@ -1683,9 +2082,19 @@ class StreamPackingMTPTrainer(Trainer):
             "loss_total_max": scalars["loss_total"]["max"],
             "loss_lm": self._average(scalars["loss_lm"]),
             "loss_gate": self._average(scalars["loss_gate"]),
+            "loss_image_gate": self._average(scalars["loss_image_gate"]),
+            "loss_slot_gate": self._average(scalars["loss_slot_gate"]),
             "loss_attention": self._average(scalars["loss_attention"]),
             "weighted_gate_loss": self._average(scalars["weighted_gate_loss"]),
+            "weighted_slot_gate_loss": self._average(scalars["weighted_slot_gate_loss"]),
             "weighted_attention_loss": self._average(scalars["weighted_attention_loss"]),
+            "loss_lm_contribution": self._average(scalars["loss_lm_contribution"]),
+            "loss_image_gate_contribution": self._average(scalars["loss_image_gate_contribution"]),
+            "loss_slot_gate_contribution": self._average(scalars["loss_slot_gate_contribution"]),
+            "loss_attention_contribution": self._average(scalars["loss_attention_contribution"]),
+            "loss_reconstructed": self._average(scalars["loss_reconstructed"]),
+            "loss_reconstruction_error": self._average(scalars["loss_reconstruction_error"]),
+            "attention_active_batch_rate": self._average(scalars["attention_active_batch_rate"]),
             "grad_norm": self._average(scalars["grad_norm"]),
             "grad_norm_max": scalars["grad_norm"]["max"],
             "samples": sum(values["samples"] for values in tasks.values()),
@@ -1695,16 +2104,34 @@ class StreamPackingMTPTrainer(Trainer):
             "detail_layer5_norm": self._average(scalars["detail_layer5_norm"]),
             "detail_layer15_norm": self._average(scalars["detail_layer15_norm"]),
             "detail_layer26_norm": self._average(scalars["detail_layer26_norm"]),
+            "detail_layer5_abs_max": self._average(scalars["detail_layer5_abs_max"]),
+            "detail_layer15_abs_max": self._average(scalars["detail_layer15_abs_max"]),
+            "detail_layer26_abs_max": self._average(scalars["detail_layer26_abs_max"]),
+            "detail_layer5_saturation_fraction": self._average(scalars["detail_layer5_saturation_fraction"]),
+            "detail_layer15_saturation_fraction": self._average(scalars["detail_layer15_saturation_fraction"]),
+            "detail_layer26_saturation_fraction": self._average(scalars["detail_layer26_saturation_fraction"]),
+            "detail_norm_ratio": self._average(scalars["detail_norm_ratio"]),
             "detail_fused_norm": self._average(scalars["detail_fused_norm"]),
             "relation_context_norm": self._average(scalars["relation_context_norm"]),
             "relation_gate_prob_mean": self._average(scalars["relation_gate_prob_mean"]),
             "pbd_delta_norm": self._average(scalars["pbd_delta_norm"]),
             "pbd_active_positions": scalars["pbd_active_positions"]["sum"],
-            "relation_grad_norm": self._average(scalars["relation_grad_norm"]),
-            "gate_grad_norm": self._average(scalars["gate_grad_norm"]),
-            "pbd_grad_norm": self._average(scalars["pbd_grad_norm"]),
+            "relation_grad_norm": global_grad_rms("relation"),
+            "image_gate_grad_norm": global_grad_rms("image_gate"),
+            "slot_gate_grad_norm": global_grad_rms("slot_gate"),
+            "pbd_grad_norm": global_grad_rms("pbd"),
             "tasks": {},
         }
+        for group in ("relation", "image_gate", "slot_gate", "pbd"):
+            metrics[f"{group}_grad_seen_steps"] = scalars[f"{group}_grad_seen_steps"]["sum"]
+            for suffix in (
+                "absolute_update_norm",
+                "relative_update_norm",
+                "changed_element_count",
+            ):
+                metrics[f"{group}_{suffix}"] = self._average(
+                    scalars[f"{group}_{suffix}"]
+                )
         for task, values in tasks.items():
             tp, fp, fn = values["tp"], values["fp"], values["fn"]
             precision = tp / (tp + fp) if tp + fp else 0.0
@@ -1733,6 +2160,13 @@ class StreamPackingMTPTrainer(Trainer):
                 "gate_precision": precision,
                 "gate_recall": recall,
                 "gate_f1": f1,
+                "gate_pr_auc": task_pr_auc.get(task),
+                "slot_gate_loss": (
+                    values["slot_gate_loss_sum"] / values["slot_gate_loss_count"]
+                    if values["slot_gate_loss_count"] else None
+                ),
+                "slot_positive": values["slot_positive"],
+                "slot_negative": values["slot_negative"],
                 "detail_weight_l5": (
                     values["detail_weight_l5_sum"] / values["detail_weight_count"]
                     if values["detail_weight_count"] else None
@@ -1763,6 +2197,22 @@ class StreamPackingMTPTrainer(Trainer):
             self._add_ui5_scalar("grad_norm", logs["grad_norm"])
         result = super().log(logs, start_time)
         step = int(self.state.global_step)
+        if step in {1, 20, 100}:
+            self._capture_ui5_parameter_updates()
+            if step == 20:
+                required_groups = {"relation", "image_gate", "slot_gate"}
+                if self._ui5_scalar["pbd_active_positions"]["sum"] > 0:
+                    required_groups.add("pbd")
+                failed_groups = [
+                    group
+                    for group in sorted(required_groups)
+                    if self._ui5_scalar[f"{group}_absolute_update_norm"]["sum"] <= 0
+                ]
+                if failed_groups:
+                    raise RuntimeError(
+                        "UI modules had effective supervision but no parameter update "
+                        f"through optimizer step 20: {failed_groups}"
+                    )
         if (
             step > 0
             and step % 100 == 0
@@ -1956,43 +2406,49 @@ def main():
         # ===== LocateAnything (MoonVit + Qwen2/Qwen3) Loading Path =====
         logger.info('Loading LocateAnythingForConditionalGeneration...')
         config = LocateAnythingConfig.from_pretrained(model_args.model_name_or_path)
-        config._attn_implementation = model_args.attn_implementation
-        config._attn_implementation_autoset = False
-        config.text_config._attn_implementation = model_args.attn_implementation
-        config.text_config._attn_implementation_autoset = False
-        config.vision_config._attn_implementation = 'flash_attention_2'
-        config.vision_config._attn_implementation_autoset = False
+        configure_ui5_model_config(
+            config,
+            attn_implementation=model_args.attn_implementation,
+            image_token_index=image_token_index,
+            block_size=model_args.block_size,
+            causal_attn=model_args.causal_attn,
+            text_mask_token_id=text_mask_token_id,
+            null_token_id=null_token_id,
+            box_start_token_id=box_start_token_id,
+            box_end_token_id=box_end_token_id,
+            coord_start_token_id=coord_start_token_id,
+            coord_end_token_id=coord_end_token_id,
+            ref_start_token_id=ref_start_token_id,
+            ref_end_token_id=ref_end_token_id,
+            none_token_id=none_token_id,
+            enable_ui_relation=model_args.enable_ui_relation,
+            relation_detail_hidden_size=model_args.relation_detail_hidden_size,
+            relation_num_slots=model_args.relation_num_slots,
+            relation_adapter_bottleneck=model_args.relation_adapter_bottleneck,
+            relation_detail_layers=relation_detail_layers,
+            relation_gate_loss_weight=model_args.relation_gate_loss_weight,
+            relation_slot_gate_loss_weight=model_args.relation_slot_gate_loss_weight,
+            relation_attention_loss_weight=model_args.relation_attention_loss_weight,
+            relation_gate_threshold=model_args.relation_gate_threshold,
+            relation_focal_beta=model_args.relation_focal_beta,
+            relation_focal_gamma=model_args.relation_focal_gamma,
+        )
         logger.info(f'Text attn: {model_args.attn_implementation}, Vision attn: flash_attention_2')
 
-        config.image_token_index = image_token_index
-        config.text_config.block_size = int(model_args.block_size)
-        config.text_config.causal_attn = model_args.causal_attn
-        config.text_config.text_mask_token_id = text_mask_token_id
-        config.text_config.null_token_id = null_token_id
-        config.box_start_token_id = box_start_token_id
-        config.box_end_token_id = box_end_token_id
-        config.coord_start_token_id = coord_start_token_id
-        config.coord_end_token_id = coord_end_token_id
-        config.ref_start_token_id = ref_start_token_id
-        config.ref_end_token_id = ref_end_token_id
-        config.none_token_id = none_token_id
-        config.enable_ui_relation = model_args.enable_ui_relation
-        config.relation_detail_hidden_size = model_args.relation_detail_hidden_size
-        config.relation_num_slots = model_args.relation_num_slots
-        config.relation_adapter_bottleneck = model_args.relation_adapter_bottleneck
-        if relation_detail_layers is not None:
-            config.relation_detail_layers = relation_detail_layers
-        config.relation_gate_loss_weight = model_args.relation_gate_loss_weight
-        config.relation_attention_loss_weight = model_args.relation_attention_loss_weight
-        config.relation_gate_threshold = model_args.relation_gate_threshold
-        config.relation_focal_beta = model_args.relation_focal_beta
-        config.relation_focal_gamma = model_args.relation_focal_gamma
-
-        model = LocateAnythingForConditionalGeneration.from_pretrained(
+        loaded_model = LocateAnythingForConditionalGeneration.from_pretrained(
             model_args.model_name_or_path, 
             torch_dtype=torch.bfloat16, config=config, 
-            attn_implementation=model_args.attn_implementation
+            attn_implementation=model_args.attn_implementation,
+            output_loading_info=True,
         )
+        model, loading_info = loaded_model
+        ui_load_report = initialize_or_validate_ui_relation(
+            model,
+            loading_info,
+            seed=training_args.seed,
+            all_missing_reason="all-ui-relation-keys-missing-from-base-checkpoint",
+        )
+        logger.warning("UI Relation/Gate/PBD load policy report: %s", ui_load_report)
             
         model.text_mask_token_id = text_mask_token_id
         model.language_model.block_size = int(model_args.block_size)
@@ -2047,12 +2503,17 @@ def main():
             relation_adapter_bottleneck=model_args.relation_adapter_bottleneck,
             relation_detail_layers=relation_detail_layers,
             relation_gate_loss_weight=model_args.relation_gate_loss_weight,
+            relation_slot_gate_loss_weight=model_args.relation_slot_gate_loss_weight,
             relation_attention_loss_weight=model_args.relation_attention_loss_weight,
             relation_gate_threshold=model_args.relation_gate_threshold,
+            relation_gate_mode="observe",
             relation_focal_beta=model_args.relation_focal_beta,
             relation_focal_gamma=model_args.relation_focal_gamma)
         locateanything_config._attn_implementation = 'magi'
         model = LocateAnythingForConditionalGeneration(locateanything_config, vision_model, llm)
+        model.initialize_ui_relation_modules(
+            training_args.seed, "new-model-without-composite-checkpoint"
+        )
 
         chat_template_data = load_config(model_args.chat_template_path)
         processor_config = load_config(model_args.processor_config_path)
@@ -2063,9 +2524,8 @@ def main():
         
     model.neftune_alpha = data_args.neftune_alpha
     if getattr(model, "enable_ui_relation", False):
-        repair_report = model.repair_nonfinite_ui_relation_parameters()
-        if repair_report["values"] > 0:
-            logger.warning(f"Repaired invalid UI relation parameters: {repair_report}")
+        validation_report = model.validate_ui_relation_parameters()
+        logger.info("Validated UI relation parameters without mutation: %s", validation_report)
     
     # Enable packing mode for stream packing (works for both pretrained and scratch models)
     model.language_model.model.is_packing_mode = True
@@ -2170,6 +2630,10 @@ def main():
     # This ensures parameter order consistency across ranks for ZeRO-3
     dist.barrier()
     logger.info(f"Rank {dist.get_rank()}: Model initialization synchronized across all ranks")
+    if getattr(model, "enable_ui_relation", False):
+        rank_report = model.assert_ui_relation_rank_consistency()
+        if dist.get_rank() == 0:
+            logger.info("UI relation cross-rank checksum: %s", rank_report)
 
     set_seed(training_args.seed)
 

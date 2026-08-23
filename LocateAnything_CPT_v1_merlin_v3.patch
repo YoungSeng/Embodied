@@ -1,0 +1,601 @@
+diff --git a/README_LOCANY_CPT.md b/README_LOCANY_CPT.md
+index d1ab127..10db2bb 100644
+--- a/README_LOCANY_CPT.md
++++ b/README_LOCANY_CPT.md
+@@ -47,7 +47,7 @@ reshuffles when exhausted.
+ Run this once on the HL cluster:
+ 
+ ```bash
+-cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied
++cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+ 
+ python scripts/prepare_locany_cpt.py \
+   --source-root /mnt/bn/intelligent-service-arnold-hl/dataset/gui/gui_base/sample/raw_data_v4.1_hl_norm1k/raw_data_v4.1_hl \
+@@ -81,30 +81,42 @@ Copy the complete `locany_cpt_v4_smoke` directory to:
+ Because copied image paths are root-relative, no JSONL rewriting is needed
+ after the directory moves.
+ 
+-## Four-card launch commands
++## Four-card Merlin submissions
+ 
+-A100/A800-compatible SDPA smoke test on YG:
++A100-profile smoke test on YG (the current YG Arnold resource enum is
++`A800_SXM_40GB`, four cards, SDPA):
+ 
+ ```bash
+-cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied
+-bash shell/run_locany_cpt.sh a100 smoke
++cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
++mlx job submitv2 --path locany_cpt_v4_a100x4_smoke_merlin.yaml
+ ```
+ 
+ The default smoke run performs two optimizer steps and saves
+ `checkpoint-2`.
+ 
++A100-profile formal training on YG:
++
++The complete prepared directory must exist at
++`/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4`
++before submission.
++
++```bash
++cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
++mlx job submitv2 --path locany_cpt_v4_a100x4_formal_merlin.yaml
++```
++
+ H20 Magi formal training on HL:
+ 
+ ```bash
+-cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied
+-bash shell/run_locany_cpt.sh h20 formal
++cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
++mlx job submitv2 --path locany_cpt_v4_h20x4_formal_merlin.yaml
+ ```
+ 
+ Formal defaults are full-parameter training, four GPUs, gradient accumulation
+-2, learning rate `5e-6`, 20,000 optimizer steps, H20 `8192/25600` per-sample
+-and per-rank packed-token limits, and a checkpoint approximately every 12
+-hours.  Trainer checkpoint directories always include the current optimizer
+-global step, for example `checkpoint-4372`.
++2, learning rate `5e-6`, 20,000 optimizer steps, A100-profile `7268/12800`
++and H20 `8192/25600` per-sample/per-rank packed-token limits, and a checkpoint
++approximately every 12 hours. Trainer checkpoint directories always include
++the current optimizer global step, for example `checkpoint-4372`.
+ 
+ All defaults can be overridden without editing code:
+ 
+@@ -116,6 +128,13 @@ SAVE_EVERY_N_HOURS=12 \
+ bash shell/run_locany_cpt.sh h20 formal
+ ```
+ 
++The direct `bash shell/run_locany_cpt.sh ...` commands are retained for an
++already allocated interactive worker.  Normal smoke and formal runs should be
++submitted through the Merlin YAML files above.  All three YAMLs use
++`shell/run_locany_cpt_merlin.sh` for cache isolation, four-GPU preflight,
++logging, and exit-code propagation, then delegate training parameters to
++`shell/run_locany_cpt.sh`.
++
+ An interrupted run resumes from the newest complete checkpoint in the same
+ `OUTPUT_DIR`, including optimizer, scheduler, random state, and packed
+ dataloader state.
+diff --git a/shell/run_locany_cpt.sh b/shell/run_locany_cpt.sh
+index 37f8a50..3edd8d1 100755
+--- a/shell/run_locany_cpt.sh
++++ b/shell/run_locany_cpt.sh
+@@ -3,6 +3,7 @@ set -Eeuo pipefail
+ 
+ # Usage:
+ #   bash shell/run_locany_cpt.sh a100 smoke
++#   bash shell/run_locany_cpt.sh a100 formal
+ #   bash shell/run_locany_cpt.sh h20 formal
+ 
+ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+diff --git a/shell/run_locany_cpt_merlin.sh b/shell/run_locany_cpt_merlin.sh
+new file mode 100755
+index 0000000..ecc595a
+--- /dev/null
++++ b/shell/run_locany_cpt_merlin.sh
+@@ -0,0 +1,167 @@
++#!/usr/bin/env bash
++set -Eeuo pipefail
++
++# Common in-container launcher used by the three Merlin job definitions.
++# Usage: bash shell/run_locany_cpt_merlin.sh <a100|h20> <smoke|formal>
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
++MACHINE_TYPE="${1:-}"
++CPT_MODE="${2:-}"
++
++if [[ "${MACHINE_TYPE}" != "a100" && "${MACHINE_TYPE}" != "h20" ]]; then
++  echo "Usage: bash shell/run_locany_cpt_merlin.sh <a100|h20> <smoke|formal>" >&2
++  exit 2
++fi
++if [[ "${CPT_MODE}" != "smoke" && "${CPT_MODE}" != "formal" ]]; then
++  echo "CPT mode must be smoke or formal, got: ${CPT_MODE}" >&2
++  exit 2
++fi
++if [[ "${MACHINE_TYPE}" == "h20" && "${CPT_MODE}" != "formal" ]]; then
++  echo "Only the formal H20 Merlin profile is defined." >&2
++  exit 2
++fi
++
++case "${MACHINE_TYPE}" in
++  a100)
++    WORKSPACE="${WORKSPACE:-/mnt/bn/intelligent-service-yg/logging/sicheng_workspace}"
++    FILESYSTEM_ROOT=/mnt/bn/intelligent-service-yg
++    ;;
++  h20)
++    WORKSPACE="${WORKSPACE:-/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace}"
++    FILESYSTEM_ROOT=/mnt/bn/intelligent-service-arnold-hl
++    ;;
++esac
++
++ENV_DIR="${ENV_DIR:-${WORKSPACE}/conda_envs/LocateAnything}"
++RAW_JOB_ID="${ARNOLD_TRIAL_ID:-${ARNOLD_JOB_ID:-manual-$$}}"
++JOB_ID="${RAW_JOB_ID//[^a-zA-Z0-9._-]/_}"
++LOCAL_RUNTIME_DIR="${LOCAL_RUNTIME_DIR:-/tmp/locany-cpt-${JOB_ID}}"
++SHARED_RUNTIME_DIR="${SHARED_RUNTIME_DIR:-${WORKSPACE}/runtime/locany-cpt/${JOB_ID}}"
++CACHE_ROOT="${CACHE_ROOT:-${LOCAL_RUNTIME_DIR}/cache}"
++
++mkdir -p \
++  "${SHARED_RUNTIME_DIR}" \
++  "${CACHE_ROOT}/tmp" \
++  "${CACHE_ROOT}/pycache" \
++  "${CACHE_ROOT}/hf_datasets" \
++  "${CACHE_ROOT}/triton" \
++  "${CACHE_ROOT}/torch_extensions" \
++  "${CACHE_ROOT}/torchinductor" \
++  "${CACHE_ROOT}/cuda" \
++  "${CACHE_ROOT}/xdg" \
++  "${CACHE_ROOT}/wandb" \
++  "${WORKSPACE}/cache/huggingface/hub" \
++  "${WORKSPACE}/cache/torch"
++
++export PROJECT_ROOT WORKSPACE ENV_DIR CACHE_ROOT
++export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${CUDA_DEVICES:-0,1,2,3}}"
++export PATH="${ENV_DIR}/bin:${PATH}"
++export CONDA_PREFIX="${ENV_DIR}"
++export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
++export PYTHONNOUSERSITE=1
++export PYTHONUNBUFFERED=1
++export TOKENIZERS_PARALLELISM=false
++
++# Lock-heavy caches stay on the worker-local disk. Reusable model downloads
++# remain on ByteNAS, but formal jobs run offline against MODEL_PATH.
++export TMPDIR="${CACHE_ROOT}/tmp"
++export TEMP="${TMPDIR}"
++export TMP="${TMPDIR}"
++export PYTHONPYCACHEPREFIX="${CACHE_ROOT}/pycache"
++export HF_HOME="${HF_HOME:-${WORKSPACE}/cache/huggingface}"
++export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
++export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HUB_CACHE}}"
++export HF_DATASETS_CACHE="${CACHE_ROOT}/hf_datasets"
++export TRITON_CACHE_DIR="${CACHE_ROOT}/triton"
++export TORCH_EXTENSIONS_DIR="${CACHE_ROOT}/torch_extensions"
++export TORCHINDUCTOR_CACHE_DIR="${CACHE_ROOT}/torchinductor"
++export CUDA_CACHE_PATH="${CACHE_ROOT}/cuda"
++export XDG_CACHE_HOME="${CACHE_ROOT}/xdg"
++export WANDB_DIR="${CACHE_ROOT}/wandb"
++export TORCH_HOME="${WORKSPACE}/cache/torch"
++export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
++export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
++export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
++export HF_HUB_DISABLE_TELEMETRY=1
++export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
++export NCCL_ASYNC_ERROR_HANDLING=1
++export CUDA_DEVICE_ORDER=PCI_BUS_ID
++export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
++
++if [[ "${CPT_MODE}" == "smoke" ]]; then
++  export RUN_NAME="${RUN_NAME:-locany-3b-ui-cpt-v4-a100x4-smoke-${JOB_ID}}"
++  export REPORT_TO="${REPORT_TO:-none}"
++else
++  export RUN_NAME="${RUN_NAME:-locany-3b-ui-cpt-v4-${MACHINE_TYPE}x4-formal}"
++  export REPORT_TO="${REPORT_TO:-tensorboard}"
++fi
++
++test -d "${PROJECT_ROOT}" || {
++  echo "ERROR: Project directory not found: ${PROJECT_ROOT}" >&2
++  exit 20
++}
++test -x "${ENV_DIR}/bin/python" || {
++  echo "ERROR: Python environment not found: ${ENV_DIR}" >&2
++  exit 21
++}
++test -f "${PROJECT_ROOT}/shell/run_locany_cpt.sh" || {
++  echo "ERROR: CPT launcher not found under ${PROJECT_ROOT}" >&2
++  exit 22
++}
++test -d "${FILESYSTEM_ROOT}" || {
++  echo "ERROR: ByteNAS mount not found: ${FILESYSTEM_ROOT}" >&2
++  exit 23
++}
++
++cd "${PROJECT_ROOT}"
++hash -r
++ulimit -n 65535 || true
++
++echo "===== LocateAnything CPT Merlin preflight ====="
++echo "job_id           : ${JOB_ID}"
++echo "machine          : ${MACHINE_TYPE}"
++echo "mode             : ${CPT_MODE}"
++echo "project_root     : ${PROJECT_ROOT}"
++echo "workspace        : ${WORKSPACE}"
++echo "environment      : ${ENV_DIR}"
++echo "run_name         : ${RUN_NAME}"
++echo "visible_gpus     : ${CUDA_VISIBLE_DEVICES}"
++echo "local_cache      : ${CACHE_ROOT}"
++echo "launcher_log     : ${SHARED_RUNTIME_DIR}/launcher.log"
++git rev-parse --short HEAD 2>/dev/null || true
++bash -n "${PROJECT_ROOT}/shell/run_locany_cpt.sh"
++bash -n "${PROJECT_ROOT}/shell/train_locany_ui_defect.sh"
++
++"${ENV_DIR}/bin/python" - "${MACHINE_TYPE}" <<'PY'
++import importlib.util
++import sys
++import torch
++
++machine = sys.argv[1]
++print("python:", sys.executable)
++print("torch:", torch.__version__)
++print("cuda available:", torch.cuda.is_available())
++print("gpu count:", torch.cuda.device_count())
++for index in range(torch.cuda.device_count()):
++    print(f"gpu {index}:", torch.cuda.get_device_name(index))
++if not torch.cuda.is_available() or torch.cuda.device_count() != 4:
++    raise SystemExit("Merlin CPT jobs require exactly four visible GPUs")
++if machine == "h20" and importlib.util.find_spec("magi_attention") is None:
++    raise SystemExit("H20 formal profile requires magi_attention")
++PY
++
++df -h /tmp "${FILESYSTEM_ROOT}" || true
++nvidia-smi
++
++LAUNCH_LOG="${SHARED_RUNTIME_DIR}/launcher.log"
++echo "===== Start ${MACHINE_TYPE} ${CPT_MODE} ====="
++set +e
++bash "${PROJECT_ROOT}/shell/run_locany_cpt.sh" "${MACHINE_TYPE}" "${CPT_MODE}" \
++  2>&1 | tee -a "${LAUNCH_LOG}"
++TRAIN_EXIT_CODE="${PIPESTATUS[0]}"
++set -e
++
++echo "TRAIN_EXIT_CODE=${TRAIN_EXIT_CODE}"
++echo "LAUNCH_LOG=${LAUNCH_LOG}"
++exit "${TRAIN_EXIT_CODE}"
+diff --git a/locany_cpt_v4_a100x4_smoke_merlin.yaml b/locany_cpt_v4_a100x4_smoke_merlin.yaml
+new file mode 100644
+index 0000000..f4d8dc5
+--- /dev/null
++++ b/locany_cpt_v4_a100x4_smoke_merlin.yaml
+@@ -0,0 +1,80 @@
++# Merlin smoke test: LocateAnything-3B UI CPT, YG four-card SDPA profile.
++# The YG resource enum used by the existing project is A800_SXM_40GB;
++# the training profile remains named "a100" for compatibility.
++# Submit: mlx job submitv2 --path locany_cpt_v4_a100x4_smoke_merlin.yaml
++
++caption: 'LocateAnything UI CPT Smoke - A100 profile x4'
++
++jobDefVersion:
++  entrypointMode: FULL_SCRIPT
++
++  gitRepo:
++    mnt: /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
++
++  imageMeta:
++    imageSource: url
++    imageUrl: hub.byted.org/base/lab.cuda.devel:0ffcd17bfdf8d07a198e6cff167eae26
++    imageVid: d8ap37f1enlcr23291ug
++
++  lazyDownloadCode: true
++  name: 'locany-cpt-v4-a100x4-smoke'
++
++  resource:
++    arnoldConfig:
++      clusterId: 24
++      elasticTraining: {}
++      groupIds:
++        - 1602
++      bytenasVolumes:
++        - name: intelligent-service-yg
++          accessMode: RW
++          roles:
++            - worker
++          subPath: ""
++      keepMins: 1
++      preemptible: false
++      quotaPool: default
++      roles:
++        - name: worker
++          num: 1
++          cpu: 58
++          gpu: 4
++          gpuv: A800_SXM_40GB
++          memory: 262144
++          ports: 1
++    backend: ARNOLD
++
++  volumes:
++    - volumeId: 19922
++      mountPath: /mnt/bn/intelligent-service-yg
++
++jobRunParams:
++  entrypointFullScript: |
++    set -Eeuo pipefail
++    PROJECT_ROOT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
++    test -f "${PROJECT_ROOT}/shell/run_locany_cpt_merlin.sh"
++    cd "${PROJECT_ROOT}"
++    export PROJECT_ROOT
++    export WORKSPACE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace
++    export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES:-0,1,2,3}"
++    exec bash shell/run_locany_cpt_merlin.sh a100 smoke
++
++  envsList:
++    CUDA_DEVICES: "0,1,2,3"
++    DATA_DIR: "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4_smoke"
++    RECIPE_NAME: "locany_cpt_smoke.json"
++    ATTN_IMPLEMENTATION: "sdpa"
++    MAX_SEQ_LENGTH: "7268"
++    MAX_NUM_TOKENS_PER_SAMPLE: "7268"
++    MAX_NUM_TOKENS: "12800"
++    PACKING_BUFFER_SIZE: "16"
++    GRADIENT_ACCUMULATION_STEPS: "2"
++    MAX_STEPS: "2"
++    WARMUP_STEPS: "0"
++    LEARNING_RATE: "5e-6"
++    SAVE_STEPS: "2"
++    SAVE_EVERY_N_HOURS: "0"
++    SAVE_TOTAL_LIMIT: "2"
++    REPORT_TO: "none"
++
++namespace: /user/sicheng.yang
+diff --git a/locany_cpt_v4_a100x4_formal_merlin.yaml b/locany_cpt_v4_a100x4_formal_merlin.yaml
+new file mode 100644
+index 0000000..ad72138
+--- /dev/null
++++ b/locany_cpt_v4_a100x4_formal_merlin.yaml
+@@ -0,0 +1,79 @@
++# Merlin formal training: LocateAnything-3B UI CPT, YG four-card SDPA profile.
++# Submit: mlx job submitv2 --path locany_cpt_v4_a100x4_formal_merlin.yaml
++
++caption: 'LocateAnything UI CPT Formal - A100 profile x4'
++
++jobDefVersion:
++  entrypointMode: FULL_SCRIPT
++
++  gitRepo:
++    mnt: /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
++
++  imageMeta:
++    imageSource: url
++    imageUrl: hub.byted.org/base/lab.cuda.devel:0ffcd17bfdf8d07a198e6cff167eae26
++    imageVid: d8ap37f1enlcr23291ug
++
++  lazyDownloadCode: true
++  name: 'locany-cpt-v4-a100x4-formal'
++
++  resource:
++    arnoldConfig:
++      clusterId: 24
++      elasticTraining: {}
++      groupIds:
++        - 1602
++      bytenasVolumes:
++        - name: intelligent-service-yg
++          accessMode: RW
++          roles:
++            - worker
++          subPath: ""
++      keepMins: 1
++      preemptible: false
++      quotaPool: default
++      roles:
++        - name: worker
++          num: 1
++          cpu: 58
++          gpu: 4
++          gpuv: A800_SXM_40GB
++          memory: 262144
++          ports: 1
++    backend: ARNOLD
++
++  volumes:
++    - volumeId: 19922
++      mountPath: /mnt/bn/intelligent-service-yg
++
++jobRunParams:
++  entrypointFullScript: |
++    set -Eeuo pipefail
++    PROJECT_ROOT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
++    test -f "${PROJECT_ROOT}/shell/run_locany_cpt_merlin.sh"
++    cd "${PROJECT_ROOT}"
++    export PROJECT_ROOT
++    export WORKSPACE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace
++    export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES:-0,1,2,3}"
++    exec bash shell/run_locany_cpt_merlin.sh a100 formal
++
++  envsList:
++    CUDA_DEVICES: "0,1,2,3"
++    DATA_DIR: "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4"
++    RECIPE_NAME: "locany_cpt_train.json"
++    RUN_NAME: "locany-3b-ui-cpt-v4-a100x4-formal"
++    ATTN_IMPLEMENTATION: "sdpa"
++    MAX_SEQ_LENGTH: "7268"
++    MAX_NUM_TOKENS_PER_SAMPLE: "7268"
++    MAX_NUM_TOKENS: "12800"
++    PACKING_BUFFER_SIZE: "16"
++    GRADIENT_ACCUMULATION_STEPS: "2"
++    MAX_STEPS: "20000"
++    WARMUP_STEPS: "500"
++    LEARNING_RATE: "5e-6"
++    SAVE_STEPS: "1000000000"
++    SAVE_EVERY_N_HOURS: "12"
++    SAVE_TOTAL_LIMIT: "20"
++    REPORT_TO: "tensorboard"
++
++namespace: /user/sicheng.yang
+diff --git a/locany_cpt_v4_h20x4_formal_merlin.yaml b/locany_cpt_v4_h20x4_formal_merlin.yaml
+new file mode 100644
+index 0000000..79f40c9
+--- /dev/null
++++ b/locany_cpt_v4_h20x4_formal_merlin.yaml
+@@ -0,0 +1,80 @@
++# Merlin formal training: LocateAnything-3B UI CPT, HL H20 x4 Magi profile.
++# Submit: mlx job submitv2 --path locany_cpt_v4_h20x4_formal_merlin.yaml
++
++caption: 'LocateAnything UI CPT Formal - H20x4'
++
++jobDefVersion:
++  entrypointMode: FULL_SCRIPT
++
++  gitRepo:
++    mnt: /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
++
++  imageMeta:
++    imageSource: url
++    imageUrl: hub.byted.org/base/lab.cuda.devel:0ffcd17bfdf8d07a198e6cff167eae26
++    imageVid: d8ap37f1enlcr23291ug
++
++  lazyDownloadCode: true
++  name: 'locany-cpt-v4-h20x4-formal'
++
++  resource:
++    arnoldConfig:
++      clusterId: 20
++      elasticTraining: {}
++      groupIds:
++        - 1000
++      bytenasVolumes:
++        - name: intelligent-service-arnold-hl
++          accessMode: RW
++          roles:
++            - worker
++          subPath: ""
++      keepMins: 1
++      preemptible: false
++      quotaPool: default
++      roles:
++        - name: worker
++          num: 1
++          cpu: 80
++          gpu: 4
++          gpuv: NVIDIA_H20
++          queueName: compute-329-hl-cloudnative-ai-iesqa.llm4se-guarantee
++          memory: 921600
++          ports: 1
++    backend: ARNOLD
++
++  volumes:
++    - volumeId: 18834
++      mountPath: /mnt/bn/intelligent-service-arnold-hl
++
++jobRunParams:
++  entrypointFullScript: |
++    set -Eeuo pipefail
++    PROJECT_ROOT=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
++    test -f "${PROJECT_ROOT}/shell/run_locany_cpt_merlin.sh"
++    cd "${PROJECT_ROOT}"
++    export PROJECT_ROOT
++    export WORKSPACE=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace
++    export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES:-0,1,2,3}"
++    exec bash shell/run_locany_cpt_merlin.sh h20 formal
++
++  envsList:
++    CUDA_DEVICES: "0,1,2,3"
++    DATA_DIR: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4"
++    RECIPE_NAME: "locany_cpt_train.json"
++    RUN_NAME: "locany-3b-ui-cpt-v4-h20x4-formal"
++    ATTN_IMPLEMENTATION: "magi"
++    MAX_SEQ_LENGTH: "8192"
++    MAX_NUM_TOKENS_PER_SAMPLE: "8192"
++    MAX_NUM_TOKENS: "25600"
++    PACKING_BUFFER_SIZE: "32"
++    GRADIENT_ACCUMULATION_STEPS: "2"
++    MAX_STEPS: "20000"
++    WARMUP_STEPS: "500"
++    LEARNING_RATE: "5e-6"
++    SAVE_STEPS: "1000000000"
++    SAVE_EVERY_N_HOURS: "12"
++    SAVE_TOTAL_LIMIT: "20"
++    REPORT_TO: "tensorboard"
++
++namespace: /user/sicheng.yang
+diff --git a/tests/test_locany_cpt_merlin.py b/tests/test_locany_cpt_merlin.py
+new file mode 100644
+index 0000000..ed7d1a4
+--- /dev/null
++++ b/tests/test_locany_cpt_merlin.py
+@@ -0,0 +1,72 @@
++from __future__ import annotations
++
++import unittest
++from pathlib import Path
++
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++
++
++class LocateAnythingCPTMerlinTest(unittest.TestCase):
++    PROFILES = {
++        "locany_cpt_v4_a100x4_smoke_merlin.yaml": (
++            "shell/run_locany_cpt_merlin.sh a100 smoke",
++            "gpuv: A800_SXM_40GB",
++            "clusterId: 24",
++        ),
++        "locany_cpt_v4_a100x4_formal_merlin.yaml": (
++            "shell/run_locany_cpt_merlin.sh a100 formal",
++            "gpuv: A800_SXM_40GB",
++            "clusterId: 24",
++        ),
++        "locany_cpt_v4_h20x4_formal_merlin.yaml": (
++            "shell/run_locany_cpt_merlin.sh h20 formal",
++            "gpuv: NVIDIA_H20",
++            "clusterId: 20",
++        ),
++    }
++
++    def test_merlin_profiles_have_expected_resources_and_commands(self):
++        for filename, expected in self.PROFILES.items():
++            with self.subTest(filename=filename):
++                text = (REPO_ROOT / filename).read_text(encoding="utf-8")
++                for value in expected:
++                    self.assertIn(value, text)
++                self.assertIn("gpu: 4", text)
++                self.assertIn("Embodied-CPT", text)
++                self.assertIn("CUDA_DEVICES: \"0,1,2,3\"", text)
++
++    def test_yaml_pins_smoke_and_formal_training_parameters(self):
++        smoke = (REPO_ROOT / "locany_cpt_v4_a100x4_smoke_merlin.yaml").read_text(
++            encoding="utf-8"
++        )
++        self.assertIn('MAX_STEPS: "2"', smoke)
++        self.assertIn('SAVE_STEPS: "2"', smoke)
++        self.assertIn('MAX_NUM_TOKENS: "12800"', smoke)
++
++        a100 = (REPO_ROOT / "locany_cpt_v4_a100x4_formal_merlin.yaml").read_text(
++            encoding="utf-8"
++        )
++        h20 = (REPO_ROOT / "locany_cpt_v4_h20x4_formal_merlin.yaml").read_text(
++            encoding="utf-8"
++        )
++        for text in (a100, h20):
++            self.assertIn('GRADIENT_ACCUMULATION_STEPS: "2"', text)
++            self.assertIn('MAX_STEPS: "20000"', text)
++            self.assertIn('LEARNING_RATE: "5e-6"', text)
++            self.assertIn('SAVE_EVERY_N_HOURS: "12"', text)
++            self.assertIn('SAVE_STEPS: "1000000000"', text)
++        self.assertIn('MAX_NUM_TOKENS: "12800"', a100)
++        self.assertIn('ATTN_IMPLEMENTATION: "sdpa"', a100)
++        self.assertIn('MAX_NUM_TOKENS: "25600"', h20)
++        self.assertIn('ATTN_IMPLEMENTATION: "magi"', h20)
++
++    def test_formal_defaults_keep_four_card_rank_batch_and_twelve_hour_saves(self):
++        launcher = (REPO_ROOT / "shell" / "run_locany_cpt.sh").read_text(encoding="utf-8")
++        self.assertIn('GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"', launcher)
++        self.assertIn('SAVE_EVERY_N_HOURS="${SAVE_EVERY_N_HOURS:-12}"', launcher)
++        self.assertIn('MAX_STEPS="${MAX_STEPS:-20000}"', launcher)
++
++
++if __name__ == "__main__":
++    unittest.main()
+

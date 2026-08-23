@@ -24,6 +24,7 @@ TRAIN_BASE_COLUMNS = (
     "max_num_tokens",
     "learning_rate",
     "gate_loss_weight",
+    "slot_gate_loss_weight",
     "attention_loss_weight",
     "gate_threshold",
     "focal_beta",
@@ -34,9 +35,19 @@ TRAIN_BASE_COLUMNS = (
     "loss_total_max",
     "loss_lm",
     "loss_gate",
+    "loss_image_gate",
+    "loss_slot_gate",
     "loss_attention",
     "weighted_gate_loss",
+    "weighted_slot_gate_loss",
     "weighted_attention_loss",
+    "loss_lm_contribution",
+    "loss_image_gate_contribution",
+    "loss_slot_gate_contribution",
+    "loss_attention_contribution",
+    "loss_reconstructed",
+    "loss_reconstruction_error",
+    "attention_active_batch_rate",
     "grad_norm",
     "grad_norm_max",
     "samples",
@@ -55,6 +66,10 @@ TRAIN_TASK_SUFFIXES = (
     "gate_precision",
     "gate_recall",
     "gate_f1",
+    "gate_pr_auc",
+    "slot_gate_loss",
+    "slot_positive",
+    "slot_negative",
     "detail_weight_l5",
     "detail_weight_l15",
     "detail_weight_l26",
@@ -63,14 +78,38 @@ TRAIN_MODULE_COLUMNS = (
     "detail_layer5_norm",
     "detail_layer15_norm",
     "detail_layer26_norm",
+    "detail_layer5_abs_max",
+    "detail_layer15_abs_max",
+    "detail_layer26_abs_max",
+    "detail_layer5_saturation_fraction",
+    "detail_layer15_saturation_fraction",
+    "detail_layer26_saturation_fraction",
+    "detail_norm_ratio",
     "detail_fused_norm",
     "relation_context_norm",
     "relation_gate_prob_mean",
     "pbd_delta_norm",
     "pbd_active_positions",
     "relation_grad_norm",
-    "gate_grad_norm",
+    "image_gate_grad_norm",
+    "slot_gate_grad_norm",
     "pbd_grad_norm",
+    "relation_grad_seen_steps",
+    "image_gate_grad_seen_steps",
+    "slot_gate_grad_seen_steps",
+    "pbd_grad_seen_steps",
+    "relation_absolute_update_norm",
+    "relation_relative_update_norm",
+    "relation_changed_element_count",
+    "image_gate_absolute_update_norm",
+    "image_gate_relative_update_norm",
+    "image_gate_changed_element_count",
+    "slot_gate_absolute_update_norm",
+    "slot_gate_relative_update_norm",
+    "slot_gate_changed_element_count",
+    "pbd_absolute_update_norm",
+    "pbd_relative_update_norm",
+    "pbd_changed_element_count",
 )
 TRAIN_COLUMNS = (
     *TRAIN_BASE_COLUMNS,
@@ -104,6 +143,16 @@ EVAL_COLUMNS = (
     "f1_change_from_previous",
     "best_f1_so_far",
     "best_step_so_far",
+    "raw_precision",
+    "raw_recall",
+    "raw_f1",
+    "raw_predicted_positive",
+    "selected_gate_threshold",
+    "gated_precision",
+    "gated_recall",
+    "gated_f1",
+    "gated_predicted_positive",
+    "gate_filter_rate",
 )
 
 SHEET_TRAIN = "train_100steps"
@@ -203,6 +252,28 @@ class UI5ExcelLogger:
             raise ValueError(
                 f"Expected exactly sheets {EXPECTED_SHEETS}, found {workbook.sheetnames}"
             )
+        for sheet_name, expected in (
+            (SHEET_TRAIN, TRAIN_COLUMNS),
+            (SHEET_EVAL, EVAL_COLUMNS),
+        ):
+            sheet = workbook[sheet_name]
+            current = tuple(cell.value for cell in sheet[1])
+            if current != expected:
+                if not set(current).issubset(set(expected)):
+                    workbook.close()
+                    raise ValueError(
+                        f"Cannot migrate {sheet_name} header: current={current}"
+                    )
+                rows = [
+                    dict(zip(current, values))
+                    for values in sheet.iter_rows(min_row=2, values_only=True)
+                ]
+                sheet.delete_rows(1, sheet.max_row)
+                sheet.append(list(expected))
+                for row in rows:
+                    sheet.append([row.get(column) for column in expected])
+                sheet.freeze_panes = "A2"
+                sheet.auto_filter.ref = sheet.dimensions
         return workbook
 
     def _atomic_save(self, workbook) -> None:
@@ -399,6 +470,16 @@ def build_eval_rows(
                     "p_defect_pos": gate.get("p_defect_pos"),
                     "p_defect_neg": gate.get("p_defect_neg"),
                     "parse_error": gate.get("parse_error"),
+                    "raw_precision": gate.get("raw_precision"),
+                    "raw_recall": gate.get("raw_recall"),
+                    "raw_f1": gate.get("raw_f1"),
+                    "raw_predicted_positive": gate.get("raw_predicted_positive"),
+                    "selected_gate_threshold": gate.get("selected_gate_threshold"),
+                    "gated_precision": gate.get("gated_precision"),
+                    "gated_recall": gate.get("gated_recall"),
+                    "gated_f1": gate.get("gated_f1"),
+                    "gated_predicted_positive": gate.get("gated_predicted_positive"),
+                    "gate_filter_rate": gate.get("gate_filter_rate"),
                 }
             )
 
@@ -475,6 +556,41 @@ def build_eval_rows(
                 "parse_error": sum(
                     int(gate_metrics.get(task, {}).get("parse_error", 0))
                     for task in scorer_to_diagnostic
+                ),
+                "raw_precision": (
+                    sum(float(row.get("raw_precision") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "raw_recall": (
+                    sum(float(row.get("raw_recall") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "raw_f1": (
+                    sum(float(row.get("raw_f1") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "raw_predicted_positive": summed("raw_predicted_positive"),
+                "selected_gate_threshold": (
+                    sum(float(row.get("selected_gate_threshold") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "gated_precision": (
+                    sum(float(row.get("gated_precision") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "gated_recall": (
+                    sum(float(row.get("gated_recall") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "gated_f1": (
+                    sum(float(row.get("gated_f1") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "gated_predicted_positive": summed("gated_predicted_positive"),
+                "gate_filter_rate": (
+                    1.0
+                    - summed("gated_predicted_positive")
+                    / max(1, summed("raw_predicted_positive"))
                 ),
             }
         )

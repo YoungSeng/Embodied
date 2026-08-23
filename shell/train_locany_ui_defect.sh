@@ -310,6 +310,9 @@ echo "UI_RECORDS_PER_CLASS           : ${UI_RECORDS_PER_CLASS:-17604}"
 echo "UI_NEGATIVE:POSITIVE           : ${UI_NEGATIVE_TO_POSITIVE_RATIO:-2.0}:1"
 echo "PACKING_BUFFER_SIZE           : ${PACKING_BUFFER_SIZE}"
 echo "GRADIENT_ACCUMULATION_STEPS   : ${GRADIENT_ACCUMULATION_STEPS}"
+echo "RELATION_GATE_LOSS_WEIGHT     : ${RELATION_GATE_LOSS_WEIGHT:-1.0}"
+echo "RELATION_SLOT_GATE_LOSS_WEIGHT: ${RELATION_SLOT_GATE_LOSS_WEIGHT:-0.1}"
+echo "RELATION_ATTENTION_LOSS_WEIGHT: ${RELATION_ATTENTION_LOSS_WEIGHT:-0.1}"
 echo "LEARNING_RATE                 : ${LEARNING_RATE}"
 echo "MAX_STEPS                     : ${MAX_STEPS}"
 echo "SAVE_EVERY_N_HOURS            : ${SAVE_EVERY_N_HOURS:-0}"
@@ -356,6 +359,7 @@ if torchrun \
   --relation_num_slots "${RELATION_NUM_SLOTS:-8}" \
   --relation_adapter_bottleneck "${RELATION_ADAPTER_BOTTLENECK:-64}" \
   --relation_gate_loss_weight "${RELATION_GATE_LOSS_WEIGHT:-1.0}" \
+  --relation_slot_gate_loss_weight "${RELATION_SLOT_GATE_LOSS_WEIGHT:-0.1}" \
   --relation_attention_loss_weight "${RELATION_ATTENTION_LOSS_WEIGHT:-0.1}" \
   --relation_gate_threshold "${RELATION_GATE_THRESHOLD:-0.5}" \
   --relation_focal_beta "${RELATION_FOCAL_BETA:-0.999}" \

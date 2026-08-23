@@ -137,6 +137,8 @@ bash -n "${PROJECT_ROOT}/shell/train_locany_ui_defect.sh"
 import importlib.util
 import sys
 import torch
+import os
+expected_gpu_count = int(os.environ.get("GPU_COUNT", "4"))
 
 machine = sys.argv[1]
 print("python:", sys.executable)
@@ -145,7 +147,7 @@ print("cuda available:", torch.cuda.is_available())
 print("gpu count:", torch.cuda.device_count())
 for index in range(torch.cuda.device_count()):
     print(f"gpu {index}:", torch.cuda.get_device_name(index))
-if not torch.cuda.is_available() or torch.cuda.device_count() != 4:
+if not torch.cuda.is_available() or torch.cuda.device_count() != expected_gpu_count:
     raise SystemExit("Merlin CPT jobs require exactly four visible GPUs")
 if machine == "h20" and importlib.util.find_spec("magi_attention") is None:
     raise SystemExit("H20 formal profile requires magi_attention")

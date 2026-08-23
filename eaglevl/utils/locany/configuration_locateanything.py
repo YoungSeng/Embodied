@@ -70,10 +70,15 @@ class LocateAnythingConfig(PretrainedConfig):
             relation_adapter_bottleneck=64,
             relation_detail_layers=None,
             relation_gate_loss_weight=1.0,
+            relation_slot_gate_loss_weight=0.1,
             relation_attention_loss_weight=0.1,
             relation_focal_gamma=2.0,
             relation_focal_beta=0.999,
             relation_gate_threshold=0.5,
+            relation_gate_mode="observe",
+            relation_gate_thresholds=None,
+            ui_relation_initialization_seed=20260823,
+            ui_relation_initialization_reason=None,
             **kwargs):
         super().__init__(**kwargs)
 
@@ -127,10 +132,17 @@ class LocateAnythingConfig(PretrainedConfig):
                 f"layers={self.relation_detail_layers}, num_layers={self.vision_config.num_hidden_layers}"
             )
         self.relation_gate_loss_weight = relation_gate_loss_weight
+        self.relation_slot_gate_loss_weight = relation_slot_gate_loss_weight
         self.relation_attention_loss_weight = relation_attention_loss_weight
         self.relation_focal_gamma = relation_focal_gamma
         self.relation_focal_beta = relation_focal_beta
         self.relation_gate_threshold = relation_gate_threshold
+        self.relation_gate_mode = str(relation_gate_mode).lower()
+        if self.relation_gate_mode not in {"observe", "hard"}:
+            raise ValueError("relation_gate_mode must be 'observe' or 'hard'")
+        self.relation_gate_thresholds = dict(relation_gate_thresholds or {})
+        self.ui_relation_initialization_seed = int(ui_relation_initialization_seed)
+        self.ui_relation_initialization_reason = ui_relation_initialization_reason
         if not 0.0 <= float(self.relation_gate_threshold) <= 1.0:
             raise ValueError("relation_gate_threshold must be in [0, 1]")
 
@@ -163,10 +175,15 @@ class LocateAnythingConfig(PretrainedConfig):
         output['relation_adapter_bottleneck'] = self.relation_adapter_bottleneck
         output['relation_detail_layers'] = self.relation_detail_layers
         output['relation_gate_loss_weight'] = self.relation_gate_loss_weight
+        output['relation_slot_gate_loss_weight'] = self.relation_slot_gate_loss_weight
         output['relation_attention_loss_weight'] = self.relation_attention_loss_weight
         output['relation_focal_gamma'] = self.relation_focal_gamma
         output['relation_focal_beta'] = self.relation_focal_beta
         output['relation_gate_threshold'] = self.relation_gate_threshold
+        output['relation_gate_mode'] = self.relation_gate_mode
+        output['relation_gate_thresholds'] = self.relation_gate_thresholds
+        output['ui_relation_initialization_seed'] = self.ui_relation_initialization_seed
+        output['ui_relation_initialization_reason'] = self.ui_relation_initialization_reason
         output['_attn_implementation'] = self._attn_implementation
         if hasattr(self, '_attn_implementation_autoset'):
             output['_attn_implementation_autoset'] = self._attn_implementation_autoset

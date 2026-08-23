@@ -395,6 +395,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--relation-gate-mode",
+        choices=("observe", "hard"),
+        default="observe",
+        help="observe 始终生成并记录 Gate；hard 才允许阈值提前返回 none",
+    )
+    parser.add_argument(
+        "--relation-gate-threshold",
+        type=float,
+        default=None,
+        help="仅覆盖本次推理阈值，不写回 checkpoint config",
+    )
+    parser.add_argument(
         "--no-enable-ui-relation",
         dest="enable_ui_relation",
         action="store_false",
@@ -466,6 +478,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-images-per-task 不能小于 0")
     if args.compat_confidence is not None and not 0 <= args.compat_confidence <= 1:
         parser.error("--compat-confidence 必须位于 [0, 1]")
+    if args.relation_gate_threshold is not None and not 0 <= args.relation_gate_threshold <= 1:
+        parser.error("--relation-gate-threshold 必须位于 [0, 1]")
     if args.preflight_forward and not args.load_only:
         parser.error("--preflight-forward 必须与 --load-only 一起使用")
 
@@ -931,6 +945,8 @@ class LocateAnythingInferencer:
         print(f"logical device          : {self.device}")
         print(f"dtype                   : {args.dtype}")
         print(f"generation mode         : {args.generation_mode}")
+        print(f"relation gate mode      : {args.relation_gate_mode}")
+        print(f"relation gate override  : {args.relation_gate_threshold}")
 
         if self.device.startswith("cuda"):
             logical_index = int(self.device.split(":", 1)[1]) if ":" in self.device else 0
@@ -1003,9 +1019,23 @@ class LocateAnythingInferencer:
                 for key in loading_info.get("unexpected_keys", ())
                 if "relation_pyramid" in key or "relation_pbd" in key
             ]
+            legacy_slot_gate = bool(
+                getattr(
+                    model_config,
+                    "ui_relation_legacy_slot_gate_as_image_gate",
+                    False,
+                )
+            )
+            nonlegacy_missing = [
+                key for key in relation_missing_keys if "image_gate_heads" not in key
+            ]
             if (
                 bool(getattr(model_config, "enable_ui_relation", False))
-                and (relation_missing_keys or relation_unexpected_keys)
+                and (
+                    nonlegacy_missing
+                    or relation_unexpected_keys
+                    or (relation_missing_keys and not legacy_slot_gate)
+                )
             ):
                 raise RuntimeError(
                     "Checkpoint Relation/Gate/PBD weights are incompatible; "
@@ -1087,7 +1117,11 @@ class LocateAnythingInferencer:
             "enable_ui_relation": True,
             "relation_family": self._scalar(interface.get("relation_family")),
             "p_defect": self._scalar(interface.get("p_defect")),
+            "gate_source": interface.get("gate_source", "image_gate"),
             "gate_threshold": self._scalar(interface.get("gate_threshold")),
+            "gate_mode": interface.get("gate_mode", self.args.relation_gate_mode),
+            "threshold": self._scalar(interface.get("gate_threshold")),
+            "would_pass": bool(interface.get("would_pass", interface.get("gate_passed"))),
             "gate_passed": bool(interface.get("gate_passed")),
             "gate_filtered": bool(interface.get("gate_filtered")),
             "final_has_bbox": bool(interface.get("final_has_bbox")),
@@ -1142,6 +1176,8 @@ class LocateAnythingInferencer:
             "max_new_tokens": self.args.max_new_tokens,
             "use_cache": True,
             "generation_mode": self.args.generation_mode,
+            "relation_gate_mode": self.args.relation_gate_mode,
+            "relation_gate_threshold": self.args.relation_gate_threshold,
             "repetition_penalty": self.args.repetition_penalty,
             "verbose": self.args.verbose_generation,
         }
@@ -1402,6 +1438,8 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "dtype": args.dtype,
             "attn_implementation": args.attn_implementation,
             "enable_ui_relation": args.enable_ui_relation,
+            "relation_gate_mode": args.relation_gate_mode,
+            "relation_gate_threshold": args.relation_gate_threshold,
         },
         "output": {
             "tag_filename": args.tag_filename,
@@ -1675,6 +1713,12 @@ def run_one_task(
                 )
 
             gate_path = work.output_dir / "gate" / f"{stem}{suffix}.json"
+            gate_diagnostics.setdefault("p_defect", None)
+            gate_diagnostics.setdefault("gate_mode", args.relation_gate_mode)
+            gate_diagnostics.setdefault("threshold", args.relation_gate_threshold)
+            gate_diagnostics.setdefault("would_pass", None)
+            gate_diagnostics.setdefault("gate_filtered", False)
+            gate_diagnostics["final_has_bbox"] = bool(detections)
             atomic_write_json(
                 gate_path,
                 {
@@ -1713,7 +1757,7 @@ def run_one_task(
             if gate_diagnostics.get("available"):
                 counts["gate_available"] += 1
                 counts["gate_positive"] += int(
-                    bool(gate_diagnostics.get("gate_passed"))
+                    bool(gate_diagnostics.get("would_pass"))
                 )
                 counts["gate_filtered"] += int(
                     bool(gate_diagnostics.get("gate_filtered"))

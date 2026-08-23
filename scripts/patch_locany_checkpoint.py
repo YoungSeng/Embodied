@@ -35,6 +35,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Fail unless checkpoint weights contain every Relation/Gate/PBD group",
     )
+    parser.add_argument(
+        "--allow-legacy-slot-gate",
+        action="store_true",
+        help="Observe-only compatibility for pre-image-gate checkpoints",
+    )
     return parser.parse_args()
 
 
@@ -82,6 +87,7 @@ REQUIRED_RELATION_WEIGHT_GROUPS = (
     "relation_pyramid.context_queries",
     "relation_pyramid.family_adapters.",
     "relation_pyramid.gate_heads.",
+    "relation_pyramid.image_gate_heads.",
     "relation_pbd.semantic_projection.",
     "relation_pbd.box_projection.",
     "relation_pbd.semantic_scale",
@@ -183,6 +189,7 @@ def patch_checkpoint(
     project_root: Path,
     force: bool = False,
     validate_relation_weights: bool = False,
+    allow_legacy_slot_gate: bool = False,
 ) -> dict[str, Any]:
     base_model = base_model.expanduser().resolve()
     checkpoint = checkpoint.expanduser().resolve()
@@ -201,7 +208,12 @@ def patch_checkpoint(
         relation_weight_report = validate_relation_weight_keys(
             checkpoint_weight_keys(checkpoint)
         )
-        if not relation_weight_report["valid"]:
+        legacy_only = relation_weight_report["missing_groups"] == [
+            "relation_pyramid.image_gate_heads."
+        ]
+        if not relation_weight_report["valid"] and not (
+            allow_legacy_slot_gate and legacy_only
+        ):
             raise RuntimeError(
                 "Checkpoint is missing trained UI relation weights: "
                 + ", ".join(relation_weight_report["missing_groups"])
@@ -241,6 +253,12 @@ def patch_checkpoint(
 
     config_path = checkpoint / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    original_config = dict(config)
+    if allow_legacy_slot_gate and relation_weight_report is not None:
+        config["ui_relation_legacy_slot_gate_as_image_gate"] = bool(
+            relation_weight_report["missing_groups"]
+            == ["relation_pyramid.image_gate_heads."]
+        )
     if validate_relation_weights:
         if not bool(config.get("enable_ui_relation", False)):
             raise RuntimeError(
@@ -263,9 +281,9 @@ def patch_checkpoint(
             )
     else:
         pbd_config_report = None
-    config_changed = config.get("auto_map") != AUTO_MAP
+    config["auto_map"] = AUTO_MAP
+    config_changed = config != original_config
     if config_changed:
-        config["auto_map"] = AUTO_MAP
         atomic_write_json(config_path, config)
 
     manifest = {
@@ -297,6 +315,7 @@ def main() -> int:
         project_root=args.project_root,
         force=args.force,
         validate_relation_weights=args.validate_relation_weights,
+        allow_legacy_slot_gate=args.allow_legacy_slot_gate,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if report["stale_skipped"]:

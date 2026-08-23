@@ -43,7 +43,7 @@ python scripts/submit_locany_ui5.py \
   --enable-eval
 ```
 
-H20 × 4 沿用现有配置的 `magi + MAX_NUM_TOKENS=25600` 默认值，可通过 `--max-num-tokens` 覆盖。
+H20 × 4 使用 `magi + MAX_NUM_TOKENS=12800`；八卡仍为 25600。
 
 ### 关闭 evaluation 的四卡 smoke test
 
@@ -100,10 +100,22 @@ python scripts/submit_locany_ui5.py \
   --gpus 4 \
   --eval-checkpoint /path/to/checkpoint-4000 \
   --eval-step 4000 \
+  --relation-gate-mode observe \
   --eval-max-images-per-task 10
 ```
 
 `--eval-max-images-per-task` 只用于小样本 smoke；省略或设置为 0 时仍跑完整的每任务 1,555 条评测。
+
+复评旧 relationfix checkpoint-1000（不会用 0.5 提前清空生成）：
+
+```bash
+python scripts/submit_locany_ui5.py \
+  --machine a800 --gpu 4 \
+  --run-name locany-ui5-v4-relationfix-a800x4 \
+  --eval-checkpoint /path/to/relationfix/checkpoint-1000 \
+  --eval-step 1000 \
+  --relation-gate-mode observe
+```
 
 如果已经处于分配好四张 GPU 的节点，也可以直接执行 pipeline：
 
@@ -168,7 +180,7 @@ SCORER_ROOT
 |---|---:|---:|---:|
 | A800 × 8 | sdpa | 7268 | 25600 |
 | A800 × 4 | sdpa | 7268 | 12800 |
-| H20 × 4 | magi | 8192 | 25600 |
+| H20 × 4 | magi | 8192 | 12800 |
 
 `MAX_NUM_TOKENS` 在当前 `StreamPackedDatasetMTP` 中是每个 rank 的 packed batch token 硬上限。它不是四卡或八卡的全局 token 总和。`MAX_NUM_TOKENS_PER_SAMPLE` 先过滤单条原始样本，随后 packer 用 `MAX_NUM_TOKENS` 决定一个 rank 上何时 flush batch。
 
@@ -314,7 +326,23 @@ rank 0 使用临时 `.xlsx` 保存并重新打开校验，成功后才以 `os.re
 
 运行环境需要 `openpyxl>=3.1`（已加入 `pyproject.toml`）；pipeline 会在加载模型前检查并给出明确错误。
 
-推理时阈值只读取 checkpoint 的 `relation_gate_threshold`（默认 0.5）：低于阈值直接返回 `<box>none</box>`，否则进入原 bbox 生成。对照旧路径可运行：
+评测默认使用 `relation_gate_mode=observe`：始终执行原始 bbox 生成，同时保存 image-level `p_defect`，再用同一批 raw prediction 离线扫描 0.00–0.60。完整扫描保存在当前预测目录和评分目录的 `gate_threshold_sweep.json/.txt`；`t=0` 严格等价于 raw/no-hard-gate。只有显式指定 `--relation-gate-mode hard` 时，低于阈值才提前返回 `<box>none</box>`。
+
+训练开始前会导出真正包含 Relation、image Gate、slot Gate 和 PBD 权重的 full-model `checkpoint-0`，因此 step 0 与后续 checkpoint 结构一致。旧 relationfix checkpoint 可用 observe 兼容模式复评；其历史 slot gate 只用于复现，不作为新 image Gate 的训练结论。
+
+checkpoint 之间的四组参数更新可独立复核并输出 JSON/文本：
+
+```bash
+python scripts/check_ui_relation_training_state.py \
+  --checkpoint-0 "${OUTPUT_DIR}/checkpoint-0" \
+  --checkpoint-n "${OUTPUT_DIR}/checkpoint-1000" \
+  --output-json "${OUTPUT_DIR}/diagnostics/ui_relation_update_step1000.json" \
+  --output-txt "${OUTPUT_DIR}/diagnostics/ui_relation_update_step1000.txt"
+```
+
+训练模式在 resume 前执行严格权重组审计；缺少新的 image Gate 的旧 checkpoint 只能使用上面的 evaluation-only observe 命令复评，不能静默续训。
+
+对照无 Relation 路径可运行：
 
 ```bash
 python scripts/inference_ui_defect_locany.py ... --enable-ui-relation false

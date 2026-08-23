@@ -39,6 +39,9 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(eight["MAX_NUM_TOKENS"], 25600)
         self.assertEqual(four["GRADIENT_ACCUMULATION_STEPS"], 2)
         self.assertEqual(eight["GRADIENT_ACCUMULATION_STEPS"], 1)
+        self.assertEqual(
+            locany_ui5_common.machine_resource_config("a800")["cpu"], 58
+        )
         self.assertNotEqual(four["OUTPUT_DIR"], eight["OUTPUT_DIR"])
         locany_ui5_common.assert_gpu_mode_consistency(four, eight)
         self.assertEqual(four["MAX_NUM_TOKENS_SCOPE"], "per_rank_packed_batch")
@@ -106,6 +109,8 @@ class RuntimeConfigTests(unittest.TestCase):
             }
         )
         self.assertEqual(config["ATTN_IMPLEMENTATION"], "magi")
+        self.assertEqual(config["MAX_NUM_TOKENS"], 12800)
+        self.assertEqual(config["GRADIENT_ACCUMULATION_STEPS"], 2)
         self.assertIn("intelligent-service-arnold-hl", config["WORKSPACE"])
         self.assertTrue(config["PROJECT_ROOT"].startswith("/mnt/"))
 
@@ -302,6 +307,26 @@ class CheckpointTests(unittest.TestCase):
 
 
 class HistoryTests(unittest.TestCase):
+    def test_gate_sweep_zero_is_raw_and_selects_without_regeneration(self) -> None:
+        metrics = {
+            task: {"_sweep_samples": []}
+            for task in locany_ui5_common.TASKS
+        }
+        metrics["occlusion"]["_sweep_samples"] = [
+            {"label": True, "raw_positive": True, "p_defect": 0.30},
+            {"label": False, "raw_positive": True, "p_defect": 0.10},
+            {"label": False, "raw_positive": False, "p_defect": 0.90},
+        ]
+        sweep = collect_ui5_metrics.build_gate_threshold_sweep(metrics)
+        raw = sweep["tasks"]["occlusion"]["raw"]
+        selected = sweep["tasks"]["occlusion"]["selected"]
+        self.assertEqual(raw["threshold"], 0.0)
+        self.assertEqual(raw["predicted_positive"], 2)
+        self.assertEqual(raw["tp"], 1)
+        self.assertEqual(raw["fp"], 1)
+        self.assertGreaterEqual(selected["f1"], raw["f1"])
+        self.assertEqual(len(sweep["tasks"]["occlusion"]["sweep"]), 61)
+
     def test_legacy_markdown_report_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             report = Path(temporary) / "all_tasks_evaluation.txt"

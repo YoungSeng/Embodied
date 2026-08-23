@@ -124,8 +124,10 @@ export RELATION_DETAIL_HIDDEN_SIZE="${RELATION_DETAIL_HIDDEN_SIZE:-256}"
 export RELATION_NUM_SLOTS="${RELATION_NUM_SLOTS:-8}"
 export RELATION_ADAPTER_BOTTLENECK="${RELATION_ADAPTER_BOTTLENECK:-64}"
 export RELATION_GATE_LOSS_WEIGHT="${RELATION_GATE_LOSS_WEIGHT:-1.0}"
+export RELATION_SLOT_GATE_LOSS_WEIGHT="${RELATION_SLOT_GATE_LOSS_WEIGHT:-0.1}"
 export RELATION_ATTENTION_LOSS_WEIGHT="${RELATION_ATTENTION_LOSS_WEIGHT:-0.1}"
 export RELATION_GATE_THRESHOLD="${RELATION_GATE_THRESHOLD:-0.5}"
+export RELATION_GATE_MODE="${RELATION_GATE_MODE:-observe}"
 export RELATION_FOCAL_BETA="${RELATION_FOCAL_BETA:-0.999}"
 export RELATION_FOCAL_GAMMA="${RELATION_FOCAL_GAMMA:-2.0}"
 export CHECK_MAGI_IMPORT="${CHECK_MAGI_IMPORT:-$([[ "${ATTN_IMPLEMENTATION}" == "magi" ]] && echo 1 || echo 0)}"
@@ -157,8 +159,10 @@ printf '%-28s: %s\n' \
   "SAVE_STEPS" "${SAVE_STEPS}" \
   "GRADIENT_ACCUMULATION_STEPS" "${GRADIENT_ACCUMULATION_STEPS}" \
   "RELATION_GATE_LOSS_WEIGHT" "${RELATION_GATE_LOSS_WEIGHT}" \
+  "RELATION_SLOT_GATE_LOSS_WEIGHT" "${RELATION_SLOT_GATE_LOSS_WEIGHT}" \
   "RELATION_ATTENTION_LOSS_WEIGHT" "${RELATION_ATTENTION_LOSS_WEIGHT}" \
   "RELATION_GATE_THRESHOLD" "${RELATION_GATE_THRESHOLD}" \
+  "RELATION_GATE_MODE" "${RELATION_GATE_MODE}" \
   "RELATION_FOCAL_BETA" "${RELATION_FOCAL_BETA}" \
   "RELATION_FOCAL_GAMMA" "${RELATION_FOCAL_GAMMA}" \
   "RELATION_NUM_SLOTS" "${RELATION_NUM_SLOTS}" \
@@ -211,6 +215,8 @@ run_evaluation() {
     --output-dir "${OUTPUT_DIR}"
     --scorer-root "${SCORER_ROOT}"
     --project-root "${PROJECT_ROOT}"
+    --relation-gate-mode "${RELATION_GATE_MODE}"
+    --relation-gate-threshold "${RELATION_GATE_THRESHOLD}"
   )
   if [[ "${skip_patch}" == "1" ]]; then
     command+=(--skip-patch)
@@ -237,7 +243,8 @@ run_evaluation() {
 has_successful_evaluation() {
   local step="$1"
   "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/collect_ui5_metrics.py" \
-    has-success --history-dir "${OUTPUT_DIR}/evaluation" --step "${step}"
+    has-success --history-dir "${OUTPUT_DIR}/evaluation" --step "${step}" \
+    --relation-gate-mode "${RELATION_GATE_MODE}"
 }
 
 if [[ "${PIPELINE_MODE}" == "eval" ]]; then
@@ -325,8 +332,25 @@ if [[ "${ENABLE_EVAL}" == "0" ]]; then
   exec bash "${PROJECT_ROOT}/shell/train_locany_ui_defect.sh"
 fi
 
+CHECKPOINT_ZERO="${OUTPUT_DIR}/checkpoint-0"
 if [[ "${EVAL_AT_START}" == "1" ]] && ! has_successful_evaluation 0; then
-  if run_evaluation 0 "${BASE_MODEL}" 1; then
+  echo "[PIPELINE] exporting deterministic full-model checkpoint-0"
+  "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/export_ui5_checkpoint0.py" \
+    --base-model "${BASE_MODEL}" \
+    --output "${CHECKPOINT_ZERO}" \
+    --seed 42 \
+    --block-size 6 \
+    --attn-implementation "${ATTN_IMPLEMENTATION}" \
+    --relation-detail-hidden-size "${RELATION_DETAIL_HIDDEN_SIZE}" \
+    --relation-num-slots "${RELATION_NUM_SLOTS}" \
+    --relation-adapter-bottleneck "${RELATION_ADAPTER_BOTTLENECK}" \
+    --relation-gate-loss-weight "${RELATION_GATE_LOSS_WEIGHT}" \
+    --relation-slot-gate-loss-weight "${RELATION_SLOT_GATE_LOSS_WEIGHT}" \
+    --relation-attention-loss-weight "${RELATION_ATTENTION_LOSS_WEIGHT}" \
+    --relation-gate-threshold "${RELATION_GATE_THRESHOLD}" \
+    --relation-focal-beta "${RELATION_FOCAL_BETA}" \
+    --relation-focal-gamma "${RELATION_FOCAL_GAMMA}"
+  if run_evaluation 0 "${CHECKPOINT_ZERO}" 0; then
     :
   else
     code=$?
@@ -346,6 +370,24 @@ fi
 if (( current_step == 0 )) && compgen -G "${OUTPUT_DIR}/checkpoint-*" >/dev/null; then
   locany_die 28 \
     "Checkpoint directories exist, but none passed resume validation; refusing to restart from zero: ${OUTPUT_DIR}"
+fi
+
+# Evaluation-only observe mode may deliberately load a legacy checkpoint whose
+# image-level Gate did not exist yet.  Training resume must never do that: an
+# old slot-Gate checkpoint would otherwise be accepted by Trainer and silently
+# mix the repaired architecture with an invalid optimization history.
+if (( current_step > 0 )); then
+  resume_checkpoint="${OUTPUT_DIR}/checkpoint-${current_step}"
+  echo "[PIPELINE] strict UI module audit before training resume: ${resume_checkpoint}"
+  if ! "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/patch_locany_checkpoint.py" \
+      --base-model "${BASE_MODEL}" \
+      --checkpoint "${resume_checkpoint}" \
+      --project-root "${PROJECT_ROOT}" \
+      --force \
+      --validate-relation-weights; then
+    locany_die 31 \
+      "Training resume checkpoint is not a complete Image-Gate/Slot-Gate/Relation/PBD model. Use --eval-checkpoint with observe mode for legacy reproduction, or choose a fresh --run-name for training: ${resume_checkpoint}"
+  fi
 fi
 
 if (( current_step > 0 )) && ! has_successful_evaluation "${current_step}"; then

@@ -269,12 +269,18 @@ def resolve_runtime_config(
         "RELATION_GATE_LOSS_WEIGHT": float(
             _env_value(env, "RELATION_GATE_LOSS_WEIGHT", 1.0)
         ),
+        "RELATION_SLOT_GATE_LOSS_WEIGHT": float(
+            _env_value(env, "RELATION_SLOT_GATE_LOSS_WEIGHT", 0.1)
+        ),
         "RELATION_ATTENTION_LOSS_WEIGHT": float(
             _env_value(env, "RELATION_ATTENTION_LOSS_WEIGHT", 0.1)
         ),
         "RELATION_GATE_THRESHOLD": float(
             _env_value(env, "RELATION_GATE_THRESHOLD", 0.5)
         ),
+        "RELATION_GATE_MODE": str(
+            _env_value(env, "RELATION_GATE_MODE", "observe")
+        ).lower(),
         "RELATION_FOCAL_BETA": float(
             _env_value(env, "RELATION_FOCAL_BETA", 0.999)
         ),
@@ -305,6 +311,8 @@ def resolve_runtime_config(
         raise ValueError("GRADIENT_ACCUMULATION_STEPS must be positive")
     if not 0.0 <= resolved["RELATION_GATE_THRESHOLD"] <= 1.0:
         raise ValueError("RELATION_GATE_THRESHOLD must be in [0, 1]")
+    if resolved["RELATION_GATE_MODE"] not in {"observe", "hard"}:
+        raise ValueError("RELATION_GATE_MODE must be observe or hard")
     if not 0.0 <= resolved["RELATION_FOCAL_BETA"] < 1.0:
         raise ValueError("RELATION_FOCAL_BETA must be in [0, 1)")
     if resolved["RELATION_FOCAL_GAMMA"] < 0.0:

@@ -24,6 +24,8 @@ BASE_COLUMNS = [
     "gpu_count",
     "max_num_tokens",
     "max_num_tokens_scope",
+    "relation_gate_mode",
+    "ui_model_signature",
     "checkpoint",
     "macro_precision",
     "macro_recall",
@@ -78,6 +80,52 @@ def load_metrics(path: Path | None) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"Invalid metric summary: {path}")
     return value
+
+
+def ui_model_signature(checkpoint: Path) -> str:
+    config_path = checkpoint / "config.json"
+    if not config_path.is_file():
+        return ""
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    has_image_gate = False
+    index_path = checkpoint / "model.safetensors.index.json"
+    if index_path.is_file():
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        has_image_gate = any(
+            "relation_pyramid.image_gate_heads" in key
+            for key in index.get("weight_map", {})
+        )
+    else:
+        try:
+            from safetensors import safe_open
+
+            for path in checkpoint.glob("model*.safetensors"):
+                with safe_open(path, framework="pt", device="cpu") as handle:
+                    if any(
+                        "relation_pyramid.image_gate_heads" in key
+                        for key in handle.keys()
+                    ):
+                        has_image_gate = True
+                        break
+        except ImportError:
+            pass
+    signature = {
+        "enable_ui_relation": bool(config.get("enable_ui_relation", False)),
+        "relation_detail_layers": config.get("relation_detail_layers"),
+        "relation_detail_hidden_size": config.get("relation_detail_hidden_size"),
+        "relation_num_slots": config.get("relation_num_slots"),
+        "relation_slot_gate_loss_weight": config.get(
+            "relation_slot_gate_loss_weight"
+        ),
+        "box_start_token_id": config.get("box_start_token_id"),
+        "text_mask_token_id": (config.get("text_config") or {}).get(
+            "text_mask_token_id"
+        ),
+        "mtp_block_size": (config.get("text_config") or {}).get("block_size"),
+        "causal_attn": (config.get("text_config") or {}).get("causal_attn"),
+        "has_image_gate": has_image_gate,
+    }
+    return json.dumps(signature, sort_keys=True, separators=(",", ":"))
 
 
 def _sample_image_path(sample: dict[str, Any], jsonl_dir: Path) -> str | None:
@@ -162,6 +210,7 @@ def collect_gate_metrics(
                     records.append(value)
         positives: list[float] = []
         negatives: list[float] = []
+        sweep_samples: list[dict[str, Any]] = []
         gate_tp = gate_fp = gate_fn = 0
         labels = ground_truth.get(task, {})
         for record in records:
@@ -170,10 +219,17 @@ def collect_gate_metrics(
             label = labels.get(image_path, labels.get(Path(image_path).name))
             if isinstance(p_defect, (int, float)) and label is not None:
                 (positives if label else negatives).append(float(p_defect))
-                predicted = bool(record.get("gate_passed"))
+                predicted = bool(record.get("would_pass", record.get("gate_passed")))
                 gate_tp += int(label and predicted)
                 gate_fp += int(not label and predicted)
                 gate_fn += int(label and not predicted)
+                sweep_samples.append(
+                    {
+                        "label": bool(label),
+                        "raw_positive": record.get("prediction_status") == "defect",
+                        "p_defect": float(p_defect),
+                    }
+                )
         gate_precision = gate_tp / (gate_tp + gate_fp) if gate_tp + gate_fp else 0.0
         gate_recall = gate_tp / (gate_tp + gate_fn) if gate_tp + gate_fn else 0.0
         gate_f1 = (
@@ -181,9 +237,17 @@ def collect_gate_metrics(
             if gate_precision + gate_recall
             else 0.0
         )
+        if records and len(sweep_samples) != len(records):
+            raise RuntimeError(
+                f"Gate sidecars are incomplete for task={task}: "
+                f"labeled_p_defect={len(sweep_samples)}, records={len(records)}"
+            )
         result[task] = {
             "samples": len(records),
-            "gate_positive": sum(bool(row.get("gate_passed")) for row in records),
+            "gate_positive": sum(
+                bool(row.get("would_pass", row.get("gate_passed")))
+                for row in records
+            ),
             "gate_filtered": sum(bool(row.get("gate_filtered")) for row in records),
             "p_defect_pos": (
                 sum(positives) / len(positives) if positives else None
@@ -202,8 +266,92 @@ def collect_gate_metrics(
             "gate_precision": gate_precision,
             "gate_recall": gate_recall,
             "gate_f1": gate_f1,
+            "_sweep_samples": sweep_samples,
         }
     return result
+
+
+def build_gate_threshold_sweep(
+    gate_metrics: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Apply image Gate thresholds to one immutable set of raw predictions."""
+
+    output: dict[str, Any] = {
+        "schema_version": 1,
+        "thresholds": [index / 100.0 for index in range(61)],
+        "tasks": {},
+    }
+    for task in TASKS:
+        samples = list(gate_metrics.get(task, {}).get("_sweep_samples", []))
+        rows = []
+        for index in range(61):
+            threshold = index / 100.0
+            tp = fp = fn = tn = predicted_positive = 0
+            for sample in samples:
+                # t=0 is exactly the raw/no-hard-gate result.
+                predicted = bool(sample["raw_positive"]) and (
+                    threshold == 0.0 or float(sample["p_defect"]) >= threshold
+                )
+                label = bool(sample["label"])
+                tp += int(label and predicted)
+                fp += int(not label and predicted)
+                fn += int(label and not predicted)
+                tn += int(not label and not predicted)
+                predicted_positive += int(predicted)
+            precision = tp / (tp + fp) if tp + fp else 0.0
+            recall = tp / (tp + fn) if tp + fn else 0.0
+            f1 = (
+                2.0 * precision * recall / (precision + recall)
+                if precision + recall
+                else 0.0
+            )
+            rows.append(
+                {
+                    "threshold": threshold,
+                    "precision": precision,
+                    "recall": recall,
+                    "f1": f1,
+                    "tp": tp,
+                    "fp": fp,
+                    "fn": fn,
+                    "tn": tn,
+                    "predicted_positive": predicted_positive,
+                }
+            )
+        best = max(rows, key=lambda row: (float(row["f1"]), -float(row["threshold"])))
+        output["tasks"][task] = {
+            "raw": rows[0],
+            "selected": best,
+            "sweep": rows,
+        }
+    return output
+
+
+def write_gate_threshold_sweep(prediction_dir: Path, sweep: dict[str, Any]) -> None:
+    atomic_write_text(
+        prediction_dir / "gate_threshold_sweep.json",
+        json.dumps(sweep, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    lines = ["task\tthreshold\tprecision\trecall\tf1\ttp\tfp\tfn\tpredicted_positive"]
+    for task in TASKS:
+        selected = sweep.get("tasks", {}).get(task, {}).get("selected", {})
+        lines.append(
+            "\t".join(
+                str(value)
+                for value in (
+                    task,
+                    selected.get("threshold"),
+                    selected.get("precision"),
+                    selected.get("recall"),
+                    selected.get("f1"),
+                    selected.get("tp"),
+                    selected.get("fp"),
+                    selected.get("fn"),
+                    selected.get("predicted_positive"),
+                )
+            )
+        )
+    atomic_write_text(prediction_dir / "gate_threshold_sweep.txt", "\n".join(lines) + "\n")
 
 
 def parse_markdown_report(path: Path) -> dict[str, Any]:
@@ -271,6 +419,8 @@ def build_row(args: argparse.Namespace) -> dict[str, Any]:
         "gpu_count": args.gpu_count,
         "max_num_tokens": args.max_num_tokens,
         "max_num_tokens_scope": args.max_num_tokens_scope,
+        "relation_gate_mode": getattr(args, "relation_gate_mode", "observe"),
+        "ui_model_signature": ui_model_signature(args.checkpoint),
         "checkpoint": str(args.checkpoint),
         "macro_precision": image_macro.get("precision"),
         "macro_recall": image_macro.get("recall"),
@@ -312,9 +462,52 @@ def append_excel_evaluation(
     gate_metrics = collect_gate_metrics(
         args.prediction_dir, args.gt_dir, args.scorer_root
     )
+    sweep = build_gate_threshold_sweep(gate_metrics)
+    if args.prediction_dir is not None:
+        write_gate_threshold_sweep(args.prediction_dir, sweep)
+    if args.evaluation_run_dir is not None:
+        write_gate_threshold_sweep(args.evaluation_run_dir, sweep)
+    for task in TASKS:
+        task_sweep = sweep.get("tasks", {}).get(task, {})
+        raw = task_sweep.get("raw", {})
+        selected = task_sweep.get("selected", {})
+        gate_metrics.setdefault(task, {}).update(
+            {
+                "raw_precision": raw.get("precision"),
+                "raw_recall": raw.get("recall"),
+                "raw_f1": raw.get("f1"),
+                "raw_predicted_positive": raw.get("predicted_positive"),
+                "raw_fp": raw.get("fp"),
+                "selected_gate_threshold": selected.get("threshold"),
+                "gated_precision": selected.get("precision"),
+                "gated_recall": selected.get("recall"),
+                "gated_f1": selected.get("f1"),
+                "gated_predicted_positive": selected.get("predicted_positive"),
+                "gated_fp": selected.get("fp"),
+                "gate_filter_rate": (
+                    1.0
+                    - float(selected.get("predicted_positive", 0))
+                    / max(1, int(raw.get("predicted_positive", 0)))
+                ),
+            }
+        )
+        gate_metrics[task].pop("_sweep_samples", None)
+        sample_count = int(gate_metrics[task].get("samples", 0))
+        if sample_count >= 100 and int(
+            gate_metrics[task].get("raw_predicted_positive") or 0
+        ) == 0:
+            raise RuntimeError(
+                f"observe-mode raw predictions are all negative for task={task}; "
+                f"samples={sample_count}"
+            )
+        if sample_count and int(gate_metrics[task].get("gate_filtered", 0)) == sample_count:
+            raise RuntimeError(
+                f"hard Gate filtered every sample for task={task}; samples={sample_count}"
+            )
     for task, values in gate_metrics.items():
         image_metrics = metrics.get("tasks", {}).get(task, {}).get("image", {})
-        values["post_gate_fp"] = image_metrics.get("fp")
+        values["post_gate_fp"] = values.get("gated_fp")
+        values["raw_fp"] = values.get("raw_fp", image_metrics.get("fp"))
         tp = image_metrics.get("tp")
         fp = image_metrics.get("fp")
         values["final_predicted_positive"] = (
@@ -376,6 +569,9 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument(
         "--max-num-tokens-scope", default="per_rank_packed_batch"
     )
+    record.add_argument(
+        "--relation-gate-mode", choices=("observe", "hard"), default="observe"
+    )
     record.add_argument("--checkpoint", type=Path, required=True)
     record.add_argument("--metrics-json", type=Path, default=None)
     record.add_argument("--start-time", required=True)
@@ -391,6 +587,9 @@ def build_parser() -> argparse.ArgumentParser:
     check = subparsers.add_parser("has-success")
     check.add_argument("--history-dir", type=Path, required=True)
     check.add_argument("--step", type=int, required=True)
+    check.add_argument(
+        "--relation-gate-mode", choices=("observe", "hard"), default="observe"
+    )
 
     convert = subparsers.add_parser("convert-report")
     convert.add_argument("--report", type=Path, required=True)
@@ -413,6 +612,15 @@ def main() -> int:
         found = any(
             int(row.get("step", -1)) == args.step
             and row.get("evaluation_status") == "success"
+            and row.get("relation_gate_mode", "observe") == args.relation_gate_mode
+            and (
+                args.step != 0
+                or (
+                    Path(str(row.get("checkpoint", ""))).name == "checkpoint-0"
+                    and '"has_image_gate":true' in str(row.get("ui_model_signature", ""))
+                    and row.get("relation_gate_mode") == "observe"
+                )
+            )
             for row in rows
         )
         if found:
@@ -440,6 +648,27 @@ def main() -> int:
             "the failed retry remains in attempts/ and does not replace the successful metric row"
         )
         return 0
+    if args.status == "success" and args.step > 0:
+        step_zero = next(
+            (
+                existing
+                for existing in rows
+                if int(existing.get("step", -1)) == 0
+                and existing.get("evaluation_status") == "success"
+            ),
+            None,
+        )
+        if step_zero is not None:
+            if step_zero.get("relation_gate_mode") not in (None, row["relation_gate_mode"]):
+                raise RuntimeError(
+                    "checkpoint-0 and checkpoint-N evaluation gate modes differ: "
+                    f"{step_zero.get('relation_gate_mode')} != {row['relation_gate_mode']}"
+                )
+            if step_zero.get("ui_model_signature") not in (None, "", row["ui_model_signature"]):
+                raise RuntimeError(
+                    "checkpoint-0 and checkpoint-N UI model structures differ: "
+                    f"{step_zero.get('ui_model_signature')} != {row['ui_model_signature']}"
+                )
     rows = [existing for existing in rows if int(existing.get("step", -1)) != args.step]
     rows.append(row)
     diagnostics_xlsx = None

@@ -37,6 +37,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tasks", nargs="+", choices=TASKS, default=list(TASKS))
     parser.add_argument("--max-images-per-task", type=int, default=0)
     parser.add_argument(
+        "--relation-gate-mode", choices=("observe", "hard"), default="observe"
+    )
+    parser.add_argument("--relation-gate-threshold", type=float, default=None)
+    parser.add_argument(
         "--model-load-preflight",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -52,6 +56,7 @@ def parse_args() -> argparse.Namespace:
         help="worker 或模型预检失败时回显到主日志的末尾行数",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
@@ -122,7 +127,15 @@ def build_command(
         task,
         "--skip-figma",
         "--fail-fast",
+        "--relation-gate-mode",
+        args.relation_gate_mode,
     ]
+    if args.relation_gate_threshold is not None:
+        command.extend(
+            ["--relation-gate-threshold", str(args.relation_gate_threshold)]
+        )
+    if args.overwrite:
+        command.append("--overwrite")
     if load_only:
         command.append("--load-only")
     if args.max_images_per_task:
@@ -180,6 +193,21 @@ def main() -> int:
     if not args.inference_script.is_file():
         raise FileNotFoundError(f"inference script does not exist: {args.inference_script}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.overwrite and not args.dry_run:
+        removed = 0
+        for task in args.tasks:
+            task_dir = args.output_dir / task
+            if task_dir.is_dir():
+                for artifact in task_dir.rglob("*"):
+                    if artifact.is_file():
+                        artifact.unlink()
+                        removed += 1
+        for name in ("_run_manifest.json", "_summary.json", "parallel_inference_status.json"):
+            target = args.output_dir / name
+            if target.is_file():
+                target.unlink()
+                removed += 1
+        print(f"[OVERWRITE] removed {removed} stale inference artifacts before workers")
 
     gpus = parse_gpu_devices(args.gpu_devices)
     counts: dict[str, int] = {}

@@ -1,0 +1,81 @@
+# Merlin formal training: LocateAnything-3B UI CPT, HL H20 x4 Magi profile.
+# Submit: mlx job submitv2 --path locany_cpt_v4_h20x4_formal_merlin.yaml
+
+caption: 'LocateAnything UI CPT Formal - H20x2'
+
+jobDefVersion:
+  entrypointMode: FULL_SCRIPT
+
+  gitRepo:
+    mnt: /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+
+  imageMeta:
+    imageSource: url
+    imageUrl: hub.byted.org/base/lab.cuda.devel:0ffcd17bfdf8d07a198e6cff167eae26
+    imageVid: d8ap37f1enlcr23291ug
+
+  lazyDownloadCode: true
+  name: 'locany-cpt-v4-h20x2-formal'
+
+  resource:
+    arnoldConfig:
+      clusterId: 20
+      elasticTraining: {}
+      groupIds:
+        - 1000
+      bytenasVolumes:
+        - name: intelligent-service-arnold-hl
+          accessMode: RW
+          roles:
+            - worker
+          subPath: ""
+      keepMins: 1
+      preemptible: false
+      quotaPool: default
+      roles:
+        - name: worker
+          num: 1
+          cpu: 40
+          gpu: 2
+          gpuv: NVIDIA_H20
+          queueName: compute-329-hl-cloudnative-ai-iesqa.llm4se-guarantee
+          memory: 921600
+          ports: 1
+    backend: ARNOLD
+
+  volumes:
+    - volumeId: 18834
+      mountPath: /mnt/bn/intelligent-service-arnold-hl
+
+jobRunParams:
+  entrypointFullScript: |
+    set -Eeuo pipefail
+    PROJECT_ROOT=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+    test -f "${PROJECT_ROOT}/shell/run_locany_cpt_merlin.sh"
+    cd "${PROJECT_ROOT}"
+    export PROJECT_ROOT
+    export WORKSPACE=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace
+    export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES:-0,1}"
+    exec bash shell/run_locany_cpt_merlin.sh h20 formal
+
+  envsList:
+    CUDA_DEVICES: "0,1"
+    GPU_COUNT: "2"
+    DATA_DIR: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4"
+    RECIPE_NAME: "locany_cpt_train.json"
+    RUN_NAME: "locany-3b-ui-cpt-v4-h20x2-formal"
+    ATTN_IMPLEMENTATION: "magi"
+    MAX_SEQ_LENGTH: "8192"
+    MAX_NUM_TOKENS_PER_SAMPLE: "8192"
+    MAX_NUM_TOKENS: "25600"
+    PACKING_BUFFER_SIZE: "32"
+    GRADIENT_ACCUMULATION_STEPS: "4"
+    MAX_STEPS: "20000"
+    WARMUP_STEPS: "500"
+    LEARNING_RATE: "5e-6"
+    SAVE_STEPS: "1000000000"
+    SAVE_EVERY_N_HOURS: "12"
+    SAVE_TOTAL_LIMIT: "20"
+    REPORT_TO: "tensorboard"
+
+namespace: /user/sicheng.yang

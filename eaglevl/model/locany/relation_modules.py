@@ -105,6 +105,8 @@ class RelationPyramidOutput:
     relation_tokens: torch.Tensor
     relation_family: torch.Tensor
     p_defect: torch.Tensor
+    image_gate_logits: torch.Tensor
+    slot_gate_logits: torch.Tensor
     gate_logits: torch.Tensor
     coarse_boxes: torch.Tensor
     query_attention: Tuple[torch.Tensor, ...]
@@ -112,12 +114,20 @@ class RelationPyramidOutput:
     best_relation_token: torch.Tensor
     scale_weights: torch.Tensor
     gate_targets: Optional[torch.Tensor] = None
+    image_gate_targets: Optional[torch.Tensor] = None
     projected_level_norms: Optional[torch.Tensor] = None
+    projected_level_abs_max: Optional[torch.Tensor] = None
+    projected_level_saturation_fraction: Optional[torch.Tensor] = None
+    projected_level_norm_ratio: Optional[torch.Tensor] = None
     fused_feature_norm: Optional[torch.Tensor] = None
     relation_context_norm: Optional[torch.Tensor] = None
     per_task_gate_loss: Optional[Dict[int, torch.Tensor]] = None
     per_task_attention_loss: Optional[Dict[int, torch.Tensor]] = None
     gate_loss: Optional[torch.Tensor] = None
+    image_gate_loss: Optional[torch.Tensor] = None
+    slot_gate_loss: Optional[torch.Tensor] = None
+    per_task_image_gate_loss: Optional[Dict[int, torch.Tensor]] = None
+    per_task_slot_gate_loss: Optional[Dict[int, torch.Tensor]] = None
     attention_loss: Optional[torch.Tensor] = None
 
 
@@ -152,8 +162,9 @@ def class_balanced_focal_loss(
     neg_weight = neg_weight * normalizer
 
     class_ids = defect_type.clamp(min=0, max=len(positive_counts) - 1).long()
-    sample_pos_weight = pos_weight[class_ids].to(dtype=dtype).unsqueeze(-1)
-    sample_neg_weight = neg_weight[class_ids].to(dtype=dtype).unsqueeze(-1)
+    trailing_dims = (1,) * max(0, logits.ndim - 1)
+    sample_pos_weight = pos_weight[class_ids].to(dtype=dtype).view(-1, *trailing_dims)
+    sample_neg_weight = neg_weight[class_ids].to(dtype=dtype).view(-1, *trailing_dims)
     balance_weight = torch.where(targets > 0.5, sample_pos_weight, sample_neg_weight)
 
     bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
@@ -252,13 +263,30 @@ class RelationConditionedDetailPyramid(nn.Module):
                 for _ in range(num_families)
             ]
         )
+        # Slot objectness and image defectness are deliberately separate.
+        # Slot heads select relation evidence for PBD; these five fixed-task
+        # heads answer whether the screenshot contains that defect at all.
+        self.image_gate_heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.LayerNorm(detail_hidden_size),
+                    nn.Linear(detail_hidden_size, adapter_bottleneck),
+                    nn.GELU(),
+                    nn.Linear(adapter_bottleneck, 1),
+                )
+                for _ in range(num_defect_types)
+            ]
+        )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.evidence_queries, std=0.02)
         nn.init.normal_(self.context_queries, std=0.02)
+        nn.init.zeros_(self.scale_logits)
         # Start conservatively: an unseen slot should prefer non-defect.
         for head in self.gate_heads:
+            nn.init.constant_(head[-1].bias, -2.0)
+        for head in self.image_gate_heads:
             nn.init.constant_(head[-1].bias, -2.0)
 
     @staticmethod
@@ -379,15 +407,27 @@ class RelationConditionedDetailPyramid(nn.Module):
                 f"image_flags ({image_flags.numel()}) and relation_family ({num_samples}) disagree"
             )
 
-        projected_levels = [
-            self._sanitize(projection(self._sanitize(level)))
+        projected_raw = [
+            projection(self._sanitize(level))
             for projection, level in zip(self.level_projections, pyramid_features)
         ]
+        nonfinite_levels = [
+            index
+            for index, level in enumerate(projected_raw)
+            if not bool(torch.isfinite(level).all())
+        ]
+        if nonfinite_levels:
+            raise FloatingPointError(
+                "Detail Pyramid projection produced NaN/Inf at level indices "
+                f"{nonfinite_levels}"
+            )
+        projected_levels = [self._sanitize(level) for level in projected_raw]
         image_features = self._split_features(projected_levels, grid_hws)
         scale_weights_all = self.scale_logits.softmax(dim=-1)
 
         relation_tokens_list: List[torch.Tensor] = []
         gate_logits_list: List[torch.Tensor] = []
+        image_gate_logits_list: List[torch.Tensor] = []
         coarse_boxes_list: List[torch.Tensor] = []
         attention_list: List[torch.Tensor] = []
         scale_weights_list: List[torch.Tensor] = []
@@ -415,6 +455,10 @@ class RelationConditionedDetailPyramid(nn.Module):
                 ) + parameter_zero
                 relation_tokens_list.append(empty_tokens)
                 gate_logits_list.append(torch.full((self.num_slots,), -20.0, device=empty_tokens.device, dtype=empty_tokens.dtype))
+                image_gate_logits_list.append(
+                    torch.full((), -20.0, device=empty_tokens.device, dtype=empty_tokens.dtype)
+                    + parameter_zero
+                )
                 coarse_boxes_list.append(torch.zeros(self.num_slots, 4, device=empty_tokens.device, dtype=empty_tokens.dtype))
                 attention_list.append(torch.zeros(2, self.num_slots, 1, device=empty_tokens.device, dtype=empty_tokens.dtype))
                 scale_weights_list.append(scale_weights_all[family])
@@ -483,6 +527,11 @@ class RelationConditionedDetailPyramid(nn.Module):
                 [head(adapted_relation).squeeze(-1) for head in self.gate_heads], dim=0
             )
             gate_logits = self._sanitize(logits_all[family], limit=30.0)
+            pooled_relation = adapted_relation.mean(dim=0)
+            image_gate_logit = self._sanitize(
+                self.image_gate_heads[task](pooled_relation).squeeze(-1),
+                limit=30.0,
+            )
             gated_relation = self._sanitize(
                 torch.sigmoid(gate_logits).unsqueeze(-1) * adapted_relation,
                 limit=32.0,
@@ -490,6 +539,7 @@ class RelationConditionedDetailPyramid(nn.Module):
 
             relation_tokens_list.append(gated_relation)
             gate_logits_list.append(gate_logits)
+            image_gate_logits_list.append(image_gate_logit)
             coarse_boxes_list.append(self._coarse_boxes(evidence_attention, height, width))
             attention_list.append(torch.stack((evidence_attention, context_attention), dim=0))
             scale_weights_list.append(weights)
@@ -517,11 +567,12 @@ class RelationConditionedDetailPyramid(nn.Module):
             gate_targets_list.append(gate_targets)
 
         relation_tokens = torch.stack(relation_tokens_list, dim=0)
-        gate_logits = torch.stack(gate_logits_list, dim=0)
+        slot_gate_logits = torch.stack(gate_logits_list, dim=0)
+        image_gate_logits = torch.stack(image_gate_logits_list, dim=0)
         coarse_boxes = torch.stack(coarse_boxes_list, dim=0)
         scale_weights = torch.stack(scale_weights_list, dim=0)
-        gate_probability = torch.sigmoid(gate_logits)
-        p_defect = gate_probability.max(dim=-1).values
+        gate_probability = torch.sigmoid(slot_gate_logits)
+        p_defect = torch.sigmoid(image_gate_logits)
         # Do not divide by the summed gate probability: that would cancel the
         # gate on negative samples.  A mean preserves defectness attenuation.
         relation_summary = relation_tokens.mean(dim=1)
@@ -531,14 +582,27 @@ class RelationConditionedDetailPyramid(nn.Module):
         ]
 
         gate_targets = None
-        gate_loss = None
-        per_task_gate_loss: Dict[int, torch.Tensor] = {}
+        image_gate_targets = None
+        image_gate_loss = None
+        slot_gate_loss = None
+        per_task_image_gate_loss: Dict[int, torch.Tensor] = {}
+        per_task_slot_gate_loss: Dict[int, torch.Tensor] = {}
         if target_boxes is not None and target_box_mask is not None:
-            gate_targets = torch.stack(gate_targets_list, dim=0).to(dtype=gate_logits.dtype)
+            gate_targets = torch.stack(gate_targets_list, dim=0).to(dtype=slot_gate_logits.dtype)
+            image_gate_targets = target_box_mask.bool().any(dim=-1).to(
+                dtype=image_gate_logits.dtype
+            )
             valid_samples = relation_family >= 0
             if bool(valid_samples.any()):
-                gate_loss = class_balanced_focal_loss(
-                    gate_logits[valid_samples],
+                image_gate_loss = class_balanced_focal_loss(
+                    image_gate_logits[valid_samples],
+                    image_gate_targets[valid_samples],
+                    defect_type[valid_samples],
+                    gamma=self.focal_gamma,
+                    beta=self.focal_beta,
+                )
+                slot_gate_loss = class_balanced_focal_loss(
+                    slot_gate_logits[valid_samples],
                     gate_targets[valid_samples],
                     defect_type[valid_samples],
                     gamma=self.focal_gamma,
@@ -547,8 +611,15 @@ class RelationConditionedDetailPyramid(nn.Module):
                 for task in range(self.num_defect_types):
                     task_mask = valid_samples & (defect_type == task)
                     if bool(task_mask.any()):
-                        per_task_gate_loss[task] = class_balanced_focal_loss(
-                            gate_logits[task_mask],
+                        per_task_image_gate_loss[task] = class_balanced_focal_loss(
+                            image_gate_logits[task_mask],
+                            image_gate_targets[task_mask],
+                            defect_type[task_mask],
+                            gamma=self.focal_gamma,
+                            beta=self.focal_beta,
+                        )
+                        per_task_slot_gate_loss[task] = class_balanced_focal_loss(
+                            slot_gate_logits[task_mask],
                             gate_targets[task_mask],
                             defect_type[task_mask],
                             gamma=self.focal_gamma,
@@ -563,6 +634,21 @@ class RelationConditionedDetailPyramid(nn.Module):
         projected_level_norms = torch.stack(
             [level.detach().float().norm(dim=-1).mean() for level in projected_levels]
         )
+        projected_level_abs_max = torch.stack(
+            [level.detach().float().abs().max() for level in projected_raw]
+        )
+        projected_level_saturation_fraction = torch.stack(
+            [
+                ((~torch.isfinite(level)) | (level.detach().float().abs() >= 128.0))
+                .float()
+                .mean()
+                for level in projected_raw
+            ]
+        )
+        projected_level_norm_ratio = (
+            projected_level_norms.max()
+            / projected_level_norms.min().clamp_min(1.0e-12)
+        )
         fused_feature_norm = torch.stack(fused_norms).mean()
         relation_context_norm = torch.stack(relation_context_norms).mean()
 
@@ -570,19 +656,29 @@ class RelationConditionedDetailPyramid(nn.Module):
             relation_tokens=relation_tokens,
             relation_family=relation_family,
             p_defect=p_defect,
-            gate_logits=gate_logits,
+            image_gate_logits=image_gate_logits,
+            slot_gate_logits=slot_gate_logits,
+            gate_logits=slot_gate_logits,
             coarse_boxes=coarse_boxes,
             query_attention=tuple(attention_list),
             relation_summary=relation_summary,
             best_relation_token=best_relation,
             scale_weights=scale_weights,
             gate_targets=gate_targets,
+            image_gate_targets=image_gate_targets,
             projected_level_norms=projected_level_norms,
+            projected_level_abs_max=projected_level_abs_max,
+            projected_level_saturation_fraction=projected_level_saturation_fraction,
+            projected_level_norm_ratio=projected_level_norm_ratio,
             fused_feature_norm=fused_feature_norm,
             relation_context_norm=relation_context_norm,
-            per_task_gate_loss=per_task_gate_loss,
+            per_task_gate_loss=per_task_image_gate_loss,
+            per_task_image_gate_loss=per_task_image_gate_loss,
+            per_task_slot_gate_loss=per_task_slot_gate_loss,
             per_task_attention_loss=per_task_attention_loss,
-            gate_loss=gate_loss,
+            gate_loss=image_gate_loss,
+            image_gate_loss=image_gate_loss,
+            slot_gate_loss=slot_gate_loss,
             attention_loss=attention_loss,
         )
 

@@ -32,6 +32,7 @@ from .generate_utils import (
     get_token_ids_from_config,
 )
 from .relation_modules import (
+    DEFECT_TYPES,
     RelationConditionedDetailPyramid,
     RelationToPBD,
     match_ui_relation_prompt,
@@ -331,6 +332,12 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             defect_type=defect_type,
             image_flags=image_flags,
         )
+        if bool(
+            getattr(self.config, "ui_relation_legacy_slot_gate_as_image_gate", False)
+        ):
+            relation_output.p_defect = torch.sigmoid(
+                relation_output.slot_gate_logits
+            ).max(dim=-1).values
         cache = None
         if return_global_visual_cache:
             cache = {
@@ -404,6 +411,8 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         relation_family = None,
         defect_type = None,
         return_ui_defect_interface: bool = False,
+        relation_gate_mode: Optional[str] = None,
+        relation_gate_threshold: Optional[float] = None,
         **generate_kwargs,
     ) -> torch.LongTensor:
 
@@ -460,22 +469,68 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             vit_embeds = torch.cat(vit_embeds, dim=0)
             vit_embeds = self.mlp1(vit_embeds)
 
-        gate_threshold = float(
-            getattr(self.config, "relation_gate_threshold", 0.5)
+        gate_mode = str(
+            relation_gate_mode
+            if relation_gate_mode is not None
+            else getattr(self.config, "relation_gate_mode", "observe")
+        ).lower()
+        if gate_mode not in {"observe", "hard"}:
+            raise ValueError(
+                f"relation_gate_mode must be observe or hard, got {gate_mode!r}"
+            )
+        task_thresholds = dict(
+            getattr(self.config, "relation_gate_thresholds", {}) or {}
         )
-        gate_passed = None
+        task_name = None
+        threshold_aliases = ()
+        if defect_type is not None:
+            task_index = int(defect_type.reshape(-1)[0].item())
+            if 0 <= task_index < len(DEFECT_TYPES):
+                task_name = DEFECT_TYPES[task_index]
+                threshold_aliases = (
+                    ("text_overflow",),
+                    ("cropping", "element_cropping"),
+                    ("overlap", "occlusion", "element_overlap"),
+                    ("ellipsis", "text_ellipsis"),
+                    ("missing", "content_missing"),
+                )[task_index]
+        task_threshold = next(
+            (task_thresholds[key] for key in threshold_aliases if key in task_thresholds),
+            None,
+        )
+        configured_threshold = task_thresholds.get(
+            task_name,
+            task_threshold
+            if task_threshold is not None
+            else getattr(self.config, "relation_gate_threshold", 0.5),
+        )
+        gate_threshold = float(
+            relation_gate_threshold
+            if relation_gate_threshold is not None
+            else configured_threshold
+        )
+        if not 0.0 <= gate_threshold <= 1.0:
+            raise ValueError(f"relation gate threshold must be in [0,1], got {gate_threshold}")
+        would_pass = None
         if relation_output is not None:
             gate_override = relation_gate_output_override(
                 relation_output.p_defect[0], gate_threshold
             )
-            gate_passed = gate_override is None
-            if gate_override is not None:
+            would_pass = gate_override is None
+            if gate_mode == "hard" and gate_override is not None:
                 response = gate_override
                 self._last_ui_defect_interface = {
                     "relation_tokens": relation_output.relation_tokens,
                     "relation_family": relation_output.relation_family,
                     "p_defect": relation_output.p_defect,
+                    "gate_source": (
+                        "legacy_slot_max"
+                        if bool(getattr(self.config, "ui_relation_legacy_slot_gate_as_image_gate", False))
+                        else "image_gate"
+                    ),
+                    "gate_mode": gate_mode,
                     "gate_threshold": gate_threshold,
+                    "would_pass": False,
                     "gate_passed": False,
                     "gate_filtered": True,
                     "final_has_bbox": False,
@@ -745,8 +800,15 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 "relation_tokens": relation_output.relation_tokens,
                 "relation_family": relation_output.relation_family,
                 "p_defect": relation_output.p_defect,
+                "gate_source": (
+                    "legacy_slot_max"
+                    if bool(getattr(self.config, "ui_relation_legacy_slot_gate_as_image_gate", False))
+                    else "image_gate"
+                ),
+                "gate_mode": gate_mode,
                 "gate_threshold": gate_threshold,
-                "gate_passed": gate_passed,
+                "would_pass": would_pass,
+                "gate_passed": would_pass,
                 "gate_filtered": False,
                 "final_has_bbox": (
                     "<box>none</box>" not in compact_response

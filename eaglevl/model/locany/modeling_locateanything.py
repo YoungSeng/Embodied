@@ -5,6 +5,7 @@
 # --------------------------------------------------------
 
 import warnings
+from contextlib import nullcontext
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -84,6 +85,10 @@ class LocateAnythingPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.weight.data.fill_(1.0)
+            if module.bias is not None:
+                module.bias.data.zero_()
 
 IGNORE_INDEX = -100
 
@@ -102,17 +107,34 @@ class UIDefectModelOutput(CausalLMOutputWithPast):
     coordinate_logits: Optional[torch.Tensor] = None
     lm_loss: Optional[torch.Tensor] = None
     gate_loss: Optional[torch.Tensor] = None
+    image_gate_loss: Optional[torch.Tensor] = None
+    slot_gate_loss: Optional[torch.Tensor] = None
     attention_loss: Optional[torch.Tensor] = None
     per_task_gate_loss: Optional[Dict[int, torch.Tensor]] = None
+    per_task_image_gate_loss: Optional[Dict[int, torch.Tensor]] = None
+    per_task_slot_gate_loss: Optional[Dict[int, torch.Tensor]] = None
     per_task_attention_loss: Optional[Dict[int, torch.Tensor]] = None
     gate_targets: Optional[torch.Tensor] = None
+    image_gate_targets: Optional[torch.Tensor] = None
+    slot_gate_logits: Optional[torch.Tensor] = None
+    image_gate_logits: Optional[torch.Tensor] = None
     detail_layer_weights: Optional[torch.Tensor] = None
     detail_feature_norm: Optional[torch.Tensor] = None
+    detail_feature_abs_max: Optional[torch.Tensor] = None
+    detail_saturation_fraction: Optional[torch.Tensor] = None
+    detail_norm_ratio: Optional[torch.Tensor] = None
     detail_fused_norm: Optional[torch.Tensor] = None
     relation_context_norm: Optional[torch.Tensor] = None
     relation_gate_prob_mean: Optional[torch.Tensor] = None
     pbd_delta_norm: Optional[torch.Tensor] = None
     pbd_active_positions: Optional[torch.Tensor] = None
+    loss_lm_contribution: Optional[torch.Tensor] = None
+    loss_image_gate_contribution: Optional[torch.Tensor] = None
+    loss_slot_gate_contribution: Optional[torch.Tensor] = None
+    loss_attention_contribution: Optional[torch.Tensor] = None
+    loss_reconstructed: Optional[torch.Tensor] = None
+    loss_reconstruction_error: Optional[torch.Tensor] = None
+    attention_active: Optional[torch.Tensor] = None
     global_visual_cache: Optional[Any] = None
 
 
@@ -190,6 +212,146 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             self._no_split_modules = ["Qwen3DecoderLayer"]
         else:
             self._no_split_modules = ["Qwen2DecoderLayer"]
+
+    @torch.no_grad()
+    def initialize_ui_relation_modules(self, seed: int, reason: str) -> dict:
+        """Deterministically initialize only checkpoint-optional UI modules."""
+
+        if not self.enable_ui_relation:
+            return {"seed": int(seed), "reason": str(reason), "parameters": 0}
+        std = float(
+            getattr(self.config, "initializer_range", None)
+            or self.config.text_config.initializer_range
+        )
+        relation_parameters = [
+            *self.relation_pyramid.parameters(),
+            *self.relation_pbd.parameters(),
+        ]
+        gather_context = nullcontext()
+        zero_partitioned = any(
+            hasattr(parameter, "ds_id") for parameter in relation_parameters
+        )
+        if zero_partitioned:
+            import deepspeed
+
+            gather_context = deepspeed.zero.GatheredParameters(
+                relation_parameters, modifier_rank=0
+            )
+        cuda_devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+        with gather_context:
+            should_initialize = not zero_partitioned or not dist.is_initialized() or dist.get_rank() == 0
+            if should_initialize:
+                with torch.random.fork_rng(devices=cuda_devices):
+                    torch.manual_seed(int(seed))
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(int(seed))
+                    for root in (self.relation_pyramid, self.relation_pbd):
+                        for module in root.modules():
+                            if isinstance(module, nn.LayerNorm):
+                                nn.init.ones_(module.weight)
+                                if module.bias is not None:
+                                    nn.init.zeros_(module.bias)
+                            elif isinstance(module, nn.Linear):
+                                nn.init.normal_(module.weight, mean=0.0, std=std)
+                                if module.bias is not None:
+                                    nn.init.zeros_(module.bias)
+                            elif isinstance(module, nn.Embedding):
+                                nn.init.normal_(module.weight, mean=0.0, std=std)
+                    nn.init.normal_(self.relation_pyramid.evidence_queries, mean=0.0, std=0.02)
+                    nn.init.normal_(self.relation_pyramid.context_queries, mean=0.0, std=0.02)
+                    nn.init.zeros_(self.relation_pyramid.scale_logits)
+                    for adapter in self.relation_pyramid.family_adapters:
+                        adapter.scale.fill_(0.1)
+                    for head in (*self.relation_pyramid.gate_heads, *self.relation_pyramid.image_gate_heads):
+                        nn.init.constant_(head[-1].bias, -2.0)
+                    self.relation_pbd.semantic_scale.fill_(0.01)
+                    self.relation_pbd.box_scale.fill_(0.01)
+
+        self.config.ui_relation_initialization_seed = int(seed)
+        self.config.ui_relation_initialization_reason = str(reason)
+        report = self.validate_ui_relation_parameters()
+        report.update({"seed": int(seed), "reason": str(reason), "initializer_range": std})
+        self.config.ui_relation_initialization_stats = dict(report)
+        logger.warning("Initialized UI Relation/Gate/PBD modules: %s", report)
+        return report
+
+    @torch.no_grad()
+    def validate_ui_relation_parameters(self) -> dict:
+        """Validate and summarize UI parameters; never mutate learned weights."""
+
+        if not self.enable_ui_relation:
+            return {"parameters": 0, "values": 0, "checksum": 0.0}
+        names = []
+        values = 0
+        checksum = 0.0
+        square_checksum = 0.0
+        for prefix, module in (("relation_pyramid", self.relation_pyramid), ("relation_pbd", self.relation_pbd)):
+            for name, parameter in module.named_parameters():
+                local_parameter = getattr(parameter, "ds_tensor", parameter)
+                if not bool(torch.isfinite(local_parameter).all()):
+                    names.append(f"{prefix}.{name}")
+                tensor = local_parameter.detach().double()
+                values += tensor.numel()
+                checksum += float(tensor.sum().item())
+                square_checksum += float(tensor.square().sum().item())
+        nonfinite_count = len(names)
+        zero_partitioned = any(
+            hasattr(parameter, "ds_id")
+            for module in (self.relation_pyramid, self.relation_pbd)
+            for parameter in module.parameters()
+        )
+        if zero_partitioned and dist.is_available() and dist.is_initialized():
+            gathered_names = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered_names, names)
+            names = sorted(
+                {
+                    name
+                    for rank_names in gathered_names
+                    for name in (rank_names or [])
+                }
+            )
+            device = next(self.parameters()).device
+            totals = torch.tensor(
+                [float(values), checksum, square_checksum, float(nonfinite_count)],
+                dtype=torch.float64,
+                device=device,
+            )
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+            values = int(totals[0].item())
+            checksum = float(totals[1].item())
+            square_checksum = float(totals[2].item())
+            nonfinite_count = int(totals[3].item())
+        if nonfinite_count:
+            raise FloatingPointError(f"Non-finite UI relation parameters: {names}")
+        return {
+            "parameters": sum(1 for _ in self.relation_pyramid.parameters())
+            + sum(1 for _ in self.relation_pbd.parameters()),
+            "values": values,
+            "checksum": checksum,
+            "square_checksum": square_checksum,
+        }
+
+    @torch.no_grad()
+    def assert_ui_relation_rank_consistency(self, atol: float = 1.0e-8) -> dict:
+        report = self.validate_ui_relation_parameters()
+        if not dist.is_available() or not dist.is_initialized():
+            report["world_size"] = 1
+            return report
+        local = torch.tensor(
+            [report["checksum"], report["square_checksum"]],
+            dtype=torch.float64,
+            device=next(self.parameters()).device,
+        )
+        gathered = [torch.zeros_like(local) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, local)
+        stacked = torch.stack(gathered)
+        max_diff = float((stacked - stacked[0]).abs().max().item())
+        if max_diff > float(atol):
+            raise RuntimeError(
+                f"UI relation initialization differs across ranks: max_diff={max_diff}, checksums={stacked.cpu().tolist()}"
+            )
+        report.update({"world_size": dist.get_world_size(), "rank_max_diff": max_diff})
+        return report
 
         
     def wrap_backbone_lora(self, r=128, lora_alpha=256, lora_dropout=0.05):
@@ -411,6 +573,11 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
 
         loss = None
         lm_loss = None
+        image_gate_contribution = None
+        slot_gate_contribution = None
+        attention_contribution = None
+        loss_reconstructed = None
+        loss_reconstruction_error = None
         logits = None
         if labels is not None:
             shift_hidden_states = hidden_states[..., :-1, :].contiguous()
@@ -436,10 +603,41 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             lm_loss = liger_loss_fn(lm_head_weight, shift_hidden_states, shift_labels)
             loss = lm_loss
             if relation_output is not None:
-                if relation_output.gate_loss is not None:
-                    loss = loss + float(self.config.relation_gate_loss_weight) * relation_output.gate_loss
+                if relation_output.image_gate_loss is not None:
+                    image_gate_contribution = (
+                        float(self.config.relation_gate_loss_weight)
+                        * relation_output.image_gate_loss
+                    )
+                    loss = loss + image_gate_contribution
+                if relation_output.slot_gate_loss is not None:
+                    slot_gate_contribution = (
+                        float(getattr(self.config, "relation_slot_gate_loss_weight", 0.1))
+                        * relation_output.slot_gate_loss
+                    )
+                    loss = loss + slot_gate_contribution
                 if relation_output.attention_loss is not None:
-                    loss = loss + float(self.config.relation_attention_loss_weight) * relation_output.attention_loss
+                    attention_contribution = (
+                        float(self.config.relation_attention_loss_weight)
+                        * relation_output.attention_loss
+                    )
+                    loss = loss + attention_contribution
+            zero = lm_loss.new_zeros(())
+            image_gate_contribution = image_gate_contribution if image_gate_contribution is not None else zero
+            slot_gate_contribution = slot_gate_contribution if slot_gate_contribution is not None else zero
+            attention_contribution = attention_contribution if attention_contribution is not None else zero
+            loss_reconstructed = (
+                lm_loss
+                + image_gate_contribution
+                + slot_gate_contribution
+                + attention_contribution
+            )
+            loss_reconstruction_error = (loss - loss_reconstructed).abs()
+            if float(loss_reconstruction_error.detach().float().item()) >= 1.0e-4:
+                raise FloatingPointError(
+                    "UI5 loss decomposition mismatch: "
+                    f"loss={loss.detach().float().item()}, "
+                    f"reconstructed={loss_reconstructed.detach().float().item()}"
+                )
             if not torch.isfinite(loss):
                 gate_loss_value = (
                     relation_output.gate_loss.detach().float().item()
@@ -469,6 +667,12 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
 
         if ignore_flag and loss is not None:
             loss = loss * 0.0
+            lm_loss = lm_loss * 0.0
+            image_gate_contribution = image_gate_contribution * 0.0
+            slot_gate_contribution = slot_gate_contribution * 0.0
+            attention_contribution = attention_contribution * 0.0
+            loss_reconstructed = loss_reconstructed * 0.0
+            loss_reconstruction_error = loss_reconstruction_error * 0.0
         
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -489,9 +693,17 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             coordinate_logits=coordinate_logits,
             lm_loss=lm_loss,
             gate_loss=relation_output.gate_loss if relation_output is not None else None,
+            image_gate_loss=relation_output.image_gate_loss if relation_output is not None else None,
+            slot_gate_loss=relation_output.slot_gate_loss if relation_output is not None else None,
             attention_loss=relation_output.attention_loss if relation_output is not None else None,
             per_task_gate_loss=(
                 relation_output.per_task_gate_loss if relation_output is not None else None
+            ),
+            per_task_image_gate_loss=(
+                relation_output.per_task_image_gate_loss if relation_output is not None else None
+            ),
+            per_task_slot_gate_loss=(
+                relation_output.per_task_slot_gate_loss if relation_output is not None else None
             ),
             per_task_attention_loss=(
                 relation_output.per_task_attention_loss if relation_output is not None else None
@@ -499,11 +711,29 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             gate_targets=(
                 relation_output.gate_targets if relation_output is not None else None
             ),
+            image_gate_targets=(
+                relation_output.image_gate_targets if relation_output is not None else None
+            ),
+            slot_gate_logits=(
+                relation_output.slot_gate_logits if relation_output is not None else None
+            ),
+            image_gate_logits=(
+                relation_output.image_gate_logits if relation_output is not None else None
+            ),
             detail_layer_weights=(
                 relation_output.scale_weights if relation_output is not None else None
             ),
             detail_feature_norm=(
                 relation_output.projected_level_norms if relation_output is not None else None
+            ),
+            detail_feature_abs_max=(
+                relation_output.projected_level_abs_max if relation_output is not None else None
+            ),
+            detail_saturation_fraction=(
+                relation_output.projected_level_saturation_fraction if relation_output is not None else None
+            ),
+            detail_norm_ratio=(
+                relation_output.projected_level_norm_ratio if relation_output is not None else None
             ),
             detail_fused_norm=(
                 relation_output.fused_feature_norm if relation_output is not None else None
@@ -512,12 +742,26 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 relation_output.relation_context_norm if relation_output is not None else None
             ),
             relation_gate_prob_mean=(
-                torch.sigmoid(relation_output.gate_logits.detach()).float().mean()
+                torch.sigmoid(relation_output.image_gate_logits.detach()).float().mean()
                 if relation_output is not None
                 else None
             ),
             pbd_delta_norm=pbd_delta_norm,
             pbd_active_positions=pbd_active_positions,
+            loss_lm_contribution=lm_loss,
+            loss_image_gate_contribution=image_gate_contribution,
+            loss_slot_gate_contribution=slot_gate_contribution,
+            loss_attention_contribution=attention_contribution,
+            loss_reconstructed=loss_reconstructed,
+            loss_reconstruction_error=loss_reconstruction_error,
+            attention_active=(
+                torch.tensor(
+                    float(relation_output is not None and relation_output.attention_loss is not None),
+                    device=hidden_states.device,
+                )
+                if labels is not None
+                else None
+            ),
             global_visual_cache=global_visual_cache,
         )
 
@@ -580,30 +824,17 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
 
     @torch.no_grad()
     def repair_nonfinite_ui_relation_parameters(self, absolute_limit: float = 1.0e4) -> dict:
-        """Repair only invalid values in newly introduced checkpoint-missing tensors.
+        """Backward-compatible validator; invalid tensors are never repaired silently."""
 
-        Older LocateAnything checkpoints do not contain relation parameters. A
-        few Transformers/DeepSpeed loading combinations can leave missing
-        tensors with non-finite or clearly uninitialized values. Existing
-        finite learned relation weights are never reset.
-        """
-        repaired = []
-        repaired_values = 0
-        if not self.enable_ui_relation:
-            return {"parameters": repaired, "values": repaired_values}
-        for module_name, module in (
-            ("relation_pyramid", self.relation_pyramid),
-            ("relation_pbd", self.relation_pbd),
-        ):
-            for name, parameter in module.named_parameters():
-                invalid = ~torch.isfinite(parameter) | (parameter.abs() > absolute_limit)
-                count = int(invalid.sum().item())
-                if count:
-                    replacement = 1.0 if "norm" in name and name.endswith("weight") else 0.0
-                    parameter.masked_fill_(invalid, replacement)
-                    repaired.append(f"{module_name}.{name}")
-                    repaired_values += count
-        return {"parameters": repaired, "values": repaired_values}
+        warnings.warn(
+            "repair_nonfinite_ui_relation_parameters is now validation-only; "
+            "use initialize_ui_relation_modules for an all-missing base checkpoint",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        report = self.validate_ui_relation_parameters()
+        report.update({"parameters_repaired": [], "values_repaired": 0})
+        return report
 
     @torch.no_grad()
     def generate(

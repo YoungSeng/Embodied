@@ -141,6 +141,10 @@ class ModelArguments:
         default=1.0,
         metadata={'help': 'Weight of class-balanced focal defectness loss.'},
     )
+    relation_slot_gate_loss_weight: float = field(
+        default=0.1,
+        metadata={'help': 'Weight of slot-objectness focal loss.'},
+    )
     relation_attention_loss_weight: float = field(
         default=0.1,
         metadata={'help': 'Weight of evidence/context weak-supervision loss.'},
