@@ -37,6 +37,7 @@ from .relation_modules import (
     RelationToPBD,
     match_ui_relation_prompt,
     pbd_active_delta_norm,
+    replace_pbd_active_logits,
     relation_gate_output_override,
 )
 
@@ -740,16 +741,11 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                             pbd_output.hidden_states,
                             self.language_model.lm_head.weight,
                         )
-                        outputs.logits = outputs.logits.clone()
-                        flat_logits = outputs.logits.reshape(
-                            -1, outputs.logits.shape[-1]
+                        outputs.logits = replace_pbd_active_logits(
+                            outputs.logits,
+                            replacement_logits,
+                            pbd_output.active_positions,
                         )
-                        flat_replacement = replacement_logits.reshape(
-                            -1, replacement_logits.shape[-1]
-                        )
-                        flat_logits[pbd_output.active_positions] = flat_replacement[
-                            pbd_output.active_positions
-                        ]
                         box_anchor_hidden = pbd_output.box_anchor_hidden
                         coord_start = int(self.config.coord_start_token_id)
                         coord_end = int(self.config.coord_end_token_id) + 1

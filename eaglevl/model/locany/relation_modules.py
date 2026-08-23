@@ -784,6 +784,48 @@ def pbd_active_delta_norm(
     return delta.float().norm(dim=-1).mean()
 
 
+def replace_pbd_active_logits(
+    destination_logits: torch.Tensor,
+    replacement_logits: torch.Tensor,
+    active_positions: torch.Tensor,
+) -> torch.Tensor:
+    """Replace PBD positions while preserving the decoder logits dtype/device.
+
+    Some attention implementations expose decoder logits as float32 even when
+    the LM head/PBD hidden path is bfloat16. PyTorch indexed assignment does
+    not perform this conversion implicitly, so the source is cast explicitly
+    to the destination contract before the write.
+    """
+
+    if destination_logits.shape != replacement_logits.shape:
+        raise ValueError(
+            "PBD replacement logits shape mismatch: "
+            f"destination={tuple(destination_logits.shape)}, "
+            f"replacement={tuple(replacement_logits.shape)}"
+        )
+    output = destination_logits.clone()
+    flat_output = output.reshape(-1, output.shape[-1])
+    flat_replacement = replacement_logits.reshape(
+        -1, replacement_logits.shape[-1]
+    )
+    positions = active_positions.reshape(-1).to(
+        device=flat_output.device, dtype=torch.long
+    )
+    if positions.numel() == 0:
+        return output
+    if int(positions.min().item()) < 0 or int(positions.max().item()) >= flat_output.shape[0]:
+        raise IndexError(
+            "PBD active position is outside logits: "
+            f"positions={positions.tolist()}, tokens={flat_output.shape[0]}"
+        )
+    selected = flat_replacement[positions.to(flat_replacement.device)].to(
+        device=flat_output.device,
+        dtype=flat_output.dtype,
+    )
+    flat_output[positions] = selected
+    return output
+
+
 @dataclass
 class PBDForwardOutput:
     hidden_states: torch.Tensor

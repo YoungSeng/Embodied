@@ -13,16 +13,29 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
             "shell/run_locany_cpt_merlin.sh a100 smoke",
             "gpuv: A800_SXM_40GB",
             "clusterId: 24",
+            "gpu: 4",
+            'CUDA_DEVICES: "0,1,2,3"',
         ),
         "locany_cpt_v4_a100x4_formal_merlin.yaml": (
             "shell/run_locany_cpt_merlin.sh a100 formal",
             "gpuv: A800_SXM_40GB",
             "clusterId: 24",
+            "gpu: 4",
+            'CUDA_DEVICES: "0,1,2,3"',
         ),
         "locany_cpt_v4_h20x4_formal_merlin.yaml": (
             "shell/run_locany_cpt_merlin.sh h20 formal",
             "gpuv: NVIDIA_H20",
             "clusterId: 20",
+            "gpu: 4",
+            'CUDA_DEVICES: "0,1,2,3"',
+        ),
+        "locany_cpt_v4_h20x2_formal_merlin.yaml": (
+            "shell/run_locany_cpt_merlin.sh h20 formal",
+            "gpuv: NVIDIA_H20",
+            "clusterId: 20",
+            "gpu: 2",
+            'CUDA_DEVICES: "0,1"',
         ),
     }
 
@@ -32,9 +45,7 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
                 text = (REPO_ROOT / filename).read_text(encoding="utf-8")
                 for value in expected:
                     self.assertIn(value, text)
-                self.assertIn("gpu: 4", text)
                 self.assertIn("Embodied-CPT", text)
-                self.assertIn("CUDA_DEVICES: \"0,1,2,3\"", text)
 
     def test_yaml_pins_smoke_and_formal_training_parameters(self):
         smoke = (REPO_ROOT / "locany_cpt_v4_a100x4_smoke_merlin.yaml").read_text(
@@ -61,11 +72,30 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn('MAX_NUM_TOKENS: "25600"', h20)
         self.assertIn('ATTN_IMPLEMENTATION: "magi"', h20)
 
+        h20x2 = (REPO_ROOT / "locany_cpt_v4_h20x2_formal_merlin.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("caption: 'LocateAnything UI CPT Formal - H20x2'", h20x2)
+        self.assertIn("name: 'locany-cpt-v4-h20x2-formal'", h20x2)
+        self.assertIn("cpu: 40", h20x2)
+        self.assertIn("memory: 460800", h20x2)
+        self.assertIn('GPU_COUNT: "2"', h20x2)
+        self.assertIn('GRADIENT_ACCUMULATION_STEPS: "4"', h20x2)
+        self.assertIn('MAX_NUM_TOKENS: "25600"', h20x2)
+
     def test_formal_defaults_keep_four_card_rank_batch_and_twelve_hour_saves(self):
         launcher = (REPO_ROOT / "shell" / "run_locany_cpt.sh").read_text(encoding="utf-8")
         self.assertIn('GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"', launcher)
         self.assertIn('SAVE_EVERY_N_HOURS="${SAVE_EVERY_N_HOURS:-12}"', launcher)
         self.assertIn('MAX_STEPS="${MAX_STEPS:-20000}"', launcher)
+        self.assertIn('GPU_COUNT="${GPU_COUNT:-4}"', launcher)
+        self.assertIn('export GPUS="${GPU_COUNT}" GPU_COUNT', launcher)
+
+        merlin = (REPO_ROOT / "shell" / "run_locany_cpt_merlin.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('expected_gpu_count = int(os.environ.get("GPU_COUNT", "4"))', merlin)
+        self.assertIn('x${GPU_COUNT}-formal', merlin)
 
 
 if __name__ == "__main__":

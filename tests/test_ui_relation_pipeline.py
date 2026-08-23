@@ -18,6 +18,7 @@ from eaglevl.model.locany.relation_modules import (
     pbd_active_delta_norm,
     pbd_prediction_positions,
     passes_relation_gate,
+    replace_pbd_active_logits,
     relation_gate_output_override,
 )
 from eaglevl.model.locany.ui_relation_setup import (
@@ -357,6 +358,21 @@ class UIRelationPipelineTest(unittest.TestCase):
         baseline_logits = torch.nn.functional.linear(training_hidden, lm_head)
         changed = (training_logits - baseline_logits).abs().sum(dim=-1)
         self.assertTrue(bool((changed > 0).all()))
+
+    def test_pbd_logit_replacement_casts_to_destination_dtype(self):
+        destination = torch.randn(1, 8, 13, dtype=torch.float32)
+        replacement = torch.randn(1, 8, 13, dtype=torch.bfloat16)
+        positions = torch.tensor([1, 2, 3, 4, 5, 6])
+        output = replace_pbd_active_logits(
+            destination, replacement, positions
+        )
+        self.assertEqual(output.dtype, torch.float32)
+        torch.testing.assert_close(output[:, 0], destination[:, 0])
+        torch.testing.assert_close(output[:, 7], destination[:, 7])
+        torch.testing.assert_close(
+            output.reshape(-1, 13)[positions],
+            replacement.reshape(-1, 13)[positions].float(),
+        )
 
     def test_pbd_delta_norm_uses_active_positions_only(self):
         ids = [17] * 1000 + [self.BOX, *([self.MASK] * 5)]

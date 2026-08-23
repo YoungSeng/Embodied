@@ -81,7 +81,7 @@ Copy the complete `locany_cpt_v4_smoke` directory to:
 Because copied image paths are root-relative, no JSONL rewriting is needed
 after the directory moves.
 
-## Four-card Merlin submissions
+## Merlin submissions
 
 A100-profile smoke test on YG (the current YG Arnold resource enum is
 `A800_SXM_40GB`, four cards, SDPA):
@@ -112,6 +112,14 @@ cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Em
 mlx job submitv2 --path locany_cpt_v4_h20x4_formal_merlin.yaml
 ```
 
+H20 × 2 keeps the same per-rank `MAX_NUM_TOKENS=25600` and preserves the
+effective batch with gradient accumulation 4:
+
+```bash
+cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+mlx job submitv2 --path locany_cpt_v4_h20x2_formal_merlin.yaml
+```
+
 Formal defaults are full-parameter training, four GPUs, gradient accumulation
 2, learning rate `5e-6`, 20,000 optimizer steps, A100-profile `7268/12800`
 and H20 `8192/25600` per-sample/per-rank packed-token limits, and a checkpoint
@@ -130,8 +138,8 @@ bash shell/run_locany_cpt.sh h20 formal
 
 The direct `bash shell/run_locany_cpt.sh ...` commands are retained for an
 already allocated interactive worker.  Normal smoke and formal runs should be
-submitted through the Merlin YAML files above.  All three YAMLs use
-`shell/run_locany_cpt_merlin.sh` for cache isolation, four-GPU preflight,
+submitted through the Merlin YAML files above. All YAMLs use
+`shell/run_locany_cpt_merlin.sh` for cache isolation, GPU-count-aware preflight,
 logging, and exit-code propagation, then delegate training parameters to
 `shell/run_locany_cpt.sh`.
 

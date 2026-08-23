@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Common in-container launcher used by the three Merlin job definitions.
+# Common in-container launcher used by the CPT Merlin job definitions.
 # Usage: bash shell/run_locany_cpt_merlin.sh <a100|h20> <smoke|formal>
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,6 +39,8 @@ JOB_ID="${RAW_JOB_ID//[^a-zA-Z0-9._-]/_}"
 LOCAL_RUNTIME_DIR="${LOCAL_RUNTIME_DIR:-/tmp/locany-cpt-${JOB_ID}}"
 SHARED_RUNTIME_DIR="${SHARED_RUNTIME_DIR:-${WORKSPACE}/runtime/locany-cpt/${JOB_ID}}"
 CACHE_ROOT="${CACHE_ROOT:-${LOCAL_RUNTIME_DIR}/cache}"
+GPU_COUNT="${GPU_COUNT:-4}"
+export GPU_COUNT
 
 mkdir -p \
   "${SHARED_RUNTIME_DIR}" \
@@ -93,7 +95,7 @@ if [[ "${CPT_MODE}" == "smoke" ]]; then
   export RUN_NAME="${RUN_NAME:-locany-3b-ui-cpt-v4-a100x4-smoke-${JOB_ID}}"
   export REPORT_TO="${REPORT_TO:-none}"
 else
-  export RUN_NAME="${RUN_NAME:-locany-3b-ui-cpt-v4-${MACHINE_TYPE}x4-formal}"
+  export RUN_NAME="${RUN_NAME:-locany-3b-ui-cpt-v4-${MACHINE_TYPE}x${GPU_COUNT}-formal}"
   export REPORT_TO="${REPORT_TO:-tensorboard}"
 fi
 
@@ -148,7 +150,10 @@ print("gpu count:", torch.cuda.device_count())
 for index in range(torch.cuda.device_count()):
     print(f"gpu {index}:", torch.cuda.get_device_name(index))
 if not torch.cuda.is_available() or torch.cuda.device_count() != expected_gpu_count:
-    raise SystemExit("Merlin CPT jobs require exactly four visible GPUs")
+    raise SystemExit(
+        f"Merlin CPT job requires {expected_gpu_count} visible GPUs; "
+        f"found {torch.cuda.device_count()}"
+    )
 if machine == "h20" and importlib.util.find_spec("magi_attention") is None:
     raise SystemExit("H20 formal profile requires magi_attention")
 PY

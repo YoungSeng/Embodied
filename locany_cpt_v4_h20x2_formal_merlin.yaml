@@ -1,5 +1,5 @@
-# Merlin formal training: LocateAnything-3B UI CPT, HL H20 x4 Magi profile.
-# Submit: mlx job submitv2 --path locany_cpt_v4_h20x4_formal_merlin.yaml
+# Merlin formal training: LocateAnything-3B UI CPT, HL H20 x2 Magi profile.
+# Submit: mlx job submitv2 --path locany_cpt_v4_h20x2_formal_merlin.yaml
 
 caption: 'LocateAnything UI CPT Formal - H20x2'
 
@@ -39,7 +39,7 @@ jobDefVersion:
           gpu: 2
           gpuv: NVIDIA_H20
           queueName: compute-329-hl-cloudnative-ai-iesqa.llm4se-guarantee
-          memory: 921600
+          memory: 460800
           ports: 1
     backend: ARNOLD
 
