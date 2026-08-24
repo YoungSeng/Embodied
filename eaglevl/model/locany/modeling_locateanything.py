@@ -36,6 +36,7 @@ from .relation_modules import (
     RelationToPBD,
     pbd_active_delta_norm,
 )
+from .ui_relation_setup import ui_relation_collective_device
 
 
 logger = logging.get_logger(__name__)
@@ -310,7 +311,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                     for name in (rank_names or [])
                 }
             )
-            device = next(self.parameters()).device
+            device = ui_relation_collective_device(next(self.parameters()).device)
             totals = torch.tensor(
                 [float(values), checksum, square_checksum, float(nonfinite_count)],
                 dtype=torch.float64,
@@ -337,10 +338,13 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         if not dist.is_available() or not dist.is_initialized():
             report["world_size"] = 1
             return report
+        collective_device = ui_relation_collective_device(
+            next(self.parameters()).device
+        )
         local = torch.tensor(
             [report["checksum"], report["square_checksum"]],
             dtype=torch.float64,
-            device=next(self.parameters()).device,
+            device=collective_device,
         )
         gathered = [torch.zeros_like(local) for _ in range(dist.get_world_size())]
         dist.all_gather(gathered, local)
@@ -350,7 +354,14 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             raise RuntimeError(
                 f"UI relation initialization differs across ranks: max_diff={max_diff}, checksums={stacked.cpu().tolist()}"
             )
-        report.update({"world_size": dist.get_world_size(), "rank_max_diff": max_diff})
+        report.update(
+            {
+                "world_size": dist.get_world_size(),
+                "rank_max_diff": max_diff,
+                "collective_backend": str(dist.get_backend()),
+                "collective_device": str(collective_device),
+            }
+        )
         return report
 
         

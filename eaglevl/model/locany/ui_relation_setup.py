@@ -9,6 +9,34 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
+import torch
+import torch.distributed as dist
+
+
+def ui_relation_collective_device(
+    parameter_device: torch.device | str | None = None,
+) -> torch.device:
+    """Choose a tensor device supported by the active process-group backend.
+
+    UI relation modules are audited before Trainer/DeepSpeed moves the model to
+    CUDA.  Consequently, ``next(model.parameters()).device`` is still CPU at
+    that point.  NCCL collectives cannot consume CPU tensors, so they must use
+    the CUDA device selected for the current torchrun rank.  CPU-capable
+    backends keep the audit tensor on CPU.
+    """
+
+    fallback = torch.device(parameter_device or "cpu")
+    if not dist.is_available() or not dist.is_initialized():
+        return fallback
+    backend = str(dist.get_backend()).lower()
+    if "nccl" in backend:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "NCCL UI relation consistency audit requires an available CUDA device"
+            )
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
 
 def configure_ui5_model_config(
     config,

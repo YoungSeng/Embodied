@@ -19,10 +19,49 @@ import collect_ui5_metrics
 import locany_ui5_checkpoint
 import locany_ui5_common
 import patch_locany_checkpoint
+import run_locany_ui5_local_debug
 import submit_locany_ui5
 
 
 class RuntimeConfigTests(unittest.TestCase):
+    def test_local_debug_starts_same_pipeline_without_evaluation(self) -> None:
+        args = run_locany_ui5_local_debug.parse_args(
+            [
+                "--machine",
+                "a800",
+                "--gpus",
+                "4",
+                "--cuda-devices",
+                "0,1,2,3",
+                "--max-steps",
+                "20",
+                "--run-name",
+                "local-smoke",
+                "--project-root",
+                str(PROJECT_ROOT),
+            ]
+        )
+        env = run_locany_ui5_local_debug.build_environment(args, base_env={})
+        command = run_locany_ui5_local_debug.build_command(args)
+        self.assertEqual(env["ENABLE_EVAL"], "0")
+        self.assertEqual(env["EVAL_AT_START"], "0")
+        self.assertEqual(env["MAX_NUM_TOKENS"], "12800")
+        self.assertEqual(env["GRADIENT_ACCUMULATION_STEPS"], "2")
+        self.assertEqual(env["MAX_STEPS"], "20")
+        self.assertEqual(env["SAVE_STEPS"], "20")
+        self.assertEqual(env["RUN_NAME"], "local-smoke")
+        self.assertEqual(
+            Path(command[-1]), PROJECT_ROOT / "shell" / "run_locany_ui5_pipeline.sh"
+        )
+
+    def test_local_eight_gpu_debug_keeps_formal_accumulation_schedule(self) -> None:
+        args = run_locany_ui5_local_debug.parse_args(
+            ["--gpus", "8", "--project-root", str(PROJECT_ROOT)]
+        )
+        env = run_locany_ui5_local_debug.build_environment(args, base_env={})
+        self.assertEqual(env["MAX_NUM_TOKENS"], "25600")
+        self.assertEqual(env["GRADIENT_ACCUMULATION_STEPS"], "1")
+
     def test_a800_defaults_are_gpu_count_specific(self) -> None:
         common = {"MACHINE_TYPE": "a800", "VERSION": "v4"}
         four = locany_ui5_common.resolve_runtime_config(

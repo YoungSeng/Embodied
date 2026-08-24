@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 from torch import nn
@@ -24,6 +25,7 @@ from eaglevl.model.locany.relation_modules import (
 from eaglevl.model.locany.ui_relation_setup import (
     configure_ui5_model_config,
     initialize_or_validate_ui_relation,
+    ui_relation_collective_device,
 )
 
 
@@ -31,6 +33,26 @@ class UIRelationPipelineTest(unittest.TestCase):
     BOX = 101
     MASK = 102
     BLOCK_SIZE = 6
+
+    def test_nccl_consistency_audit_uses_current_rank_cuda_device(self):
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_backend", return_value="nccl"),
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch("torch.cuda.current_device", return_value=3),
+        ):
+            device = ui_relation_collective_device(torch.device("cpu"))
+        self.assertEqual(device, torch.device("cuda", 3))
+
+    def test_cpu_collective_backend_keeps_audit_tensor_on_cpu(self):
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_backend", return_value="gloo"),
+        ):
+            device = ui_relation_collective_device(torch.device("cuda", 2))
+        self.assertEqual(device, torch.device("cpu"))
 
     def test_training_and_checkpoint0_share_ui5_config_builder(self):
         config = SimpleNamespace(
