@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import glob
 import json
 import logging
 import os
@@ -21,6 +20,7 @@ import re
 import shutil
 import time
 import copy
+from pathlib import Path
 from typing import List
 
 import torch
@@ -36,7 +36,7 @@ from pynvml import (
 )
 from PIL import Image
 from transformers import TrainerCallback
-from transformers.trainer_utils import get_last_checkpoint
+from .ui5_checkpoint_utils import list_training_checkpoints, validate_checkpoint
 from .fastseek.draw_marker import DRAW_FUNCTIONS
 from .checkpoint_schedule import PeriodicCheckpointSchedule
 
@@ -48,31 +48,35 @@ _DETECTION_CATEGORY_RE = re.compile(
 _BOX_RE = re.compile(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>")
 
 def get_last_checkpoint_guard(folder):
-    while True:
-        last_checkpoint = get_last_checkpoint(folder)
-        if last_checkpoint is None:
-            break
+    """Return only a fully resumable checkpoint and never delete user data.
 
-        # UI5 exports a model-only checkpoint-0 for architecture-identical
-        # step-0 evaluation.  It intentionally lacks optimizer/Trainer state
-        # and must not be resumed from or removed as an incomplete checkpoint.
-        # Returning None lets a fresh run initialize from model_name_or_path;
-        # later checkpoint-N directories still retain the existing guard.
-        if osp.basename(osp.normpath(last_checkpoint)) == "checkpoint-0":
-            logger.info(
-                "Ignoring evaluation-only checkpoint-0 during training resume detection: %s",
-                last_checkpoint,
-            )
-            return None
-        
-        world_size = dist.get_world_size()
-        if len(glob.glob(os.path.join(last_checkpoint, "*.pth"))) != world_size:
-            # incomplete xxx.pth
-            shutil.rmtree(last_checkpoint)
-        else:
-            break
+    The former guard counted legacy ``*.pth`` files and could delete a valid
+    modern UI5 checkpoint whose states are ``*.pt``/DeepSpeed directories.
+    This entrypoint now shares exactly the same validator as the pipeline CLI.
+    """
 
-    return last_checkpoint
+    candidates = list_training_checkpoints(Path(folder))
+    if not candidates:
+        return None
+    _, last_checkpoint = candidates[-1]
+    world_size = dist.get_world_size() if dist.is_initialized() else None
+    report = validate_checkpoint(
+        last_checkpoint,
+        mode="resume",
+        expected_ranks=world_size,
+    )
+    if not report["valid"]:
+        raise RuntimeError(
+            "Latest checkpoint is not resumable; refusing silent fallback or deletion: "
+            f"checkpoint={last_checkpoint}; errors={'; '.join(report['errors'])}"
+        )
+    if report["warnings"]:
+        logger.warning(
+            "Checkpoint resume warnings for %s: %s",
+            last_checkpoint,
+            "; ".join(report["warnings"]),
+        )
+    return str(last_checkpoint)
 
 class SaveCheckpointCallback(TrainerCallback):
     """Request a Trainer checkpoint after each wall-clock interval.

@@ -195,6 +195,19 @@ if [[ "${ENABLE_EVAL}" == "1" || "${PIPELINE_MODE}" == "eval" ]]; then
     locany_die 25 "Scorer missing: ${SCORER_ROOT}/qwen3vl_merge_and_score_fixed_5tasks.py"
 fi
 
+# Establish the binary environment fingerprint before step-0 evaluation.  The
+# training entrypoint checks the same baseline again before and after every
+# segment, so an in-place pip/conda reinstall cannot silently span evaluation
+# and training.
+PIPELINE_ENVIRONMENT_AUDIT=(
+  "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/check_locany_environment.py"
+  --output-dir "${OUTPUT_DIR}"
+)
+if [[ "${ALLOW_RUNTIME_ENVIRONMENT_CHANGE:-0}" == "1" ]]; then
+  PIPELINE_ENVIRONMENT_AUDIT+=(--allow-change)
+fi
+"${PIPELINE_ENVIRONMENT_AUDIT[@]}" --phase pre
+
 install_ui5_system_runtime_deps() {
   if ! command -v apt-get >/dev/null 2>&1; then
     locany_die 32 \
@@ -390,6 +403,46 @@ if [[ "${ENABLE_EVAL}" == "0" ]]; then
   exec bash "${PROJECT_ROOT}/shell/train_locany_ui_defect.sh"
 fi
 
+current_step="$("${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/locany_ui5_checkpoint.py" \
+  latest --output-dir "${OUTPUT_DIR}" --require-resume --expected-ranks "${GPU_COUNT}" --field step)"
+
+if [[ ! "${current_step}" =~ ^[0-9]+$ ]]; then
+  locany_die 27 "Could not resolve latest checkpoint step: ${current_step}"
+fi
+
+training_checkpoint_count="$("${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/locany_ui5_checkpoint.py" \
+  training-candidates --output-dir "${OUTPUT_DIR}" --field count)"
+if [[ ! "${training_checkpoint_count}" =~ ^[0-9]+$ ]]; then
+  locany_die 27 "Could not count training checkpoint candidates: ${training_checkpoint_count}"
+fi
+
+# Run resume validation before the potentially 45-minute step-0 evaluation.
+# checkpoint-0 is model-only by design; every checkpoint-N (N > 0) must be a
+# complete resume point.  Never skip a newer incomplete directory and fall
+# back to an older checkpoint.
+if (( current_step == 0 && training_checkpoint_count > 0 )); then
+  invalid_training_checkpoints="$("${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/locany_ui5_checkpoint.py" \
+    training-candidates --output-dir "${OUTPUT_DIR}" --field paths)"
+  locany_die 28 \
+    "Nonzero checkpoint directories exist, but the newest one failed resume validation; refusing fallback/restart: ${invalid_training_checkpoints}"
+fi
+
+# Evaluation-only observe mode may load legacy checkpoints.  Training resume
+# must have the complete Image-Gate/Slot-Gate/Relation/PBD architecture.
+if (( current_step > 0 )); then
+  resume_checkpoint="${OUTPUT_DIR}/checkpoint-${current_step}"
+  echo "[PIPELINE] strict UI module audit before training resume: ${resume_checkpoint}"
+  if ! "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/patch_locany_checkpoint.py" \
+      --base-model "${BASE_MODEL}" \
+      --checkpoint "${resume_checkpoint}" \
+      --project-root "${PROJECT_ROOT}" \
+      --force \
+      --validate-relation-weights; then
+    locany_die 31 \
+      "Training resume checkpoint is not a complete Image-Gate/Slot-Gate/Relation/PBD model. Use --eval-checkpoint with observe mode for legacy reproduction, or choose a fresh --run-name for training: ${resume_checkpoint}"
+  fi
+fi
+
 CHECKPOINT_ZERO="${OUTPUT_DIR}/checkpoint-0"
 if [[ "${EVAL_AT_START}" == "1" ]] && ! has_successful_evaluation 0; then
   echo "[PIPELINE] exporting deterministic full-model checkpoint-0"
@@ -418,47 +471,6 @@ if [[ "${EVAL_AT_START}" == "1" ]] && ! has_successful_evaluation 0; then
   fi
 fi
 
-current_step="$("${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/locany_ui5_checkpoint.py" \
-  latest --output-dir "${OUTPUT_DIR}" --require-resume --expected-ranks "${GPU_COUNT}" --field step)"
-
-if [[ ! "${current_step}" =~ ^[0-9]+$ ]]; then
-  locany_die 27 "Could not resolve latest checkpoint step: ${current_step}"
-fi
-
-training_checkpoint_count="$("${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/locany_ui5_checkpoint.py" \
-  training-candidates --output-dir "${OUTPUT_DIR}" --field count)"
-if [[ ! "${training_checkpoint_count}" =~ ^[0-9]+$ ]]; then
-  locany_die 27 "Could not count training checkpoint candidates: ${training_checkpoint_count}"
-fi
-
-# checkpoint-0 is a deterministic, full-model evaluation artifact.  It has no
-# optimizer/scheduler/Trainer state by design, so it is neither corrupt nor a
-# resume candidate.  Keep the fail-fast guard for every checkpoint-N, N > 0.
-if (( current_step == 0 && training_checkpoint_count > 0 )); then
-  invalid_training_checkpoints="$("${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/locany_ui5_checkpoint.py" \
-    training-candidates --output-dir "${OUTPUT_DIR}" --field paths)"
-  locany_die 28 \
-    "Nonzero checkpoint directories exist, but none passed resume validation; refusing to restart from zero: ${invalid_training_checkpoints}"
-fi
-
-# Evaluation-only observe mode may deliberately load a legacy checkpoint whose
-# image-level Gate did not exist yet.  Training resume must never do that: an
-# old slot-Gate checkpoint would otherwise be accepted by Trainer and silently
-# mix the repaired architecture with an invalid optimization history.
-if (( current_step > 0 )); then
-  resume_checkpoint="${OUTPUT_DIR}/checkpoint-${current_step}"
-  echo "[PIPELINE] strict UI module audit before training resume: ${resume_checkpoint}"
-  if ! "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/patch_locany_checkpoint.py" \
-      --base-model "${BASE_MODEL}" \
-      --checkpoint "${resume_checkpoint}" \
-      --project-root "${PROJECT_ROOT}" \
-      --force \
-      --validate-relation-weights; then
-    locany_die 31 \
-      "Training resume checkpoint is not a complete Image-Gate/Slot-Gate/Relation/PBD model. Use --eval-checkpoint with observe mode for legacy reproduction, or choose a fresh --run-name for training: ${resume_checkpoint}"
-  fi
-fi
-
 if (( current_step > 0 )) && ! has_successful_evaluation "${current_step}"; then
   checkpoint="${OUTPUT_DIR}/checkpoint-${current_step}"
   if run_evaluation "${current_step}" "${checkpoint}" 0; then
@@ -473,7 +485,8 @@ fi
 
 if (( current_step > 0 )) && has_successful_evaluation "${current_step}"; then
   "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/locany_ui5_checkpoint.py" cleanup \
-    --output-dir "${OUTPUT_DIR}" --formal-interval "${SAVE_STEPS}" --latest-step "${current_step}"
+    --output-dir "${OUTPUT_DIR}" --formal-interval "${SAVE_STEPS}" \
+    --latest-step "${current_step}" --expected-ranks "${GPU_COUNT}"
 fi
 
 while (( current_step < MAX_STEPS )); do
@@ -512,7 +525,8 @@ while (( current_step < MAX_STEPS )); do
 
   if (( eval_succeeded == 1 )); then
     "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/locany_ui5_checkpoint.py" cleanup \
-      --output-dir "${OUTPUT_DIR}" --formal-interval "${SAVE_STEPS}" --latest-step "${next_step}"
+      --output-dir "${OUTPUT_DIR}" --formal-interval "${SAVE_STEPS}" \
+      --latest-step "${next_step}" --expected-ranks "${GPU_COUNT}"
   else
     echo "[WARN] Evaluation failed under warn policy; temporary checkpoints were retained" >&2
   fi

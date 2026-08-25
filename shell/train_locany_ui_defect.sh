@@ -325,6 +325,15 @@ echo "MASTER_PORT                   : ${MASTER_PORT}"
 echo "LOG_FILE                      : ${LOG_FILE}"
 echo "============================================================"
 
+ENVIRONMENT_AUDIT_COMMAND=(
+  "${ENV_DIR}/bin/python" "${PROJECT_ROOT}/scripts/check_locany_environment.py"
+  --output-dir "${OUTPUT_DIR}"
+)
+if [[ "${ALLOW_RUNTIME_ENVIRONMENT_CHANGE:-0}" == "1" ]]; then
+  ENVIRONMENT_AUDIT_COMMAND+=(--allow-change)
+fi
+"${ENVIRONMENT_AUDIT_COMMAND[@]}" --phase pre
+
 cleanup_gpu_monitor() {
   stop_gpu_monitor
 }
@@ -401,10 +410,22 @@ fi
 TRAIN_EXIT_CODE="${TRAIN_PIPESTATUS[0]}"
 stop_gpu_monitor
 
+ENVIRONMENT_AUDIT_EXIT_CODE=0
+if "${ENVIRONMENT_AUDIT_COMMAND[@]}" --phase post; then
+  :
+else
+  ENVIRONMENT_AUDIT_EXIT_CODE=$?
+  echo "[LOCANY ENVIRONMENT ERROR] post-training environment audit failed with exit_code=${ENVIRONMENT_AUDIT_EXIT_CODE}" >&2
+  if (( TRAIN_EXIT_CODE == 0 )); then
+    TRAIN_EXIT_CODE="${ENVIRONMENT_AUDIT_EXIT_CODE}"
+  fi
+fi
+
 {
   print_gpu_memory_summary
   echo
   echo "TRAIN_EXIT_CODE: ${TRAIN_EXIT_CODE}"
+  echo "ENVIRONMENT_AUDIT_EXIT_CODE: ${ENVIRONMENT_AUDIT_EXIT_CODE}"
   if (( TRAIN_EXIT_CODE == 0 )); then
     echo "TRAIN_STATUS: SUCCESS"
   else
