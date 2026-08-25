@@ -5,10 +5,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 from eaglevl.train.ui5_excel_logger import (
+    EVAL_COLUMNS,
     EXPECTED_SHEETS,
+    TRAIN_COLUMNS,
     TRAIN_TASKS,
     UI5ExcelLogger,
     build_eval_rows,
@@ -75,6 +77,60 @@ def scorer_metrics(value: float = 0.5) -> dict:
 
 
 class UI5ExcelLoggerTest(unittest.TestCase):
+    def test_legacy_noncontiguous_train_header_migrates_by_name(self):
+        """Reproduce the production workbook that failed after Gate splitting."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "ui5_training_evaluation.xlsx"
+            workbook = Workbook()
+            train = workbook.active
+            train.title = "train_100steps"
+            evaluation = workbook.create_sheet("eval_1000steps")
+            # This intentionally is not a prefix of TRAIN_COLUMNS.  In the old
+            # schema gate_grad_norm followed relation_grad_norm and represented
+            # both Gate branches as one value.
+            legacy_header = (
+                "step",
+                "epoch",
+                "text_overflow_detail_weight_l5",
+                "relation_grad_norm",
+                "gate_grad_norm",
+                "pbd_grad_norm",
+            )
+            train.append(list(legacy_header))
+            train.append([100, 0.1, 0.2, 0.5, 0.75, 0.25])
+            evaluation.append(list(EVAL_COLUMNS))
+            workbook.save(path)
+            workbook.close()
+
+            logger = UI5ExcelLogger(path)
+            rows = build_eval_rows(
+                step=0,
+                checkpoint="checkpoint-0",
+                metrics=scorer_metrics(0.4),
+            )
+            self.assertTrue(logger.append_eval(0, rows))
+
+            migrated = load_workbook(path, read_only=True)
+            try:
+                self.assertEqual(tuple(migrated.sheetnames), EXPECTED_SHEETS)
+                train_sheet = migrated["train_100steps"]
+                header = tuple(cell.value for cell in train_sheet[1])
+                self.assertEqual(header, TRAIN_COLUMNS)
+                values = next(train_sheet.iter_rows(min_row=2, values_only=True))
+                row = dict(zip(header, values))
+                self.assertEqual(row["step"], 100)
+                self.assertEqual(row["epoch"], 0.1)
+                self.assertEqual(row["gate_grad_norm"], 0.75)
+                self.assertIsNone(row["image_gate_grad_norm"])
+                self.assertIsNone(row["slot_gate_grad_norm"])
+                self.assertEqual(
+                    migrated["eval_1000steps"].max_row - 1,
+                    12,
+                )
+            finally:
+                migrated.close()
+
     def test_train_resume_deduplicates_and_keeps_exactly_two_sheets(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "diagnostics" / "ui5_training_evaluation.xlsx"

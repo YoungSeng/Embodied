@@ -2073,6 +2073,21 @@ class StreamPackingMTPTrainer(Trainer):
             return (
                 state["sum"] * max(1, int(self.args.world_size)) / state["count"]
             ) ** 0.5
+        relation_grad_norm = global_grad_rms("relation")
+        image_gate_grad_norm = global_grad_rms("image_gate")
+        slot_gate_grad_norm = global_grad_rms("slot_gate")
+        pbd_grad_norm = global_grad_rms("pbd")
+        gate_grad_components = (
+            value
+            for value in (image_gate_grad_norm, slot_gate_grad_norm)
+            if value is not None
+        )
+        gate_grad_squared_sum = sum(value * value for value in gate_grad_components)
+        gate_grad_norm = (
+            gate_grad_squared_sum ** 0.5
+            if image_gate_grad_norm is not None or slot_gate_grad_norm is not None
+            else None
+        )
         metrics = {
             "step": step,
             "epoch": self.state.epoch,
@@ -2125,10 +2140,11 @@ class StreamPackingMTPTrainer(Trainer):
             "relation_gate_prob_mean": self._average(scalars["relation_gate_prob_mean"]),
             "pbd_delta_norm": self._average(scalars["pbd_delta_norm"]),
             "pbd_active_positions": scalars["pbd_active_positions"]["sum"],
-            "relation_grad_norm": global_grad_rms("relation"),
-            "image_gate_grad_norm": global_grad_rms("image_gate"),
-            "slot_gate_grad_norm": global_grad_rms("slot_gate"),
-            "pbd_grad_norm": global_grad_rms("pbd"),
+            "relation_grad_norm": relation_grad_norm,
+            "gate_grad_norm": gate_grad_norm,
+            "image_gate_grad_norm": image_gate_grad_norm,
+            "slot_gate_grad_norm": slot_gate_grad_norm,
+            "pbd_grad_norm": pbd_grad_norm,
             "tasks": {},
         }
         for group in ("relation", "image_gate", "slot_gate", "pbd"):

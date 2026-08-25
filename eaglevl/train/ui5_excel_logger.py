@@ -91,6 +91,11 @@ TRAIN_MODULE_COLUMNS = (
     "pbd_delta_norm",
     "pbd_active_positions",
     "relation_grad_norm",
+    # Kept as the backwards-compatible aggregate of image/slot Gate gradients.
+    # Older workbooks contain this column, while newer runs also expose the two
+    # components below.  Retaining it lets name-based schema migration preserve
+    # completed evaluations instead of rejecting the legacy header.
+    "gate_grad_norm",
     "image_gate_grad_norm",
     "slot_gate_grad_norm",
     "pbd_grad_norm",
