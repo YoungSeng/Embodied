@@ -142,6 +142,49 @@ test -f weights/icon_detect_v3/model.pt
 该命令来自 Microsoft OmniParser 官方说明，只下载 icon detector，不下载 caption 模型或
 整个模型仓库。也可以通过 `--icon-model /absolute/path/model.pt` 指定已有文件。
 
+### `icon_detect_v3 requires torch and torchvision` 报错
+
+这条短错误不一定表示 `torch` 和 `torchvision` 都没装。固定版本 parser 会把下面几种情况
+统一包装成同一句话：缺少 `torchvision`、Torch 与 torchvision 二进制不匹配、
+`torchvision::nms` 算子不可用。因此不需要安装 `ultralytics`，也不要直接在已经跑通 OCR 的
+Paddle 环境中升级/降级 Torch。
+
+先在当前环境查看真正的导入结果：
+
+```bash
+python -c 'import torch, torchvision; from torchvision.ops import batched_nms; print("torch", torch.__version__, "torchvision", torchvision.__version__, "torch_cuda", torch.version.cuda, "cuda", torch.cuda.is_available())'
+```
+
+如果这条命令失败，优先复用已经能运行 LocateAnything/训练代码的 PyTorch 环境。YG 集群
+现有 UI5 文档使用下面这个环境；先检查路径确实存在：
+
+```bash
+ICON_PYTHON=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python
+test -x "${ICON_PYTHON}"
+
+"${ICON_PYTHON}" -c 'import numpy, PIL, torch, torchvision; from torchvision.ops import batched_nms; print("torch", torch.__version__, "torchvision", torchvision.__version__, "torch_cuda", torch.version.cuda, "cuda", torch.cuda.is_available())'
+```
+
+如果该绝对路径在当前机器不存在，就把它替换为 `conda env list` 中实际 LocateAnything/Torch
+环境的 `bin/python`。如果路径存在但验证仍失败，先保留完整 traceback 和版本信息；不要盲目
+执行 `pip install -U torch torchvision`，否则可能改坏正式训练环境。
+
+验证成功后，给审计命令增加：
+
+```bash
+--icon-python "${ICON_PYTHON}"
+```
+
+也可以 `export ICON_PYTHON=/absolute/path/to/.../bin/python`，脚本会自动读取。主脚本和 text
+worker 仍使用当前 Paddle Python，只有 icon worker 使用该 PyTorch Python。启动四个 icon
+worker 前，脚本会先单进程检查 NumPy/Pillow、Torch、`torchvision.ops.batched_nms`、CUDA
+可见性和 `model.pt` 是否能加载；失败时会打印未被 parser 隐藏的原始 traceback。
+
+本次如果 text 已经完成而 icon 在 `0/17281` 失败，更新代码后仍可使用原来的
+`--stage all --resume`。prepare 和全部 text shard 会校验后跳过，流水线直接回到 icon；不会
+重新执行 17,281 张 OCR。也可把 `--stage all` 改为 `--stage icon`，icon 成功后再执行
+`merge` 和 `crop-audit`。
+
 ## 4. 正式运行：最简单是一条命令
 
 在 `Embodied-ui5-det-crop` 目录执行：
@@ -154,6 +197,7 @@ bash shell/run_ui5_crop_audit.sh \
   --output-dir work_dirs/ui5_crop_audit_20260825 \
   --gpus 0,1,2,3 \
   --workers-per-gpu 1 \
+  --icon-python "${ICON_PYTHON}" \
   --stage all \
   --resume
 ```

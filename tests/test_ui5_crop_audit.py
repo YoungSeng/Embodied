@@ -26,14 +26,18 @@ from run_ui5_crop_audit import (  # noqa: E402
     atomic_write_jsonl,
     build_preview_rows,
     completed_shard_valid,
+    detection_worker_command,
     detector_config,
     ensure_detector_config,
     digest_ids,
     normalize_gt_in_crop,
     proposal_crops,
     prepared_manifest_valid,
+    preflight_icon_runtime,
     resolve_required_directory,
+    resolve_python_executable,
     run_crop_audit,
+    run_detection_stage,
     uses_task_whole_image_policy,
     write_excel_report,
     write_statistics_csv,
@@ -265,6 +269,59 @@ class GeometryTest(unittest.TestCase):
 
 
 class ResumeAndExcelTest(unittest.TestCase):
+    def test_detection_workers_can_use_separate_python_environments(self):
+        args = SimpleNamespace(
+            text_python="/envs/paddle/bin/python",
+            icon_python="/envs/locateanything/bin/python",
+            source_dir=Path("/source"),
+            locany_data_dir=Path("/data"),
+            parser_root=Path("/parser"),
+            output_dir=Path("/output"),
+            gpus="0,1,2,3",
+            workers_per_gpu=1,
+            image_loader_threads=4,
+            shard_size=750,
+            max_unique_images=0,
+            progress_interval_seconds=10,
+            progress_every_images=25,
+            text_long_side=1920,
+            text_box_threshold=0.3,
+            icon_long_side=1920,
+            icon_confidence=0.05,
+            text_model_dir=None,
+            icon_model=None,
+            resume=True,
+            enable_mkldnn=False,
+        )
+        text_command = detection_worker_command(args, "text", 0, 4)
+        icon_command = detection_worker_command(args, "icon", 0, 4)
+        self.assertEqual(text_command[0], args.text_python)
+        self.assertEqual(icon_command[0], args.icon_python)
+
+    def test_icon_runtime_preflight_preserves_original_import_error(self):
+        failed = __import__("subprocess").CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr="RuntimeError: operator torchvision::nms does not exist\n",
+        )
+        with mock.patch("run_ui5_crop_audit.subprocess.run", return_value=failed):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"(?s)尚未启动 GPU worker.*torchvision::nms does not exist",
+            ):
+                preflight_icon_runtime(
+                    "/envs/icon/bin/python",
+                    gpu="0",
+                    model_path=Path("/parser/weights/icon_detect_v3/model.pt"),
+                )
+
+    def test_python_executable_defaults_to_current_interpreter(self):
+        self.assertEqual(
+            Path(resolve_python_executable(None, "--icon-python")),
+            Path(sys.executable).absolute(),
+        )
+
     def test_missing_cli_directory_reports_option_and_resolved_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             missing = Path(temporary) / "does-not-exist"
@@ -365,6 +422,43 @@ class ResumeAndExcelTest(unittest.TestCase):
             self.assertTrue(completed_shard_valid(input_path, output_path, done_path, "text"))
             atomic_write_jsonl(output_path, outputs[:1])
             self.assertFalse(completed_shard_valid(input_path, output_path, done_path, "text"))
+
+    def test_fully_completed_resume_does_not_load_model_or_start_workers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = AuditPaths(Path(temporary))
+            rows = [{"image_id": "a"}, {"image_id": "b"}]
+            shard = paths.shards / "shard_00000.jsonl"
+            output = paths.stage_dir("text") / shard.name
+            marker = paths.stage_dir("text") / "shard_00000.done.json"
+            atomic_write_jsonl(paths.unique_images, rows)
+            atomic_write_jsonl(shard, rows)
+            atomic_write_jsonl(output, rows)
+            atomic_write_json(
+                marker,
+                {
+                    "stage": "text",
+                    "count": 2,
+                    "image_id_digest": digest_ids(["a", "b"]),
+                },
+            )
+            args = SimpleNamespace(
+                output_dir=Path(temporary),
+                resume=True,
+                progress_interval_seconds=60,
+            )
+            with (
+                mock.patch("run_ui5_crop_audit.print_preflight"),
+                mock.patch("run_ui5_crop_audit.subprocess.Popen") as popen,
+                mock.patch("run_ui5_crop_audit.preflight_icon_runtime") as runtime_probe,
+            ):
+                run_detection_stage(args, "text")
+            popen.assert_not_called()
+            runtime_probe.assert_not_called()
+            status = json.loads(
+                (Path(temporary) / "run_status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(status["completed"], 2)
+            self.assertEqual(status["status"], "completed")
 
     def test_excel_summary_matches_json_and_statistics_csv(self):
         try:

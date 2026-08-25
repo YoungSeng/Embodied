@@ -16,6 +16,7 @@ Usage:
     --output-dir work_dirs/ui5_crop_audit_20260825 \
     --gpus 0,1,2,3 \
     --workers-per-gpu 1 \
+    --icon-python /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python \
     --stage prepare \
     --resume
 

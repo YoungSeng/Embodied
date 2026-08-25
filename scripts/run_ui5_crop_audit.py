@@ -108,6 +108,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument("--workers-per-gpu", type=int, choices=(1, 2), default=1)
     parser.add_argument("--allow-two-processes-per-gpu", action="store_true")
+    parser.add_argument(
+        "--text-python",
+        default=os.environ.get("TEXT_PYTHON"),
+        help="Python executable for PP-OCRv5 workers; defaults to the launcher Python",
+    )
+    parser.add_argument(
+        "--icon-python",
+        default=os.environ.get("ICON_PYTHON"),
+        help=(
+            "Python executable for icon workers; may point to a separate Torch/"
+            "LocateAnything environment"
+        ),
+    )
     parser.add_argument("--image-loader-threads", type=int, default=4)
     parser.add_argument("--shard-size", type=int, default=750)
     parser.add_argument(
@@ -451,6 +464,8 @@ def print_preflight(
         f"parser_commit   : {revisions['parser']}",
         f"text_model      : {config['text']['model_dir'] or 'PaddleOCR automatic download/cache'}",
         f"icon_model      : {config['icon']['model']}",
+        f"text_python     : {args.text_python}",
+        f"icon_python     : {args.icon_python}",
         f"output_dir      : {args.output_dir.resolve(strict=False)}",
         f"GPUs            : {args.gpus}",
         f"workers/GPU     : {args.workers_per_gpu}",
@@ -934,9 +949,13 @@ def run_detector_worker(args: argparse.Namespace) -> None:
         write_worker_progress(status=worker_final_status)
 
 
+def detection_python(args: argparse.Namespace, stage: str) -> str:
+    return str(args.text_python if stage == "text" else args.icon_python)
+
+
 def detection_worker_command(args: argparse.Namespace, stage: str, worker_index: int, worker_count: int) -> list[str]:
     command = [
-        sys.executable,
+        detection_python(args, stage),
         str(Path(__file__).resolve()),
         "--stage", "_worker",
         "--detector-stage", stage,
@@ -969,9 +988,122 @@ def detection_worker_command(args: argparse.Namespace, stage: str, worker_index:
     return command
 
 
+def preflight_icon_runtime(
+    python_executable: str,
+    *,
+    gpu: str,
+    model_path: Path,
+) -> dict[str, Any]:
+    """Validate Torch, torchvision ops, CUDA and the TorchScript model once.
+
+    The parser intentionally treats every import failure as one short error.  A
+    subprocess probe preserves the real traceback and avoids starting four
+    workers that are guaranteed to fail in the same environment.
+    """
+    probe = r"""
+import json
+import sys
+import numpy
+import PIL
+import torch
+import torchvision
+from torchvision.ops import batched_nms
+
+boxes = torch.tensor([[0.0, 0.0, 2.0, 2.0], [1.0, 1.0, 3.0, 3.0]])
+scores = torch.tensor([0.9, 0.8])
+classes = torch.tensor([0, 0])
+batched_nms(boxes, scores, classes, 0.5)
+model = torch.jit.load(sys.argv[1], map_location="cpu")
+del model
+payload = {
+    "torch": torch.__version__,
+    "torchvision": torchvision.__version__,
+    "numpy": numpy.__version__,
+    "pillow": PIL.__version__,
+    "torch_cuda": torch.version.cuda,
+    "cuda_available": torch.cuda.is_available(),
+    "cuda_device_count": torch.cuda.device_count(),
+    "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+    "model_loaded": True,
+}
+print("UI5_ICON_RUNTIME=" + json.dumps(payload, ensure_ascii=False))
+"""
+    environment = os.environ.copy()
+    environment["CUDA_VISIBLE_DEVICES"] = gpu
+    result = subprocess.run(
+        [python_executable, "-c", probe, str(model_path)],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    if result.returncode != 0:
+        raise RuntimeError(
+            "icon Python 环境预检失败；尚未启动 GPU worker。\n"
+            f"icon_python: {python_executable}\n"
+            f"CUDA_VISIBLE_DEVICES: {gpu}\n"
+            "需要同一环境可导入 torch、torchvision.ops.batched_nms，且能加载 model.pt。\n"
+            "原始异常如下：\n"
+            f"{output or '(no subprocess output)'}"
+        )
+    prefix = "UI5_ICON_RUNTIME="
+    payload_line = next(
+        (line for line in result.stdout.splitlines() if line.startswith(prefix)),
+        None,
+    )
+    if payload_line is None:
+        raise RuntimeError(f"icon Python 预检没有返回版本信息：\n{output}")
+    payload = json.loads(payload_line[len(prefix) :])
+    if not payload.get("cuda_available") or int(payload.get("cuda_device_count", 0)) < 1:
+        raise RuntimeError(
+            "icon Python 可以导入 Torch，但该环境看不到请求的 CUDA GPU。\n"
+            f"icon_python: {python_executable}\n"
+            f"CUDA_VISIBLE_DEVICES: {gpu}\n"
+            f"runtime: {json.dumps(payload, ensure_ascii=False)}"
+        )
+    print(
+        "[icon 环境预检] "
+        f"python={python_executable} | torch={payload['torch']} | "
+        f"torchvision={payload['torchvision']} | torch CUDA={payload['torch_cuda']} | "
+        f"GPU={payload['cuda_device']} | model.pt=OK",
+        flush=True,
+    )
+    return payload
+
+
 def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
     paths = AuditPaths(args.output_dir)
     unique = read_jsonl(paths.unique_images)
+    baseline_completed = 0
+    for shard in sorted(paths.shards.glob("shard_*.jsonl")):
+        output_path = paths.stage_dir(stage) / shard.name
+        done_path = paths.stage_dir(stage) / (shard.stem + ".done.json")
+        if args.resume and completed_shard_valid(shard, output_path, done_path, stage):
+            baseline_completed += len(read_jsonl(shard))
+    if args.resume and unique and baseline_completed == len(unique):
+        # A fully completed stage must not import or initialize its model again.
+        # This also lets merge/crop reuse immutable detections after GPU envs are released.
+        print_preflight(
+            args,
+            unique_count=len(unique),
+            readable_count=len(unique),
+            detector_stage=None,
+        )
+        reporter = ProgressReporter(
+            stage=stage,
+            total=len(unique),
+            output_dir=args.output_dir,
+            interval_seconds=args.progress_interval_seconds,
+            initial_completed=baseline_completed,
+        )
+        reporter.update(
+            baseline_completed,
+            status="completed",
+            detail="--resume 已验证全部 shard，跳过模型加载和 GPU worker",
+            force=True,
+        )
+        return
     print_preflight(args, unique_count=len(unique), readable_count=len(unique), detector_stage=stage)
     if args.workers_per_gpu == 2 and not args.allow_two_processes_per_gpu:
         raise ValueError(
@@ -995,15 +1127,19 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
     missing_gpus = [gpu for gpu in gpus if gpu not in available]
     if missing_gpus:
         raise ValueError(f"requested GPUs are unavailable: {missing_gpus}; available={sorted(available)}")
+    runtime: dict[str, Any] = {"python": detection_python(args, stage)}
+    if stage == "icon":
+        config = detector_config(args)
+        runtime.update(
+            preflight_icon_runtime(
+                detection_python(args, stage),
+                gpu=gpus[0],
+                model_path=Path(config["icon"]["model"]),
+            )
+        )
     slots = [(gpu, slot) for gpu in gpus for slot in range(args.workers_per_gpu)]
     processes = []
     wall_started = time.perf_counter()
-    baseline_completed = 0
-    for shard in sorted(paths.shards.glob("shard_*.jsonl")):
-        output_path = paths.stage_dir(stage) / shard.name
-        done_path = paths.stage_dir(stage) / (shard.stem + ".done.json")
-        if args.resume and completed_shard_valid(shard, output_path, done_path, stage):
-            baseline_completed += len(read_jsonl(shard))
     reporter = ProgressReporter(
         stage=stage,
         total=len(unique),
@@ -1072,6 +1208,7 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
             "images": len(stage_rows),
             "workers": len(slots),
             "workers_per_gpu": args.workers_per_gpu,
+            "runtime": runtime,
             "wall_seconds": round(wall_seconds, 3),
             "throughput_images_per_second": round(len(stage_rows) / wall_seconds, 6) if wall_seconds else 0.0,
             "sum_inference_ms": round(total_inference_ms, 3),
@@ -2066,12 +2203,29 @@ def resolve_required_directory(value: Path, option_name: str) -> Path:
     return resolved.resolve(strict=True)
 
 
+def resolve_python_executable(value: str | None, option_name: str) -> str:
+    supplied = value or sys.executable
+    expanded = str(Path(supplied).expanduser())
+    if Path(expanded).is_file():
+        # Do not resolve the final symlink: venv uses the executable location
+        # (and adjacent pyvenv.cfg) to select its site-packages.
+        return str(Path(expanded).absolute())
+    located = shutil.which(expanded)
+    if located:
+        return str(Path(located).absolute())
+    raise FileNotFoundError(
+        f"{option_name} Python executable does not exist or is not on PATH: {supplied}"
+    )
+
+
 def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     args.source_dir = resolve_required_directory(args.source_dir, "--source-dir")
     args.locany_data_dir = resolve_required_directory(
         args.locany_data_dir, "--locany-data-dir"
     )
     args.parser_root = resolve_required_directory(args.parser_root, "--parser-root")
+    args.text_python = resolve_python_executable(args.text_python, "--text-python")
+    args.icon_python = resolve_python_executable(args.icon_python, "--icon-python")
     args.output_dir = args.output_dir.expanduser().resolve(strict=False)
     if args.text_model_dir:
         args.text_model_dir = args.text_model_dir.expanduser().resolve(strict=False)
