@@ -20,11 +20,13 @@ from analyze_ui5_source_overlap import TASK_NAMES, analyze  # noqa: E402
 from run_ui5_crop_audit import (  # noqa: E402
     CONFIGS,
     AuditPaths,
+    ProgressReporter,
     aggregate_scope,
     atomic_write_json,
     atomic_write_jsonl,
     build_preview_rows,
     completed_shard_valid,
+    detector_config,
     digest_ids,
     normalize_gt_in_crop,
     proposal_crops,
@@ -260,6 +262,43 @@ class GeometryTest(unittest.TestCase):
 
 
 class ResumeAndExcelTest(unittest.TestCase):
+    def test_progress_reporter_writes_atomic_status_with_eta_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            reporter = ProgressReporter(
+                stage="text",
+                total=100,
+                output_dir=Path(temporary),
+                interval_seconds=60,
+            )
+            payload = reporter.update(25, force=True)
+            stored = json.loads(
+                (Path(temporary) / "run_status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(stored["stage"], "text")
+            self.assertEqual(stored["completed"], 25)
+            self.assertEqual(stored["total"], 100)
+            self.assertEqual(stored["percent"], 0.25)
+            self.assertIn("eta_seconds", payload)
+
+    def test_ocr_defaults_to_paddle_auto_download_but_icon_is_explicit(self):
+        args = SimpleNamespace(
+            text_model_dir=None,
+            icon_model=None,
+            parser_root=Path("/tmp/ui-region-parser"),
+            text_long_side=1920,
+            text_box_threshold=0.3,
+            icon_long_side=1920,
+            icon_confidence=0.05,
+        )
+        config = detector_config(args)
+        self.assertIsNone(config["text"]["model_dir"])
+        self.assertTrue(config["text"]["auto_download"])
+        self.assertTrue(
+            Path(config["icon"]["model"]).as_posix().endswith(
+                "weights/icon_detect_v3/model.pt"
+            )
+        )
+
     def test_interrupted_shard_is_not_skipped_but_complete_shard_is(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -376,6 +415,7 @@ class ResumeAndExcelTest(unittest.TestCase):
                 boundary_margin_ratio=0.01,
                 whole_image_trim_ratio=0.01,
                 whole_image_detection_margin_ratio=0.005,
+                progress_interval_seconds=60,
             )
             with mock.patch("run_ui5_crop_audit.load_parser_module", return_value=FakeCropper):
                 result = run_crop_audit(args)

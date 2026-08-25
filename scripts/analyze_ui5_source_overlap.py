@@ -12,9 +12,10 @@ import hashlib
 import json
 import os
 import re
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from prepare_ui_defect_locany import (
     TASKS,
@@ -29,6 +30,37 @@ BOX_PATTERN = re.compile(
     r"<(-?\d+(?:\.\d+)?)>\s*<(-?\d+(?:\.\d+)?)>\s*</box>"
 )
 TASK_NAMES = tuple(task["name"] for task in TASKS)
+ProgressCallback = Callable[[str, int, int], None]
+
+
+def _count_nonempty_lines(paths: Iterable[Path]) -> int:
+    total = 0
+    for path in paths:
+        with path.open("r", encoding="utf-8") as handle:
+            total += sum(1 for line in handle if line.strip())
+    return total
+
+
+def _print_progress(label: str, completed: int, total: int, started: float) -> None:
+    elapsed = max(0.001, time.monotonic() - started)
+    rate = completed / elapsed if completed else 0.0
+    remaining = max(0, total - completed)
+    eta = remaining / rate if rate else None
+
+    def duration(seconds: float | None) -> str:
+        if seconds is None:
+            return "--:--:--"
+        value = int(round(seconds))
+        hours, remainder = divmod(value, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    percent = completed / total if total else 1.0
+    print(
+        f"[进度 prepare/overlap {label}] {completed}/{total} ({percent:.1%}) | "
+        f"已耗时 {duration(elapsed)} | 速度 {rate:.2f} records/s | ETA {duration(eta)}",
+        flush=True,
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -144,8 +176,20 @@ def load_source_rows(
     val_ratio: float,
     seed: int,
     fingerprint_cache: dict[str, str],
+    progress_callback: ProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    source_paths = [source_dir / task["file"] for task in TASKS]
+    missing = [path for path in source_paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("missing source JSONL: " + ", ".join(map(str, missing)))
+    total = _count_nonempty_lines(source_paths)
+    started = time.monotonic()
+    if progress_callback:
+        progress_callback("source", 0, total)
+    else:
+        _print_progress("source", 0, total, started)
+    completed = 0
     for task in TASKS:
         source_file = source_dir / task["file"]
         if not source_file.is_file():
@@ -174,6 +218,12 @@ def load_source_rows(
                         split=choose_split(image, val_ratio, seed),
                     )
                 )
+                completed += 1
+                if completed % 250 == 0 or completed == total:
+                    if progress_callback:
+                        progress_callback("source", completed, total)
+                    else:
+                        _print_progress("source", completed, total, started)
     return rows
 
 
@@ -183,9 +233,23 @@ def load_locany_rows(
     *,
     fingerprint_cache: dict[str, str],
     include_val: bool,
+    progress_callback: ProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     splits = ("train", "val") if include_val else ("train",)
+    locany_paths = [
+        locany_data_dir / f"{task['name']}_{split}.jsonl"
+        for task in TASKS
+        for split in splits
+        if (locany_data_dir / f"{task['name']}_{split}.jsonl").is_file()
+    ]
+    total = _count_nonempty_lines(locany_paths)
+    started = time.monotonic()
+    if progress_callback:
+        progress_callback("train/val", 0, total)
+    else:
+        _print_progress("train/val", 0, total, started)
+    completed = 0
     for task in TASKS:
         for split in splits:
             source_file = locany_data_dir / f"{task['name']}_{split}.jsonl"
@@ -218,6 +282,12 @@ def load_locany_rows(
                             split=split,
                         )
                     )
+                    completed += 1
+                    if completed % 250 == 0 or completed == total:
+                        if progress_callback:
+                            progress_callback("train/val", completed, total)
+                        else:
+                            _print_progress("train/val", completed, total, started)
     return rows
 
 
@@ -366,6 +436,7 @@ def analyze(
     *,
     val_ratio: float = 0.02,
     seed: int = 20260728,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     if not 0 <= val_ratio < 1:
         raise ValueError("val_ratio must be in [0, 1)")
@@ -374,13 +445,18 @@ def analyze(
     output_dir.mkdir(parents=True, exist_ok=True)
     fingerprints: dict[str, str] = {}
     source_rows = load_source_rows(
-        source_dir, val_ratio=val_ratio, seed=seed, fingerprint_cache=fingerprints
+        source_dir,
+        val_ratio=val_ratio,
+        seed=seed,
+        fingerprint_cache=fingerprints,
+        progress_callback=progress_callback,
     )
     all_locany_rows = load_locany_rows(
         source_dir,
         locany_data_dir,
         fingerprint_cache=fingerprints,
         include_val=True,
+        progress_callback=progress_callback,
     )
     training_rows = [row for row in all_locany_rows if row["split"] == "train"]
     split_conflicts = cross_split_content(all_locany_rows)

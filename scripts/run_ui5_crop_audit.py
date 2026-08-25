@@ -23,6 +23,7 @@ import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
@@ -50,6 +51,7 @@ CONFIGS = {
     "C": {"horizontal_link_ratio": 0.025, "vertical_link_ratio": 0.025, "context_ratio": 0.20},
 }
 TASK_LABELS = {task["name"]: task["en"] for task in TASKS}
+PIPELINE_STAGES = ("prepare", "text", "icon", "merge", "crop-audit")
 
 
 @dataclass(frozen=True)
@@ -115,7 +117,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="0 means all; use 2000 with a separate output directory for process/GPU benchmarking",
     )
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--text-model-dir", type=Path, default=None)
+    parser.add_argument(
+        "--progress-interval-seconds",
+        type=float,
+        default=10.0,
+        help="Consolidated terminal/run_status.json update interval",
+    )
+    parser.add_argument(
+        "--progress-every-images",
+        type=int,
+        default=25,
+        help="Detector worker progress checkpoint frequency",
+    )
+    parser.add_argument(
+        "--text-model-dir",
+        type=Path,
+        default=None,
+        help="Optional local PP-OCRv5 directory; omitted means PaddleOCR auto-download/cache",
+    )
     parser.add_argument("--icon-model", type=Path, default=None)
     parser.add_argument("--text-long-side", type=int, default=1920)
     parser.add_argument("--text-box-threshold", type=float, default=0.3)
@@ -154,6 +173,87 @@ def atomic_write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> int:
         os.fsync(handle.fileno())
     os.replace(temporary, path)
     return count
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None or not math.isfinite(seconds) or seconds < 0:
+        return "--:--:--"
+    value = int(round(seconds))
+    hours, remainder = divmod(value, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+class ProgressReporter:
+    """Write human-readable progress and an atomic machine-readable snapshot."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        total: int,
+        output_dir: Path,
+        interval_seconds: float,
+        initial_completed: int = 0,
+        unit: str = "images",
+    ) -> None:
+        self.stage = stage
+        self.total = max(0, int(total))
+        self.output_dir = output_dir
+        self.interval_seconds = max(1.0, float(interval_seconds))
+        self.initial_completed = max(0, int(initial_completed))
+        self.unit = unit
+        self.started = time.monotonic()
+        self.last_print = 0.0
+
+    def update(
+        self,
+        completed: int,
+        *,
+        status: str = "running",
+        detail: str | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        completed = max(0, min(int(completed), self.total)) if self.total else max(0, int(completed))
+        elapsed = max(0.0, time.monotonic() - self.started)
+        newly_completed = max(0, completed - self.initial_completed)
+        rate = newly_completed / elapsed if elapsed > 0 and newly_completed else 0.0
+        remaining = max(0, self.total - completed)
+        eta_seconds = remaining / rate if rate > 0 else None
+        percent = completed / self.total if self.total else (1.0 if status == "completed" else 0.0)
+        stage_index = PIPELINE_STAGES.index(self.stage) + 1 if self.stage in PIPELINE_STAGES else None
+        payload = {
+            "stage": self.stage,
+            "stage_index": stage_index,
+            "stage_total": len(PIPELINE_STAGES),
+            "status": status,
+            "detail": detail,
+            "completed": completed,
+            "total": self.total,
+            "unit": self.unit,
+            "percent": round(percent, 6),
+            "elapsed_seconds": round(elapsed, 3),
+            "rate_per_second": round(rate, 6),
+            "eta_seconds": round(eta_seconds, 3) if eta_seconds is not None else None,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        atomic_write_json(self.output_dir / "run_status.json", payload)
+        now = time.monotonic()
+        if force or now - self.last_print >= self.interval_seconds:
+            stage_label = (
+                f"{self.stage} {stage_index}/{len(PIPELINE_STAGES)}"
+                if stage_index is not None
+                else self.stage
+            )
+            suffix = f" | {detail}" if detail else ""
+            print(
+                f"[进度 {stage_label}] {completed}/{self.total} {self.unit} "
+                f"({percent:.1%}) | 已耗时 {format_duration(elapsed)} | "
+                f"速度 {rate:.2f} {self.unit}/s | ETA {format_duration(eta_seconds)}{suffix}",
+                flush=True,
+            )
+            self.last_print = now
+        return payload
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -242,12 +342,13 @@ def verify_revisions(project_root: Path, parser_root: Path) -> dict[str, str]:
 
 
 def detector_config(args: argparse.Namespace) -> dict[str, Any]:
-    text_model = args.text_model_dir or args.parser_root / "weights" / "PP-OCRv5_server_det_infer"
+    text_model = args.text_model_dir.resolve(strict=False) if args.text_model_dir else None
     icon_model = args.icon_model or args.parser_root / "weights" / "icon_detect_v3" / "model.pt"
     return {
         "parser_commit": PARSER_COMMIT,
         "text": {
-            "model_dir": str(text_model.resolve(strict=False)),
+            "model_dir": str(text_model) if text_model else None,
+            "auto_download": text_model is None,
             "model_name": "PP-OCRv5_server_det",
             "engine": "paddle_static",
             "long_side": args.text_long_side,
@@ -311,7 +412,11 @@ def print_preflight(
     sources = source_files(args.source_dir)
     trains = training_files(args.locany_data_dir)
     config = detector_config(args)
-    if detector_stage in {"text", "all"} and not Path(config["text"]["model_dir"]).is_dir():
+    if (
+        detector_stage in {"text", "all"}
+        and config["text"]["model_dir"] is not None
+        and not Path(config["text"]["model_dir"]).is_dir()
+    ):
         raise FileNotFoundError(f"missing PP-OCRv5 model directory: {config['text']['model_dir']}")
     if detector_stage in {"icon", "all"} and not Path(config["icon"]["model"]).is_file():
         raise FileNotFoundError(f"missing icon detector weights: {config['icon']['model']}")
@@ -323,7 +428,7 @@ def print_preflight(
         f"images_readable : {readable_count if readable_count is not None else 'from prepared manifest'}",
         f"unique_images   : {unique_count if unique_count is not None else 'from prepared manifest'}",
         f"parser_commit   : {revisions['parser']}",
-        f"text_model      : {config['text']['model_dir']}",
+        f"text_model      : {config['text']['model_dir'] or 'PaddleOCR automatic download/cache'}",
         f"icon_model      : {config['icon']['model']}",
         f"output_dir      : {args.output_dir.resolve(strict=False)}",
         f"GPUs            : {args.gpus}",
@@ -337,18 +442,73 @@ def build_task_aware_manifest(args: argparse.Namespace) -> tuple[list[dict[str, 
     if not 500 <= args.shard_size <= 1000:
         raise ValueError("--shard-size must be in [500, 1000]")
     paths = AuditPaths(args.output_dir)
+    # Fail on missing JSONL/parser/icon weights before spending time hashing images.
+    print_preflight(args, detector_stage="all")
+    overlap_reporter = ProgressReporter(
+        stage="prepare",
+        total=1,
+        output_dir=args.output_dir,
+        interval_seconds=args.progress_interval_seconds,
+        unit="substeps",
+    )
+    overlap_reporter.update(
+        0,
+        detail="子步骤 1/3：统计源数据与训练数据重叠",
+        force=True,
+    )
+    overlap_phase_reporters: dict[str, ProgressReporter] = {}
+
+    def overlap_progress(phase: str, completed: int, total: int) -> None:
+        if phase not in overlap_phase_reporters:
+            overlap_phase_reporters[phase] = ProgressReporter(
+                stage="prepare",
+                total=total,
+                output_dir=args.output_dir,
+                interval_seconds=args.progress_interval_seconds,
+                unit="records",
+            )
+        overlap_phase_reporters[phase].update(
+            completed,
+            detail=f"子步骤 1/3：重叠统计 {phase}",
+            force=completed in {0, total},
+        )
+
     overlap = analyze_overlap(
         args.source_dir,
         args.locany_data_dir,
         paths.manifest / "overlap",
+        progress_callback=overlap_progress,
+    )
+    overlap_reporter.update(
+        1,
+        status="completed",
+        detail="子步骤 1/3：重叠统计完成",
+        force=True,
     )
     fingerprints: dict[str, str] = {}
     aliases_by_content: dict[str, set[str]] = defaultdict(set)
     raw_samples: list[dict[str, Any]] = []
     readable = 0
+    task_records: list[tuple[Mapping[str, str], Path, int, dict[str, Any]]] = []
     for task in TASKS:
         annotation = args.locany_data_dir / f"{task['name']}_train.jsonl"
-        for line_no, record in enumerate(read_jsonl(annotation), 1):
+        task_records.extend(
+            (task, annotation, line_no, record)
+            for line_no, record in enumerate(read_jsonl(annotation), 1)
+        )
+    manifest_reporter = ProgressReporter(
+        stage="prepare",
+        total=len(task_records),
+        output_dir=args.output_dir,
+        interval_seconds=args.progress_interval_seconds,
+        unit="records",
+    )
+    manifest_reporter.update(
+        0,
+        detail="子步骤 2/3：解析图片、内容指纹与 task-aware GT",
+        force=True,
+    )
+    for record_index, (task, annotation, line_no, record) in enumerate(task_records, 1):
             raw_image = str(record["image"])
             image_path = resolve_training_image(raw_image, args.source_dir, args.locany_data_dir)
             canonical = str(image_path)
@@ -379,6 +539,14 @@ def build_task_aware_manifest(args: argparse.Namespace) -> tuple[list[dict[str, 
                     "split": "train",
                 }
             )
+            if (
+                record_index % args.progress_every_images == 0
+                or record_index == len(task_records)
+            ):
+                manifest_reporter.update(
+                    record_index,
+                    detail="子步骤 2/3：解析图片、内容指纹与 task-aware GT",
+                )
 
     # Exactly one manifest sample per image x task.  Same-task duplicates retain
     # source provenance and their distinct GT is combined only within that task.
@@ -470,6 +638,12 @@ def build_task_aware_manifest(args: argparse.Namespace) -> tuple[list[dict[str, 
         "cpt_enabled": False,
     }
     atomic_write_json(paths.manifest / "prepare_summary.json", prepare_summary)
+    manifest_reporter.update(
+        len(task_records),
+        status="completed",
+        detail=f"子步骤 3/3：已生成 {len(unique_images)} 张唯一图片、{prepare_summary['shards']} 个 shard",
+        force=True,
+    )
     return unique_images, task_samples
 
 
@@ -564,7 +738,7 @@ def run_detector_worker(args: argparse.Namespace) -> None:
         settings = config["text"]
         detector = module.PaddleTextDetector(
             model_name=settings["model_name"],
-            model_dir=Path(settings["model_dir"]),
+            model_dir=Path(settings["model_dir"]) if settings["model_dir"] else None,
             device="cuda:0",
             engine=settings["engine"],
             limit_side_len=settings["long_side"],
@@ -587,6 +761,35 @@ def run_detector_worker(args: argparse.Namespace) -> None:
     ]
     output_dir = paths.stage_dir(stage)
     output_dir.mkdir(parents=True, exist_ok=True)
+    worker_progress_path = output_dir / "progress" / f"worker_{args.worker_index:02d}.json"
+    assigned_total = sum(len(read_jsonl(shard)) for shard in assigned)
+    processed_this_run = 0
+
+    def write_worker_progress(
+        *,
+        status: str,
+        current_shard: str | None = None,
+        current_completed: int = 0,
+        current_total: int = 0,
+    ) -> None:
+        atomic_write_json(
+            worker_progress_path,
+            {
+                "stage": stage,
+                "worker_index": args.worker_index,
+                "worker_count": args.worker_count,
+                "status": status,
+                "assigned_images": assigned_total,
+                "processed_images_this_run": processed_this_run,
+                "current_shard": current_shard,
+                "current_shard_completed": current_completed,
+                "current_shard_total": current_total,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    write_worker_progress(status="starting")
+    worker_final_status = "failed"
     try:
         for shard in assigned:
             output_path = output_dir / shard.name
@@ -596,7 +799,15 @@ def run_detector_worker(args: argparse.Namespace) -> None:
                 continue
             rows = read_jsonl(shard)
             outputs = []
-            for row, image in _loaded_images(rows, args.image_loader_threads):
+            write_worker_progress(
+                status="running",
+                current_shard=shard.name,
+                current_completed=0,
+                current_total=len(rows),
+            )
+            for image_index, (row, image) in enumerate(
+                _loaded_images(rows, args.image_loader_threads), 1
+            ):
                 try:
                     started = time.perf_counter()
                     if stage == "text":
@@ -624,6 +835,17 @@ def run_detector_worker(args: argparse.Namespace) -> None:
                             "inference_ms": elapsed_ms,
                         }
                     )
+                    processed_this_run += 1
+                    if (
+                        image_index % args.progress_every_images == 0
+                        or image_index == len(rows)
+                    ):
+                        write_worker_progress(
+                            status="running",
+                            current_shard=shard.name,
+                            current_completed=image_index,
+                            current_total=len(rows),
+                        )
                 finally:
                     image.close()
             atomic_write_jsonl(output_path, outputs)
@@ -636,11 +858,14 @@ def run_detector_worker(args: argparse.Namespace) -> None:
                     "input_shard": str(shard),
                 },
             )
+            write_worker_progress(status="running")
             print(f"[{stage}] completed {shard.name}: {len(outputs)} images", flush=True)
+        worker_final_status = "completed"
     finally:
         close_model = getattr(getattr(detector, "model", None), "close", None)
         if callable(close_model):
             close_model()
+        write_worker_progress(status=worker_final_status)
 
 
 def detection_worker_command(args: argparse.Namespace, stage: str, worker_index: int, worker_count: int) -> list[str]:
@@ -660,6 +885,8 @@ def detection_worker_command(args: argparse.Namespace, stage: str, worker_index:
         "--image-loader-threads", str(args.image_loader_threads),
         "--shard-size", str(args.shard_size),
         "--max-unique-images", str(args.max_unique_images),
+        "--progress-interval-seconds", str(args.progress_interval_seconds),
+        "--progress-every-images", str(args.progress_every_images),
         "--text-long-side", str(args.text_long_side),
         "--text-box-threshold", str(args.text_box_threshold),
         "--icon-long-side", str(args.icon_long_side),
@@ -703,17 +930,65 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
     slots = [(gpu, slot) for gpu in gpus for slot in range(args.workers_per_gpu)]
     processes = []
     wall_started = time.perf_counter()
+    baseline_completed = 0
+    for shard in sorted(paths.shards.glob("shard_*.jsonl")):
+        output_path = paths.stage_dir(stage) / shard.name
+        done_path = paths.stage_dir(stage) / (shard.stem + ".done.json")
+        if args.resume and completed_shard_valid(shard, output_path, done_path, stage):
+            baseline_completed += len(read_jsonl(shard))
+    reporter = ProgressReporter(
+        stage=stage,
+        total=len(unique),
+        output_dir=args.output_dir,
+        interval_seconds=args.progress_interval_seconds,
+        initial_completed=baseline_completed,
+    )
+    reporter.update(
+        baseline_completed,
+        detail=f"启动 {len(slots)} 个常驻 GPU worker",
+        force=True,
+    )
     for worker_index, (gpu, _slot) in enumerate(slots):
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = gpu
         command = detection_worker_command(args, stage, worker_index, len(slots))
         processes.append((worker_index, gpu, subprocess.Popen(command, env=env)))
-    failures = []
-    for worker_index, gpu, process in processes:
-        code = process.wait()
-        if code:
-            failures.append((worker_index, gpu, code))
+    def observed_completed() -> int:
+        done_shards: set[str] = set()
+        completed = 0
+        for marker_path in paths.stage_dir(stage).glob("shard_*.done.json"):
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                if marker.get("stage") == stage:
+                    completed += int(marker.get("count", 0))
+                    done_shards.add(marker_path.name.replace(".done.json", ".jsonl"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+        for progress_path in (paths.stage_dir(stage) / "progress").glob("worker_*.json"):
+            try:
+                progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            current_shard = progress.get("current_shard")
+            if current_shard and current_shard not in done_shards:
+                completed += int(progress.get("current_shard_completed", 0))
+        return min(len(unique), completed)
+
+    while any(process.poll() is None for _, _, process in processes):
+        reporter.update(observed_completed())
+        time.sleep(min(1.0, args.progress_interval_seconds))
+    failures = [
+        (worker_index, gpu, int(process.returncode))
+        for worker_index, gpu, process in processes
+        if process.returncode
+    ]
     if failures:
+        reporter.update(
+            observed_completed(),
+            status="failed",
+            detail=f"GPU worker 失败：{failures}",
+            force=True,
+        )
         raise RuntimeError(f"{stage} detector workers failed: {failures}")
     stage_rows = [
         row
@@ -735,6 +1010,12 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
             "mean_inference_ms": round(total_inference_ms / len(stage_rows), 3) if stage_rows else 0.0,
         },
     )
+    reporter.update(
+        len(stage_rows),
+        status="completed",
+        detail=f"{len(slots)} 个 worker 已退出，检测结果已落盘",
+        force=True,
+    )
 
 
 def merge_detections(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -746,6 +1027,13 @@ def merge_detections(args: argparse.Namespace) -> list[dict[str, Any]]:
     expected = {row["image_id"]: row for row in expected_rows}
     if len(expected) != len(expected_rows):
         raise ValueError("unique_images.jsonl contains duplicate image_id")
+    reporter = ProgressReporter(
+        stage="merge",
+        total=len(expected),
+        output_dir=args.output_dir,
+        interval_seconds=args.progress_interval_seconds,
+    )
+    reporter.update(0, detail="验证 text/icon shard 完整性", force=True)
     by_stage: dict[str, dict[str, dict[str, Any]]] = {}
     for stage in ("text", "icon"):
         invalid_shards = []
@@ -777,7 +1065,7 @@ def merge_detections(args: argparse.Namespace) -> list[dict[str, Any]]:
             )
         by_stage[stage] = indexed
     merged = []
-    for image_id in sorted(expected):
+    for merge_index, image_id in enumerate(sorted(expected), 1):
         manifest = expected[image_id]
         text_row = by_stage["text"][image_id]
         icon_row = by_stage["icon"][image_id]
@@ -799,6 +1087,8 @@ def merge_detections(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "icon_detections": icon_row["icon_detections"],
             }
         )
+        if merge_index % args.progress_every_images == 0 or merge_index == len(expected):
+            reporter.update(merge_index, detail="按 image_id 合并 text/icon 检测")
     if len(merged) != len(expected):
         raise AssertionError("merged count changed unexpectedly")
     atomic_write_jsonl(paths.merged, merged)
@@ -811,6 +1101,12 @@ def merge_detections(args: argparse.Namespace) -> list[dict[str, Any]]:
             "merged_rows": len(merged),
             "image_id_digest": digest_ids(expected),
         },
+    )
+    reporter.update(
+        len(merged),
+        status="completed",
+        detail="数量、重复、缺失和尺寸检查全部通过",
+        force=True,
     )
     return merged
 
@@ -1453,6 +1749,19 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
     all_details: list[dict[str, Any]] = []
     all_failures: list[dict[str, Any]] = []
     summary: dict[str, Any] = {"configs": {}, "cpt_enabled": False}
+    crop_reporter = ProgressReporter(
+        stage="crop-audit",
+        total=len(unique) * len(CONFIGS),
+        output_dir=args.output_dir,
+        interval_seconds=args.progress_interval_seconds,
+        unit="image-configs",
+    )
+    crop_completed = 0
+    crop_reporter.update(
+        0,
+        detail="开始纯 CPU A/B/C crop、GT 关联和 overview",
+        force=True,
+    )
 
     samples_by_image: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for sample in samples:
@@ -1535,10 +1844,13 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
                         if failure["failure_type"] == "roundtrip_error":
                             failure["visualization"] = str(overview.resolve())
                             anomaly_categories["roundtrip_error"].append(failure)
-            print(
-                f"[crop {config_name} {image_index}/{len(unique)}] {image_id}: "
-                f"{proposal['detection_count']} boxes -> {len(proposal['crop_boxes'])} crops",
-                flush=True,
+            crop_completed += 1
+            crop_reporter.update(
+                crop_completed,
+                detail=(
+                    f"config {config_name}，当前 {image_index}/{len(unique)}，"
+                    f"{proposal['detection_count']} boxes -> {len(proposal['crop_boxes'])} crops"
+                ),
             )
         # Basename collisions and shared-image task annotations are explicit
         # risks in the fixed parser's legacy basename aggregation path.  Link
@@ -1648,8 +1960,19 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
     write_statistics_csv(paths.crop_audit / "statistics.csv", all_details)
     atomic_write_jsonl(paths.crop_audit / "task_aware_manifest.jsonl", all_details)
     atomic_write_jsonl(paths.crop_audit / "gt_failures.jsonl", all_failures)
+    crop_reporter.update(
+        crop_completed,
+        detail="crop 已完成，正在写 summary、CSV 和 Excel",
+        force=True,
+    )
     write_excel_report(
         paths.crop_audit / "ui5_crop_audit.xlsx", summary, overlap, all_details, all_failures
+    )
+    crop_reporter.update(
+        crop_completed,
+        status="completed",
+        detail="A/B/C 报告、preview、异常清单和 Excel 已完成",
+        force=True,
     )
     return summary
 
@@ -1667,6 +1990,10 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("--max-crops must be in [1, 10]")
     if not 2 <= args.image_loader_threads <= 4:
         raise ValueError("--image-loader-threads must be in [2, 4]")
+    if args.progress_interval_seconds <= 0:
+        raise ValueError("--progress-interval-seconds must be positive")
+    if args.progress_every_images <= 0:
+        raise ValueError("--progress-every-images must be positive")
     return args
 
 
@@ -1674,19 +2001,58 @@ def run(args: argparse.Namespace) -> Any:
     args = normalize_args(args)
     if args.stage == "_worker":
         return run_detector_worker(args)
-    stages = ("prepare", "text", "icon", "merge", "crop-audit") if args.stage == "all" else (args.stage,)
+    stages = PIPELINE_STAGES if args.stage == "all" else (args.stage,)
     result = None
     for stage in stages:
-        if stage == "prepare":
-            result = build_task_aware_manifest(args)
-        elif stage in {"text", "icon"}:
-            result = run_detection_stage(args, stage)
-        elif stage == "merge":
-            print_preflight(args)
-            result = merge_detections(args)
-        elif stage == "crop-audit":
-            print_preflight(args)
-            result = run_crop_audit(args)
+        stage_index = PIPELINE_STAGES.index(stage) + 1
+        print(
+            f"\n[流水线] 开始阶段 {stage_index}/{len(PIPELINE_STAGES)}：{stage}",
+            flush=True,
+        )
+        stage_started = time.monotonic()
+        try:
+            if stage == "prepare":
+                result = build_task_aware_manifest(args)
+            elif stage in {"text", "icon"}:
+                result = run_detection_stage(args, stage)
+            elif stage == "merge":
+                print_preflight(args)
+                result = merge_detections(args)
+            elif stage == "crop-audit":
+                print_preflight(args)
+                result = run_crop_audit(args)
+        except Exception as exc:
+            status_path = args.output_dir / "run_status.json"
+            try:
+                payload = (
+                    json.loads(status_path.read_text(encoding="utf-8"))
+                    if status_path.is_file()
+                    else {}
+                )
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            payload.update(
+                {
+                    "stage": stage,
+                    "stage_index": stage_index,
+                    "stage_total": len(PIPELINE_STAGES),
+                    "status": "failed",
+                    "error": str(exc),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            atomic_write_json(status_path, payload)
+            print(
+                f"[流水线] 阶段 {stage_index}/{len(PIPELINE_STAGES)} 失败：{stage}：{exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
+        print(
+            f"[流水线] 完成阶段 {stage_index}/{len(PIPELINE_STAGES)}：{stage}，"
+            f"本阶段耗时 {format_duration(time.monotonic() - stage_started)}",
+            flush=True,
+        )
     return result
 
 

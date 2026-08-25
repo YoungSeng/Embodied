@@ -1,18 +1,19 @@
-# UI5 detector crop audit (CPT disabled)
+# UI5 检测 Crop 审计（CPT disabled）
 
-This branch is based on `locany-cpt-v1@c06f1479a11b0175579994b880466b57bba50a87`.
-It reuses the updated Detail Pyramid, relation/gate, BF16 fixes, and UI5
-training/evaluation infrastructure, but this workflow does **not** load CPT data,
-expose a CPT training entrypoint, start training, or infer that good crop coverage
-guarantees a model improvement.
+本分支基于 `locany-cpt-v1@c06f1479a11b0175579994b880466b57bba50a87`。
+本轮只复用已更新的 Detail Pyramid、relation/gate、BF16 修复和 UI5 训练/评测基础设施：
 
-The external `ui-region-parser` must remain a separate sibling checkout at
-`06eaebf8eb4ea01e61b690f2ff972bf614915918`. The audit runner imports only its
-detector classes and geometry functions. It does not use the parser's
-basename-indexed annotation/image discovery and does not enter its rendering
-loop during full detection, so the fixed checkout remains clean.
+- 不加载 CPT 数据；
+- 不开放 CPT 训练入口；
+- 不启动正式训练；
+- crop 覆盖率高只说明方案可用，不代表训练效果一定提升。
 
-## One-time checkout
+`ui-region-parser` 保持为同级独立工具仓库，固定在
+`06eaebf8eb4ea01e61b690f2ff972bf614915918`。审计入口只复用它的 detector 类和
+cropper 几何函数，不使用其基于 basename 的 annotation/image 聚合，也不会在全量检测时
+保存 combined/stage 可视化。
+
+## 1. 一次性准备仓库
 
 ```bash
 cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied
@@ -26,16 +27,118 @@ git clone https://github.com/YoungSeng/ui-region-parser.git
 git -C ui-region-parser checkout 06eaebf8eb4ea01e61b690f2ff972bf614915918
 ```
 
-Before running, install the existing project/parser requirements and place the
-models at the parser defaults (or pass the model overrides):
+如果 worktree 和 parser 已经存在，不要重复执行这一节。
 
-- `weights/PP-OCRv5_server_det_infer/`
-- `weights/icon_detect_v3/model.pt`
+## 2. 模型权重
 
-## Cluster launch commands
+### PP-OCRv5：默认自动下载，不需要手动放权重
 
-Use one timestamped output directory for an immutable detector run. All five
-paths are CLI-controlled; no source root is taken from a hand-edited global.
+不传 `--text-model-dir` 时，脚本使用 `PP-OCRv5_server_det`，PaddleOCR 会在首次 text
+阶段自动下载到自己的缓存目录，后续直接复用缓存。
+
+如果希望在四卡任务启动前先单进程预热缓存，可选执行：
+
+```bash
+cd ../ui-region-parser
+export PADDLE_PDX_CACHE_HOME=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/cache/paddlex
+python -c "from paddleocr import TextDetection; TextDetection(model_name='PP-OCRv5_server_det', device='cpu')"
+```
+
+这只是提前触发自动下载，不是额外必需权重。正式命令不用传
+`--text-model-dir`。如果集群已经有本地 OCR 模型，才使用：
+
+```bash
+--text-model-dir /absolute/path/to/PP-OCRv5_server_det_infer
+```
+
+### OmniParser icon detector：需要手动下载
+
+安装 Hugging Face CLI，并只下载需要的 v3 detector 文件：
+
+```bash
+cd ../ui-region-parser
+python -m pip install -U "huggingface_hub[cli]"
+mkdir -p weights/icon_detect_v3
+huggingface-cli download microsoft/OmniParser-v2.0 \
+  icon_detect_v3/model.pt \
+  --revision refs/pr/37 \
+  --local-dir weights
+test -f weights/icon_detect_v3/model.pt
+```
+
+最终必须得到：
+
+```text
+../ui-region-parser/weights/icon_detect_v3/model.pt
+```
+
+该命令来自 Microsoft OmniParser 官方说明，只下载 icon detector，不下载 caption 模型或
+整个模型仓库。也可以通过 `--icon-model /absolute/path/model.pt` 指定已有文件。
+
+## 3. 正式运行：最简单是一条命令
+
+在 `Embodied-ui5-det-crop` 目录执行：
+
+```bash
+bash shell/run_ui5_crop_audit.sh \
+  --source-dir /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data \
+  --locany-data-dir data/ui_defect_locany \
+  --parser-root ../ui-region-parser \
+  --output-dir work_dirs/ui5_crop_audit_20260825 \
+  --gpus 0,1,2,3 \
+  --workers-per-gpu 1 \
+  --stage all \
+  --resume
+```
+
+`--stage all` 会按顺序自动完成：
+
+1. `prepare`：读取五类 JSONL、检查图片、按内容去重、生成 manifest 和 shard；
+2. `text`：四卡运行 PP-OCRv5，按 shard 落盘后退出 Paddle 进程；
+3. `icon`：四卡运行 OmniParser icon detector，按 shard 落盘后退出 Torch 进程；
+4. `merge`：检查数量、重复、缺失和尺寸，再生成唯一 `detections.jsonl`；
+5. `crop-audit`：只用 CPU 读取落盘检测，运行 A/B/C crop、preview、统计、可视化和 Excel。
+
+所以，正常首次运行不需要手动复制执行五条命令。
+
+## 4. 实时进度和剩余时间
+
+默认每 10 秒汇总一次所有 GPU worker，在终端/集群日志打印：
+
+```text
+[进度 text 2/5] 12850/50000 images (25.7%) | 已耗时 00:41:23 | 速度 5.17 images/s | ETA 01:59:42
+```
+
+这里显示的是：当前阶段、流水线第几步、已完成/总数、百分比、当前实测吞吐、已耗时和当前
+阶段预计剩余时间。刚启动、模型加载或还没有完成第一张图时，ETA 会显示 `--:--:--`；处理
+一批图片后才会逐渐稳定。不同分辨率图片耗时不同，因此 ETA 是动态估计，不是承诺时间。
+
+脚本还会原子更新：
+
+```text
+work_dirs/ui5_crop_audit_20260825/run_status.json
+```
+
+另开一个终端即可实时查看：
+
+```bash
+watch -n 5 'cat work_dirs/ui5_crop_audit_20260825/run_status.json'
+```
+
+默认参数通常不需要修改；若日志太密，可改为每 30 秒显示一次：
+
+```bash
+--progress-interval-seconds 30
+```
+
+`prepare` 会显示源数据/训练数据重叠分析和 manifest 构建进度；`text`、`icon` 汇总四卡
+worker；`merge` 显示合并数量；`crop-audit` 把 A/B/C 三组配置合并成一个总进度。使用
+`--resume` 时，已验证完成的 shard 会直接计入已完成数量，ETA 只按本次剩余工作估算。
+
+## 5. 什么时候才需要一条一条运行？
+
+以下情况建议分阶段：集群任务有时限、需要在 OCR 后释放资源、某阶段失败后单独重跑，或想先
+检查检测数量再裁图。所有命令使用同一个 `--output-dir`：
 
 ```bash
 COMMON_ARGS=(
@@ -48,85 +151,32 @@ COMMON_ARGS=(
   --resume
 )
 
-# 1. Task-aware manifest, content deduplication, overlap audit, 500–1000 image shards.
 bash shell/run_ui5_crop_audit.sh "${COMMON_ARGS[@]}" --stage prepare
-
-# 2. Four persistent Paddle workers; shard JSONL + completion marker per shard.
 bash shell/run_ui5_crop_audit.sh "${COMMON_ARGS[@]}" --stage text
-
-# 3. Paddle has exited; now four persistent Torch/OmniParser workers.
 bash shell/run_ui5_crop_audit.sh "${COMMON_ARGS[@]}" --stage icon
-
-# 4. Strict image-id/count/dimension merge.
 bash shell/run_ui5_crop_audit.sh "${COMMON_ARGS[@]}" --stage merge
-
-# 5. CPU-only A/B/C geometry, raw crops, preview labels, metrics and Excel.
 bash shell/run_ui5_crop_audit.sh "${COMMON_ARGS[@]}" --stage crop-audit
 ```
 
-`--stage all` executes the same stages in order. Detection results live only in
-`detections/text`, `detections/icon`, and `detections/merged`; changing crop
-parameters never overwrites or reruns them. A shard is skipped under `--resume`
-only when its output and marker have the exact expected count and image-id set.
-Writes use a temporary file followed by atomic rename.
+这里确实是从上到下依次执行。`--resume` 会验证 shard 的行数、image_id 集合和完成标记；
+完整 shard 会跳过，不完整 shard 才重跑。已经有 text/icon 检测结果时，反复调整 crop 参数只需
+执行 `--stage crop-audit`，不会再调用 GPU 模型。
 
-The default is one model process per GPU and 2–4 image-loader threads per process.
-Two processes per GPU are rejected unless `--allow-two-processes-per-gpu` is also
-passed after a 2,000-image benchmark has shown sustained GPU utilization below
-40%, stable memory below 12 GB, and an actual throughput gain.
+## 6. 1/2 processes per GPU benchmark（可选，不是正式流程）
 
-Use separate detector directories for the process-count benchmark so neither run
-can be mistaken for the formal detector output:
+正式运行默认保持 `--workers-per-gpu 1`。只有先用独立输出目录对同一批 2,000 张图实测，且
+满足 GPU 利用率持续低于 40%、显存稳定低于 12 GB、2 processes/GPU 吞吐确实更高，才允许
+改成 2。绝大多数情况下可以先跳过 benchmark，直接使用 1 process/GPU。
 
-```bash
-# Prepare the same stable 2,000-image subset in two output directories.
-for N in 1 2; do
-  bash shell/run_ui5_crop_audit.sh \
-    --source-dir /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data \
-    --locany-data-dir data/ui_defect_locany \
-    --parser-root ../ui-region-parser \
-    --output-dir "work_dirs/ui5_crop_benchmark_${N}proc" \
-    --stage prepare --max-unique-images 2000
-done
+需要 benchmark 时，分别用 `--max-unique-images 2000` 建两个输出目录，再比较
+`detections/text/stage_summary.json` 的 `throughput_images_per_second`。2 processes/GPU
+还必须显式加 `--allow-two-processes-per-gpu`。benchmark 输出不能作为正式全量输出。
 
-bash shell/run_ui5_crop_audit.sh \
-  --source-dir /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data \
-  --locany-data-dir data/ui_defect_locany --parser-root ../ui-region-parser \
-  --output-dir work_dirs/ui5_crop_benchmark_1proc --stage text \
-  --gpus 0,1,2,3 --workers-per-gpu 1 --resume
-
-# Run only after nvidia-smi monitoring satisfies the utilization/memory gate.
-bash shell/run_ui5_crop_audit.sh \
-  --source-dir /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data \
-  --locany-data-dir data/ui_defect_locany --parser-root ../ui-region-parser \
-  --output-dir work_dirs/ui5_crop_benchmark_2proc --stage text \
-  --gpus 0,1,2,3 --workers-per-gpu 2 \
-  --allow-two-processes-per-gpu --resume
-```
-
-Compare `detections/text/stage_summary.json` throughput. The icon stage writes
-the same summary layout. Formal runs must omit `--max-unique-images`.
-
-## Invariants
-
-- Detection is once per byte-unique original image, independent of task and GT.
-- GT remains separate per `image_id × task`; basename is warning-only.
-- `ui_content_missing` gets one lightly trimmed near-full crop because of its
-  task identity. The same image uses regional crops for other tasks.
-- Expansion boxes are geometric only. Saved crops are ordinary unannotated
-  rectangular pixels from the source image; no masks, boxes, or background edits.
-- Dense detections may form one near-full connected component. There is no
-  whitespace/long-edge post-split.
-- Any crop that partially intersects a GT is `training_eligible=false`; it is not
-  a negative. At most one truly non-intersecting hard negative is retained for
-  each image/task. This stage produces preview JSONL only.
-- Train/val identity remains content-based; crop filenames are never randomly
-  re-split. The overlap report surfaces any existing content leakage.
-
-## Output layout
+## 7. 输出目录
 
 ```text
 work_dirs/ui5_crop_audit_20260825/
+  run_status.json
   manifest/
     unique_images.jsonl
     task_samples.jsonl
@@ -139,6 +189,10 @@ work_dirs/ui5_crop_audit_20260825/
     merged/detections.jsonl
   crop_audit/
     config_A/
+      crops/
+      overviews/
+      preview/*.jsonl
+      anomalies.json
     config_B/
     config_C/
     summary.json
@@ -148,13 +202,29 @@ work_dirs/ui5_crop_audit_20260825/
     ui5_crop_audit.xlsx
 ```
 
-The workbook has exactly five decision sheets: `summary`, `task_overlap`,
-`image_detail`, `gt_failures`, and `config_compare`. Overview images are separate
-from raw crop files and are linked from the workbook.
+Excel 只包含五个有决策价值的 sheet：`summary`、`task_overlap`、`image_detail`、
+`gt_failures`、`config_compare`。overview 和原始无框 crop 分开保存，并从 Excel 设置超链接。
 
-Do not start the full-image/full+crop/full+crop-at-inference experiment until the
-report is reviewed. The suggested minimum gate is at least 99% combined GT-box
-containment across the four local tasks, at least 98% for each local task, and
-zero detector boxes cut by crop boundaries. `ui_content_missing` is evaluated
-separately as a near-full-image policy. Failed coverage must be addressed by
-link/context geometry and detector behavior, never by reading GT to add a crop.
+## 8. 必须保持的原则
+
+- 每张内容唯一的原图只检测一次；不同任务复用检测与 crop 图片，但 GT、prompt 和正负标签独立。
+- basename 只用于冲突告警，不能作为图片身份。
+- `ui_content_missing` 根据任务身份使用一张近似整图，不依赖文件名，不读取 GT 决定 crop。
+- 正式 crop 是未画框、无 mask、未遮挡背景的原图矩形像素；扩张框只用于几何计算。
+- dense 页面允许形成一个近整图连通区域，不按空白或长边二次强切。
+- 部分相交 GT 对应的 crop 标记为 `training_eligible=false`，不能当负样本。
+- 每个“原图 × 任务”最多保留一个完全不与 GT 相交的 hard negative。
+- crop 参数变化只能读取 `detections/merged/detections.jsonl`，不能重新推理或覆盖检测结果。
+
+## 9. 审计通过条件与后续训练
+
+先提交审计报告，不启动训练。建议进入 full image、full+crop、full+crop 且推理使用 crop 三组
+对照的最低条件：
+
+- 四个局部任务总体 GT box 完整包含率不低于 99%；
+- 每个局部任务不低于 98%；
+- detector box 被 crop 边界切断数为 0；
+- `ui_content_missing` 单独按近整图策略统计。
+
+若未达到，先看 `gt_failures.jsonl` 和 overview，调整 link/context 参数；不得读取 GT 位置
+直接补 crop。
