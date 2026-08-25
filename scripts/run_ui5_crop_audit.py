@@ -50,9 +50,78 @@ CONFIGS = {
     "B": {"horizontal_link_ratio": 0.015, "vertical_link_ratio": 0.015, "context_ratio": 0.20},
     "C": {"horizontal_link_ratio": 0.025, "vertical_link_ratio": 0.025, "context_ratio": 0.20},
 }
+REGION_TASKS = (
+    "ui_occlusion",
+    "ui_cropping",
+    "ui_text_overflow",
+    "ui_text_ellipsis",
+)
+ELEMENT_TASKS = ("ui_occlusion", "ui_cropping")
+TEXT_TASKS = ("ui_text_overflow", "ui_text_ellipsis")
+
+
+def _task_aware_candidate(
+    *,
+    element_min_context_image_ratio: float,
+    text_horizontal_link_ratio: float,
+) -> dict[str, Any]:
+    rules: dict[str, dict[str, float]] = {}
+    for task in ELEMENT_TASKS:
+        rules[task] = {
+            "horizontal_link_ratio": 0.025,
+            "vertical_link_ratio": 0.025,
+            "context_ratio": 0.20,
+            "min_context_image_ratio": element_min_context_image_ratio,
+        }
+    for task in TEXT_TASKS:
+        rules[task] = {
+            "horizontal_link_ratio": text_horizontal_link_ratio,
+            "vertical_link_ratio": 0.025,
+            "context_ratio": 0.20,
+            "min_context_image_ratio": 0.0,
+        }
+    return {
+        "task_aware": True,
+        "element_min_context_image_ratio": element_min_context_image_ratio,
+        "text_horizontal_link_ratio": text_horizontal_link_ratio,
+        "task_rules": rules,
+    }
+
+
+TASK_AWARE_CANDIDATES = {
+    "C": {
+        "task_aware": False,
+        "description": "uniform config C baseline",
+        "task_rules": {
+            task: {
+                "horizontal_link_ratio": 0.025,
+                "vertical_link_ratio": 0.025,
+                "context_ratio": 0.20,
+                "min_context_image_ratio": 0.0,
+            }
+            for task in REGION_TASKS
+        },
+    },
+    "TA_CTX010_H035": _task_aware_candidate(
+        element_min_context_image_ratio=0.010,
+        text_horizontal_link_ratio=0.035,
+    ),
+    "TA_CTX015_H035": _task_aware_candidate(
+        element_min_context_image_ratio=0.015,
+        text_horizontal_link_ratio=0.035,
+    ),
+    "TA_CTX010_H050": _task_aware_candidate(
+        element_min_context_image_ratio=0.010,
+        text_horizontal_link_ratio=0.050,
+    ),
+    "TA_CTX015_H050": _task_aware_candidate(
+        element_min_context_image_ratio=0.015,
+        text_horizontal_link_ratio=0.050,
+    ),
+}
 TASK_LABELS = {task["name"]: task["en"] for task in TASKS}
 PIPELINE_STAGES = ("prepare", "text", "icon", "merge", "crop-audit")
-CROP_AUDIT_FORMAT_VERSION = 2
+CROP_AUDIT_FORMAT_VERSION = 3
 ANOMALY_PRIORITY = (
     "gt_uncovered",
     "gt_partial_only",
@@ -67,6 +136,7 @@ ANOMALY_PRIORITY = (
 @dataclass(frozen=True)
 class AuditPaths:
     output: Path
+    crop_audit_name: str = "crop_audit_v3"
 
     @property
     def manifest(self) -> Path:
@@ -101,7 +171,7 @@ class AuditPaths:
 
     @property
     def crop_audit(self) -> Path:
-        return self.output / "crop_audit"
+        return self.output / self.crop_audit_name
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -115,6 +185,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--locany-data-dir", type=Path, required=True)
     parser.add_argument("--parser-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--crop-audit-name",
+        default="crop_audit_v3",
+        help="Named CPU audit directory under --output-dir; detector outputs remain shared/read-only",
+    )
     parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument("--workers-per-gpu", type=int, choices=(1, 2), default=1)
     parser.add_argument("--allow-two-processes-per-gpu", action="store_true")
@@ -147,6 +222,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Consolidated terminal/run_status.json update interval",
     )
     parser.add_argument(
+        "--expected-unique-images",
+        type=int,
+        default=0,
+        help="Fail crop-audit unless the prepared manifest has exactly this many images; 0 disables",
+    )
+    parser.add_argument(
         "--progress-every-images",
         type=int,
         default=25,
@@ -173,8 +254,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--icon-confidence", type=float, default=0.05)
     parser.add_argument("--max-crops", type=int, default=10)
     parser.add_argument("--boundary-margin-ratio", type=float, default=0.01)
-    parser.add_argument("--whole-image-trim-ratio", type=float, default=0.01)
-    parser.add_argument("--whole-image-detection-margin-ratio", type=float, default=0.005)
     parser.add_argument(
         "--crop-workers",
         type=int,
@@ -474,6 +553,11 @@ def print_preflight(
     sources = source_files(args.source_dir)
     trains = training_files(args.locany_data_dir)
     config = detector_config(args)
+    prepared_paths = AuditPaths(
+        args.output_dir, str(getattr(args, "crop_audit_name", "crop_audit_v3"))
+    )
+    if unique_count is None and prepared_paths.unique_images.is_file():
+        unique_count = len(read_jsonl(prepared_paths.unique_images))
     if (
         detector_stage in {"text", "all"}
         and config["text"]["model_dir"] is not None
@@ -488,17 +572,19 @@ def print_preflight(
         "CPT             : disabled (no CPT data or training entrypoint)",
         "input_files     : " + ", ".join(str(path) for path in (*sources, *trains)),
         f"images_readable : {readable_count if readable_count is not None else 'from prepared manifest'}",
-        f"unique_images   : {unique_count if unique_count is not None else 'from prepared manifest'}",
+        f"unique_images   : {unique_count if unique_count is not None else 'not prepared'}",
+        f"expected_unique : {getattr(args, 'expected_unique_images', 0) or 'not enforced'}",
         f"parser_commit   : {revisions['parser']}",
         f"text_model      : {config['text']['model_dir'] or 'PaddleOCR automatic download/cache'}",
         f"icon_model      : {config['icon']['model']}",
         f"text_python     : {args.text_python}",
         f"icon_python     : {args.icon_python}",
         f"output_dir      : {args.output_dir.resolve(strict=False)}",
+        f"crop_audit_name : {args.crop_audit_name}",
         f"GPUs            : {args.gpus}",
         f"workers/GPU     : {args.workers_per_gpu}",
         f"crop_workers    : {args.crop_workers}",
-        f"parameters      : {json.dumps({'detector': config, 'crop': CONFIGS, 'boundary_margin_ratio': args.boundary_margin_ratio, 'max_crops': args.max_crops}, ensure_ascii=False)}",
+        f"parameters      : {json.dumps({'detector': config, 'crop_candidates': TASK_AWARE_CANDIDATES, 'boundary_margin_ratio': args.boundary_margin_ratio, 'max_crops': args.max_crops}, ensure_ascii=False)}",
     ]
     print("\n".join(lines), flush=True)
 
@@ -1364,6 +1450,7 @@ def proposal_crops(
     *,
     max_crops: int,
     boundary_margin_ratio: float,
+    min_context_image_ratio: float = 0.0,
 ) -> dict[str, Any]:
     width, height = int(detection_record["width"]), int(detection_record["height"])
     detections = []
@@ -1391,9 +1478,64 @@ def proposal_crops(
     if components:
         groups, merge_history = cropper.merge_groups_to_limit(components, detections, max_crops)
         groups, overlap_history = cropper.merge_overlapping_group_envelopes(groups)
-        crops, context_adjustments = cropper.make_non_overlapping_context_crops(
-            groups, width, height, config["context_ratio"]
-        )
+        if min_context_image_ratio > 0:
+            crops = []
+            for group in groups:
+                group_width = max(1, int(group.bbox[2]) - int(group.bbox[0]))
+                group_height = max(1, int(group.bbox[3]) - int(group.bbox[1]))
+                pad_x = max(
+                    math.ceil(group_width * config["context_ratio"]),
+                    math.ceil(width * min_context_image_ratio),
+                )
+                pad_y = max(
+                    math.ceil(group_height * config["context_ratio"]),
+                    math.ceil(height * min_context_image_ratio),
+                )
+                crops.append(
+                    (
+                        max(0, int(group.bbox[0]) - pad_x),
+                        max(0, int(group.bbox[1]) - pad_y),
+                        min(width, int(group.bbox[2]) + pad_x),
+                        min(height, int(group.bbox[3]) + pad_y),
+                    )
+                )
+            context_adjustments = [
+                {
+                    "reason": "task_min_context_image_ratio",
+                    "min_context_image_ratio": min_context_image_ratio,
+                }
+            ]
+            # A minimum context floor may make desired rectangles overlap.
+            # Merge them losslessly; never trim through a detector box.
+            while True:
+                pair = next(
+                    (
+                        (left, right)
+                        for left in range(len(crops))
+                        for right in range(left + 1, len(crops))
+                        if rect_intersects(crops[left], crops[right])
+                    ),
+                    None,
+                )
+                if pair is None:
+                    break
+                left, right = pair
+                merged_context = cropper.union_bbox([crops[left], crops[right]])
+                overlap_history.append(
+                    {
+                        "reason": "overlapping_task_min_context",
+                        "left": list(crops[left]),
+                        "right": list(crops[right]),
+                        "merged": list(merged_context),
+                    }
+                )
+                crops.pop(right)
+                crops.pop(left)
+                crops.append(merged_context)
+        else:
+            crops, context_adjustments = cropper.make_non_overlapping_context_crops(
+                groups, width, height, config["context_ratio"]
+            )
     else:
         groups, merge_history, overlap_history, context_adjustments = [], [], [], []
         crops = [(0, 0, width, height)]
@@ -1449,7 +1591,7 @@ def proposal_crops(
         "detection_count": len(boxes),
         "edge_count": edge_count,
         "component_count_before_merge": initial_count,
-        "forced_merge": bool(merge_history or boundary_merge_history),
+        "forced_merge": bool(merge_history or overlap_history or boundary_merge_history),
         "merge_history": merge_history,
         "boundary_merge_history": boundary_merge_history,
         "overlap_merge_history": overlap_history,
@@ -1509,6 +1651,59 @@ def build_preview_rows(
     config_name: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     gt_boxes = sample["gt_boxes"]
+    if uses_task_whole_image_policy(str(sample["task"])):
+        full_box = [0, 0, int(sample["width"]), int(sample["height"])]
+        if len(crop_boxes) != 1 or list(crop_boxes[0]) != full_box:
+            raise AssertionError("ui_content_missing must use the exact full image")
+        if len(crop_paths) != 1:
+            raise AssertionError("ui_content_missing must reference exactly one full image")
+        original_norm = [list(box) for box in sample["gt_boxes_1000"]]
+        if len(original_norm) != len(gt_boxes):
+            raise ValueError("content_missing pixel and normalized GT counts differ")
+        transforms = [
+            {
+                "original_bbox": list(pixel_box),
+                "original_norm1000": list(norm_box),
+                "output_norm1000": list(norm_box),
+                "label_transform_applied": False,
+                "normalized_gt_identical": True,
+                "roundtrip_max_error_px": 0,
+                "roundtrip_gate_excluded": True,
+            }
+            for pixel_box, norm_box in zip(gt_boxes, original_norm)
+        ]
+        label = TASK_LABELS[str(sample["task"])]
+        return [
+            {
+                "sample_id": sample["sample_id"],
+                "image_id": sample["image_id"],
+                "task": sample["task"],
+                "config": config_name,
+                "source_image": sample["canonical_path"],
+                "image": str(crop_paths[0]),
+                "crop_id": 1,
+                "crop_bbox": full_box,
+                "positive": bool(gt_boxes),
+                "gt_count": len(gt_boxes),
+                "contained_gt_indices": list(range(len(gt_boxes))),
+                "partial_gt_indices": [],
+                "training_eligible": True,
+                "roundtrip_max_error_px": 0,
+                "roundtrip_gate_excluded": True,
+                "label_transform_applied": False,
+                "normalized_gt_identical": True,
+                "original_gt_boxes_1000": original_norm,
+                "output_gt_boxes_1000": [list(box) for box in original_norm],
+                "coordinate_transforms": transforms,
+                "conversations": [
+                    {
+                        "from": "human",
+                        "value": f"Locate all the instances that match the following description: {label}.",
+                    },
+                    {"from": "gpt", "value": build_answer(label, original_norm)},
+                ],
+            }
+        ], []
     preview = []
     failures = []
     negative_kept = False
@@ -1537,6 +1732,7 @@ def build_preview_rows(
                     "crop_id": crop_index,
                     "crop_bbox": list(crop),
                     "failure_type": failure_type,
+                    "training_eligible": training_eligible,
                     "partial_gt_indices": partial,
                     "roundtrip_max_error_px": max_error,
                 }
@@ -1563,6 +1759,8 @@ def build_preview_rows(
                 "partial_gt_indices": partial,
                 "training_eligible": training_eligible,
                 "roundtrip_max_error_px": max_error,
+                "roundtrip_gate_excluded": False,
+                "label_transform_applied": True,
                 "coordinate_transforms": transformed,
                 "conversations": [
                     {
@@ -1663,6 +1861,14 @@ def percentile(values: Sequence[float], percent: float) -> float:
     return float(ordered[lower] * (1 - fraction) + ordered[upper] * fraction)
 
 
+def detection_density_bucket(detection_count: int) -> str:
+    if detection_count <= 50:
+        return "sparse"
+    if detection_count <= 150:
+        return "medium"
+    return "dense"
+
+
 def aggregate_scope(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     gt_total = sum(row["gt_count"] for row in rows)
     gt_contained = sum(row["gt_contained_count"] for row in rows)
@@ -1718,7 +1924,7 @@ def aggregate_scope(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "forced_merge_images": forced_merge,
         "detector_boundary_cut_count": boundary_cuts,
         "roundtrip_error_over_1_count": roundtrip_failures,
-        "exception_count": (
+        "anomaly_event_count": (
             uncovered + partial_only + near_full + empty_fallback + forced_merge
             + boundary_cuts + roundtrip_failures
         ),
@@ -1738,6 +1944,7 @@ def make_image_detail(
     gains = []
     failures = []
     width, height = sample["width"], sample["height"]
+    density = detection_density_bucket(int(proposal.get("detection_count", 0)))
     for gt_index, gt in enumerate(sample["gt_boxes"]):
         contained_by = [index + 1 for index, crop in enumerate(crop_boxes) if rect_contains(crop, gt)]
         partial_by = [
@@ -1754,6 +1961,30 @@ def make_image_detail(
             )
         else:
             failure_type = "partial_intersection" if partial_by else "uncovered"
+            compensation: dict[str, int] | None = None
+            compensation_max: int | None = None
+            compensation_total: int | None = None
+            compensation_bucket = "not_applicable"
+            if partial_by:
+                choices = []
+                for crop_id in partial_by:
+                    crop = crop_boxes[crop_id - 1]
+                    required = {
+                        "left": max(0, int(crop[0]) - int(gt[0])),
+                        "top": max(0, int(crop[1]) - int(gt[1])),
+                        "right": max(0, int(gt[2]) - int(crop[2])),
+                        "bottom": max(0, int(gt[3]) - int(crop[3])),
+                    }
+                    maximum = max(required.values())
+                    total = sum(required.values())
+                    choices.append((maximum, total, crop_id, required))
+                compensation_max, compensation_total, _, compensation = min(choices)
+                if compensation_max <= 16:
+                    compensation_bucket = "small_0_16px"
+                elif compensation_max <= 64:
+                    compensation_bucket = "medium_17_64px"
+                else:
+                    compensation_bucket = "large_over_64px"
             failures.append(
                 {
                     "config": config_name,
@@ -1765,12 +1996,19 @@ def make_image_detail(
                     "intersecting_crop_ids": partial_by,
                     "intersecting_crop_bboxes": [crop_boxes[index - 1] for index in partial_by],
                     "failure_type": failure_type,
+                    "detection_density": density,
+                    "required_compensation_px": compensation,
+                    "required_max_single_side_px": compensation_max,
+                    "required_total_px": compensation_total,
+                    "compensation_bucket": compensation_bucket,
                     "visualization": str(overview.resolve()),
                 }
             )
         gt_coverage.append({"contained_by": contained_by, "partial_by": partial_by})
     original_area = width * height
     union_area = rectangle_union_area(crop_boxes)
+    whole_image = uses_task_whole_image_policy(str(sample["task"]))
+    detection_count = int(proposal.get("detection_count", 0))
     detail = {
         "config": config_name,
         "sample_id": sample["sample_id"],
@@ -1790,8 +2028,15 @@ def make_image_detail(
         "empty_detection_fallback": proposal["empty_detection_fallback"],
         "forced_merge": proposal["forced_merge"],
         "component_count_before_merge": proposal["component_count_before_merge"],
+        "detection_count": detection_count,
+        "detection_density": density,
         "detector_boundary_cut_count": proposal["detector_boundary_cut_count"],
-        "roundtrip_error_over_1_count": sum(error > 1 for error in roundtrip_errors),
+        "roundtrip_error_over_1_count": (
+            0 if whole_image else sum(error > 1 for error in roundtrip_errors)
+        ),
+        "roundtrip_gate_excluded": whole_image,
+        "label_transform_applied": not whole_image,
+        "normalized_gt_identical": whole_image,
         "overview": str(overview.resolve()),
         "source_image": sample["canonical_path"],
         "crop_boxes": [list(crop) for crop in crop_boxes],
@@ -1819,8 +2064,10 @@ def write_statistics_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         "config", "sample_id", "image_id", "task", "positive", "gt_count",
         "gt_contained_count", "partial_only_gt_count", "all_gt_contained", "crop_count",
         "original_area", "union_crop_area", "union_area_ratio", "pixel_reduction_ratio",
-        "empty_detection_fallback", "forced_merge", "detector_boundary_cut_count",
-        "roundtrip_error_over_1_count", "overview", "source_image",
+        "detection_count", "detection_density", "empty_detection_fallback",
+        "forced_merge", "detector_boundary_cut_count", "roundtrip_error_over_1_count",
+        "roundtrip_gate_excluded", "label_transform_applied", "normalized_gt_identical",
+        "partial_training_eligible_count", "hard_negative_count", "overview", "source_image",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + f".tmp.{os.getpid()}")
@@ -1849,6 +2096,7 @@ def write_excel_report(
     workbook.remove(workbook.active)
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
+    candidate_summaries = summary.get("candidates", summary.get("configs", {}))
 
     summary_sheet = workbook.create_sheet("summary")
     summary_headers = [
@@ -1859,12 +2107,12 @@ def write_excel_report(
         "union_area_p90", "pixel_reduction_ratio", "near_full_image_ratio",
         "gt_gain_over_1_25_ratio", "gt_gain_over_1_5_ratio", "gt_gain_over_2_0_ratio",
         "empty_detection_fallback_images", "forced_merge_images", "detector_boundary_cut_count",
-        "roundtrip_error_over_1_count", "exception_count",
+        "roundtrip_error_over_1_count", "anomaly_event_count",
     ]
     summary_sheet.append(summary_headers)
-    for config_name in CONFIGS:
+    for config_name in candidate_summaries:
         for scope in ("ALL", *TASK_NAMES):
-            metric = summary["configs"][config_name]["by_scope"][scope]
+            metric = candidate_summaries[config_name]["by_scope"][scope]
             summary_sheet.append(
                 [
                     config_name, scope, metric["samples"], metric["positive_samples"],
@@ -1879,19 +2127,46 @@ def write_excel_report(
                     metric["gt_gain_over_1_25_ratio"], metric["gt_gain_over_1_5_ratio"],
                     metric["gt_gain_over_2_0_ratio"], metric["empty_detection_fallback_images"],
                     metric["forced_merge_images"], metric["detector_boundary_cut_count"],
-                    metric["roundtrip_error_over_1_count"], metric["exception_count"],
+                    metric["roundtrip_error_over_1_count"], metric["anomaly_event_count"],
                 ]
             )
 
     overlap_sheet = workbook.create_sheet("task_overlap")
     for row in task_overlap_rows(overlap):
         overlap_sheet.append(row)
+    cross_task = summary.get("cross_task_supervision", {})
+    if cross_task:
+        overlap_sheet.append(["v3_audit", "metric", "key", "value"])
+        for task, count in cross_task.get(
+            "per_task_content_unique_images", {}
+        ).items():
+            overlap_sheet.append(
+                ["v3_audit", "content_unique_images", task, count]
+            )
+        for cardinality, count in cross_task.get(
+            "task_cardinality_by_content", {}
+        ).items():
+            overlap_sheet.append(
+                ["v3_audit", "task_cardinality", cardinality, count]
+            )
+        for key in (
+            "cross_task_positive_label_difference_images",
+            "cross_task_gt_difference_images",
+            "same_content_cross_train_val_count",
+            "all_tasks_share_one_content_pool",
+        ):
+            overlap_sheet.append(["v3_audit", "summary", key, cross_task.get(key)])
+        for key, value in summary.get("materialization", {}).items():
+            if not isinstance(value, (list, dict)):
+                overlap_sheet.append(["v3_audit", "physical_reuse", key, value])
 
     detail_sheet = workbook.create_sheet("image_detail")
     detail_headers = [
         "config", "sample_id", "image_id", "task", "positive", "gt_count",
         "gt_contained_count", "crop_count", "union_area_ratio", "pixel_reduction_ratio",
-        "all_gt_contained", "empty_detection_fallback", "forced_merge", "overview", "source_image",
+        "all_gt_contained", "detection_density", "empty_detection_fallback",
+        "forced_merge", "roundtrip_error_over_1_count", "roundtrip_gate_excluded",
+        "label_transform_applied", "normalized_gt_identical", "overview", "source_image",
         *[f"crop_{index:02d}" for index in range(1, 11)],
     ]
     detail_sheet.append(detail_headers)
@@ -1904,7 +2179,10 @@ def write_excel_report(
     failure_sheet = workbook.create_sheet("gt_failures")
     failure_headers = [
         "config", "sample_id", "image_id", "task", "gt_index", "gt_bbox",
-        "intersecting_crop_ids", "intersecting_crop_bboxes", "failure_type", "visualization",
+        "intersecting_crop_ids", "intersecting_crop_bboxes", "failure_type",
+        "detection_density", "required_compensation_px",
+        "required_max_single_side_px", "required_total_px", "compensation_bucket",
+        "visualization",
     ]
     failure_sheet.append(failure_headers)
     for row in gt_failures:
@@ -1917,18 +2195,23 @@ def write_excel_report(
 
     compare_sheet = workbook.create_sheet("config_compare")
     compare_headers = [
-        "config", "task", "link_ratio", "context_ratio", "gt_box_containment_recall",
+        "config", "task", "density", "horizontal_link_ratio", "vertical_link_ratio",
+        "context_ratio", "min_context_image_ratio", "gt_box_containment_recall",
         "positive_sample_success_rate", "union_area_mean", "pixel_reduction_ratio",
         "gt_gain_over_1_25_ratio", "gt_gain_over_1_5_ratio", "gt_gain_over_2_0_ratio",
         "uncovered_gt_count", "partial_only_gt_count", "detector_boundary_cut_count",
     ]
     compare_sheet.append(compare_headers)
-    for config_name, config in CONFIGS.items():
+    for config_name, config_summary in candidate_summaries.items():
+        config = config_summary.get("parameters", {})
         for scope in ("ALL", *TASK_NAMES):
-            metric = summary["configs"][config_name]["by_scope"][scope]
+            metric = config_summary["by_scope"][scope]
+            rule = config.get("task_rules", {}).get(scope, {})
             compare_sheet.append(
                 [
-                    config_name, scope, config["horizontal_link_ratio"], config["context_ratio"],
+                    config_name, scope, "ALL", rule.get("horizontal_link_ratio"),
+                    rule.get("vertical_link_ratio"), rule.get("context_ratio"),
+                    rule.get("min_context_image_ratio"),
                     metric["gt_box_containment_recall"], metric["positive_sample_success_rate"],
                     metric["union_area_ratio"]["mean"], metric["pixel_reduction_ratio"],
                     metric["gt_gain_over_1_25_ratio"], metric["gt_gain_over_1_5_ratio"],
@@ -1936,9 +2219,52 @@ def write_excel_report(
                     metric["partial_only_gt_count"], metric["detector_boundary_cut_count"],
                 ]
             )
+        for density, metric in config_summary.get(
+            "region_by_detection_density", {}
+        ).items():
+            compare_sheet.append(
+                [
+                    config_name, "REGION_ALL", density, None, None, None, None,
+                    metric["gt_box_containment_recall"],
+                    metric["positive_sample_success_rate"],
+                    metric["union_area_ratio"]["mean"],
+                    metric["pixel_reduction_ratio"],
+                    metric["gt_gain_over_1_25_ratio"],
+                    metric["gt_gain_over_1_5_ratio"],
+                    metric["gt_gain_over_2_0_ratio"],
+                    metric["uncovered_gt_count"], metric["partial_only_gt_count"],
+                    metric["detector_boundary_cut_count"],
+                ]
+            )
+        for task, density_rows in config_summary.get(
+            "region_by_task_and_detection_density", {}
+        ).items():
+            rule = config.get("task_rules", {}).get(task, {})
+            for density, metric in density_rows.items():
+                compare_sheet.append(
+                    [
+                        config_name, task, density,
+                        rule.get("horizontal_link_ratio"),
+                        rule.get("vertical_link_ratio"),
+                        rule.get("context_ratio"),
+                        rule.get("min_context_image_ratio"),
+                        metric["gt_box_containment_recall"],
+                        metric["positive_sample_success_rate"],
+                        metric["union_area_ratio"]["mean"],
+                        metric["pixel_reduction_ratio"],
+                        metric["gt_gain_over_1_25_ratio"],
+                        metric["gt_gain_over_1_5_ratio"],
+                        metric["gt_gain_over_2_0_ratio"],
+                        metric["uncovered_gt_count"],
+                        metric["partial_only_gt_count"],
+                        metric["detector_boundary_cut_count"],
+                    ]
+                )
 
     for sheet in workbook.worksheets:
         sheet.freeze_panes = "A2"
+        sheet.sheet_view.showGridLines = False
+        sheet.row_dimensions[1].height = 24
         if sheet.max_row >= 1 and sheet.max_column >= 1:
             sheet.auto_filter.ref = f"A1:{get_column_letter(sheet.max_column)}{sheet.max_row}"
         for cell in sheet[1]:
@@ -1961,6 +2287,16 @@ def write_excel_report(
         for name in percent_names & headers.keys():
             for row in range(2, sheet.max_row + 1):
                 sheet.cell(row, headers[name]).number_format = "0.00%"
+    decimal_names = {
+        "crop_mean", "crop_p50", "crop_p90", "horizontal_link_ratio",
+        "vertical_link_ratio", "context_ratio", "min_context_image_ratio",
+        "required_max_single_side_px", "required_total_px",
+    }
+    for sheet in workbook.worksheets:
+        headers = {cell.value: cell.column for cell in sheet[1]}
+        for name in decimal_names & headers.keys():
+            for row in range(2, sheet.max_row + 1):
+                sheet.cell(row, headers[name]).number_format = "0.00"
     hyperlink_columns = [
         (detail_sheet, "overview"),
         (detail_sheet, "source_image"),
@@ -1984,21 +2320,53 @@ def write_excel_report(
     os.replace(temporary, path)
 
 
-def initialize_crop_audit_v2(
+def audit_input_snapshot(
+    paths: AuditPaths,
+    unique: Sequence[Mapping[str, Any]],
+    detections: Sequence[Mapping[str, Any]],
+    samples: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    unique_ids = [str(row["image_id"]) for row in unique]
+    detection_ids = [str(row["image_id"]) for row in detections]
+    if len(detection_ids) != len(set(detection_ids)) or set(detection_ids) != set(unique_ids):
+        raise ValueError("merged detections do not exactly match unique manifest")
+    return {
+        "unique_images": len(unique_ids),
+        "unique_image_id_digest": digest_ids(unique_ids),
+        "merged_detections": len(detection_ids),
+        "merged_image_id_digest": digest_ids(detection_ids),
+        "task_samples": len(samples),
+        "unique_images_file_digest": content_fingerprint(paths.unique_images),
+        "task_samples_file_digest": content_fingerprint(paths.task_samples),
+        "merged_detections_file_digest": content_fingerprint(paths.merged),
+        "detector_config_file_digest": content_fingerprint(paths.detector_config),
+    }
+
+
+def audit_state_digest(state: Mapping[str, Any]) -> str:
+    payload = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def initialize_crop_audit_v3(
     args: argparse.Namespace,
     paths: AuditPaths,
     unique: Sequence[Mapping[str, Any]],
+    input_snapshot: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create immutable v2 state and recoverably archive legacy partial output."""
+    """Create immutable named v3 state without touching any other audit."""
     expected = {
         "format_version": CROP_AUDIT_FORMAT_VERSION,
+        "crop_audit_name": paths.crop_audit_name,
         "unique_images": len(unique),
+        "expected_unique_images": int(getattr(args, "expected_unique_images", 0)),
         "image_id_digest": digest_ids(str(row["image_id"]) for row in unique),
-        "configs": CONFIGS,
+        "input_snapshot": dict(input_snapshot or {}),
+        "candidates": TASK_AWARE_CANDIDATES,
         "max_crops": args.max_crops,
         "boundary_margin_ratio": args.boundary_margin_ratio,
-        "whole_image_trim_ratio": args.whole_image_trim_ratio,
-        "whole_image_detection_margin_ratio": args.whole_image_detection_margin_ratio,
+        "content_missing_crop": "full_original_[0,0,W,H]",
+        "content_missing_label_transform_applied": False,
         "overview_samples_per_task": int(
             getattr(args, "overview_samples_per_task", 50)
         ),
@@ -2017,20 +2385,18 @@ def initialize_crop_audit_v2(
             )
         return expected
     if root.is_dir() and any(root.iterdir()):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        archive = root.with_name(f"{root.name}_legacy_slow_{timestamp}")
-        suffix = 1
-        while archive.exists():
-            archive = root.with_name(f"{root.name}_legacy_slow_{timestamp}_{suffix}")
-            suffix += 1
-        root.rename(archive)
-        print(
-            f"[crop-audit] 检测到旧版串行 partial 输出，已可恢复地移到：{archive}",
-            flush=True,
+        raise RuntimeError(
+            f"named crop audit directory already contains non-v3 output: {root}; "
+            "choose a new --crop-audit-name. Existing audit directories are never moved or overwritten."
         )
     root.mkdir(parents=True, exist_ok=True)
     atomic_write_json(state_path, expected)
     return expected
+
+
+# Backward-compatible import for older smoke tests and callers.  The state
+# written by this alias is still format_version=3.
+initialize_crop_audit_v2 = initialize_crop_audit_v3
 
 
 def planned_crop_paths(
@@ -2041,7 +2407,11 @@ def planned_crop_paths(
     prefix: str,
 ) -> list[Path]:
     directory = config_root / "crops" / image_id
-    return [directory / f"{prefix}_{index:02d}.png" for index in range(1, len(crop_boxes) + 1)]
+    paths = []
+    for crop in crop_boxes:
+        bbox_token = stable_id("bbox", ",".join(str(int(value)) for value in crop), 12)
+        paths.append(directory / f"{prefix}_{bbox_token}.png")
+    return paths
 
 
 def planned_overview_path(config_root: Path, sample: Mapping[str, Any]) -> Path:
@@ -2060,47 +2430,63 @@ def compute_geometry_record(
     detection: Mapping[str, Any],
     image_samples: Sequence[Mapping[str, Any]],
     config_name: str,
-    config: Mapping[str, float],
+    candidate: Mapping[str, Any],
     config_root: Path,
     max_crops: int,
     boundary_margin_ratio: float,
-    whole_image_trim_ratio: float,
-    whole_image_detection_margin_ratio: float,
+    shared_proposal_cache: dict[
+        tuple[float, float, float, float], dict[str, Any]
+    ] | None = None,
 ) -> dict[str, Any]:
-    """Compute one image/config audit record without opening the source image."""
+    """Compute task-aware image/candidate geometry without opening the image."""
     image_id = str(manifest["image_id"])
     width, height = int(manifest["width"]), int(manifest["height"])
-    proposal = proposal_crops(
-        cropper,
-        detection,
-        config,
-        max_crops=max_crops,
-        boundary_margin_ratio=boundary_margin_ratio,
+    whole_box = [0, 0, width, height]
+    detection_count = sum(
+        len(detection.get(f"{source}_detections", [])) for source in ("text", "icon")
     )
-    region_boxes = proposal["crop_boxes"]
-    whole_box = list(
-        cropper.make_lightly_trimmed_whole_image_crop(
-            proposal["detection_boxes"],
-            width,
-            height,
-            whole_image_trim_ratio,
-            whole_image_detection_margin_ratio,
-        )
-    )
-    if any(
-        rect_intersects(whole_box, box) and not rect_contains(whole_box, box)
-        for box in proposal["detection_boxes"]
-    ):
-        raise AssertionError("task-aware whole-image crop cuts a detector box")
-
+    whole_proposal = {
+        "detection_count": detection_count,
+        "edge_count": 0,
+        "component_count_before_merge": 0,
+        "forced_merge": False,
+        "empty_detection_fallback": detection_count == 0,
+        "detector_boundary_cut_count": 0,
+    }
+    proposal_cache = shared_proposal_cache if shared_proposal_cache is not None else {}
     sample_results: list[dict[str, Any]] = []
     for sample in image_samples:
-        use_whole = uses_task_whole_image_policy(str(sample["task"]))
-        crop_boxes = [whole_box] if use_whole else region_boxes
-        prefix = "whole" if use_whole else "crop"
-        crop_paths = planned_crop_paths(
-            config_root, image_id, crop_boxes, prefix=prefix
-        )
+        task = str(sample["task"])
+        use_whole = uses_task_whole_image_policy(task)
+        if use_whole:
+            proposal = whole_proposal
+            crop_boxes = [whole_box]
+            crop_paths = [Path(str(manifest["image_path"])).resolve()]
+            rule: Mapping[str, float] | None = None
+        else:
+            rule = candidate["task_rules"][task]
+            rule_key = (
+                float(rule["horizontal_link_ratio"]),
+                float(rule["vertical_link_ratio"]),
+                float(rule["context_ratio"]),
+                float(rule.get("min_context_image_ratio", 0.0)),
+            )
+            if rule_key not in proposal_cache:
+                proposal_cache[rule_key] = proposal_crops(
+                    cropper,
+                    detection,
+                    rule,
+                    max_crops=max_crops,
+                    boundary_margin_ratio=boundary_margin_ratio,
+                    min_context_image_ratio=float(
+                        rule.get("min_context_image_ratio", 0.0)
+                    ),
+                )
+            proposal = proposal_cache[rule_key]
+            crop_boxes = proposal["crop_boxes"]
+            crop_paths = planned_crop_paths(
+                config_root, image_id, crop_boxes, prefix="region"
+            )
         overview = planned_overview_path(config_root, sample)
         preview, preview_failures = build_preview_rows(
             sample, crop_boxes, crop_paths, config_name=config_name
@@ -2115,6 +2501,26 @@ def compute_geometry_record(
             config_name,
             errors,
         )
+        detail["partial_training_eligible_count"] = sum(
+            row.get("failure_type") == "partial_intersection"
+            and bool(row.get("training_eligible"))
+            for row in preview_failures
+        )
+        detail["hard_negative_count"] = sum(
+            row.get("training_eligible") and row.get("positive") is False
+            for row in preview
+        )
+        proposal_summary = {
+            key: proposal[key]
+            for key in (
+                "detection_count",
+                "edge_count",
+                "component_count_before_merge",
+                "forced_merge",
+                "empty_detection_fallback",
+                "detector_boundary_cut_count",
+            )
+        }
         # Geometry reports never claim that a file was rendered.  The selected
         # config materialization pass fills these fields with verified paths.
         detail["overview"] = ""
@@ -2126,30 +2532,31 @@ def compute_geometry_record(
                 "sample_id": sample["sample_id"],
                 "task": sample["task"],
                 "gt_boxes": sample["gt_boxes"],
+                "gt_boxes_1000": sample["gt_boxes_1000"],
                 "crop_kind": "whole" if use_whole else "region",
+                "task_geometry_rule": dict(rule) if rule is not None else None,
                 "crop_boxes": [list(box) for box in crop_boxes],
+                "proposal": proposal_summary,
                 "detail": detail,
                 "failures": failures,
                 "preview_failures": preview_failures,
             }
         )
-    proposal_summary = {
-        key: proposal[key]
-        for key in (
-            "detection_count",
-            "edge_count",
-            "component_count_before_merge",
-            "forced_merge",
-            "empty_detection_fallback",
-            "detector_boundary_cut_count",
-        )
-    }
+    unique_region_boxes = sorted(
+        {
+            tuple(int(value) for value in box)
+            for result in sample_results
+            if result["crop_kind"] == "region"
+            for box in result["crop_boxes"]
+        },
+        key=lambda box: (box[1], box[0], box[3], box[2]),
+    )
     return {
         "image_id": image_id,
         "config": config_name,
-        "region_boxes": [list(box) for box in region_boxes],
+        "unique_region_boxes": [list(box) for box in unique_region_boxes],
         "whole_box": whole_box,
-        "proposal": proposal_summary,
+        "detection_count": detection_count,
         "sample_results": sample_results,
     }
 
@@ -2170,17 +2577,45 @@ def geometry_worker(payload: Mapping[str, Any]) -> dict[str, Any]:
     return compute_geometry_record(_GEOMETRY_CROPPER, **values)
 
 
+def geometry_bundle_worker(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Evaluate all missing candidates for one image while reusing rule geometry."""
+    if _GEOMETRY_CROPPER is None:
+        raise RuntimeError("geometry worker cropper was not initialized")
+    values = dict(payload)
+    candidates = values.pop("candidates")
+    config_roots = values.pop("config_roots")
+    shared_cache: dict[tuple[float, float, float, float], dict[str, Any]] = {}
+    return [
+        compute_geometry_record(
+            _GEOMETRY_CROPPER,
+            **values,
+            config_name=name,
+            candidate=candidate,
+            config_root=Path(str(config_roots[name])),
+            shared_proposal_cache=shared_cache,
+        )
+        for name, candidate in candidates.items()
+    ]
+
+
 def geometry_shard_valid(
     input_path: Path,
     output_path: Path,
     done_path: Path,
     config_name: str,
+    expected_state_digest: str,
 ) -> bool:
     stage = f"crop-geometry-{config_name}"
     if not completed_shard_valid(input_path, output_path, done_path, stage):
         return False
     try:
-        return all(row.get("config") == config_name for row in read_jsonl(output_path))
+        marker = json.loads(done_path.read_text(encoding="utf-8"))
+        return (
+            marker.get("audit_state_digest") == expected_state_digest
+            and all(
+                row.get("config") == config_name for row in read_jsonl(output_path)
+            )
+        )
     except (OSError, ValueError, json.JSONDecodeError):
         return False
 
@@ -2190,16 +2625,21 @@ def materialization_shard_valid(
     output_path: Path,
     done_path: Path,
     config_name: str,
+    expected_state_digest: str,
 ) -> bool:
     stage = f"crop-materialize-{config_name}"
     if not completed_shard_valid(input_path, output_path, done_path, stage):
         return False
     try:
+        marker = json.loads(done_path.read_text(encoding="utf-8"))
+        if marker.get("audit_state_digest") != expected_state_digest:
+            return False
         rows = read_jsonl(output_path)
     except (OSError, ValueError, json.JSONDecodeError):
         return False
     for row in rows:
         paths = [*row.get("region_paths", []), *row.get("whole_paths", [])]
+        paths.extend(row.get("whole_source_paths", []))
         paths.extend(row.get("overview_paths", {}).values())
         if any(not Path(str(path)).is_file() for path in paths):
             return False
@@ -2212,14 +2652,19 @@ def collect_config_audit(
     overlap: Mapping[str, Any],
     samples_by_image: Mapping[str, Sequence[Mapping[str, Any]]],
     max_crops: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, list[dict[str, Any]]],
+    list[dict[str, Any]],
+]:
     details: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     anomaly_categories: dict[str, list[dict[str, Any]]] = defaultdict(list)
     preview_failures: list[dict[str, Any]] = []
     for record in records:
-        proposal = record["proposal"]
         for sample_result in record["sample_results"]:
+            proposal = sample_result["proposal"]
             detail = dict(sample_result["detail"])
             details.append(detail)
             sample_failures = [dict(row) for row in sample_result["failures"]]
@@ -2285,38 +2730,95 @@ def collect_config_audit(
                 }
             )
     ordered = {name: anomaly_categories.get(name, []) for name in ANOMALY_PRIORITY}
-    return details, failures, ordered
+    return details, failures, ordered, preview_failures
 
 
-def select_recommended_config(
+def candidate_selection_key(
+    config_name: str,
     summary: Mapping[str, Any],
     all_details: Sequence[Mapping[str, Any]],
-) -> str:
-    local_tasks = [task for task in TASK_NAMES if task != "ui_content_missing"]
+) -> tuple[float, float, float, float, float]:
+    scopes = summary["candidates"][config_name]["by_scope"]
+    gt_total = sum(scopes[task]["gt_count"] for task in REGION_TASKS)
+    contained = sum(scopes[task]["gt_contained_count"] for task in REGION_TASKS)
+    positives = sum(scopes[task]["positive_samples"] for task in REGION_TASKS)
+    successful = sum(
+        scopes[task]["positive_sample_success_count"] for task in REGION_TASKS
+    )
+    local_rows = [
+        row
+        for row in all_details
+        if row["config"] == config_name and row["task"] in REGION_TASKS
+    ]
+    efficiency = aggregate_scope(local_rows)
+    return (
+        contained / gt_total if gt_total else 1.0,
+        min(scopes[task]["gt_box_containment_recall"] for task in REGION_TASKS),
+        successful / positives if positives else 1.0,
+        efficiency["pixel_reduction_ratio"],
+        efficiency["gt_gain_over_1_5_ratio"],
+    )
 
-    def selection_key(name: str) -> tuple[float, float, float, float, float]:
-        scopes = summary["configs"][name]["by_scope"]
-        gt_total = sum(scopes[task]["gt_count"] for task in local_tasks)
-        contained = sum(scopes[task]["gt_contained_count"] for task in local_tasks)
-        positives = sum(scopes[task]["positive_samples"] for task in local_tasks)
-        successful = sum(
-            scopes[task]["positive_sample_success_count"] for task in local_tasks
-        )
-        local_rows = [
-            row
-            for row in all_details
-            if row["config"] == name and row["task"] in local_tasks
-        ]
-        efficiency = aggregate_scope(local_rows)
-        return (
-            contained / gt_total if gt_total else 1.0,
-            min(scopes[task]["gt_box_containment_recall"] for task in local_tasks),
-            successful / positives if positives else 1.0,
-            efficiency["pixel_reduction_ratio"],
-            efficiency["gt_gain_over_1_5_ratio"],
-        )
 
-    return max(CONFIGS, key=selection_key)
+def evaluate_candidate_gate(
+    config_name: str,
+    summary: Mapping[str, Any],
+    all_details: Sequence[Mapping[str, Any]],
+    preview_failures: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    scopes = summary["candidates"][config_name]["by_scope"]
+    region_rows = [
+        row
+        for row in all_details
+        if row["config"] == config_name and row["task"] in REGION_TASKS
+    ]
+    region = aggregate_scope(region_rows)
+    overall_recall = region["gt_box_containment_recall"]
+    per_task = {
+        task: scopes[task]["gt_box_containment_recall"] for task in REGION_TASKS
+    }
+    partial_eligible_from_details = sum(
+        int(row.get("partial_training_eligible_count", 0)) for row in region_rows
+    )
+    partial_eligible_from_preview = sum(
+        row.get("failure_type") == "partial_intersection"
+        and bool(row.get("training_eligible"))
+        for row in preview_failures
+    )
+    if partial_eligible_from_details != partial_eligible_from_preview:
+        raise AssertionError("partial eligibility accounting mismatch")
+    partial_eligible = partial_eligible_from_details
+    hard_negative_violations = sum(
+        int(row.get("hard_negative_count", 0)) > 1 for row in region_rows
+    )
+    conditions = {
+        "region_overall_recall_at_least_0_99": overall_recall >= 0.99,
+        "each_region_task_recall_at_least_0_98": all(
+            value >= 0.98 for value in per_task.values()
+        ),
+        "detector_boundary_cut_count_zero": (
+            region["detector_boundary_cut_count"] == 0
+        ),
+        "region_roundtrip_error_over_1_count_zero": (
+            region["roundtrip_error_over_1_count"] == 0
+        ),
+        "partial_crop_training_eligible_count_zero": partial_eligible == 0,
+        "hard_negative_max_one_per_image_task": hard_negative_violations == 0,
+    }
+    return {
+        "config": config_name,
+        "region_overall_recall": overall_recall,
+        "region_min_task_recall": min(per_task.values(), default=1.0),
+        "region_task_recall": per_task,
+        "detector_boundary_cut_count": region["detector_boundary_cut_count"],
+        "region_roundtrip_error_over_1_count": region[
+            "roundtrip_error_over_1_count"
+        ],
+        "partial_crop_training_eligible_count": partial_eligible,
+        "hard_negative_limit_violation_count": hard_negative_violations,
+        "conditions": conditions,
+        "passes": all(conditions.values()),
+    }
 
 
 def select_overview_sample_ids(
@@ -2336,8 +2838,37 @@ def select_overview_sample_ids(
         )[:samples_per_task]:
             selected.add(str(sample["sample_id"]))
     for category in ANOMALY_PRIORITY:
+        category_rows = list(anomalies.get(category, []))
+        if category == "gt_uncovered":
+            for row in category_rows:
+                if row.get("sample_id") is not None:
+                    selected.add(str(row["sample_id"]))
+            continue
+        if category == "gt_partial_only":
+            strata: dict[tuple[str, str, str], list[Mapping[str, Any]]] = defaultdict(list)
+            for row in category_rows:
+                strata[
+                    (
+                        str(row.get("task", "")),
+                        str(row.get("detection_density", "")),
+                        str(row.get("compensation_bucket", "")),
+                    )
+                ].append(row)
+            queues = {
+                key: sorted(
+                    values, key=lambda item: str(item.get("sample_id", ""))
+                )
+                for key, values in strata.items()
+            }
+            category_rows = []
+            offset = 0
+            while any(offset < len(values) for values in queues.values()):
+                for key in sorted(queues):
+                    if offset < len(queues[key]):
+                        category_rows.append(queues[key][offset])
+                offset += 1
         added = 0
-        for row in anomalies.get(category, []):
+        for row in category_rows:
             sample_id = row.get("sample_id")
             if sample_id is None:
                 continue
@@ -2355,37 +2886,34 @@ def materialize_image_record(
     config_root: Path,
     overview_sample_ids: set[str],
 ) -> dict[str, Any]:
-    """Decode an image once and materialize only the selected configuration."""
+    """Decode once; write each unique region bbox once and reuse whole originals."""
     image_id = str(manifest["image_id"])
     sample_results = geometry["sample_results"]
-    needs_region = any(row["crop_kind"] == "region" for row in sample_results)
-    needs_whole = any(row["crop_kind"] == "whole" for row in sample_results)
+    region_boxes = [list(box) for box in geometry["unique_region_boxes"]]
+    region_paths = planned_crop_paths(
+        config_root, image_id, region_boxes, prefix="region"
+    )
+    bbox_to_path = {
+        tuple(box): path.resolve() for box, path in zip(region_boxes, region_paths)
+    }
+    source_path = Path(str(manifest["image_path"])).resolve()
     with open_raw_image(Path(str(manifest["image_path"]))) as image:
-        region_paths = (
-            save_raw_crops(
-                image,
-                geometry["region_boxes"],
-                config_root / "crops" / image_id,
-                prefix="crop",
-            )
-            if needs_region
-            else []
-        )
-        whole_paths = (
-            save_raw_crops(
-                image,
-                [geometry["whole_box"]],
-                config_root / "crops" / image_id,
-                prefix="whole",
-            )
-            if needs_whole
-            else []
-        )
+        for crop, path in zip(region_boxes, region_paths):
+            cropped = image.crop(tuple(crop))
+            try:
+                atomic_save_png(cropped, path)
+            finally:
+                cropped.close()
         overview_paths: dict[str, str] = {}
         sample_paths: dict[str, list[str]] = {}
         for sample_result in sample_results:
             sample_id = str(sample_result["sample_id"])
-            crop_paths = whole_paths if sample_result["crop_kind"] == "whole" else region_paths
+            if sample_result["crop_kind"] == "whole":
+                crop_paths = [source_path]
+            else:
+                crop_paths = [
+                    bbox_to_path[tuple(box)] for box in sample_result["crop_boxes"]
+                ]
             sample_paths[sample_id] = [str(path) for path in crop_paths]
             if sample_id not in overview_sample_ids:
                 continue
@@ -2404,26 +2932,162 @@ def materialize_image_record(
             overview_paths[sample_id] = str(overview.resolve())
     return {
         "image_id": image_id,
-        "region_paths": [str(path) for path in region_paths],
-        "whole_paths": [str(path) for path in whole_paths],
+        "region_paths": [str(path.resolve()) for path in region_paths],
+        "whole_paths": [],
+        "whole_source_paths": (
+            [str(source_path)]
+            if any(row["crop_kind"] == "whole" for row in sample_results)
+            else []
+        ),
+        "region_reference_count": sum(
+            len(row["crop_boxes"])
+            for row in sample_results
+            if row["crop_kind"] == "region"
+        ),
+        "whole_reference_count": sum(
+            row["crop_kind"] == "whole" for row in sample_results
+        ),
         "sample_paths": sample_paths,
         "overview_paths": overview_paths,
     }
 
 
+def build_cross_task_supervision_audit(
+    samples: Sequence[Mapping[str, Any]], overlap: Mapping[str, Any]
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    by_image: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for sample in samples:
+        by_image[str(sample["image_id"])].append(sample)
+    rows = []
+    cardinality = Counter()
+    positive_diff = 0
+    gt_diff = 0
+    for image_id, members in sorted(by_image.items()):
+        supervision = {
+            str(row["task"]): {
+                "positive": bool(row["positive"]),
+                "gt_count": int(row["gt_count"]),
+                "gt_boxes_1000": row["gt_boxes_1000"],
+            }
+            for row in members
+        }
+        cardinality[len(supervision)] += 1
+        has_positive_diff = len(
+            {entry["positive"] for entry in supervision.values()}
+        ) > 1
+        has_gt_diff = len(
+            {
+                json.dumps(entry["gt_boxes_1000"], sort_keys=True)
+                for entry in supervision.values()
+            }
+        ) > 1
+        positive_diff += has_positive_diff
+        gt_diff += has_gt_diff
+        rows.append(
+            {
+                "image_id": image_id,
+                "tasks": sorted(supervision),
+                "task_count": len(supervision),
+                "positive_labels_differ": has_positive_diff,
+                "gt_labels_differ": has_gt_diff,
+                "task_supervision": supervision,
+            }
+        )
+    actual = overlap["actual_training_data"]
+    split_overlap = int(
+        overlap.get("same_content_cross_train_val", {}).get("count", 0)
+    )
+    return {
+        "per_task_content_unique_images": {
+            task: len(
+                {
+                    str(row["image_id"])
+                    for row in samples
+                    if str(row["task"]) == task
+                }
+            )
+            for task in TASK_NAMES
+        },
+        "content_overlap": actual["content_overlap"],
+        "task_cardinality_by_content": {
+            str(size): cardinality.get(size, 0) for size in range(1, 6)
+        },
+        "cross_task_positive_label_difference_images": positive_diff,
+        "cross_task_gt_difference_images": gt_diff,
+        "same_content_cross_train_val_count": split_overlap,
+        "all_tasks_share_one_content_pool": all(
+            len(
+                {
+                    str(row["image_id"])
+                    for row in samples
+                    if str(row["task"]) == task
+                }
+            )
+            == len(by_image)
+            for task in TASK_NAMES
+        ),
+    }, rows
+
+
+def materialization_reuse_metrics(
+    rows: Sequence[Mapping[str, Any]], overview_count: int
+) -> dict[str, Any]:
+    region_paths = {
+        str(path) for row in rows for path in row.get("region_paths", [])
+    }
+    whole_sources = {
+        str(path) for row in rows for path in row.get("whole_source_paths", [])
+    }
+    region_references = sum(int(row.get("region_reference_count", 0)) for row in rows)
+    whole_references = sum(int(row.get("whole_reference_count", 0)) for row in rows)
+    return {
+        "unique_images": len(rows),
+        "region_physical_file_count": len(region_paths),
+        "region_task_reference_count": region_references,
+        "region_reference_reuse_ratio": (
+            1 - len(region_paths) / region_references if region_references else 0.0
+        ),
+        "whole_original_physical_file_count": len(whole_sources),
+        "whole_generated_file_count": 0,
+        "whole_task_reference_count": whole_references,
+        "whole_reference_reuse_ratio": (
+            1 - len(whole_sources) / whole_references if whole_references else 0.0
+        ),
+        "overview_file_count": overview_count,
+        "whole_image_policy": "reuse original path; no duplicate PNG",
+    }
+
+
 def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
-    paths = AuditPaths(args.output_dir)
-    detections = {row["image_id"]: row for row in read_jsonl(paths.merged)}
+    """Run the named CPU-only v3 audit against immutable detector output."""
+    paths = AuditPaths(
+        args.output_dir, str(getattr(args, "crop_audit_name", "crop_audit_v3"))
+    )
+    detection_rows = read_jsonl(paths.merged)
+    detections = {str(row["image_id"]): row for row in detection_rows}
     unique = read_jsonl(paths.unique_images)
     samples = read_jsonl(paths.task_samples)
-    if set(detections) != {row["image_id"] for row in unique}:
-        raise ValueError("merged detections do not exactly match unique manifest")
+    input_snapshot = audit_input_snapshot(paths, unique, detection_rows, samples)
+    expected_unique = int(getattr(args, "expected_unique_images", 0))
+    if expected_unique and len(unique) != expected_unique:
+        raise RuntimeError(
+            f"expected {expected_unique} unique images, found {len(unique)}; "
+            "refusing an incomplete crop-only audit"
+        )
     overlap = json.loads(
         (paths.manifest / "overlap" / "source_overlap.json").read_text(
             encoding="utf-8"
         )
     )
-    initialize_crop_audit_v2(args, paths, unique)
+    supervision_audit, supervision_rows = build_cross_task_supervision_audit(
+        samples, overlap
+    )
+    if supervision_audit["same_content_cross_train_val_count"] != 0:
+        raise RuntimeError("same-content train/val leakage must be zero before crop audit")
+    audit_state = initialize_crop_audit_v3(
+        args, paths, unique, input_snapshot=input_snapshot
+    )
+    state_digest = audit_state_digest(audit_state)
     resume = bool(getattr(args, "resume", False))
     crop_workers = int(getattr(args, "crop_workers", 1))
     samples_by_image: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -2437,15 +3101,29 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
         samples_by_id[sample_id] = sample
 
     shard_paths = sorted(paths.shards.glob("shard_*.jsonl"))
-    geometry_total = len(unique) * len(CONFIGS)
+    if not shard_paths:
+        raise FileNotFoundError(f"no manifest shards found under {paths.shards}")
+    expected_ids = {str(row["image_id"]) for row in unique}
+    shard_ids = [
+        str(row["image_id"])
+        for shard in shard_paths
+        for row in read_jsonl(shard)
+    ]
+    if len(shard_ids) != len(expected_ids) or set(shard_ids) != expected_ids:
+        raise ValueError("manifest shards do not exactly match unique_images.jsonl")
+
+    candidate_names = tuple(TASK_AWARE_CANDIDATES)
+    geometry_total = len(unique) * len(candidate_names)
     geometry_completed = 0
-    for config_name in CONFIGS:
-        geometry_root = paths.crop_audit / f"config_{config_name}" / "geometry"
+    for candidate_name in candidate_names:
+        root = paths.crop_audit / f"candidate_{candidate_name}" / "geometry"
         for shard in shard_paths:
-            output = geometry_root / shard.name
-            marker = geometry_root / f"{shard.stem}.done.json"
             if resume and geometry_shard_valid(
-                shard, output, marker, config_name
+                shard,
+                root / shard.name,
+                root / f"{shard.stem}.done.json",
+                candidate_name,
+                state_digest,
             ):
                 geometry_completed += len(read_jsonl(shard))
     geometry_reporter = ProgressReporter(
@@ -2454,14 +3132,16 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
         output_dir=args.output_dir,
         interval_seconds=args.progress_interval_seconds,
         initial_completed=geometry_completed,
-        unit="image-configs",
+        unit="image-candidates",
     )
     geometry_reporter.update(
         geometry_completed,
-        detail=f"阶段 1/2：{crop_workers} 个 CPU worker 纯几何比较 A/B/C；不读取原图、不写 PNG",
+        detail=(
+            f"阶段 1/2：{crop_workers} 个 CPU worker，{len(candidate_names)} 个"
+            " task-aware 候选；复用 merged detections，不运行 GPU"
+        ),
         force=True,
     )
-
     geometry_remaining = geometry_completed < geometry_total
     local_cropper = (
         load_parser_module(args.parser_root, "ui_region_cropper")
@@ -2478,66 +3158,100 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
         else None
     )
     try:
-        for config_name, config in CONFIGS.items():
-            config_root = paths.crop_audit / f"config_{config_name}"
-            geometry_root = config_root / "geometry"
-            for shard in shard_paths:
-                output = geometry_root / shard.name
-                marker = geometry_root / f"{shard.stem}.done.json"
-                if resume and geometry_shard_valid(
-                    shard, output, marker, config_name
-                ):
-                    continue
-                shard_rows = read_jsonl(shard)
-                payloads = [
-                    {
-                        "manifest": manifest,
-                        "detection": detections[str(manifest["image_id"])],
-                        "image_samples": samples_by_image[str(manifest["image_id"])],
-                        "config_name": config_name,
-                        "config": config,
-                        "config_root": str(config_root),
-                        "max_crops": args.max_crops,
-                        "boundary_margin_ratio": args.boundary_margin_ratio,
-                        "whole_image_trim_ratio": args.whole_image_trim_ratio,
-                        "whole_image_detection_margin_ratio": args.whole_image_detection_margin_ratio,
-                    }
-                    for manifest in shard_rows
-                ]
-                if process_pool is not None:
-                    iterator = process_pool.map(geometry_worker, payloads, chunksize=4)
-                else:
-                    assert local_cropper is not None
-                    iterator = (
-                        compute_geometry_record(
-                            local_cropper,
-                            **{**payload, "config_root": Path(payload["config_root"])},
-                        )
-                        for payload in payloads
+        for shard in shard_paths:
+            missing = []
+            for name in candidate_names:
+                root = paths.crop_audit / f"candidate_{name}" / "geometry"
+                if not (
+                    resume
+                    and geometry_shard_valid(
+                        shard,
+                        root / shard.name,
+                        root / f"{shard.stem}.done.json",
+                        name,
+                        state_digest,
                     )
-                output_rows = []
-                for row in iterator:
-                    output_rows.append(row)
+                ):
+                    missing.append(name)
+            if not missing:
+                continue
+            shard_rows = read_jsonl(shard)
+            payloads = [
+                {
+                    "manifest": manifest,
+                    "detection": detections[str(manifest["image_id"])],
+                    "image_samples": samples_by_image[str(manifest["image_id"])],
+                    "candidates": {
+                        name: TASK_AWARE_CANDIDATES[name] for name in missing
+                    },
+                    "config_roots": {
+                        name: str(paths.crop_audit / f"candidate_{name}")
+                        for name in missing
+                    },
+                    "max_crops": args.max_crops,
+                    "boundary_margin_ratio": args.boundary_margin_ratio,
+                }
+                for manifest in shard_rows
+            ]
+            if process_pool is not None:
+                iterator = process_pool.map(
+                    geometry_bundle_worker, payloads, chunksize=4
+                )
+            else:
+                assert local_cropper is not None
+
+                def local_bundles() -> Iterator[list[dict[str, Any]]]:
+                    for payload in payloads:
+                        shared: dict[
+                            tuple[float, float, float, float], dict[str, Any]
+                        ] = {}
+                        yield [
+                            compute_geometry_record(
+                                local_cropper,
+                                manifest=payload["manifest"],
+                                detection=payload["detection"],
+                                image_samples=payload["image_samples"],
+                                config_name=name,
+                                candidate=TASK_AWARE_CANDIDATES[name],
+                                config_root=Path(payload["config_roots"][name]),
+                                max_crops=args.max_crops,
+                                boundary_margin_ratio=args.boundary_margin_ratio,
+                                shared_proposal_cache=shared,
+                            )
+                            for name in missing
+                        ]
+
+                iterator = local_bundles()
+            rows_by_candidate: dict[str, list[dict[str, Any]]] = {
+                name: [] for name in missing
+            }
+            for bundle in iterator:
+                for row in bundle:
+                    name = str(row["config"])
+                    rows_by_candidate[name].append(row)
                     geometry_completed += 1
                     geometry_reporter.update(
                         geometry_completed,
                         detail=(
-                            f"阶段 1/2：config {config_name}，{shard.name}，"
-                            f"{row['proposal']['detection_count']} boxes -> "
-                            f"{len(row['region_boxes'])} crops"
+                            f"阶段 1/2：candidate {name}，{shard.name}，"
+                            f"{row['detection_count']} boxes -> "
+                            f"{len(row['unique_region_boxes'])} unique crops"
                         ),
                     )
-                atomic_write_jsonl(output, output_rows)
+            for name, output_rows in rows_by_candidate.items():
+                root = paths.crop_audit / f"candidate_{name}" / "geometry"
+                atomic_write_jsonl(root / shard.name, output_rows)
                 atomic_write_json(
-                    marker,
+                    root / f"{shard.stem}.done.json",
                     {
-                        "stage": f"crop-geometry-{config_name}",
-                        "config": config_name,
+                        "stage": f"crop-geometry-{name}",
+                        "config": name,
                         "count": len(output_rows),
                         "image_id_digest": digest_ids(
                             str(row["image_id"]) for row in output_rows
                         ),
                         "input_shard": str(shard),
+                        "audit_state_digest": state_digest,
                     },
                 )
     finally:
@@ -2545,83 +3259,150 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
             process_pool.shutdown(wait=True, cancel_futures=True)
     geometry_reporter.update(
         geometry_total,
-        detail="阶段 1/2 完成：A/B/C 几何、GT 关联和坐标 round-trip 已落盘",
+        detail="阶段 1/2 完成：task-aware 几何、GT 离线评价和坐标检查已落盘",
         force=True,
     )
 
-    expected_ids = {str(row["image_id"]) for row in unique}
-    details_by_config: dict[str, list[dict[str, Any]]] = {}
-    failures_by_config: dict[str, list[dict[str, Any]]] = {}
-    anomalies_by_config: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    details_by_candidate: dict[str, list[dict[str, Any]]] = {}
+    failures_by_candidate: dict[str, list[dict[str, Any]]] = {}
+    anomalies_by_candidate: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    preview_failures_by_candidate: dict[str, list[dict[str, Any]]] = {}
     summary: dict[str, Any] = {
-        "configs": {},
+        "candidates": {},
         "cpt_enabled": False,
+        "crop_only": True,
+        "detector_stages_executed": [],
         "audit_format_version": CROP_AUDIT_FORMAT_VERSION,
+        "crop_audit_name": paths.crop_audit_name,
+        "input_snapshot_before": input_snapshot,
+        "cross_task_supervision": supervision_audit,
+        "detection_density_definition": {
+            "sparse": "detector boxes <= 50",
+            "medium": "51-150 detector boxes",
+            "dense": "detector boxes > 150",
+        },
+        "training_started": False,
     }
-    for config_name, config in CONFIGS.items():
-        geometry_root = paths.crop_audit / f"config_{config_name}" / "geometry"
+    for name, candidate in TASK_AWARE_CANDIDATES.items():
+        root = paths.crop_audit / f"candidate_{name}" / "geometry"
         records = [
-            row
-            for shard in shard_paths
-            for row in read_jsonl(geometry_root / shard.name)
+            row for shard in shard_paths for row in read_jsonl(root / shard.name)
         ]
         record_ids = [str(row["image_id"]) for row in records]
         if len(record_ids) != len(expected_ids) or set(record_ids) != expected_ids:
-            raise ValueError(f"config {config_name} geometry does not match unique images")
-        config_details, config_failures, ordered_anomalies = collect_config_audit(
+            raise ValueError(f"candidate {name} geometry does not match unique images")
+        details, failures, anomalies, preview_failures = collect_config_audit(
             records,
             overlap=overlap,
             samples_by_image=samples_by_image,
             max_crops=args.max_crops,
         )
-        details_by_config[config_name] = config_details
-        failures_by_config[config_name] = config_failures
-        anomalies_by_config[config_name] = ordered_anomalies
-        by_scope = {"ALL": aggregate_scope(config_details)}
+        details_by_candidate[name] = details
+        failures_by_candidate[name] = failures
+        anomalies_by_candidate[name] = anomalies
+        preview_failures_by_candidate[name] = preview_failures
+        by_scope = {"ALL": aggregate_scope(details)}
         for task in TASK_NAMES:
             by_scope[task] = aggregate_scope(
-                [row for row in config_details if row["task"] == task]
+                [row for row in details if row["task"] == task]
             )
-        summary["configs"][config_name] = {
-            "parameters": config,
+        region_details = [row for row in details if row["task"] in REGION_TASKS]
+        by_density = {
+            density: aggregate_scope(
+                [row for row in region_details if row["detection_density"] == density]
+            )
+            for density in ("sparse", "medium", "dense")
+        }
+        by_task_density = {
+            task: {
+                density: aggregate_scope(
+                    [
+                        row
+                        for row in region_details
+                        if row["task"] == task
+                        and row["detection_density"] == density
+                    ]
+                )
+                for density in ("sparse", "medium", "dense")
+            }
+            for task in REGION_TASKS
+        }
+        partial_compensation = {}
+        for task in REGION_TASKS:
+            values = [
+                float(row["required_max_single_side_px"])
+                for row in failures
+                if row["task"] == task
+                and row["failure_type"] == "partial_intersection"
+                and row.get("required_max_single_side_px") is not None
+            ]
+            partial_compensation[task] = {
+                "count": len(values),
+                "p50_px": percentile(values, 0.50),
+                "p90_px": percentile(values, 0.90),
+                "max_px": max(values, default=0.0),
+            }
+        summary["candidates"][name] = {
+            "parameters": candidate,
             "by_scope": by_scope,
-            "gt_failure_count": len(config_failures),
+            "region_by_detection_density": by_density,
+            "region_by_task_and_detection_density": by_task_density,
+            "partial_required_single_side_compensation": partial_compensation,
+            "gt_failure_count": len(failures),
             "anomaly_counts": {
-                name: len(rows) for name, rows in ordered_anomalies.items()
+                category: len(rows) for category, rows in anomalies.items()
             },
         }
-        del records
 
     all_geometry_details = [
-        row for name in CONFIGS for row in details_by_config[name]
+        row for name in candidate_names for row in details_by_candidate[name]
     ]
-    summary["recommended_config"] = select_recommended_config(
-        summary, all_geometry_details
+    candidate_gates = {
+        name: evaluate_candidate_gate(
+            name,
+            summary,
+            all_geometry_details,
+            preview_failures_by_candidate[name],
+        )
+        for name in candidate_names
+    }
+    summary["candidate_gates"] = candidate_gates
+    passing = [name for name in candidate_names if candidate_gates[name]["passes"]]
+    selection_pool = passing or list(candidate_names)
+    selected_name = max(
+        selection_pool,
+        key=lambda name: candidate_selection_key(
+            name, summary, all_geometry_details
+        ),
     )
-    recommended_name = str(summary["recommended_config"])
-    recommended_root = paths.crop_audit / f"config_{recommended_name}"
+    if passing:
+        summary["recommended_config"] = selected_name
+    else:
+        summary["best_candidate_config"] = selected_name
+    selected_root = paths.crop_audit / f"candidate_{selected_name}"
+    summary["materialized_candidate"] = selected_name
     overview_sample_ids = select_overview_sample_ids(
         samples,
-        anomalies_by_config[recommended_name],
+        anomalies_by_candidate[selected_name],
         samples_per_task=int(getattr(args, "overview_samples_per_task", 50)),
         anomalies_per_category=int(
             getattr(args, "overview_anomalies_per_category", 50)
         ),
     )
-    recommended_records = {
+    selected_records = {
         str(row["image_id"]): row
         for shard in shard_paths
-        for row in read_jsonl(
-            recommended_root / "geometry" / shard.name
-        )
+        for row in read_jsonl(selected_root / "geometry" / shard.name)
     }
-    material_root = recommended_root / "materialized"
+    material_root = selected_root / "materialized"
     material_completed = 0
     for shard in shard_paths:
-        output = material_root / shard.name
-        marker = material_root / f"{shard.stem}.done.json"
         if resume and materialization_shard_valid(
-            shard, output, marker, recommended_name
+            shard,
+            material_root / shard.name,
+            material_root / f"{shard.stem}.done.json",
+            selected_name,
+            state_digest,
         ):
             material_completed += len(read_jsonl(shard))
     material_reporter = ProgressReporter(
@@ -2635,8 +3416,8 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
     material_reporter.update(
         material_completed,
         detail=(
-            f"阶段 2/2：仅落图推荐配置 {recommended_name}；"
-            f"{crop_workers} 个 CPU worker，overview={len(overview_sample_ids)} 个样本"
+            f"阶段 2/2：落图 {selected_name}；同 bbox 物理去重，"
+            f"content_missing 复用原图；{crop_workers} 个 CPU worker"
         ),
         force=True,
     )
@@ -2644,28 +3425,29 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
         output = material_root / shard.name
         marker = material_root / f"{shard.stem}.done.json"
         if resume and materialization_shard_valid(
-            shard, output, marker, recommended_name
+            shard, output, marker, selected_name, state_digest
         ):
             continue
-        shard_rows = read_jsonl(shard)
         kwargs_rows = [
             {
                 "manifest": manifest,
-                "geometry": recommended_records[str(manifest["image_id"])],
-                "config_root": recommended_root,
+                "geometry": selected_records[str(manifest["image_id"])],
+                "config_root": selected_root,
                 "overview_sample_ids": overview_sample_ids,
             }
-            for manifest in shard_rows
+            for manifest in read_jsonl(shard)
         ]
         output_rows: list[dict[str, Any]] = []
         if crop_workers == 1:
-            iterator = (materialize_image_record(**kwargs) for kwargs in kwargs_rows)
+            iterator: Iterable[dict[str, Any]] = (
+                materialize_image_record(**kwargs) for kwargs in kwargs_rows
+            )
             for row in iterator:
                 output_rows.append(row)
                 material_completed += 1
                 material_reporter.update(
                     material_completed,
-                    detail=f"阶段 2/2：config {recommended_name}，{shard.name}",
+                    detail=f"阶段 2/2：candidate {selected_name}，{shard.name}",
                 )
         else:
             with ThreadPoolExecutor(max_workers=crop_workers) as executor:
@@ -2674,24 +3456,24 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
                     for kwargs in kwargs_rows
                 ]
                 for future in futures:
-                    row = future.result()
-                    output_rows.append(row)
+                    output_rows.append(future.result())
                     material_completed += 1
                     material_reporter.update(
                         material_completed,
-                        detail=f"阶段 2/2：config {recommended_name}，{shard.name}",
+                        detail=f"阶段 2/2：candidate {selected_name}，{shard.name}",
                     )
         atomic_write_jsonl(output, output_rows)
         atomic_write_json(
             marker,
             {
-                "stage": f"crop-materialize-{recommended_name}",
-                "config": recommended_name,
+                "stage": f"crop-materialize-{selected_name}",
+                "config": selected_name,
                 "count": len(output_rows),
                 "image_id_digest": digest_ids(
                     str(row["image_id"]) for row in output_rows
                 ),
                 "input_shard": str(shard),
+                "audit_state_digest": state_digest,
             },
         )
 
@@ -2702,119 +3484,164 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
     ]
     material_by_image = {str(row["image_id"]): row for row in material_rows}
     if len(material_by_image) != len(expected_ids) or set(material_by_image) != expected_ids:
-        raise ValueError("selected config materialization does not match unique images")
+        raise ValueError("selected candidate materialization does not match unique images")
 
     selected_details: list[dict[str, Any]] = []
     selected_failures: list[dict[str, Any]] = []
     preview_by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    overview_by_sample: dict[str, str] = {}
-    for row in material_rows:
-        overview_by_sample.update(
-            {str(key): str(value) for key, value in row["overview_paths"].items()}
-        )
-    for record in recommended_records.values():
+    overview_by_sample = {
+        str(key): str(value)
+        for row in material_rows
+        for key, value in row["overview_paths"].items()
+    }
+    for record in selected_records.values():
         material = material_by_image[str(record["image_id"])]
         for sample_result in record["sample_results"]:
             sample_id = str(sample_result["sample_id"])
             crop_paths = [
                 Path(path) for path in material["sample_paths"][sample_id]
             ]
-            overview = overview_by_sample.get(sample_id, "")
+            overview_path = overview_by_sample.get(sample_id, "")
             detail = dict(sample_result["detail"])
             detail["crop_paths"] = [str(path.resolve()) for path in crop_paths]
-            detail["overview"] = overview
+            detail["overview"] = overview_path
             selected_details.append(detail)
-            sample = samples_by_id[sample_id]
             preview, _ = build_preview_rows(
-                sample,
+                samples_by_id[sample_id],
                 sample_result["crop_boxes"],
                 crop_paths,
-                config_name=recommended_name,
+                config_name=selected_name,
             )
-            preview_by_task[str(sample["task"])].extend(preview)
+            preview_by_task[str(sample_result["task"])].extend(preview)
             for failure in sample_result["failures"]:
                 updated = dict(failure)
-                updated["visualization"] = overview
+                updated["visualization"] = overview_path
                 selected_failures.append(updated)
-    details_by_config[recommended_name] = selected_details
-    failures_by_config[recommended_name] = selected_failures
-    selected_anomalies: dict[str, list[dict[str, Any]]] = {}
-    for category, rows in anomalies_by_config[recommended_name].items():
-        selected_anomalies[category] = []
+    details_by_candidate[selected_name] = selected_details
+    failures_by_candidate[selected_name] = selected_failures
+    for category, rows in anomalies_by_candidate[selected_name].items():
         for row in rows:
-            updated = dict(row)
-            sample_id = updated.get("sample_id")
-            updated["visualization"] = overview_by_sample.get(str(sample_id), "")
-            selected_anomalies[category].append(updated)
-    anomalies_by_config[recommended_name] = selected_anomalies
+            row["visualization"] = overview_by_sample.get(
+                str(row.get("sample_id", "")), ""
+            )
 
-    for config_name in CONFIGS:
-        config_root = paths.crop_audit / f"config_{config_name}"
+    for name in candidate_names:
+        root = paths.crop_audit / f"candidate_{name}"
         atomic_write_jsonl(
-            config_root / "task_aware_manifest.jsonl",
-            details_by_config[config_name],
+            root / "task_aware_manifest.jsonl", details_by_candidate[name]
         )
         atomic_write_jsonl(
-            config_root / "gt_failures.jsonl", failures_by_config[config_name]
+            root / "gt_failures.jsonl", failures_by_candidate[name]
         )
-        atomic_write_json(
-            config_root / "anomalies.json", anomalies_by_config[config_name]
-        )
+        atomic_write_json(root / "anomalies.json", anomalies_by_candidate[name])
     for task in TASK_NAMES:
         atomic_write_jsonl(
-            recommended_root / "preview" / f"{task}.jsonl",
-            preview_by_task[task],
+            selected_root / "preview" / f"{task}.jsonl", preview_by_task[task]
         )
 
-    all_details = [row for name in CONFIGS for row in details_by_config[name]]
-    all_failures = [row for name in CONFIGS for row in failures_by_config[name]]
+    # The root machine-readable detail and Excel contain one row per image x
+    # task for the materialized candidate.  Cross-candidate metrics stay in
+    # summary/config_compare, and every candidate retains its own full JSONL.
+    report_details = details_by_candidate[selected_name]
+    report_failures = failures_by_candidate[selected_name]
     summary["materialization"] = {
-        "config": recommended_name,
-        "unique_images": len(material_rows),
-        "region_crop_files": sum(len(row["region_paths"]) for row in material_rows),
-        "whole_crop_files": sum(len(row["whole_paths"]) for row in material_rows),
-        "overview_files": len(overview_by_sample),
-        "non_recommended_configs_geometry_only": [
-            name for name in CONFIGS if name != recommended_name
+        "candidate": selected_name,
+        **materialization_reuse_metrics(material_rows, len(overview_by_sample)),
+        "geometry_only_candidates": [
+            name for name in candidate_names if name != selected_name
         ],
     }
-    local_tasks = [task for task in TASK_NAMES if task != "ui_content_missing"]
-    recommended = summary["configs"][summary["recommended_config"]]["by_scope"]
-    local_gt = sum(recommended[task]["gt_count"] for task in local_tasks)
-    local_contained = sum(recommended[task]["gt_contained_count"] for task in local_tasks)
-    summary["next_stage_gate"] = {
-        "local_task_overall_recall": local_contained / local_gt if local_gt else 1.0,
-        "local_task_min_recall": min(recommended[task]["gt_box_containment_recall"] for task in local_tasks),
-        "detector_boundary_cut_count": recommended["ALL"]["detector_boundary_cut_count"],
-        "passes": (
-            (local_contained / local_gt if local_gt else 1.0) >= 0.99
-            and all(recommended[task]["gt_box_containment_recall"] >= 0.98 for task in local_tasks)
-            and recommended["ALL"]["detector_boundary_cut_count"] == 0
-        ),
-        "training_started": False,
+    summary["root_detail_outputs"] = {
+        "candidate": selected_name,
+        "task_aware_manifest_rows": len(report_details),
+        "gt_failure_rows": len(report_failures),
+        "other_candidates": "full detail remains under candidate_*/",
     }
+    content_scope = summary["candidates"][selected_name]["by_scope"][
+        "ui_content_missing"
+    ]
+    content_preview = preview_by_task["ui_content_missing"]
+    summary["content_missing_checks"] = {
+        "full_image_bbox": "[0,0,W,H]",
+        "gt_box_containment_recall": content_scope[
+            "gt_box_containment_recall"
+        ],
+        "label_transform_applied": False,
+        "normalized_gt_identical_count": sum(
+            bool(row.get("normalized_gt_identical")) for row in content_preview
+        ),
+        "normalized_gt_box_count": sum(
+            len(row.get("original_gt_boxes_1000", [])) for row in content_preview
+        ),
+        "normalized_gt_identical_box_count": sum(
+            len(row.get("original_gt_boxes_1000", []))
+            for row in content_preview
+            if row.get("original_gt_boxes_1000")
+            == row.get("output_gt_boxes_1000")
+        ),
+        "normalized_gt_mismatch_count": sum(
+            row.get("original_gt_boxes_1000") != row.get("output_gt_boxes_1000")
+            for row in content_preview
+        ),
+        "roundtrip_gate_excluded": True,
+    }
+    if content_scope["gt_box_containment_recall"] != 1.0:
+        raise AssertionError("ui_content_missing full-image containment must be 100%")
+    if summary["content_missing_checks"]["normalized_gt_mismatch_count"] != 0:
+        raise AssertionError("ui_content_missing normalized GT must be reused verbatim")
+    gate = dict(candidate_gates[selected_name])
+    gate.update(
+        {
+            "passes": bool(candidate_gates[selected_name]["passes"]),
+            "training_ready": bool(candidate_gates[selected_name]["passes"]),
+            "training_started": False,
+        }
+    )
+    summary["next_stage_gate"] = gate
+    if gate["passes"]:
+        atomic_write_json(
+            paths.crop_audit / "training_ready.json",
+            {
+                "training_ready": True,
+                "recommended_config": selected_name,
+                "training_started": False,
+                "audit_state_digest": state_digest,
+            },
+        )
+    input_snapshot_after = audit_input_snapshot(
+        paths, unique, detection_rows, samples
+    )
+    if input_snapshot_after != input_snapshot:
+        raise RuntimeError("manifest or merged detections changed during crop-only audit")
+    summary["input_snapshot_after"] = input_snapshot_after
+    summary["input_snapshot_unchanged"] = True
+
+    atomic_write_jsonl(
+        paths.crop_audit / "cross_task_supervision.jsonl", supervision_rows
+    )
     atomic_write_json(paths.crop_audit / "summary.json", summary)
-    write_statistics_csv(paths.crop_audit / "statistics.csv", all_details)
-    atomic_write_jsonl(paths.crop_audit / "task_aware_manifest.jsonl", all_details)
-    atomic_write_jsonl(paths.crop_audit / "gt_failures.jsonl", all_failures)
+    write_statistics_csv(paths.crop_audit / "statistics.csv", report_details)
+    atomic_write_jsonl(paths.crop_audit / "task_aware_manifest.jsonl", report_details)
+    atomic_write_jsonl(paths.crop_audit / "gt_failures.jsonl", report_failures)
+    atomic_write_json(
+        paths.crop_audit / "materialization_summary.json", summary["materialization"]
+    )
     material_reporter.update(
-        len(unique),
-        detail="阶段 2/2 落图完成，正在写 summary、CSV 和 Excel",
-        force=True,
+        len(unique), detail="阶段 2/2 完成，正在写唯一 Excel 与机器可读报告", force=True
     )
     write_excel_report(
-        paths.crop_audit / "ui5_crop_audit.xlsx", summary, overlap, all_details, all_failures
-    )
-    atomic_write_json(
-        paths.crop_audit / "materialization_summary.json",
-        summary["materialization"],
+        paths.crop_audit / "ui5_crop_audit.xlsx",
+        summary,
+        overlap,
+        report_details,
+        report_failures,
     )
     material_reporter.update(
         len(unique),
         status="completed",
         detail=(
-            f"A/B/C 几何报告完成；config {recommended_name} crop、"
-            "异常/抽样 overview、preview 和 Excel 已完成"
+            f"crop-only v3 完成；materialized={selected_name}，"
+            f"training_ready={gate['passes']}，OCR/icon 未运行"
         ),
         force=True,
     )
@@ -2866,6 +3693,16 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     args.text_python = resolve_python_executable(args.text_python, "--text-python")
     args.icon_python = resolve_python_executable(args.icon_python, "--icon-python")
     args.output_dir = args.output_dir.expanduser().resolve(strict=False)
+    audit_name = str(args.crop_audit_name).strip()
+    if (
+        not audit_name
+        or audit_name in {".", ".."}
+        or Path(audit_name).name != audit_name
+        or "/" in audit_name
+        or "\\" in audit_name
+    ):
+        raise ValueError("--crop-audit-name must be one safe directory name")
+    args.crop_audit_name = audit_name
     if args.text_model_dir:
         args.text_model_dir = args.text_model_dir.expanduser().resolve(strict=False)
     if args.icon_model:
@@ -2884,6 +3721,8 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("--overview-samples-per-task must be non-negative")
     if args.overview_anomalies_per_category < 0:
         raise ValueError("--overview-anomalies-per-category must be non-negative")
+    if args.expected_unique_images < 0:
+        raise ValueError("--expected-unique-images must be non-negative")
     return args
 
 

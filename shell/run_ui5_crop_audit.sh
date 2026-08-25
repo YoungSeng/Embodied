@@ -17,11 +17,13 @@ Usage:
     --gpus 0,1,2,3 \
     --workers-per-gpu 1 \
     --crop-workers 8 \
-    --icon-python /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python \
-    --stage prepare \
+    --expected-unique-images 17281 \
+    --crop-audit-name crop_audit_v3 \
+    --stage crop-audit \
     --resume
 
 Stages: prepare, text, icon, merge, crop-audit, all.
+For the completed 17,281-image detector run, use crop-audit only; it does not start GPU workers.
 USAGE
   exit 2
 fi

@@ -1,6 +1,8 @@
 # UI5 检测 Crop 审计（CPT disabled）
 
-本分支基于 `locany-cpt-v1@c06f1479a11b0175579994b880466b57bba50a87`。
+代码分支为 `locany-ui5-det-crop-v1`，从当时最新的 `origin/locany-cpt-v1` 创建。
+本轮修改前的实现提交是 `114797b638c5b9229aed9a2045539e557f6f62c8`；脚本启动时会检查
+所需 locany-cpt 基线仍是当前 HEAD 的祖先，不要求 HEAD 恰好停在某个旧提交。
 本轮只复用已更新的 Detail Pyramid、relation/gate、BF16 修复和 UI5 训练/评测基础设施：
 
 - 不加载 CPT 数据；
@@ -185,9 +187,11 @@ worker 前，脚本会先单进程检查 NumPy/Pillow、Torch、`torchvision.ops
 重新执行 17,281 张 OCR。也可把 `--stage all` 改为 `--stage icon`，icon 成功后再执行
 `merge` 和 `crop-audit`。
 
-## 4. 正式运行：最简单是一条命令
+## 4. 当前第二轮：只跑一条 crop-only 命令
 
-在 `Embodied-ui5-det-crop` 目录执行：
+17,281 张图片的 OCR、icon 和 merged detections 已经完整落盘。当前不要再用
+`--stage all`，也不要重新执行 `prepare`、`text`、`icon` 或 `merge`。在
+`Embodied-ui5-det-crop` 目录只执行：
 
 ```bash
 bash shell/run_ui5_crop_audit.sh \
@@ -198,21 +202,30 @@ bash shell/run_ui5_crop_audit.sh \
   --gpus 0,1,2,3 \
   --workers-per-gpu 1 \
   --crop-workers 8 \
-  --icon-python "${ICON_PYTHON}" \
-  --stage all \
+  --expected-unique-images 17281 \
+  --crop-audit-name crop_audit_v3 \
+  --stage crop-audit \
   --resume
 ```
 
-`--stage all` 会按顺序自动完成：
+这条命令只读取：
 
-1. `prepare`：读取五类 JSONL、检查图片、按内容去重、生成 manifest 和 shard；
-2. `text`：四卡运行 PP-OCRv5，按 shard 落盘后退出 Paddle 进程；
-3. `icon`：四卡运行 OmniParser icon detector，按 shard 落盘后退出 Torch 进程；
-4. `merge`：检查数量、重复、缺失和尺寸，再生成唯一 `detections.jsonl`；
-5. `crop-audit`：只用 CPU 读取落盘检测，先比较 A/B/C 几何，再只为推荐配置落正式 crop，
-   最后生成 preview、抽样/异常可视化、统计和 Excel。
+- `manifest/unique_images.jsonl`；
+- `manifest/task_samples.jsonl`；
+- `manifest/shards/shard_*.jsonl`；
+- `detections/merged/detections.jsonl`；
+- `detections/detector_config.json`。
 
-所以，正常首次运行不需要手动复制执行五条命令。
+它不会启动 Paddle、Torch 或 GPU worker。新结果写入 `crop_audit_v3/`，现有旧 audit 和整个
+`detections/` 目录都保留原样。启动时会记录上述输入的文件 digest、image_id 数量及集合；结束
+时再次核对，任何变化都会报错。
+
+`--resume` 只跳过参数 digest 完全一致、JSONL 行数/image_id 检查通过、完成标记有效且落盘文件
+存在的 shard。想比较另一组代码或参数时请换名字，例如
+`--crop-audit-name crop_audit_v3_retry`，不要覆盖同名审计。
+
+只有在一个全新数据集还没有检测结果时，才需要从 `prepare → text → icon → merge` 逐阶段执行；
+本轮不属于这种情况。
 
 ## 5. 实时进度和剩余时间
 
@@ -244,37 +257,48 @@ watch -n 5 'cat work_dirs/ui5_crop_audit_20260825/run_status.json'
 --progress-interval-seconds 30
 ```
 
-`prepare` 会显示源数据/训练数据重叠分析和 manifest 构建进度；`text`、`icon` 汇总四卡
-worker；`merge` 显示合并数量；`crop-audit` 分成两个独立 ETA：阶段 1 是 A/B/C 纯几何，
-阶段 2 是推荐配置落图。使用 `--resume` 时，已验证完成的 geometry/materialized shard 都会
-直接计入已完成数量，ETA 只按本次剩余工作估算。
+本轮 `crop-audit` 分成两个独立 ETA：阶段 1 是五组 task-aware 候选的纯几何评价，阶段 2 是
+最佳候选落图。使用 `--resume` 时，已验证完成的 geometry/materialized shard 会直接计入已完成
+数量，ETA 只按本次剩余工作估算。阶段 1 的单位是 `image-candidates`，总数约为
+`17,281 × 5 = 86,405`；这不表示图片被解码五遍。相同几何规则会在同一图片内跨候选复用。
 
 ### crop-audit 为什么分成两遍
 
-旧实现对 17,281 张图的 A/B/C 三组都重复解码原图，并保存全部 crop 和全分辨率 overview；
-约 `51,843 image-configs` 会产生数十万张 PNG，实测 ETA 可接近 48 小时。新实现为：
+旧实现对 17,281 张图的 A/B/C 三组重复解码原图并保存大量 PNG，实测 ETA 可接近 48 小时。
+v3 实现为：
 
-1. 阶段 1 使用 `--crop-workers 8` 个 CPU 进程，只读取 `detections.jsonl` 做连通分量、合并、
-   context、GT 包含、面积和坐标 round-trip；不打开原图、不写 PNG；
+1. 阶段 1 使用 `--crop-workers 8` 个 CPU 进程，只读取 merged detections 做连通分量、合并、
+   context、GT 离线评价、面积和坐标 round-trip；不打开原图、不写 PNG；
 2. 每 500–1000 张沿用 manifest shard，原子写 `geometry/shard_*.jsonl` 和完成标记；
-3. 三组统计完成后，仍按四个局部任务的覆盖率优先，再比较像素减少与放大收益选择配置；
-4. 阶段 2 每张推荐配置原图只解码一次，并行保存无框、无 mask 的 lossless PNG crop；
-5. overview 默认只画每任务固定 50 个抽样，以及每个异常类别前 50 条，重复样本只画一次。
+3. 同一图片内，候选间相同的几何规则只计算一次；四个区域任务分别生成 proposal，GT 不合并；
+4. 按总体覆盖率、最低任务覆盖率、正样本成功率、像素减少和放大收益依次选择候选；
+5. 阶段 2 每张图只解码一次；同一 bbox 跨任务只保存一个无框、无 mask 的 PNG；
+6. `ui_content_missing` 直接引用完整原图 `[0,0,W,H]`，不再生成 whole PNG，也不重复归一化标签；
+7. 全部“完全未覆盖”GT（当前 C 基线为 35 个）都会进入 overview 选择；partial failure 按任务、
+   补偿量和页面密度分层抽样，其他类别默认每类 50 条。
 
-三组参数含义：
+五组候选含义：
 
-| 配置 | horizontal/vertical link ratio | context ratio | 作用 |
-|---|---:|---:|---|
-| A | 0.015 | 0.10 | 当前默认，区域通常较小 |
-| B | 0.015 | 0.20 | 分组相同，增加上下文 |
-| C | 0.025 | 0.20 | 更强连接、合并与上下文 |
+| 候选 | occlusion/cropping | overflow/ellipsis | 作用 |
+|---|---|---|---|
+| C | H/V 0.025，context 0.20 | H/V 0.025，context 0.20 | 原配置 C 统一基线 |
+| TA_CTX010_H035 | 上述基础上，最小图像 context 0.010 | H 0.035、V 0.025 | 元素任务补边，文字增强水平连接 |
+| TA_CTX015_H035 | 最小图像 context 0.015 | H 0.035、V 0.025 | 比上一组更大最小补边 |
+| TA_CTX010_H050 | 最小图像 context 0.010 | H 0.050、V 0.025 | 更强文字水平连接 |
+| TA_CTX015_H050 | 最小图像 context 0.015 | H 0.050、V 0.025 | 两个增强方向的较强组合 |
 
-只有 `config_A/` 出现不表示 A 胜出；旧版是按 A→B→C 串行。新版三个目录都会先出现
-`geometry/`，最终只有 `summary.json` 的 `recommended_config` 对应目录包含正式 `crops/`。
+元素任务的最小上下文为 `max(0.20 × component_size, ratio × image_size)`。所有规则只读取
+检测框、图片尺寸和任务类型；GT 只用于离线统计和候选选择，不能逐样本修边或生成 fallback。
 
-如果同一输出目录中存在旧版未完成的 `crop_audit/config_A/crops/`，新脚本不会删除它，而会
-在启动时自动改名为 `crop_audit_legacy_slow_<timestamp>/`，再创建 v2 输出。确认新报告无误后
-再人工处理该备份。检测结果不移动、不删除，也不会重新运行 GPU。
+五个 `candidate_*/geometry/` 都会出现，只有 `materialized_candidate` 对应目录落正式 crop。
+若至少一个候选通过严格 gate，`summary.json` 才会出现 `recommended_config` 并生成
+`training_ready.json`；如果没有候选通过，只写 `best_candidate_config`，不会产生 training-ready
+标记。旧 audit 不自动移动、不覆盖；目标名字已存在但参数不一致时直接报错，必须换
+`--crop-audit-name`。
+
+有效性报告按 text+icon 检测框总数分层：`sparse ≤ 50`、`medium = 51–150`、
+`dense > 150`。每层分别输出 crop 数、union area、near-full、GT 放大收益和正负样本数；密集页
+允许保留 near-full，不为了指标强拆。
 
 CPU 充足时默认使用 8 个 worker；内存或共享存储压力较大可改为 4：
 
@@ -289,10 +313,11 @@ CPU 充足时默认使用 8 个 worker；内存或共享存储压力较大可改
 --overview-anomalies-per-category 50
 ```
 
-## 6. 什么时候才需要一条一条运行？
+## 6. 五条阶段命令是什么意思？本轮需要逐条跑吗？
 
-以下情况建议分阶段：集群任务有时限、需要在 OCR 后释放资源、某阶段失败后单独重跑，或想先
-检查检测数量再裁图。所有命令使用同一个 `--output-dir`：
+五条命令是给“从零开始的新数据集”或某个 GPU 阶段失败后单独恢复使用的。它们确实按
+`prepare → text → icon → merge → crop-audit` 顺序逐条执行，但当前 17,281 张数据的前四步已经
+完成，因此本轮不要运行下面这组命令：
 
 ```bash
 COMMON_ARGS=(
@@ -303,6 +328,8 @@ COMMON_ARGS=(
   --gpus 0,1,2,3
   --workers-per-gpu 1
   --crop-workers 8
+  --expected-unique-images 17281
+  --crop-audit-name crop_audit_v3
   --resume
 )
 
@@ -313,9 +340,9 @@ bash shell/run_ui5_crop_audit.sh "${COMMON_ARGS[@]}" --stage merge
 bash shell/run_ui5_crop_audit.sh "${COMMON_ARGS[@]}" --stage crop-audit
 ```
 
-这里确实是从上到下依次执行。`--resume` 会验证 shard 的行数、image_id 集合和完成标记；
-完整 shard 会跳过，不完整 shard 才重跑。已经有 text/icon 检测结果时，反复调整 crop 参数只需
-执行 `--stage crop-audit`，不会再调用 GPU 模型。
+只有处理全新数据时才从上到下执行。当前只使用第 4 节那条 `--stage crop-audit` 命令。
+`--resume` 会验证 shard 行数、image_id 集合、输入/参数 digest 和完成标记；完整 shard 跳过，
+不完整 shard 才重算。crop 参数变化始终使用新的 audit 名称并复用同一份 merged detections。
 
 ## 7. 1/2 processes per GPU benchmark（可选，不是正式流程）
 
@@ -342,16 +369,19 @@ work_dirs/ui5_crop_audit_20260825/
     text/shard_*.jsonl
     icon/shard_*.jsonl
     merged/detections.jsonl
-  crop_audit/
+  crop_audit/                 # 旧审计，原样保留
+  crop_audit_v3/
     audit_state.json
-    config_A/
+    candidate_C/
       geometry/shard_*.jsonl
       geometry/shard_*.done.json
       anomalies.json
-    config_B/
-    config_C/
-    # 以下只存在于 recommended_config 对应目录
-    config_<recommended>/
+    candidate_TA_CTX010_H035/
+    candidate_TA_CTX015_H035/
+    candidate_TA_CTX010_H050/
+    candidate_TA_CTX015_H050/
+    # 以下只存在于 materialized_candidate 对应目录
+    candidate_<materialized>/
       materialized/shard_*.jsonl
       materialized/shard_*.done.json
       crops/
@@ -362,6 +392,8 @@ work_dirs/ui5_crop_audit_20260825/
     statistics.csv
     task_aware_manifest.jsonl
     gt_failures.jsonl
+    cross_task_supervision.jsonl
+    training_ready.json        # 仅严格 gate 全部通过时存在
     ui5_crop_audit.xlsx
 ```
 
@@ -372,7 +404,8 @@ Excel 只包含五个有决策价值的 sheet：`summary`、`task_overlap`、`im
 
 - 每张内容唯一的原图只检测一次；不同任务复用检测与 crop 图片，但 GT、prompt 和正负标签独立。
 - basename 只用于冲突告警，不能作为图片身份。
-- `ui_content_missing` 根据任务身份使用一张近似整图，不依赖文件名，不读取 GT 决定 crop。
+- `ui_content_missing` 根据任务身份直接使用完整原图 `[0,0,W,H]`，原样复用输入的
+  `gt_boxes_1000`；`label_transform_applied=false`。
 - 正式 crop 是未画框、无 mask、未遮挡背景的原图矩形像素；扩张框只用于几何计算。
 - dense 页面允许形成一个近整图连通区域，不按空白或长边二次强切。
 - 部分相交 GT 对应的 crop 标记为 `training_eligible=false`，不能当负样本。
@@ -387,7 +420,11 @@ Excel 只包含五个有决策价值的 sheet：`summary`、`task_overlap`、`im
 - 四个局部任务总体 GT box 完整包含率不低于 99%；
 - 每个局部任务不低于 98%；
 - detector box 被 crop 边界切断数为 0；
-- `ui_content_missing` 单独按近整图策略统计。
+- 区域 crop 坐标 round-trip error 大于 1 像素的数量为 0；
+- partial crop 均为 `training_eligible=false`，每个原图 × 任务最多一个 hard negative；
+- `ui_content_missing` 完整覆盖率为 100%，normalized GT 与输入完全一致；
+- train/val 同内容重叠数为 0。
 
 若未达到，先看 `gt_failures.jsonl` 和 overview，调整 link/context 参数；不得读取 GT 位置
-直接补 crop。
+直接补 crop。即使 gate 通过，也只是允许进入 full image、full+crop、full+crop 且推理使用 crop
+三组对照，不能据此断言训练一定提升；本脚本始终输出 `training_started=false`，不会启动训练。

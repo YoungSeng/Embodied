@@ -20,11 +20,13 @@ if str(SCRIPTS) not in sys.path:
 from analyze_ui5_source_overlap import TASK_NAMES, analyze  # noqa: E402
 from run_ui5_crop_audit import (  # noqa: E402
     CONFIGS,
+    TASK_AWARE_CANDIDATES,
     AuditPaths,
     ProgressReporter,
     aggregate_scope,
     atomic_write_json,
     atomic_write_jsonl,
+    build_task_aware_manifest,
     build_preview_rows,
     completed_shard_valid,
     detection_worker_command,
@@ -42,6 +44,8 @@ from run_ui5_crop_audit import (  # noqa: E402
     run_crop_audit,
     run_detection_stage,
     geometry_worker,
+    evaluate_candidate_gate,
+    materialize_image_record,
     uses_task_whole_image_policy,
     write_excel_report,
     write_statistics_csv,
@@ -112,6 +116,62 @@ class OverlapAuditTest(unittest.TestCase):
             records = [json.loads(line) for line in (output_dir / "training_records.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual(len({row["canonical_path"] for row in records}), 5)
 
+    def test_same_content_different_paths_has_one_detector_manifest_entry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_dir = root / "source"
+            locany_dir = root / "locany"
+            output = root / "output"
+            source_dir.mkdir()
+            locany_dir.mkdir()
+            images = []
+            for index in range(5):
+                image = root / f"alias_{index}" / "screen.png"
+                image.parent.mkdir()
+                color = "white" if index < 2 else (index * 30, 0, 0)
+                Image.new("RGB", (100, 100), color).save(image)
+                images.append(image)
+            source_names = (
+                "train_ui_occlusion_wcnt.jsonl",
+                "train_ui_cropping_wcnt.jsonl",
+                "train_ui_text_overflow_wcnt.jsonl",
+                "train_ui_text_ellipsis_wcnt.jsonl",
+                "train_ui_content_missing_wcnt.jsonl",
+            )
+            for task, source_name, image in zip(TASK_NAMES, source_names, images):
+                write_jsonl(source_dir / source_name, [source_record(image, [[1, 1, 20, 20]])])
+                write_jsonl(
+                    locany_dir / f"{task}_train.jsonl",
+                    [locany_record(image, [[100, 100, 200, 200]])],
+                )
+            args = SimpleNamespace(
+                source_dir=source_dir,
+                locany_data_dir=locany_dir,
+                parser_root=root / "parser",
+                output_dir=output,
+                shard_size=500,
+                resume=False,
+                max_unique_images=0,
+                progress_interval_seconds=60,
+                progress_every_images=25,
+                text_model_dir=None,
+                icon_model=root / "model.pt",
+                text_long_side=1920,
+                text_box_threshold=0.3,
+                icon_long_side=1920,
+                icon_confidence=0.05,
+                enable_mkldnn=False,
+            )
+            with mock.patch("run_ui5_crop_audit.print_preflight"):
+                unique, task_samples = build_task_aware_manifest(args)
+            self.assertEqual(len(unique), 4)
+            self.assertEqual(len(task_samples), 5)
+            shared = [row for row in unique if len(row["canonical_paths"]) == 2]
+            self.assertEqual(len(shared), 1)
+            self.assertEqual(
+                shared[0]["tasks"], ["ui_cropping", "ui_occlusion"]
+            )
+
 
 def sample(task: str, gt_boxes: list[list[int]], image_id: str = "img_shared") -> dict:
     return {
@@ -123,6 +183,10 @@ def sample(task: str, gt_boxes: list[list[int]], image_id: str = "img_shared") -
         "height": 100,
         "positive": bool(gt_boxes),
         "gt_boxes": gt_boxes,
+        "gt_count": len(gt_boxes),
+        "gt_boxes_1000": [
+            [round(value / 100 * 1000) for value in box] for box in gt_boxes
+        ],
     }
 
 
@@ -160,6 +224,40 @@ class TaskAwarePreviewTest(unittest.TestCase):
 
     def test_content_missing_policy_is_task_aware(self):
         self.assertTrue(uses_task_whole_image_policy("ui_content_missing"))
+
+    def test_content_missing_reuses_full_original_and_normalized_gt_verbatim(self):
+        content = sample("ui_content_missing", [[10, 20, 30, 40]])
+        content["gt_boxes_1000"] = [[101, 199, 303, 402]]
+        rows, failures = build_preview_rows(
+            content,
+            [[0, 0, 100, 100]],
+            [Path("original.png")],
+            config_name="v3",
+        )
+        self.assertEqual(failures, [])
+        self.assertEqual(rows[0]["crop_bbox"], [0, 0, 100, 100])
+        self.assertFalse(rows[0]["label_transform_applied"])
+        self.assertTrue(rows[0]["roundtrip_gate_excluded"])
+        self.assertEqual(rows[0]["original_gt_boxes_1000"], [[101, 199, 303, 402]])
+        self.assertEqual(rows[0]["output_gt_boxes_1000"], [[101, 199, 303, 402]])
+
+    def test_one_image_across_five_tasks_keeps_supervision_independent(self):
+        paths = [Path("same_physical_crop.png")]
+        outputs = {}
+        for index, task in enumerate(TASK_NAMES):
+            boxes = [] if index % 2 else [[10 + index, 10, 20 + index, 20]]
+            rows, _ = build_preview_rows(
+                sample(task, boxes), [[0, 0, 100, 100]], paths, config_name="v3"
+            )
+            outputs[task] = rows[0]
+        self.assertEqual({row["image"] for row in outputs.values()}, {str(paths[0])})
+        self.assertEqual(
+            [outputs[task]["positive"] for task in TASK_NAMES],
+            [True, False, True, False, True],
+        )
+        self.assertEqual(
+            [outputs[task]["gt_count"] for task in TASK_NAMES], [1, 0, 1, 0, 1]
+        )
         self.assertFalse(uses_task_whole_image_policy("ui_occlusion"))
         self.assertTrue(uses_task_whole_image_policy("ui_content_missing"))
 
@@ -271,6 +369,81 @@ class GeometryTest(unittest.TestCase):
         for detector in proposal["detection_boxes"]:
             self.assertTrue(any(crop[0] <= detector[0] and crop[1] <= detector[1] and crop[2] >= detector[2] and crop[3] >= detector[3] for crop in proposal["crop_boxes"]))
 
+    def test_identical_task_aware_bbox_writes_one_physical_crop(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.png"
+            Image.new("RGB", (100, 100), "white").save(source)
+            shared_box = [0, 0, 50, 50]
+            geometry = {
+                "unique_region_boxes": [shared_box],
+                "sample_results": [
+                    {
+                        "sample_id": "occlusion",
+                        "task": "ui_occlusion",
+                        "crop_kind": "region",
+                        "crop_boxes": [shared_box],
+                        "gt_boxes": [],
+                    },
+                    {
+                        "sample_id": "cropping",
+                        "task": "ui_cropping",
+                        "crop_kind": "region",
+                        "crop_boxes": [shared_box],
+                        "gt_boxes": [],
+                    },
+                    {
+                        "sample_id": "whole",
+                        "task": "ui_content_missing",
+                        "crop_kind": "whole",
+                        "crop_boxes": [[0, 0, 100, 100]],
+                        "gt_boxes": [],
+                    },
+                ],
+            }
+            result = materialize_image_record(
+                manifest={"image_id": "img", "image_path": str(source)},
+                geometry=geometry,
+                config_root=root / "candidate",
+                overview_sample_ids=set(),
+            )
+            self.assertEqual(len(result["region_paths"]), 1)
+            self.assertEqual(
+                result["sample_paths"]["occlusion"],
+                result["sample_paths"]["cropping"],
+            )
+            self.assertEqual(result["sample_paths"]["whole"], [str(source.resolve())])
+            self.assertEqual(result["whole_paths"], [])
+            self.assertEqual(result["region_reference_count"], 2)
+
+    def test_region_roundtrip_gate_is_checked_while_whole_image_is_excluded(self):
+        def detail(task: str, roundtrip_errors: int = 0) -> dict:
+            return {
+                "config": "X", "sample_id": task, "image_id": "img", "task": task,
+                "positive": True, "gt_count": 1, "gt_contained_count": 1,
+                "partial_only_gt_count": 0, "all_gt_contained": True, "crop_count": 1,
+                "original_area": 10000, "union_crop_area": 2500,
+                "union_area_ratio": 0.25, "gt_enlargement_gains": [2.0],
+                "empty_detection_fallback": False, "forced_merge": False,
+                "detector_boundary_cut_count": 0,
+                "roundtrip_error_over_1_count": roundtrip_errors,
+                "partial_training_eligible_count": 0, "hard_negative_count": 0,
+            }
+
+        region_rows = [detail(task) for task in (
+            "ui_occlusion", "ui_cropping", "ui_text_overflow", "ui_text_ellipsis"
+        )]
+        whole = detail("ui_content_missing", roundtrip_errors=99)
+        rows = [*region_rows, whole]
+        by_scope = {"ALL": aggregate_scope(rows)}
+        for task in TASK_NAMES:
+            by_scope[task] = aggregate_scope([row for row in rows if row["task"] == task])
+        summary = {"candidates": {"X": {"by_scope": by_scope}}}
+        self.assertTrue(evaluate_candidate_gate("X", summary, rows)["passes"])
+        region_rows[0]["roundtrip_error_over_1_count"] = 1
+        rows = [*region_rows, whole]
+        self.assertFalse(evaluate_candidate_gate("X", summary, rows)["passes"])
+
 
 class ResumeAndExcelTest(unittest.TestCase):
     def test_geometry_process_pool_loads_fixed_parser_without_images(self):
@@ -287,13 +460,11 @@ class ResumeAndExcelTest(unittest.TestCase):
                     "icon_detections": [],
                 },
                 "image_samples": [sample("ui_occlusion", [[15, 15, 20, 20]], "img")],
-                "config_name": "A",
-                "config": CONFIGS["A"],
+                "config_name": "C",
+                "candidate": TASK_AWARE_CANDIDATES["C"],
                 "config_root": temporary,
                 "max_crops": 10,
                 "boundary_margin_ratio": 0.01,
-                "whole_image_trim_ratio": 0.01,
-                "whole_image_detection_margin_ratio": 0.005,
             }
             with ProcessPoolExecutor(
                 max_workers=2,
@@ -302,9 +473,9 @@ class ResumeAndExcelTest(unittest.TestCase):
             ) as executor:
                 result = list(executor.map(geometry_worker, [payload]))
             self.assertEqual(result[0]["image_id"], "img")
-            self.assertEqual(result[0]["config"], "A")
+            self.assertEqual(result[0]["config"], "C")
 
-    def test_fast_audit_archives_legacy_partial_output_recoverably(self):
+    def test_named_audit_refuses_legacy_output_and_preserves_other_audits(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = AuditPaths(Path(temporary) / "audit")
             legacy = paths.crop_audit / "config_A" / "crops" / "img"
@@ -313,18 +484,16 @@ class ResumeAndExcelTest(unittest.TestCase):
             args = SimpleNamespace(
                 max_crops=10,
                 boundary_margin_ratio=0.01,
-                whole_image_trim_ratio=0.01,
-                whole_image_detection_margin_ratio=0.005,
                 overview_samples_per_task=50,
                 overview_anomalies_per_category=50,
             )
-            initialize_crop_audit_v2(args, paths, [{"image_id": "img"}])
-            archives = list(paths.output.glob("crop_audit_legacy_slow_*"))
-            self.assertEqual(len(archives), 1)
-            self.assertTrue(
-                (archives[0] / "config_A" / "crops" / "img" / "crop_01.png").is_file()
-            )
-            self.assertTrue((paths.crop_audit / "audit_state.json").is_file())
+            with self.assertRaisesRegex(RuntimeError, "choose a new --crop-audit-name"):
+                initialize_crop_audit_v2(args, paths, [{"image_id": "img"}])
+            self.assertTrue((legacy / "crop_01.png").is_file())
+            fresh = AuditPaths(paths.output, "crop_audit_v3_retry")
+            initialize_crop_audit_v2(args, fresh, [{"image_id": "img"}])
+            self.assertTrue((fresh.crop_audit / "audit_state.json").is_file())
+            self.assertTrue((legacy / "crop_01.png").is_file())
 
     def test_detection_workers_can_use_separate_python_environments(self):
         args = SimpleNamespace(
@@ -601,6 +770,7 @@ class ResumeAndExcelTest(unittest.TestCase):
             atomic_write_jsonl(paths.task_samples, samples)
             atomic_write_jsonl(paths.shards / "shard_00000.jsonl", [unique])
             atomic_write_jsonl(paths.merged, [merged])
+            atomic_write_json(paths.detector_config, {"fixed": True})
             matrix = {task: {other: 0 for other in TASK_NAMES} for task in TASK_NAMES}
             jaccard = {task: {other: 0.0 for other in TASK_NAMES} for task in TASK_NAMES}
             overlap_dataset = {
@@ -617,11 +787,10 @@ class ResumeAndExcelTest(unittest.TestCase):
                 parser_root=root,
                 max_crops=10,
                 boundary_margin_ratio=0.01,
-                whole_image_trim_ratio=0.01,
-                whole_image_detection_margin_ratio=0.005,
                 progress_interval_seconds=60,
                 resume=True,
                 crop_workers=1,
+                crop_audit_name="crop_audit_v3",
                 overview_samples_per_task=50,
                 overview_anomalies_per_category=50,
             )
@@ -631,13 +800,25 @@ class ResumeAndExcelTest(unittest.TestCase):
             self.assertTrue((paths.crop_audit / "summary.json").is_file())
             self.assertTrue((paths.crop_audit / "statistics.csv").is_file())
             self.assertTrue((paths.crop_audit / "ui5_crop_audit.xlsx").is_file())
-            self.assertTrue((paths.crop_audit / "config_A" / "preview" / "ui_occlusion.jsonl").is_file())
-            self.assertTrue((paths.crop_audit / "config_A" / "crops" / "img_shared" / "crop_01.png").is_file())
-            self.assertTrue((paths.crop_audit / "config_A" / "crops" / "img_shared" / "whole_01.png").is_file())
-            self.assertTrue((paths.crop_audit / "config_A" / "geometry" / "shard_00000.done.json").is_file())
-            self.assertTrue((paths.crop_audit / "config_B" / "geometry" / "shard_00000.done.json").is_file())
-            self.assertFalse((paths.crop_audit / "config_B" / "crops").exists())
-            self.assertEqual(result["materialization"]["config"], "A")
+            selected = result["materialized_candidate"]
+            selected_root = paths.crop_audit / f"candidate_{selected}"
+            self.assertTrue((selected_root / "preview" / "ui_occlusion.jsonl").is_file())
+            self.assertEqual(
+                len(list((selected_root / "crops" / "img_shared").glob("region_*.png"))),
+                1,
+            )
+            self.assertFalse(any(selected_root.rglob("whole_*.png")))
+            for name in TASK_AWARE_CANDIDATES:
+                self.assertTrue(
+                    (
+                        paths.crop_audit
+                        / f"candidate_{name}"
+                        / "geometry"
+                        / "shard_00000.done.json"
+                    ).is_file()
+                )
+            self.assertEqual(result["materialization"]["candidate"], selected)
+            self.assertEqual(result["materialization"]["whole_generated_file_count"], 0)
 
             with (
                 mock.patch(
@@ -654,7 +835,71 @@ class ResumeAndExcelTest(unittest.TestCase):
             ):
                 resumed = run_crop_audit(args)
             parser_loader.assert_not_called()
-            self.assertEqual(resumed["recommended_config"], "A")
+            self.assertEqual(resumed["materialized_candidate"], selected)
+
+    def test_failed_gate_uses_best_candidate_and_never_touches_detector_shards(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "audit"
+            paths = AuditPaths(output, "crop_audit_v3_fail")
+            image_path = root / "shared.png"
+            Image.new("RGB", (100, 100), "white").save(image_path)
+            unique = {
+                "image_id": "img", "content_id": "content", "image_path": str(image_path),
+                "width": 100, "height": 100, "tasks": ["ui_occlusion"],
+            }
+            failing_sample = {
+                **sample("ui_occlusion", [[80, 80, 95, 95]], "img"),
+                "canonical_path": str(image_path),
+            }
+            merged = {
+                "image_id": "img", "content_id": "content", "image": str(image_path),
+                "width": 100, "height": 100,
+                "text_detections": [{"bbox": [5, 5, 15, 15], "score": 0.9}],
+                "icon_detections": [],
+            }
+            atomic_write_jsonl(paths.unique_images, [unique])
+            atomic_write_jsonl(paths.task_samples, [failing_sample])
+            atomic_write_jsonl(paths.shards / "shard_00000.jsonl", [unique])
+            atomic_write_jsonl(paths.merged, [merged])
+            atomic_write_json(paths.detector_config, {"fixed": True})
+            text_sentinel = paths.stage_dir("text") / "shard_00000.jsonl"
+            icon_sentinel = paths.stage_dir("icon") / "shard_00000.jsonl"
+            text_sentinel.parent.mkdir(parents=True, exist_ok=True)
+            icon_sentinel.parent.mkdir(parents=True, exist_ok=True)
+            text_sentinel.write_bytes(b"immutable text detector output\n")
+            icon_sentinel.write_bytes(b"immutable icon detector output\n")
+            before = (text_sentinel.read_bytes(), icon_sentinel.read_bytes())
+            matrix = {task: {other: 0 for other in TASK_NAMES} for task in TASK_NAMES}
+            jaccard = {task: {other: 0.0 for other in TASK_NAMES} for task in TASK_NAMES}
+            overlap_dataset = {
+                "path_overlap": {"counts": matrix, "jaccard": jaccard},
+                "content_overlap": {"counts": matrix, "jaccard": jaccard},
+                "basename_conflicts": {"details": []},
+            }
+            atomic_write_json(
+                paths.manifest / "overlap" / "source_overlap.json",
+                {
+                    "source_data": overlap_dataset,
+                    "actual_training_data": overlap_dataset,
+                    "same_content_cross_train_val": {"count": 0, "details": []},
+                },
+            )
+            args = SimpleNamespace(
+                output_dir=output, parser_root=root, max_crops=10,
+                boundary_margin_ratio=0.01, progress_interval_seconds=60,
+                resume=True, crop_workers=1, crop_audit_name="crop_audit_v3_fail",
+                overview_samples_per_task=0, overview_anomalies_per_category=0,
+            )
+            with mock.patch("run_ui5_crop_audit.load_parser_module", return_value=FakeCropper):
+                result = run_crop_audit(args)
+            self.assertNotIn("recommended_config", result)
+            self.assertIn("best_candidate_config", result)
+            self.assertFalse(result["next_stage_gate"]["training_ready"])
+            self.assertFalse((paths.crop_audit / "training_ready.json").exists())
+            self.assertEqual(result["detector_stages_executed"], [])
+            self.assertTrue(result["input_snapshot_unchanged"])
+            self.assertEqual(before, (text_sentinel.read_bytes(), icon_sentinel.read_bytes()))
 
 
 if __name__ == "__main__":
