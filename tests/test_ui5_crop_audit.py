@@ -27,9 +27,11 @@ from run_ui5_crop_audit import (  # noqa: E402
     build_preview_rows,
     completed_shard_valid,
     detector_config,
+    ensure_detector_config,
     digest_ids,
     normalize_gt_in_crop,
     proposal_crops,
+    prepared_manifest_valid,
     resolve_required_directory,
     run_crop_audit,
     uses_task_whole_image_policy,
@@ -303,11 +305,51 @@ class ResumeAndExcelTest(unittest.TestCase):
         config = detector_config(args)
         self.assertIsNone(config["text"]["model_dir"])
         self.assertTrue(config["text"]["auto_download"])
+        self.assertFalse(config["text"]["enable_mkldnn"])
         self.assertTrue(
             Path(config["icon"]["model"]).as_posix().endswith(
                 "weights/icon_detect_v3/model.pt"
             )
         )
+
+    def test_old_config_migrates_to_mkldnn_disabled_before_any_text_shard(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(
+                text_model_dir=None,
+                icon_model=None,
+                parser_root=root / "parser",
+                text_long_side=1920,
+                text_box_threshold=0.3,
+                icon_long_side=1920,
+                icon_confidence=0.05,
+                enable_mkldnn=False,
+            )
+            desired = detector_config(args)
+            old = json.loads(json.dumps(desired))
+            old["text"].pop("enable_mkldnn")
+            config_path = root / "detections" / "detector_config.json"
+            atomic_write_json(config_path, old)
+            ensure_detector_config(config_path, desired)
+            migrated = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertFalse(migrated["text"]["enable_mkldnn"])
+
+    def test_complete_prepare_manifest_is_resume_eligible(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = AuditPaths(Path(temporary))
+            unique = [{"image_id": "img_a"}, {"image_id": "img_b"}]
+            samples = [
+                {"sample_id": "sample_a", "image_id": "img_a"},
+                {"sample_id": "sample_b", "image_id": "img_b"},
+            ]
+            atomic_write_jsonl(paths.unique_images, unique)
+            atomic_write_jsonl(paths.task_samples, samples)
+            atomic_write_jsonl(paths.shards / "shard_00000.jsonl", unique)
+            atomic_write_json(
+                paths.manifest / "prepare_summary.json",
+                {"unique_images": 2, "task_samples": 2, "shards": 1},
+            )
+            self.assertTrue(prepared_manifest_valid(paths))
 
     def test_interrupted_shard_is_not_skipped_but_complete_shard_is(self):
         with tempfile.TemporaryDirectory() as temporary:

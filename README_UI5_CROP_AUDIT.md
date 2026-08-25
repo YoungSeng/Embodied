@@ -81,6 +81,21 @@ python -c "from paddleocr import TextDetection; TextDetection(model_name='PP-OCR
 --text-model-dir /absolute/path/to/PP-OCRv5_server_det_infer
 ```
 
+### Paddle PIR / OneDNN 报错
+
+如果日志出现：
+
+```text
+ConvertPirAttribute2RuntimeAttribute not support [pir::ArrayAttributeAttribute]
+```
+
+说明当前 Paddle/PIR 组合进入了 MKLDNN/OneDNN 路径，并非图片或 GPU 损坏。审计脚本默认
+`enable_mkldnn=false`；不要添加 `--enable-mkldnn`。更新代码后直接重新执行原来的
+`--stage all --resume` 命令即可：已经完成的 prepare 会经过完整性验证后跳过，不会重新扫描
+17,281 张图片；尚未完成的 text shard 会用关闭 MKLDNN 的配置重新运行。
+
+只有明确验证过兼容的 Paddle CPU 环境才考虑传 `--enable-mkldnn`，四卡 GPU 正式检测不需要。
+
 ### OmniParser icon detector：需要手动下载
 
 `huggingface-cli` 已废弃。集群已经提示 `hf` 可用时，直接使用现成的 `hf`，不要在

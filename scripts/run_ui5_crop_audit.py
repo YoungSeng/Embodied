@@ -138,6 +138,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--icon-model", type=Path, default=None)
     parser.add_argument("--text-long-side", type=int, default=1920)
     parser.add_argument("--text-box-threshold", type=float, default=0.3)
+    parser.add_argument(
+        "--enable-mkldnn",
+        action="store_true",
+        help=(
+            "Opt in to Paddle MKLDNN/OneDNN. Disabled by default because some "
+            "Paddle PIR builds fail with ConvertPirAttribute2RuntimeAttribute."
+        ),
+    )
     parser.add_argument("--icon-long-side", type=int, default=1920)
     parser.add_argument("--icon-confidence", type=float, default=0.05)
     parser.add_argument("--max-crops", type=int, default=10)
@@ -356,6 +364,7 @@ def detector_config(args: argparse.Namespace) -> dict[str, Any]:
             "pixel_threshold": 0.3,
             "box_threshold": args.text_box_threshold,
             "unclip_ratio": 1.5,
+            "enable_mkldnn": bool(getattr(args, "enable_mkldnn", False)),
             "min_area": 0,
             "min_width": 0,
             "min_height": 0,
@@ -377,6 +386,18 @@ def ensure_detector_config(path: Path, config: Mapping[str, Any]) -> None:
     if path.is_file():
         existing = json.loads(path.read_text(encoding="utf-8"))
         if existing != config:
+            # Safe one-time migration for runs that prepared manifests before
+            # MKLDNN became explicit but failed before completing any text shard.
+            migrated = json.loads(json.dumps(config))
+            migrated["text"].pop("enable_mkldnn", None)
+            has_completed_text = any((path.parent / "text").glob("shard_*.done.json"))
+            if existing == migrated and not has_completed_text:
+                atomic_write_json(path, config)
+                print(
+                    "[config] migrated detector_config.json: text enable_mkldnn=false",
+                    flush=True,
+                )
+                return
             raise RuntimeError(
                 f"detector configuration is immutable once written: {path}; use a new output directory"
             )
@@ -438,12 +459,57 @@ def print_preflight(
     print("\n".join(lines), flush=True)
 
 
+def prepared_manifest_valid(paths: AuditPaths) -> bool:
+    """Return whether prepare outputs form a complete, self-consistent set."""
+    summary_path = paths.manifest / "prepare_summary.json"
+    if not paths.unique_images.is_file() or not paths.task_samples.is_file() or not summary_path.is_file():
+        return False
+    try:
+        unique = read_jsonl(paths.unique_images)
+        samples = read_jsonl(paths.task_samples)
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        shards = [row for shard in sorted(paths.shards.glob("shard_*.jsonl")) for row in read_jsonl(shard)]
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    unique_ids = [row.get("image_id") for row in unique]
+    shard_ids = [row.get("image_id") for row in shards]
+    sample_ids = [row.get("sample_id") for row in samples]
+    return (
+        bool(unique_ids)
+        and len(unique_ids) == len(set(unique_ids))
+        and len(shard_ids) == len(set(shard_ids))
+        and set(shard_ids) == set(unique_ids)
+        and len(sample_ids) == len(set(sample_ids))
+        and {row.get("image_id") for row in samples}.issubset(set(unique_ids))
+        and int(summary.get("unique_images", -1)) == len(unique)
+        and int(summary.get("task_samples", -1)) == len(samples)
+        and int(summary.get("shards", -1)) == len(list(paths.shards.glob("shard_*.jsonl")))
+    )
+
+
 def build_task_aware_manifest(args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if not 500 <= args.shard_size <= 1000:
         raise ValueError("--shard-size must be in [500, 1000]")
     paths = AuditPaths(args.output_dir)
     # Fail on missing JSONL/parser/icon weights before spending time hashing images.
     print_preflight(args, detector_stage="all")
+    if args.resume and prepared_manifest_valid(paths):
+        unique_images = read_jsonl(paths.unique_images)
+        task_samples = read_jsonl(paths.task_samples)
+        ensure_detector_config(paths.detector_config, detector_config(args))
+        reporter = ProgressReporter(
+            stage="prepare",
+            total=len(unique_images),
+            output_dir=args.output_dir,
+            interval_seconds=args.progress_interval_seconds,
+        )
+        reporter.update(
+            len(unique_images),
+            status="completed",
+            detail="--resume 验证通过，跳过 prepare，不重复扫描图片",
+            force=True,
+        )
+        return unique_images, task_samples
     overlap_reporter = ProgressReporter(
         stage="prepare",
         total=1,
@@ -746,7 +812,7 @@ def run_detector_worker(args: argparse.Namespace) -> None:
             pixel_threshold=settings["pixel_threshold"],
             box_threshold=settings["box_threshold"],
             unclip_ratio=settings["unclip_ratio"],
-            enable_mkldnn=True,
+            enable_mkldnn=settings["enable_mkldnn"],
             min_area=0,
             min_width=0,
             min_height=0,
@@ -898,6 +964,8 @@ def detection_worker_command(args: argparse.Namespace, stage: str, worker_index:
         command.extend(("--icon-model", str(args.icon_model)))
     if args.resume:
         command.append("--resume")
+    if args.enable_mkldnn:
+        command.append("--enable-mkldnn")
     return command
 
 
