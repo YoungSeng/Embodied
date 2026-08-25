@@ -29,7 +29,37 @@ git -C ui-region-parser checkout 06eaebf8eb4ea01e61b690f2ff972bf614915918
 
 如果 worktree 和 parser 已经存在，不要重复执行这一节。
 
-## 2. 模型权重
+## 2. 数据目录：直接传绝对路径，不要复制
+
+`--locany-data-dir data/ui_defect_locany` 是相对于当前 worktree 的示例。如果新 worktree
+没有这个目录，执行 `mkdir data` 只会得到空目录，不能解决问题，也不要把整份旧工程复制到
+新 worktree。
+
+现有训练 JSONL 可以继续放在旧工程的数据目录中；审计脚本只读它们。A800/YG 集群可直接用：
+
+```bash
+SOURCE_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data
+LOCANY_DATA_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied/data/ui_defect_locany_v3
+
+test -d "${SOURCE_DIR}"
+test -d "${LOCANY_DATA_DIR}"
+
+for TASK in ui_occlusion ui_cropping ui_text_overflow ui_text_ellipsis ui_content_missing; do
+  test -f "${LOCANY_DATA_DIR}/${TASK}_train.jsonl" || {
+    echo "缺少 ${LOCANY_DATA_DIR}/${TASK}_train.jsonl" >&2
+    exit 1
+  }
+done
+```
+
+该目录里的 `recipe/`、`conversion_summary.json` 可以保留原地；本阶段主要读取五个
+`*_train.jsonl`，存在 `*_val.jsonl` 时还会用于检查相同内容是否跨 train/val。把
+`ui_defect_locany_v3` 作为数据输入，不代表代码从旧 v4 分支开始；新 worktree 的 Git base
+仍是当前 `locany-cpt-v1`。
+
+不要把内网数据传到本机或提交 Git。只要审计命令也在公司内网集群执行，传绝对路径即可。
+
+## 3. 模型权重
 
 ### PP-OCRv5：默认自动下载，不需要手动放权重
 
@@ -97,14 +127,14 @@ test -f weights/icon_detect_v3/model.pt
 该命令来自 Microsoft OmniParser 官方说明，只下载 icon detector，不下载 caption 模型或
 整个模型仓库。也可以通过 `--icon-model /absolute/path/model.pt` 指定已有文件。
 
-## 3. 正式运行：最简单是一条命令
+## 4. 正式运行：最简单是一条命令
 
 在 `Embodied-ui5-det-crop` 目录执行：
 
 ```bash
 bash shell/run_ui5_crop_audit.sh \
-  --source-dir /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data \
-  --locany-data-dir data/ui_defect_locany \
+  --source-dir /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data \
+  --locany-data-dir /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied/data/ui_defect_locany_v3 \
   --parser-root ../ui-region-parser \
   --output-dir work_dirs/ui5_crop_audit_20260825 \
   --gpus 0,1,2,3 \
@@ -123,7 +153,7 @@ bash shell/run_ui5_crop_audit.sh \
 
 所以，正常首次运行不需要手动复制执行五条命令。
 
-## 4. 实时进度和剩余时间
+## 5. 实时进度和剩余时间
 
 默认每 10 秒汇总一次所有 GPU worker，在终端/集群日志打印：
 
@@ -157,15 +187,15 @@ watch -n 5 'cat work_dirs/ui5_crop_audit_20260825/run_status.json'
 worker；`merge` 显示合并数量；`crop-audit` 把 A/B/C 三组配置合并成一个总进度。使用
 `--resume` 时，已验证完成的 shard 会直接计入已完成数量，ETA 只按本次剩余工作估算。
 
-## 5. 什么时候才需要一条一条运行？
+## 6. 什么时候才需要一条一条运行？
 
 以下情况建议分阶段：集群任务有时限、需要在 OCR 后释放资源、某阶段失败后单独重跑，或想先
 检查检测数量再裁图。所有命令使用同一个 `--output-dir`：
 
 ```bash
 COMMON_ARGS=(
-  --source-dir /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data
-  --locany-data-dir data/ui_defect_locany
+  --source-dir /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data
+  --locany-data-dir /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied/data/ui_defect_locany_v3
   --parser-root ../ui-region-parser
   --output-dir work_dirs/ui5_crop_audit_20260825
   --gpus 0,1,2,3
@@ -184,7 +214,7 @@ bash shell/run_ui5_crop_audit.sh "${COMMON_ARGS[@]}" --stage crop-audit
 完整 shard 会跳过，不完整 shard 才重跑。已经有 text/icon 检测结果时，反复调整 crop 参数只需
 执行 `--stage crop-audit`，不会再调用 GPU 模型。
 
-## 6. 1/2 processes per GPU benchmark（可选，不是正式流程）
+## 7. 1/2 processes per GPU benchmark（可选，不是正式流程）
 
 正式运行默认保持 `--workers-per-gpu 1`。只有先用独立输出目录对同一批 2,000 张图实测，且
 满足 GPU 利用率持续低于 40%、显存稳定低于 12 GB、2 processes/GPU 吞吐确实更高，才允许
@@ -194,7 +224,7 @@ bash shell/run_ui5_crop_audit.sh "${COMMON_ARGS[@]}" --stage crop-audit
 `detections/text/stage_summary.json` 的 `throughput_images_per_second`。2 processes/GPU
 还必须显式加 `--allow-two-processes-per-gpu`。benchmark 输出不能作为正式全量输出。
 
-## 7. 输出目录
+## 8. 输出目录
 
 ```text
 work_dirs/ui5_crop_audit_20260825/
@@ -227,7 +257,7 @@ work_dirs/ui5_crop_audit_20260825/
 Excel 只包含五个有决策价值的 sheet：`summary`、`task_overlap`、`image_detail`、
 `gt_failures`、`config_compare`。overview 和原始无框 crop 分开保存，并从 Excel 设置超链接。
 
-## 8. 必须保持的原则
+## 9. 必须保持的原则
 
 - 每张内容唯一的原图只检测一次；不同任务复用检测与 crop 图片，但 GT、prompt 和正负标签独立。
 - basename 只用于冲突告警，不能作为图片身份。
@@ -238,7 +268,7 @@ Excel 只包含五个有决策价值的 sheet：`summary`、`task_overlap`、`im
 - 每个“原图 × 任务”最多保留一个完全不与 GT 相交的 hard negative。
 - crop 参数变化只能读取 `detections/merged/detections.jsonl`，不能重新推理或覆盖检测结果。
 
-## 9. 审计通过条件与后续训练
+## 10. 审计通过条件与后续训练
 
 先提交审计报告，不启动训练。建议进入 full image、full+crop、full+crop 且推理使用 crop 三组
 对照的最低条件：

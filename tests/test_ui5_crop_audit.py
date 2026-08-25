@@ -30,6 +30,7 @@ from run_ui5_crop_audit import (  # noqa: E402
     digest_ids,
     normalize_gt_in_crop,
     proposal_crops,
+    resolve_required_directory,
     run_crop_audit,
     uses_task_whole_image_policy,
     write_excel_report,
@@ -262,6 +263,15 @@ class GeometryTest(unittest.TestCase):
 
 
 class ResumeAndExcelTest(unittest.TestCase):
+    def test_missing_cli_directory_reports_option_and_resolved_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "does-not-exist"
+            with self.assertRaisesRegex(
+                FileNotFoundError,
+                r"--locany-data-dir directory does not exist:.*do not create an empty placeholder",
+            ):
+                resolve_required_directory(missing, "--locany-data-dir")
+
     def test_progress_reporter_writes_atomic_status_with_eta_fields(self):
         with tempfile.TemporaryDirectory() as temporary:
             reporter = ProgressReporter(

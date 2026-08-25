@@ -1977,10 +1977,33 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
     return summary
 
 
+def resolve_required_directory(value: Path, option_name: str) -> Path:
+    """Resolve a CLI directory with an actionable error for relative paths."""
+    supplied = value.expanduser()
+    candidate = supplied if supplied.is_absolute() else Path.cwd() / supplied
+    resolved = candidate.resolve(strict=False)
+    if not resolved.exists():
+        relative_note = (
+            f" Relative paths are resolved from current working directory {Path.cwd()}."
+            if not supplied.is_absolute()
+            else ""
+        )
+        raise FileNotFoundError(
+            f"{option_name} directory does not exist: {resolved}. "
+            f"Supplied value: {value!s}.{relative_note} "
+            "Pass the existing dataset/tool directory; do not create an empty placeholder."
+        )
+    if not resolved.is_dir():
+        raise NotADirectoryError(f"{option_name} is not a directory: {resolved}")
+    return resolved.resolve(strict=True)
+
+
 def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
-    args.source_dir = args.source_dir.expanduser().resolve(strict=True)
-    args.locany_data_dir = args.locany_data_dir.expanduser().resolve(strict=True)
-    args.parser_root = args.parser_root.expanduser().resolve(strict=True)
+    args.source_dir = resolve_required_directory(args.source_dir, "--source-dir")
+    args.locany_data_dir = resolve_required_directory(
+        args.locany_data_dir, "--locany-data-dir"
+    )
+    args.parser_root = resolve_required_directory(args.parser_root, "--parser-root")
     args.output_dir = args.output_dir.expanduser().resolve(strict=False)
     if args.text_model_dir:
         args.text_model_dir = args.text_model_dir.expanduser().resolve(strict=False)

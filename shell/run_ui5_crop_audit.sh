@@ -11,7 +11,7 @@ if [[ $# -eq 0 ]]; then
 Usage:
   bash shell/run_ui5_crop_audit.sh \
     --source-dir /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data \
-    --locany-data-dir data/ui_defect_locany \
+    --locany-data-dir /absolute/path/to/ui_defect_locany_v3 \
     --parser-root ../ui-region-parser \
     --output-dir work_dirs/ui5_crop_audit_20260825 \
     --gpus 0,1,2,3 \
