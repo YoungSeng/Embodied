@@ -53,18 +53,40 @@ python -c "from paddleocr import TextDetection; TextDetection(model_name='PP-OCR
 
 ### OmniParser icon detector：需要手动下载
 
-安装 Hugging Face CLI，并只下载需要的 v3 detector 文件：
+`huggingface-cli` 已废弃。集群已经提示 `hf` 可用时，直接使用现成的 `hf`，不要在
+LocateAnything、parser 或训练环境里执行 `pip install -U huggingface_hub`。升级
+`huggingface_hub` 可能改变现有 `transformers` / `tokenizers` 的依赖组合。
+
+只下载需要的 v3 detector 文件：
 
 ```bash
 cd ../ui-region-parser
-python -m pip install -U "huggingface_hub[cli]"
+command -v hf
 mkdir -p weights/icon_detect_v3
-huggingface-cli download microsoft/OmniParser-v2.0 \
+hf download microsoft/OmniParser-v2.0 \
   icon_detect_v3/model.pt \
   --revision refs/pr/37 \
   --local-dir weights
 test -f weights/icon_detect_v3/model.pt
 ```
+
+如果 `command -v hf` 找不到命令，不要修改现有 conda 环境；使用一次性的独立 venv：
+
+```bash
+python3 -m venv /tmp/ui5-hf-cli
+/tmp/ui5-hf-cli/bin/python -m pip install huggingface_hub
+
+cd ../ui-region-parser
+mkdir -p weights/icon_detect_v3
+/tmp/ui5-hf-cli/bin/hf download microsoft/OmniParser-v2.0 \
+  icon_detect_v3/model.pt \
+  --revision refs/pr/37 \
+  --local-dir weights
+test -f weights/icon_detect_v3/model.pt
+```
+
+临时 venv 只用于下载文件，不参与 Paddle、Torch 或 LocateAnything 运行，因此不会改动当前
+环境中的 `huggingface_hub`、`transformers` 或 `tokenizers`。
 
 最终必须得到：
 
