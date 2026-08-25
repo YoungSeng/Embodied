@@ -37,6 +37,18 @@
         "cpu": 58,
         "memory": 262144,
         "queue_name": ""
+      },
+      "resource_groups": {
+        "default": {
+          "display_name": "default/1602",
+          "group_id": 1602,
+          "queue_name": ""
+        },
+        "aiai_locate": {
+          "display_name": "ies_aiai_experience/AIAI_locate",
+          "group_id": 2146,
+          "queue_name": "compute-3302-yg-cloudnative-ai-aiai.locate-guarantee"
+        }
       }
     },
     "h20": {

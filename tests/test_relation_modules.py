@@ -85,6 +85,13 @@ class RelationModulesTest(unittest.TestCase):
         )
         self.assertTrue(torch.isfinite(output.relation_tokens).all())
         self.assertTrue(torch.isfinite(output.p_defect).all())
+        self.assertEqual(output.scale_weights.dtype, torch.float32)
+        torch.testing.assert_close(
+            output.scale_weights.sum(dim=-1),
+            torch.ones(output.scale_weights.shape[0]),
+            rtol=0.0,
+            atol=1.0e-6,
+        )
 
         pbd = RelationToPBD(8, 12).to(dtype=torch.bfloat16)
         hidden = torch.randn(1, 3, 12, dtype=torch.bfloat16)

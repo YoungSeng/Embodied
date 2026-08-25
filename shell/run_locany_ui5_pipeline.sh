@@ -136,6 +136,7 @@ export LOCANY_ENABLE_MILESTONE_COPIES=0
 echo "===== LocateAnything UI5 Configuration ====="
 printf '%-28s: %s\n' \
   "MACHINE_TYPE" "${MACHINE_TYPE}" \
+  "RESOURCE_GROUP" "${RESOURCE_GROUP}" \
   "GPU_COUNT" "${GPU_COUNT}" \
   "CUDA_DEVICES" "${CUDA_DEVICES}" \
   "EVAL_GPU_DEVICES" "${EVAL_GPU_DEVICES}" \

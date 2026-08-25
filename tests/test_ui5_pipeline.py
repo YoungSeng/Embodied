@@ -81,6 +81,9 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(
             locany_ui5_common.machine_resource_config("a800")["cpu"], 58
         )
+        self.assertEqual(
+            locany_ui5_common.machine_resource_config("a800")["group_id"], 1602
+        )
         self.assertNotEqual(four["OUTPUT_DIR"], eight["OUTPUT_DIR"])
         locany_ui5_common.assert_gpu_mode_consistency(four, eight)
         self.assertEqual(four["MAX_NUM_TOKENS_SCOPE"], "per_rank_packed_batch")
@@ -152,6 +155,46 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config["GRADIENT_ACCUMULATION_STEPS"], 2)
         self.assertIn("intelligent-service-arnold-hl", config["WORKSPACE"])
         self.assertTrue(config["PROJECT_ROOT"].startswith("/mnt/"))
+
+    def test_aiai_locate_resource_group_renders_group_and_queue(self) -> None:
+        resource = locany_ui5_common.machine_resource_config(
+            "a800", resource_group="aiai_locate"
+        )
+        self.assertEqual(resource["group_id"], 2146)
+        self.assertEqual(
+            resource["display_name"], "ies_aiai_experience/AIAI_locate"
+        )
+        self.assertEqual(
+            resource["queue_name"],
+            "compute-3302-yg-cloudnative-ai-aiai.locate-guarantee",
+        )
+
+        args = submit_locany_ui5.parse_args(
+            [
+                "--machine",
+                "a800",
+                "--gpus",
+                "4",
+                "--resource-group",
+                "aiai_locate",
+                "--render-only",
+            ]
+        )
+        rendered, runtime = submit_locany_ui5.render_job(args)
+        self.assertIn("        - 2146", rendered)
+        self.assertIn(
+            "queueName: compute-3302-yg-cloudnative-ai-aiai.locate-guarantee",
+            rendered,
+        )
+        self.assertIn("name: 'locany-ui5-v4-a800x4-aiai-locate'", rendered)
+        self.assertEqual(runtime["RESOURCE_GROUP"], "aiai_locate")
+        self.assertEqual(runtime["RESOURCE_GROUP_ID"], 2146)
+
+    def test_unknown_resource_group_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unknown resource group"):
+            locany_ui5_common.machine_resource_config(
+                "a800", resource_group="does_not_exist"
+            )
 
     def test_rendered_yaml_uses_posix_cluster_paths(self) -> None:
         args = Namespace(

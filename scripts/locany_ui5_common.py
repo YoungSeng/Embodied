@@ -208,6 +208,7 @@ def resolve_runtime_config(
 
     resolved: dict[str, Any] = {
         "MACHINE_TYPE": machine_type,
+        "RESOURCE_GROUP": str(_env_value(env, "RESOURCE_GROUP", "default")),
         "GPU_COUNT": gpu_count,
         "CUDA_DEVICES": cuda_devices,
         "EVAL_GPU_DEVICES": eval_gpu_devices,
@@ -371,6 +372,7 @@ def assert_gpu_mode_consistency(
 def machine_resource_config(
     machine_type: str,
     *,
+    resource_group: str = "default",
     config_path: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     raw = load_machine_config(config_path)
@@ -378,6 +380,13 @@ def machine_resource_config(
     if machine_type not in raw["machines"]:
         raise ValueError(f"Unknown machine type: {machine_type}")
     machine = raw["machines"][machine_type]
+    resource_groups = machine.get("resource_groups", {"default": {}})
+    if resource_group not in resource_groups:
+        raise ValueError(
+            f"Unknown resource group {resource_group!r} for {machine_type}; "
+            f"choose one of {sorted(resource_groups)}"
+        )
+    resource_override = resource_groups[resource_group]
     workspace = machine["workspace"]
     project_root = join_runtime_path(workspace, raw["shared"]["project_relative_path"])
     return {
@@ -389,4 +398,6 @@ def machine_resource_config(
         "image_url": raw["shared"]["image_url"],
         "image_vid": raw["shared"]["image_vid"],
         **machine["merlin"],
+        **resource_override,
+        "resource_group": resource_group,
     }

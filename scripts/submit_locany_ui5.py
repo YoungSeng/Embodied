@@ -23,11 +23,19 @@ from locany_ui5_common import (
 TEMPLATE_PATH = PROJECT_ROOT / "jobs" / "locany_ui5_merlin.template.yaml"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Render and submit a LocateAnything UI5 v4 A800/H20 4/8-GPU job"
     )
     parser.add_argument("--machine", choices=("a800", "h20"), required=True)
+    parser.add_argument(
+        "--resource-group",
+        default="default",
+        help=(
+            "Merlin resource profile from configs/locany_ui5_machines.json; "
+            "A800 supports default and aiai_locate"
+        ),
+    )
     parser.add_argument(
         "--gpus", "--gpu", dest="gpus", type=int, choices=(4, 8), required=True
     )
@@ -98,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-yaml", type=Path, default=None)
     parser.add_argument("--render-only", action="store_true")
     parser.add_argument("--mlx-bin", default="mlx")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def yaml_scalar(value: Any) -> str:
@@ -118,6 +126,7 @@ def render_template(template: str, replacements: dict[str, str]) -> str:
 
 def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
     env = dict(os.environ)
+    resource_group = str(getattr(args, "resource_group", "default"))
     cuda_devices = args.cuda_devices or ",".join(
         str(index) for index in range(args.gpus)
     )
@@ -126,6 +135,7 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
     )
     explicit = {
         "MACHINE_TYPE": args.machine,
+        "RESOURCE_GROUP": resource_group,
         "GPU_COUNT": str(args.gpus),
         "CUDA_DEVICES": cuda_devices,
         "EVAL_GPU_DEVICES": eval_gpu_devices,
@@ -206,9 +216,23 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
     for key in ("EVAL_CHECKPOINT", "EVAL_STEP", "EVAL_SKIP_PATCH"):
         if key in submission_env:
             runtime[key] = submission_env[key]
-    resource = machine_resource_config(args.machine, config_path=args.config)
+    resource = machine_resource_config(
+        args.machine,
+        resource_group=str(runtime["RESOURCE_GROUP"]),
+        config_path=args.config,
+    )
+    runtime.update(
+        {
+            "RESOURCE_GROUP_ID": int(resource["group_id"]),
+            "RESOURCE_QUEUE_NAME": str(resource.get("queue_name", "")),
+            "RESOURCE_DISPLAY_NAME": str(
+                resource.get("display_name", runtime["RESOURCE_GROUP"])
+            ),
+        }
+    )
     env_keys = (
         "MACHINE_TYPE",
+        "RESOURCE_GROUP",
         "GPU_COUNT",
         "CUDA_DEVICES",
         "EVAL_GPU_DEVICES",
@@ -253,11 +277,20 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
     queue_line = (
         f"          queueName: {queue_name}" if queue_name else ""
     )
-    job_name = f"locany-ui5-{runtime['VERSION']}-{args.machine}x{args.gpus}"
+    resource_group = str(runtime["RESOURCE_GROUP"])
+    resource_job_label = re.sub(r"[^A-Za-z0-9.-]+", "-", resource_group)
+    resource_suffix = "" if resource_group == "default" else f"-{resource_job_label}"
+    job_name = (
+        f"locany-ui5-{runtime['VERSION']}-{args.machine}x{args.gpus}"
+        f"{resource_suffix}"
+    )
     if args.eval_checkpoint is not None:
         job_name += f"-eval{args.eval_step}"
     replacements = {
-        "CAPTION": f"LocateAnything UI5 {runtime['VERSION']} - {args.machine.upper()} x {args.gpus}",
+        "CAPTION": (
+            f"LocateAnything UI5 {runtime['VERSION']} - "
+            f"{args.machine.upper()} x {args.gpus} [{resource_group}]"
+        ),
         "PROJECT_ROOT": resource["project_root"],
         "ENV_DIR": resource["env_dir"],
         "IMAGE_URL": resource["image_url"],
@@ -298,6 +331,7 @@ def main() -> int:
     print("===== LocateAnything UI5 submission =====")
     for key in (
         "MACHINE_TYPE",
+        "RESOURCE_GROUP",
         "GPU_COUNT",
         "CUDA_DEVICES",
         "ATTN_IMPLEMENTATION",
@@ -321,6 +355,9 @@ def main() -> int:
     ):
         print(f"{key:28s}: {runtime[key]}")
     print(f"rendered_yaml               : {output_yaml}")
+    print(f"resource_group_id           : {runtime['RESOURCE_GROUP_ID']}")
+    print(f"resource_display_name       : {runtime['RESOURCE_DISPLAY_NAME']}")
+    print(f"resource_queue_name         : {runtime['RESOURCE_QUEUE_NAME'] or '<default>'}")
 
     if args.render_only:
         print("[RENDER ONLY] mlx was not invoked")

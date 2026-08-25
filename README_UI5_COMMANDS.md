@@ -39,9 +39,12 @@ python scripts/run_locany_ui5_local_debug.py --gpus 4 --dry-run
 
 ## A800 四卡正式训练
 
+原资源组 `1602`（默认，不写 `--resource-group` 也一样）：
+
 ```bash
 python scripts/submit_locany_ui5.py \
   --machine a800 \
+  --resource-group default \
   --gpus 4 \
   --max-num-tokens 12800 \
   --enable-eval \
@@ -49,6 +52,22 @@ python scripts/submit_locany_ui5.py \
   --save-steps 4000 \
   --run-name locany-ui5-v4-relationfix-a800x4
 ```
+
+新资源组 `ies_aiai_experience/AIAI_locate`（group `2146`）：
+
+```bash
+python scripts/submit_locany_ui5.py \
+  --machine a800 \
+  --resource-group aiai_locate \
+  --gpus 4 \
+  --max-num-tokens 12800 \
+  --enable-eval \
+  --max-steps 16000 \
+  --save-steps 4000 \
+  --run-name locany-ui5-v4-relationfix-a800x4
+```
+
+`aiai_locate` 会自动使用 group `2146` 和队列 `compute-3302-yg-cloudnative-ai-aiai.locate-guarantee`，其他训练参数及挂载路径不变。
 
 ## A800 八卡正式训练
 

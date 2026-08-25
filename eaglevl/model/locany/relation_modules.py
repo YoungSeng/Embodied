@@ -423,7 +423,12 @@ class RelationConditionedDetailPyramid(nn.Module):
             )
         projected_levels = [self._sanitize(level) for level in projected_raw]
         image_features = self._split_features(projected_levels, grid_hws)
-        scale_weights_all = self.scale_logits.softmax(dim=-1)
+        # Keep the simplex in FP32 even when the module is cast to BF16.  Three
+        # BF16 representations of 1/3 sum to 1.001953125, which is expected
+        # quantization rather than a broken scale gate.  Returning FP32 weights
+        # also makes the training audit and Excel diagnostics reflect the
+        # mathematical softmax instead of that storage artifact.
+        scale_weights_all = self.scale_logits.float().softmax(dim=-1)
 
         relation_tokens_list: List[torch.Tensor] = []
         gate_logits_list: List[torch.Tensor] = []
@@ -476,7 +481,11 @@ class RelationConditionedDetailPyramid(nn.Module):
             height, width = [int(v) for v in grid_hws[image_index].tolist()]
             image_index += num_images
             weights = scale_weights_all[family]
-            fused = sum(weights[level] * levels[level] for level in range(3))
+            fused = sum(
+                weights[level].to(device=levels[level].device, dtype=levels[level].dtype)
+                * levels[level]
+                for level in range(3)
+            )
             fused = self._sanitize(self.token_norm(self._sanitize(fused)))
             fused_norms.append(fused.detach().float().norm(dim=-1).mean())
             keys = self._sanitize(self.key_projection(fused))
