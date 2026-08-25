@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,8 @@ from run_ui5_crop_audit import (  # noqa: E402
     detector_config,
     ensure_detector_config,
     digest_ids,
+    initialize_crop_audit_v2,
+    initialize_geometry_worker,
     normalize_gt_in_crop,
     proposal_crops,
     prepared_manifest_valid,
@@ -38,6 +41,7 @@ from run_ui5_crop_audit import (  # noqa: E402
     resolve_python_executable,
     run_crop_audit,
     run_detection_stage,
+    geometry_worker,
     uses_task_whole_image_policy,
     write_excel_report,
     write_statistics_csv,
@@ -269,6 +273,59 @@ class GeometryTest(unittest.TestCase):
 
 
 class ResumeAndExcelTest(unittest.TestCase):
+    def test_geometry_process_pool_loads_fixed_parser_without_images(self):
+        parser_root = Path(__file__).resolve().parents[2] / "ui-region-parser"
+        if not (parser_root / "ui_region_cropper.py").is_file():
+            self.skipTest("independent fixed parser checkout is not present")
+        with tempfile.TemporaryDirectory() as temporary:
+            payload = {
+                "manifest": {"image_id": "img", "width": 100, "height": 100},
+                "detection": {
+                    "width": 100,
+                    "height": 100,
+                    "text_detections": [{"bbox": [10, 10, 30, 30], "score": 0.9}],
+                    "icon_detections": [],
+                },
+                "image_samples": [sample("ui_occlusion", [[15, 15, 20, 20]], "img")],
+                "config_name": "A",
+                "config": CONFIGS["A"],
+                "config_root": temporary,
+                "max_crops": 10,
+                "boundary_margin_ratio": 0.01,
+                "whole_image_trim_ratio": 0.01,
+                "whole_image_detection_margin_ratio": 0.005,
+            }
+            with ProcessPoolExecutor(
+                max_workers=2,
+                initializer=initialize_geometry_worker,
+                initargs=(str(parser_root),),
+            ) as executor:
+                result = list(executor.map(geometry_worker, [payload]))
+            self.assertEqual(result[0]["image_id"], "img")
+            self.assertEqual(result[0]["config"], "A")
+
+    def test_fast_audit_archives_legacy_partial_output_recoverably(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = AuditPaths(Path(temporary) / "audit")
+            legacy = paths.crop_audit / "config_A" / "crops" / "img"
+            legacy.mkdir(parents=True)
+            (legacy / "crop_01.png").write_bytes(b"partial")
+            args = SimpleNamespace(
+                max_crops=10,
+                boundary_margin_ratio=0.01,
+                whole_image_trim_ratio=0.01,
+                whole_image_detection_margin_ratio=0.005,
+                overview_samples_per_task=50,
+                overview_anomalies_per_category=50,
+            )
+            initialize_crop_audit_v2(args, paths, [{"image_id": "img"}])
+            archives = list(paths.output.glob("crop_audit_legacy_slow_*"))
+            self.assertEqual(len(archives), 1)
+            self.assertTrue(
+                (archives[0] / "config_A" / "crops" / "img" / "crop_01.png").is_file()
+            )
+            self.assertTrue((paths.crop_audit / "audit_state.json").is_file())
+
     def test_detection_workers_can_use_separate_python_environments(self):
         args = SimpleNamespace(
             text_python="/envs/paddle/bin/python",
@@ -542,6 +599,7 @@ class ResumeAndExcelTest(unittest.TestCase):
             }
             atomic_write_jsonl(paths.unique_images, [unique])
             atomic_write_jsonl(paths.task_samples, samples)
+            atomic_write_jsonl(paths.shards / "shard_00000.jsonl", [unique])
             atomic_write_jsonl(paths.merged, [merged])
             matrix = {task: {other: 0 for other in TASK_NAMES} for task in TASK_NAMES}
             jaccard = {task: {other: 0.0 for other in TASK_NAMES} for task in TASK_NAMES}
@@ -562,6 +620,10 @@ class ResumeAndExcelTest(unittest.TestCase):
                 whole_image_trim_ratio=0.01,
                 whole_image_detection_margin_ratio=0.005,
                 progress_interval_seconds=60,
+                resume=True,
+                crop_workers=1,
+                overview_samples_per_task=50,
+                overview_anomalies_per_category=50,
             )
             with mock.patch("run_ui5_crop_audit.load_parser_module", return_value=FakeCropper):
                 result = run_crop_audit(args)
@@ -572,6 +634,27 @@ class ResumeAndExcelTest(unittest.TestCase):
             self.assertTrue((paths.crop_audit / "config_A" / "preview" / "ui_occlusion.jsonl").is_file())
             self.assertTrue((paths.crop_audit / "config_A" / "crops" / "img_shared" / "crop_01.png").is_file())
             self.assertTrue((paths.crop_audit / "config_A" / "crops" / "img_shared" / "whole_01.png").is_file())
+            self.assertTrue((paths.crop_audit / "config_A" / "geometry" / "shard_00000.done.json").is_file())
+            self.assertTrue((paths.crop_audit / "config_B" / "geometry" / "shard_00000.done.json").is_file())
+            self.assertFalse((paths.crop_audit / "config_B" / "crops").exists())
+            self.assertEqual(result["materialization"]["config"], "A")
+
+            with (
+                mock.patch(
+                    "run_ui5_crop_audit.load_parser_module", return_value=FakeCropper
+                ) as parser_loader,
+                mock.patch(
+                    "run_ui5_crop_audit.compute_geometry_record",
+                    side_effect=AssertionError("resume must not recompute geometry"),
+                ),
+                mock.patch(
+                    "run_ui5_crop_audit.open_raw_image",
+                    side_effect=AssertionError("resume must not decode completed images"),
+                ),
+            ):
+                resumed = run_crop_audit(args)
+            parser_loader.assert_not_called()
+            self.assertEqual(resumed["recommended_config"], "A")
 
 
 if __name__ == "__main__":

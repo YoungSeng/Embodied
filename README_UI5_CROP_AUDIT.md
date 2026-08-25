@@ -197,6 +197,7 @@ bash shell/run_ui5_crop_audit.sh \
   --output-dir work_dirs/ui5_crop_audit_20260825 \
   --gpus 0,1,2,3 \
   --workers-per-gpu 1 \
+  --crop-workers 8 \
   --icon-python "${ICON_PYTHON}" \
   --stage all \
   --resume
@@ -208,7 +209,8 @@ bash shell/run_ui5_crop_audit.sh \
 2. `text`：四卡运行 PP-OCRv5，按 shard 落盘后退出 Paddle 进程；
 3. `icon`：四卡运行 OmniParser icon detector，按 shard 落盘后退出 Torch 进程；
 4. `merge`：检查数量、重复、缺失和尺寸，再生成唯一 `detections.jsonl`；
-5. `crop-audit`：只用 CPU 读取落盘检测，运行 A/B/C crop、preview、统计、可视化和 Excel。
+5. `crop-audit`：只用 CPU 读取落盘检测，先比较 A/B/C 几何，再只为推荐配置落正式 crop，
+   最后生成 preview、抽样/异常可视化、统计和 Excel。
 
 所以，正常首次运行不需要手动复制执行五条命令。
 
@@ -243,8 +245,49 @@ watch -n 5 'cat work_dirs/ui5_crop_audit_20260825/run_status.json'
 ```
 
 `prepare` 会显示源数据/训练数据重叠分析和 manifest 构建进度；`text`、`icon` 汇总四卡
-worker；`merge` 显示合并数量；`crop-audit` 把 A/B/C 三组配置合并成一个总进度。使用
-`--resume` 时，已验证完成的 shard 会直接计入已完成数量，ETA 只按本次剩余工作估算。
+worker；`merge` 显示合并数量；`crop-audit` 分成两个独立 ETA：阶段 1 是 A/B/C 纯几何，
+阶段 2 是推荐配置落图。使用 `--resume` 时，已验证完成的 geometry/materialized shard 都会
+直接计入已完成数量，ETA 只按本次剩余工作估算。
+
+### crop-audit 为什么分成两遍
+
+旧实现对 17,281 张图的 A/B/C 三组都重复解码原图，并保存全部 crop 和全分辨率 overview；
+约 `51,843 image-configs` 会产生数十万张 PNG，实测 ETA 可接近 48 小时。新实现为：
+
+1. 阶段 1 使用 `--crop-workers 8` 个 CPU 进程，只读取 `detections.jsonl` 做连通分量、合并、
+   context、GT 包含、面积和坐标 round-trip；不打开原图、不写 PNG；
+2. 每 500–1000 张沿用 manifest shard，原子写 `geometry/shard_*.jsonl` 和完成标记；
+3. 三组统计完成后，仍按四个局部任务的覆盖率优先，再比较像素减少与放大收益选择配置；
+4. 阶段 2 每张推荐配置原图只解码一次，并行保存无框、无 mask 的 lossless PNG crop；
+5. overview 默认只画每任务固定 50 个抽样，以及每个异常类别前 50 条，重复样本只画一次。
+
+三组参数含义：
+
+| 配置 | horizontal/vertical link ratio | context ratio | 作用 |
+|---|---:|---:|---|
+| A | 0.015 | 0.10 | 当前默认，区域通常较小 |
+| B | 0.015 | 0.20 | 分组相同，增加上下文 |
+| C | 0.025 | 0.20 | 更强连接、合并与上下文 |
+
+只有 `config_A/` 出现不表示 A 胜出；旧版是按 A→B→C 串行。新版三个目录都会先出现
+`geometry/`，最终只有 `summary.json` 的 `recommended_config` 对应目录包含正式 `crops/`。
+
+如果同一输出目录中存在旧版未完成的 `crop_audit/config_A/crops/`，新脚本不会删除它，而会
+在启动时自动改名为 `crop_audit_legacy_slow_<timestamp>/`，再创建 v2 输出。确认新报告无误后
+再人工处理该备份。检测结果不移动、不删除，也不会重新运行 GPU。
+
+CPU 充足时默认使用 8 个 worker；内存或共享存储压力较大可改为 4：
+
+```bash
+--crop-workers 4
+```
+
+抽样/异常 overview 数量可覆盖，但不建议全量渲染：
+
+```bash
+--overview-samples-per-task 50 \
+--overview-anomalies-per-category 50
+```
 
 ## 6. 什么时候才需要一条一条运行？
 
@@ -259,6 +302,7 @@ COMMON_ARGS=(
   --output-dir work_dirs/ui5_crop_audit_20260825
   --gpus 0,1,2,3
   --workers-per-gpu 1
+  --crop-workers 8
   --resume
 )
 
@@ -299,14 +343,22 @@ work_dirs/ui5_crop_audit_20260825/
     icon/shard_*.jsonl
     merged/detections.jsonl
   crop_audit/
+    audit_state.json
     config_A/
-      crops/
-      overviews/
-      preview/*.jsonl
+      geometry/shard_*.jsonl
+      geometry/shard_*.done.json
       anomalies.json
     config_B/
     config_C/
+    # 以下只存在于 recommended_config 对应目录
+    config_<recommended>/
+      materialized/shard_*.jsonl
+      materialized/shard_*.done.json
+      crops/
+      overviews/
+      preview/*.jsonl
     summary.json
+    materialization_summary.json
     statistics.csv
     task_aware_manifest.jsonl
     gt_failures.jsonl
