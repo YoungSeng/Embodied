@@ -132,6 +132,7 @@ export RELATION_FOCAL_BETA="${RELATION_FOCAL_BETA:-0.999}"
 export RELATION_FOCAL_GAMMA="${RELATION_FOCAL_GAMMA:-2.0}"
 export CHECK_MAGI_IMPORT="${CHECK_MAGI_IMPORT:-$([[ "${ATTN_IMPLEMENTATION}" == "magi" ]] && echo 1 || echo 0)}"
 export LOCANY_ENABLE_MILESTONE_COPIES=0
+export INSTALL_SYSTEM_RUNTIME_DEPS="${INSTALL_SYSTEM_RUNTIME_DEPS:-0}"
 
 echo "===== LocateAnything UI5 Configuration ====="
 printf '%-28s: %s\n' \
@@ -171,6 +172,7 @@ printf '%-28s: %s\n' \
   "EVAL_AT_START" "${EVAL_AT_START}" \
   "EVAL_INTERVAL_STEPS" "${EVAL_INTERVAL_STEPS}" \
   "EVAL_FAIL_POLICY" "${EVAL_FAIL_POLICY}" \
+  "INSTALL_SYSTEM_RUNTIME_DEPS" "${INSTALL_SYSTEM_RUNTIME_DEPS}" \
   "PIPELINE_MODE" "${PIPELINE_MODE}" \
   "PIPELINE_LOG" "${PIPELINE_LOG}" \
   "PIPELINE_TRACE_LOG" "${PIPELINE_TRACE_LOG}"
@@ -191,6 +193,61 @@ fi
 if [[ "${ENABLE_EVAL}" == "1" || "${PIPELINE_MODE}" == "eval" ]]; then
   [[ -f "${SCORER_ROOT}/qwen3vl_merge_and_score_fixed_5tasks.py" ]] || \
     locany_die 25 "Scorer missing: ${SCORER_ROOT}/qwen3vl_merge_and_score_fixed_5tasks.py"
+fi
+
+install_ui5_system_runtime_deps() {
+  if ! command -v apt-get >/dev/null 2>&1; then
+    locany_die 32 \
+      "cv2 needs libGL.so.1, but apt-get is unavailable in this task container"
+  fi
+  local -a command_prefix=()
+  if (( EUID != 0 )); then
+    if ! command -v sudo >/dev/null 2>&1; then
+      locany_die 32 \
+        "cv2 needs libGL.so.1; task user is not root and sudo is unavailable"
+    fi
+    command_prefix=(sudo -n)
+  fi
+  echo "[RUNTIME DEPS] Installing libgl1 and libglib2.0-0 in the current task container"
+  "${command_prefix[@]}" env DEBIAN_FRONTEND=noninteractive apt-get update
+  "${command_prefix[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    --no-install-recommends libgl1 libglib2.0-0
+  if command -v ldconfig >/dev/null 2>&1; then
+    "${command_prefix[@]}" ldconfig
+  fi
+}
+
+ensure_ui5_inference_runtime() {
+  local -a preflight=(
+    "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/preflight_locany_runtime.py"
+    --processor-path "${BASE_MODEL}"
+  )
+  local preflight_code=0
+  if "${preflight[@]}"; then
+    return 0
+  else
+    preflight_code=$?
+  fi
+  if (( preflight_code != 42 )); then
+    locany_die "${preflight_code}" \
+      "LocateAnything inference runtime preflight failed before worker launch"
+  fi
+  if [[ "${INSTALL_SYSTEM_RUNTIME_DEPS}" != "1" ]]; then
+    locany_die 32 \
+      "libGL.so.1 is missing. Re-submit without --no-install-system-runtime-deps, or install libgl1 libglib2.0-0 in this container"
+  fi
+  install_ui5_system_runtime_deps
+  if "${preflight[@]}"; then
+    :
+  else
+    preflight_code=$?
+    locany_die "${preflight_code}" \
+      "Runtime dependency installation completed, but cv2/AutoProcessor preflight still failed"
+  fi
+}
+
+if [[ "${ENABLE_EVAL}" == "1" || "${PIPELINE_MODE}" == "eval" ]]; then
+  ensure_ui5_inference_runtime
 fi
 
 if command -v nvidia-smi >/dev/null 2>&1; then

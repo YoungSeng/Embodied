@@ -296,6 +296,12 @@ def resolve_runtime_config(
         "EVAL_AT_START": int(eval_at_start),
         "EVAL_INTERVAL_STEPS": eval_interval,
         "EVAL_FAIL_POLICY": eval_fail_policy,
+        "INSTALL_SYSTEM_RUNTIME_DEPS": int(
+            parse_bool(
+                _env_value(env, "INSTALL_SYSTEM_RUNTIME_DEPS", "0"),
+                name="INSTALL_SYSTEM_RUNTIME_DEPS",
+            )
+        ),
         "EVAL_MAX_IMAGES_PER_TASK": int(
             _env_value(env, "EVAL_MAX_IMAGES_PER_TASK", 0)
         ),

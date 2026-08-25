@@ -93,6 +93,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--relation-gate-mode", choices=("observe", "hard"), default="observe"
     )
     parser.add_argument("--relation-gate-threshold", type=float, default=None)
+    runtime_deps_group = parser.add_mutually_exclusive_group()
+    runtime_deps_group.add_argument(
+        "--install-system-runtime-deps",
+        dest="install_system_runtime_deps",
+        action="store_true",
+        help="Install libgl1/libglib2.0-0 inside the task container when cv2 needs them",
+    )
+    runtime_deps_group.add_argument(
+        "--no-install-system-runtime-deps",
+        dest="install_system_runtime_deps",
+        action="store_false",
+        help="Fail preflight instead of installing missing task-container libraries",
+    )
+    parser.set_defaults(install_system_runtime_deps=True)
     eval_group = parser.add_mutually_exclusive_group()
     eval_group.add_argument("--enable-eval", dest="enable_eval", action="store_true")
     eval_group.add_argument("--disable-eval", dest="enable_eval", action="store_false")
@@ -150,6 +164,9 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "EVAL_AT_START": "1" if args.eval_at_start else "0",
         "EVAL_FAIL_POLICY": args.eval_fail_policy,
         "RELATION_GATE_MODE": getattr(args, "relation_gate_mode", "observe"),
+        "INSTALL_SYSTEM_RUNTIME_DEPS": (
+            "1" if getattr(args, "install_system_runtime_deps", True) else "0"
+        ),
     }
     optional = {
         "MAX_NUM_TOKENS": args.max_num_tokens,
@@ -259,6 +276,7 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "EVAL_INTERVAL_STEPS",
         "EVAL_MAX_IMAGES_PER_TASK",
         "EVAL_FAIL_POLICY",
+        "INSTALL_SYSTEM_RUNTIME_DEPS",
         "RUN_NAME",
         "PIPELINE_MODE",
     )
@@ -352,6 +370,7 @@ def main() -> int:
         "EVAL_AT_START",
         "EVAL_INTERVAL_STEPS",
         "EVAL_MAX_IMAGES_PER_TASK",
+        "INSTALL_SYSTEM_RUNTIME_DEPS",
     ):
         print(f"{key:28s}: {runtime[key]}")
     print(f"rendered_yaml               : {output_yaml}")

@@ -964,9 +964,18 @@ class LocateAnythingInferencer:
                 **common_kwargs,
             )
         except Exception as exc:
+            dependency_hint = (
+                "检测到缺少 libGL.so.1；请在当前任务容器安装 "
+                "libgl1 libglib2.0-0。"
+                if "libGL.so.1" in str(exc)
+                else "若是配置文件缺失再检查 --processor-path；若是 ImportError/OSError，"
+                "请先检查当前容器运行时依赖。"
+            )
             raise RuntimeError(
-                "加载 tokenizer/processor 失败。若训练 checkpoint 未保存这些文件，请用 "
-                "--processor-path 显式指向本地 nvidia/LocateAnything-3B 目录。"
+                "加载 tokenizer/processor 失败。\n"
+                f"processor_path={processor_source}\n"
+                f"原始异常={type(exc).__name__}: {exc}\n"
+                f"{dependency_hint}"
             ) from exc
 
         if hasattr(self.processor, "tokenizer"):

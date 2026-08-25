@@ -19,6 +19,7 @@ import collect_ui5_metrics
 import locany_ui5_checkpoint
 import locany_ui5_common
 import patch_locany_checkpoint
+import preflight_locany_runtime
 import run_locany_ui5_local_debug
 import submit_locany_ui5
 
@@ -230,8 +231,28 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertIn("mnt: /mnt/bn/intelligent-service-yg/", rendered)
         self.assertIn('MAX_NUM_TOKENS: "12800"', rendered)
         self.assertIn('EVAL_MAX_IMAGES_PER_TASK: "10"', rendered)
+        self.assertIn('INSTALL_SYSTEM_RUNTIME_DEPS: "1"', rendered)
         self.assertNotIn("@@", rendered)
         self.assertEqual(runtime["ENABLE_EVAL"], 0)
+        self.assertEqual(runtime["INSTALL_SYSTEM_RUNTIME_DEPS"], 1)
+
+    def test_formal_runtime_dependency_install_can_be_disabled(self) -> None:
+        args = submit_locany_ui5.parse_args(
+            [
+                "--machine",
+                "a800",
+                "--gpus",
+                "4",
+                "--no-install-system-runtime-deps",
+                "--render-only",
+            ]
+        )
+        rendered, runtime = submit_locany_ui5.render_job(args)
+        self.assertIn('INSTALL_SYSTEM_RUNTIME_DEPS: "0"', rendered)
+        self.assertEqual(runtime["INSTALL_SYSTEM_RUNTIME_DEPS"], 0)
+
+    def test_preflight_uses_distinct_libgl_exit_code(self) -> None:
+        self.assertEqual(preflight_locany_runtime.EXIT_LIBGL_MISSING, 42)
 
     def test_h20_render_uses_h20_resources(self) -> None:
         args = Namespace(
