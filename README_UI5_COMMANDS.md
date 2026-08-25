@@ -1,5 +1,9 @@
 # LocateAnything UI5 常用命令
 
+检测 crop 审计的分阶段启动方式见
+[README_UI5_CROP_AUDIT.md](README_UI5_CROP_AUDIT.md)。该流程关闭 CPT，完成审计前不得启动
+full image / full+crop / 推理 crop 三组训练对照。
+
 先进入工程并激活现有环境：
 
 ```bash

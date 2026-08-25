@@ -1,0 +1,2 @@
+# Large runtime artifacts are never source-controlled.
+/work_dirs/

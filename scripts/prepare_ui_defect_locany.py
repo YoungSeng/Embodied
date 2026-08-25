@@ -41,17 +41,12 @@ from typing import Any, Iterable, Iterator, Sequence
 from PIL import Image, UnidentifiedImageError
 
 
-# A800
-# root_path = "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/"
-# H20
-root_path = "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace"
-
-DEFAULT_PROJECT_ROOT = Path(
-    root_path + "code/Eagle/Embodied"
-)
-DEFAULT_SOURCE_DIR = Path(
-    root_path + "data"
-)
+# Defaults are repository-relative so every cluster path remains CLI-overridable.
+# In particular, do not concatenate a hand-edited ``root_path`` string here: the
+# previous H20 default omitted a trailing slash and produced
+# ``...sicheng_workspacecode/Eagle/Embodied``.
+DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_SOURCE_DIR = DEFAULT_PROJECT_ROOT / "data"
 
 TASKS = [
     {
