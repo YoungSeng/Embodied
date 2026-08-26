@@ -50,6 +50,23 @@ if [[ ! -f "${META_PATH}" ]]; then
   exit 1
 fi
 
+# Crop-augmented training is fail-closed.  Full-image-only training is unchanged;
+# any run that opts into detector crops must supply the audited directory and
+# pass live audit-state/input-snapshot/summary digest validation.
+UI5_USE_DETECTION_CROPS="${UI5_USE_DETECTION_CROPS:-0}"
+UI5_CROP_AUDIT_DIR="${UI5_CROP_AUDIT_DIR:-}"
+if [[ "${UI5_USE_DETECTION_CROPS}" == "1" || -n "${UI5_CROP_AUDIT_DIR}" ]]; then
+  if [[ -z "${UI5_CROP_AUDIT_DIR}" ]]; then
+    echo "[ERROR] UI5_USE_DETECTION_CROPS=1 requires UI5_CROP_AUDIT_DIR." >&2
+    exit 1
+  fi
+  python "${PROJECT_ROOT}/scripts/validate_ui5_crop_training_ready.py" \
+    --audit-dir "${UI5_CROP_AUDIT_DIR}" || {
+      echo "[ERROR] Crop training-ready validation failed; refusing to start training." >&2
+      exit 1
+    }
+fi
+
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-deepspeed_configs/zero_stage2_config.json}"
 if [[ ! -f "${DEEPSPEED_CONFIG}" ]]; then
   echo "[ERROR] DeepSpeed config does not exist: ${DEEPSPEED_CONFIG}" >&2

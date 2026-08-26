@@ -17,6 +17,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import run_ui5_crop_audit as crop_audit_module  # noqa: E402
 from analyze_ui5_source_overlap import TASK_NAMES, analyze  # noqa: E402
 from run_ui5_crop_audit import (  # noqa: E402
     CONFIGS,
@@ -24,6 +25,7 @@ from run_ui5_crop_audit import (  # noqa: E402
     AuditPaths,
     ProgressReporter,
     aggregate_scope,
+    audit_state_digest,
     atomic_write_json,
     atomic_write_jsonl,
     build_task_aware_manifest,
@@ -47,6 +49,7 @@ from run_ui5_crop_audit import (  # noqa: E402
     evaluate_candidate_gate,
     materialize_image_record,
     uses_task_whole_image_policy,
+    validate_training_ready_marker,
     write_excel_report,
     write_statistics_csv,
 )
@@ -819,6 +822,53 @@ class ResumeAndExcelTest(unittest.TestCase):
                 )
             self.assertEqual(result["materialization"]["candidate"], selected)
             self.assertEqual(result["materialization"]["whole_generated_file_count"], 0)
+            self.assertTrue(result["next_stage_gate"]["training_ready"])
+            marker_path = paths.crop_audit / "training_ready.json"
+            self.assertTrue(marker_path.is_file())
+            validated = validate_training_ready_marker(paths.crop_audit)
+            self.assertEqual(validated["recommended_config"], selected)
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            summary = json.loads(
+                (paths.crop_audit / "summary.json").read_text(encoding="utf-8")
+            )
+            state = json.loads(
+                (paths.crop_audit / "audit_state.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(marker["created_after_all_checks"])
+            self.assertEqual(marker["audit_state_digest"], audit_state_digest(state))
+            self.assertEqual(
+                marker["input_snapshot_digest"],
+                audit_state_digest(summary["input_snapshot_after"]),
+            )
+            self.assertEqual(
+                marker["summary_file_digest"],
+                crop_audit_module.content_fingerprint(paths.crop_audit / "summary.json"),
+            )
+            summary_path = paths.crop_audit / "summary.json"
+            summary_bytes = summary_path.read_bytes()
+            summary_path.write_bytes(summary_bytes + b"\n")
+            with self.assertRaisesRegex(RuntimeError, "summary digest mismatch"):
+                validate_training_ready_marker(paths.crop_audit)
+            summary_path.write_bytes(summary_bytes)
+
+            state_path = paths.crop_audit / "audit_state.json"
+            state_bytes = state_path.read_bytes()
+            changed_state = dict(state)
+            changed_state["test_mutation"] = True
+            atomic_write_json(state_path, changed_state)
+            with self.assertRaisesRegex(RuntimeError, "audit state digest mismatch"):
+                validate_training_ready_marker(paths.crop_audit)
+            state_path.write_bytes(state_bytes)
+
+            merged_bytes = paths.merged.read_bytes()
+            paths.merged.write_bytes(merged_bytes + b"\n")
+            with self.assertRaisesRegex(RuntimeError, "live manifest/detections"):
+                validate_training_ready_marker(paths.crop_audit)
+            paths.merged.write_bytes(merged_bytes)
+            region_path = next(
+                (selected_root / "crops" / "img_shared").glob("region_*.png")
+            )
+            region_before = (region_path.read_bytes(), region_path.stat().st_mtime_ns)
 
             with (
                 mock.patch(
@@ -836,6 +886,67 @@ class ResumeAndExcelTest(unittest.TestCase):
                 resumed = run_crop_audit(args)
             parser_loader.assert_not_called()
             self.assertEqual(resumed["materialized_candidate"], selected)
+            self.assertEqual(
+                region_before,
+                (region_path.read_bytes(), region_path.stat().st_mtime_ns),
+            )
+
+            original_snapshot = crop_audit_module.audit_input_snapshot
+            snapshot_calls = 0
+
+            def changed_after_snapshot(*call_args, **call_kwargs):
+                nonlocal snapshot_calls
+                snapshot_calls += 1
+                value = original_snapshot(*call_args, **call_kwargs)
+                if snapshot_calls == 2:
+                    value = dict(value)
+                    value["merged_detections_file_digest"] = "changed-during-run"
+                return value
+
+            with (
+                mock.patch(
+                    "run_ui5_crop_audit.audit_input_snapshot",
+                    side_effect=changed_after_snapshot,
+                ),
+                mock.patch(
+                    "run_ui5_crop_audit.compute_geometry_record",
+                    side_effect=AssertionError("resume must not recompute geometry"),
+                ),
+                mock.patch(
+                    "run_ui5_crop_audit.open_raw_image",
+                    side_effect=AssertionError("resume must not rewrite crop PNG"),
+                ),
+            ):
+                changed = run_crop_audit(args)
+            self.assertFalse(changed["next_stage_gate"]["training_ready"])
+            self.assertFalse(
+                changed["next_stage_gate"]["conditions"]["input_snapshot_unchanged"]
+            )
+            self.assertFalse(marker_path.exists())
+
+            with mock.patch(
+                "run_ui5_crop_audit.load_parser_module", return_value=FakeCropper
+            ):
+                restored = run_crop_audit(args)
+            self.assertTrue(restored["next_stage_gate"]["training_ready"])
+            self.assertTrue(marker_path.is_file())
+
+            with mock.patch(
+                "run_ui5_crop_audit.write_excel_report",
+                side_effect=RuntimeError("simulated report interruption"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "simulated report interruption"):
+                    run_crop_audit(args)
+            self.assertFalse(marker_path.exists())
+            interrupted_summary = json.loads(
+                (paths.crop_audit / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(interrupted_summary["training_ready"])
+            self.assertFalse(
+                interrupted_summary["next_stage_gate"]["conditions"][
+                    "all_reports_written_successfully"
+                ]
+            )
 
     def test_failed_gate_uses_best_candidate_and_never_touches_detector_shards(self):
         with tempfile.TemporaryDirectory() as temporary:

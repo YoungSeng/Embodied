@@ -224,8 +224,95 @@ bash shell/run_ui5_crop_audit.sh \
 存在的 shard。想比较另一组代码或参数时请换名字，例如
 `--crop-audit-name crop_audit_v3_retry`，不要覆盖同名审计。
 
+本轮 `crop_audit_v3` 已有有效的 geometry/materialization 完成标记。上述命令会复用
+`TA_CTX015_H050` 的 geometry 和现有 47,930 个 region crop，不重新打开原图保存这些 PNG；
+它只刷新统计、Excel、107 张失败四联图和训练门禁。终端最终应显示 OCR/icon 未运行，且
+`detector_stages_executed=[]`。
+
 只有在一个全新数据集还没有检测结果时，才需要从 `prepare → text → icon → merge` 逐阶段执行；
 本轮不属于这种情况。
+
+### 4.1 当前结果与统计分母
+
+当前推荐候选是 `TA_CTX015_H050`。四个区域任务共 17,798 个正样本 GT bbox，其中
+17,691 个被至少一个 crop 完整包含，GT bbox 完整覆盖率为
+`17,691 / 17,798 = 99.3988%`。剩余 107 个失败 GT 包括 87 个
+`partial_intersection` 和 20 个 `uncovered`。`ui_content_missing` 使用完整原图，覆盖率为
+100%。
+
+报告、Excel `summary` 和 `summary.json.metric_definitions` 对各指标使用以下统一口径：
+
+- `gt_box_containment_recall`：被至少一个 crop 完整包含的 GT bbox 数 / 所有正样本中的 GT
+  bbox 总数。负样本 `gt_count=0`，不进入分母；这不是成功图片数除以全部图片数。
+- `positive_sample_success_rate`：一张正样本中全部 GT bbox 都被完整覆盖的正样本数 / 正样本
+  总数。当前区域任务为 `11,150 / 11,250 = 99.1111%`；负样本不进入分母。
+- `near_full_image_ratio`：union area / original area 大于 0.8 的图片样本数 / 该任务全部图片
+  样本数，包含正样本和负样本。
+- `gt_gain_over_1.25/1.5/2.0_ratio`：超过对应放大阈值的 GT bbox 数 / 已被 crop 完整包含且
+  可以计算放大倍率的 GT bbox 数。
+- `negative_samples` 只描述数据组成，不参与 GT 覆盖率或正样本全部成功率的分母。
+
+107 个失败的固定分布如下；脚本会逐项校验，不一致直接停止，避免展示错 audit/config 的结果：
+
+| 任务 | partial | uncovered | 合计 |
+|---|---:|---:|---:|
+| ui_occlusion | 27 | 19 | 46 |
+| ui_cropping | 23 | 0 | 23 |
+| ui_text_overflow | 2 | 1 | 3 |
+| ui_text_ellipsis | 35 | 0 | 35 |
+| ui_content_missing | 0 | 0 | 0 |
+| 合计 | 87 | 20 | 107 |
+
+| 页面密度 | partial | uncovered | 合计 |
+|---|---:|---:|---:|
+| sparse | 35 | 3 | 38 |
+| medium | 49 | 17 | 66 |
+| dense | 3 | 0 | 3 |
+| 合计 | 87 | 20 | 107 |
+
+### 4.2 四联图和人工失败归因
+
+`--stage crop-audit --resume` 会自动调用 `scripts/render_ui5_crop_failures.py`。它只读取 manifest、
+merged detections、`gt_failures.jsonl`、已完成的 task-aware geometry 和原图；不会导入或运行
+PP-OCRv5/OmniParser。每个失败 GT 生成一张横向四联图：原图、OCR text detections、icon
+detections、GT 与该任务 crop。正式 crop 图片不会被画框。
+
+先打开可筛选总览：
+
+```text
+work_dirs/ui5_crop_audit_20260825/crop_audit_v3/failure_visualizations/gallery/index.html
+```
+
+`uncovered_all.html` 包含全部 20 个 uncovered；`representative_partial.html` 按任务和补偿量
+small/medium/large 分桶展示接近 p50、p90 和最大值的代表样本。全部 107 条记录位于
+`gt_failures_visualized.jsonl`。逐条查看四联图后，只编辑每行的 `manual_root_cause` 和
+`manual_note`，原因必须是以下之一：
+
+- `text_detector_miss`
+- `icon_detector_miss`
+- `gt_spans_multiple_components`
+- `context_too_small`
+- `task_linking_rule_mismatch`
+- `annotation_suspect`
+- `other`（必须在 `manual_note` 中说明）
+
+完成全部 107 条人工判断后，用下面的纯汇总命令校验并刷新一页诊断报告；它不重新渲染 PNG：
+
+```bash
+python scripts/render_ui5_crop_failures.py \
+  --output-dir work_dirs/ui5_crop_audit_20260825 \
+  --crop-audit-name crop_audit_v3 \
+  --config TA_CTX015_H050 \
+  --expected-failures 107 \
+  --expected-partial 87 \
+  --expected-uncovered 20 \
+  --summary-only \
+  --require-manual-review
+```
+
+输出的 `failure_diagnosis_summary.json` 和 `gallery/diagnosis_summary.html` 按 task、density、
+failure type、root cause 汇总，并展示每类原因最多 3 个代表案例。人工归因只用于判断是否值得
+继续做下一轮几何规则，不能按单张 GT 坐标直接修 crop。本轮不新增 D/E/F 配置，也不重新落图。
 
 ## 5. 实时进度和剩余时间
 
@@ -274,8 +361,8 @@ v3 实现为：
 4. 按总体覆盖率、最低任务覆盖率、正样本成功率、像素减少和放大收益依次选择候选；
 5. 阶段 2 每张图只解码一次；同一 bbox 跨任务只保存一个无框、无 mask 的 PNG；
 6. `ui_content_missing` 直接引用完整原图 `[0,0,W,H]`，不再生成 whole PNG，也不重复归一化标签；
-7. 全部“完全未覆盖”GT（当前 C 基线为 35 个）都会进入 overview 选择；partial failure 按任务、
-   补偿量和页面密度分层抽样，其他类别默认每类 50 条。
+7. 当前推荐候选的全部 107 个失败 GT（20 个 uncovered、87 个 partial）逐条生成四联图；
+   可选 overview 仍只用于其他异常类别抽样，不影响正式 crop。
 
 五组候选含义：
 
@@ -392,6 +479,14 @@ work_dirs/ui5_crop_audit_20260825/
     statistics.csv
     task_aware_manifest.jsonl
     gt_failures.jsonl
+    gt_failures_visualized.jsonl
+    failure_diagnosis_summary.json
+    failure_visualizations/
+      ui_occlusion/{partial_intersection,uncovered}/*.png
+      ui_cropping/{partial_intersection,uncovered}/*.png
+      ui_text_overflow/{partial_intersection,uncovered}/*.png
+      ui_text_ellipsis/{partial_intersection,uncovered}/*.png
+      gallery/{index,uncovered_all,representative_partial,diagnosis_summary}.html
     cross_task_supervision.jsonl
     training_ready.json        # 仅严格 gate 全部通过时存在
     ui5_crop_audit.xlsx
@@ -424,6 +519,31 @@ Excel 只包含五个有决策价值的 sheet：`summary`、`task_overlap`、`im
 - partial crop 均为 `training_eligible=false`，每个原图 × 任务最多一个 hard negative；
 - `ui_content_missing` 完整覆盖率为 100%，normalized GT 与输入完全一致；
 - train/val 同内容重叠数为 0。
+
+`next_stage_gate.conditions` 会显式记录原有六项和以下五项：
+`same_content_cross_train_val_count_zero`、`content_missing_recall_equals_1`、
+`content_missing_normalized_gt_mismatch_count_zero`、`input_snapshot_unchanged`、
+`all_reports_written_successfully`。最终 `passes` 是全部 11 项的逻辑与。
+
+每次刷新报告一开始都会使旧 `training_ready.json` 失效。只有 geometry/materialization、
+content_missing、输入快照、JSONL/CSV/Excel/四联图报告全部成功且 gate 全部通过后，脚本才在
+最后一步原子写入新 marker。marker 包含 audit state、输入快照和最终 summary 的 digest；运行中断
+或任一检查失败都不会留下训练入口可以接受的旧 marker。
+
+使用检测 crop 的训练入口会在启动前再次校验 marker 和三个 digest。显式设置 audit 目录：
+
+```bash
+export UI5_USE_DETECTION_CROPS=1
+export UI5_CROP_AUDIT_DIR=/absolute/path/to/work_dirs/ui5_crop_audit_20260825/crop_audit_v3
+bash shell/train_locany_ui_defect.sh ...
+```
+
+也可以单独执行同一项只读校验：
+
+```bash
+python scripts/validate_ui5_crop_training_ready.py \
+  --audit-dir /absolute/path/to/work_dirs/ui5_crop_audit_20260825/crop_audit_v3
+```
 
 若未达到，先看 `gt_failures.jsonl` 和 overview，调整 link/context 参数；不得读取 GT 位置
 直接补 crop。即使 gate 通过，也只是允许进入 full image、full+crop、full+crop 且推理使用 crop

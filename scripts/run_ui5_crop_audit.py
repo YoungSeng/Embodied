@@ -131,6 +131,40 @@ ANOMALY_PRIORITY = (
     "max_crops_or_forced_merge",
     "roundtrip_error",
 )
+METRIC_DEFINITIONS = {
+    "gt_box_containment_recall": (
+        "至少被一个 crop 完整包含的 GT bbox 数 / 所有正样本中的 GT bbox 总数；"
+        "负样本 gt_count=0，不进入分母"
+    ),
+    "positive_sample_success_rate": (
+        "全部 GT bbox 都被完整包含的正样本数 / 正样本总数；负样本不进入分母"
+    ),
+    "near_full_image_ratio": (
+        "crop union area / original area > 0.8 的图片任务样本数 / 该范围全部图片任务样本数；"
+        "包含正样本和负样本"
+    ),
+    "gt_gain_over_1_25_1_5_2_0_ratio": (
+        "放大倍率超过阈值且已被完整包含的 GT bbox 数 / 已被完整包含且可计算放大倍率的 GT bbox 数"
+    ),
+    "negative_samples": (
+        "只描述数据组成；不参与 GT bbox 完整覆盖率或正样本全部成功率的分母"
+    ),
+}
+FINAL_TRAINING_GATE_CONDITIONS = frozenset(
+    {
+        "region_overall_recall_at_least_0_99",
+        "each_region_task_recall_at_least_0_98",
+        "detector_boundary_cut_count_zero",
+        "region_roundtrip_error_over_1_count_zero",
+        "partial_crop_training_eligible_count_zero",
+        "hard_negative_max_one_per_image_task",
+        "same_content_cross_train_val_count_zero",
+        "content_missing_recall_equals_1",
+        "content_missing_normalized_gt_mismatch_count_zero",
+        "input_snapshot_unchanged",
+        "all_reports_written_successfully",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -2108,10 +2142,17 @@ def write_excel_report(
         "gt_gain_over_1_25_ratio", "gt_gain_over_1_5_ratio", "gt_gain_over_2_0_ratio",
         "empty_detection_fallback_images", "forced_merge_images", "detector_boundary_cut_count",
         "roundtrip_error_over_1_count", "anomaly_event_count",
+        "gt_recall_denominator_definition", "positive_success_denominator_definition",
+        "near_full_denominator_definition", "gain_denominator_definition",
+        "negative_samples_definition",
     ]
     summary_sheet.append(summary_headers)
     for config_name in candidate_summaries:
-        for scope in ("ALL", *TASK_NAMES):
+        scopes = ["ALL"]
+        if "REGION_ALL" in candidate_summaries[config_name]["by_scope"]:
+            scopes.append("REGION_ALL")
+        scopes.extend(TASK_NAMES)
+        for scope in scopes:
             metric = candidate_summaries[config_name]["by_scope"][scope]
             summary_sheet.append(
                 [
@@ -2128,6 +2169,11 @@ def write_excel_report(
                     metric["gt_gain_over_2_0_ratio"], metric["empty_detection_fallback_images"],
                     metric["forced_merge_images"], metric["detector_boundary_cut_count"],
                     metric["roundtrip_error_over_1_count"], metric["anomaly_event_count"],
+                    METRIC_DEFINITIONS["gt_box_containment_recall"],
+                    METRIC_DEFINITIONS["positive_sample_success_rate"],
+                    METRIC_DEFINITIONS["near_full_image_ratio"],
+                    METRIC_DEFINITIONS["gt_gain_over_1_25_1_5_2_0_ratio"],
+                    METRIC_DEFINITIONS["negative_samples"],
                 ]
             )
 
@@ -2182,7 +2228,8 @@ def write_excel_report(
         "intersecting_crop_ids", "intersecting_crop_bboxes", "failure_type",
         "detection_density", "required_compensation_px",
         "required_max_single_side_px", "required_total_px", "compensation_bucket",
-        "visualization",
+        "text_detection_count", "icon_detection_count", "crop_count_for_task",
+        "manual_root_cause", "manual_note", "visualization", "visualization_4panel",
     ]
     failure_sheet.append(failure_headers)
     for row in gt_failures:
@@ -2204,7 +2251,11 @@ def write_excel_report(
     compare_sheet.append(compare_headers)
     for config_name, config_summary in candidate_summaries.items():
         config = config_summary.get("parameters", {})
-        for scope in ("ALL", *TASK_NAMES):
+        scopes = ["ALL"]
+        if "REGION_ALL" in config_summary["by_scope"]:
+            scopes.append("REGION_ALL")
+        scopes.extend(TASK_NAMES)
+        for scope in scopes:
             metric = config_summary["by_scope"][scope]
             rule = config.get("task_rules", {}).get(scope, {})
             compare_sheet.append(
@@ -2301,6 +2352,7 @@ def write_excel_report(
         (detail_sheet, "overview"),
         (detail_sheet, "source_image"),
         (failure_sheet, "visualization"),
+        (failure_sheet, "visualization_4panel"),
         *[(detail_sheet, f"crop_{index:02d}") for index in range(1, 11)],
     ]
     for sheet, header_name in hyperlink_columns:
@@ -2346,6 +2398,118 @@ def audit_input_snapshot(
 def audit_state_digest(state: Mapping[str, Any]) -> str:
     payload = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def invalidate_training_ready_marker(marker_path: Path) -> None:
+    """Atomically make any previous success marker unusable before refresh."""
+    marker_path.unlink(missing_ok=True)
+
+
+def build_final_training_gate(
+    candidate_gate: Mapping[str, Any],
+    *,
+    same_content_cross_train_val_count: int,
+    content_missing_recall: float,
+    content_missing_normalized_gt_mismatch_count: int,
+    input_snapshot_unchanged: bool,
+    all_reports_written_successfully: bool,
+) -> dict[str, Any]:
+    conditions = dict(candidate_gate["conditions"])
+    conditions.update(
+        {
+            "same_content_cross_train_val_count_zero": (
+                int(same_content_cross_train_val_count) == 0
+            ),
+            "content_missing_recall_equals_1": (
+                math.isclose(float(content_missing_recall), 1.0, abs_tol=1e-12)
+            ),
+            "content_missing_normalized_gt_mismatch_count_zero": (
+                int(content_missing_normalized_gt_mismatch_count) == 0
+            ),
+            "input_snapshot_unchanged": bool(input_snapshot_unchanged),
+            "all_reports_written_successfully": bool(
+                all_reports_written_successfully
+            ),
+        }
+    )
+    passes = all(bool(value) for value in conditions.values())
+    return {
+        **candidate_gate,
+        "conditions": conditions,
+        "passes": passes,
+        "training_ready": passes,
+        "training_started": False,
+        "failed_conditions": [
+            name for name, passed in conditions.items() if not passed
+        ],
+    }
+
+
+def validate_training_ready_marker(audit_dir: Path) -> dict[str, Any]:
+    """Validate marker digests against live audit inputs before crop training."""
+    audit_dir = audit_dir.resolve(strict=True)
+    marker_path = audit_dir / "training_ready.json"
+    summary_path = audit_dir / "summary.json"
+    state_path = audit_dir / "audit_state.json"
+    if not marker_path.is_file():
+        raise RuntimeError(f"training-ready marker is missing: {marker_path}")
+    for required in (summary_path, state_path):
+        if not required.is_file():
+            raise RuntimeError(f"training-ready dependency is missing: {required}")
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if marker.get("training_ready") is not True:
+        raise RuntimeError("training-ready marker does not authorize training")
+    if marker.get("training_started") is not False:
+        raise RuntimeError("training-ready marker must record training_started=false")
+    if marker.get("created_after_all_checks") is not True:
+        raise RuntimeError("training-ready marker was not created after all checks")
+    if marker.get("audit_state_digest") != audit_state_digest(state):
+        raise RuntimeError("training-ready audit state digest mismatch")
+    if marker.get("summary_file_digest") != content_fingerprint(summary_path):
+        raise RuntimeError("training-ready summary digest mismatch")
+    if summary.get("audit_state_digest") != marker.get("audit_state_digest"):
+        raise RuntimeError("summary audit state digest mismatch")
+    if summary.get("training_ready") is not True:
+        raise RuntimeError("summary does not authorize training")
+    if summary.get("training_started") is not False:
+        raise RuntimeError("summary must record training_started=false")
+    gate = summary.get("next_stage_gate", {})
+    if gate.get("passes") is not True or gate.get("training_ready") is not True:
+        raise RuntimeError("summary next-stage gate does not pass")
+    conditions = gate.get("conditions", {})
+    if set(conditions) != FINAL_TRAINING_GATE_CONDITIONS:
+        raise RuntimeError("summary does not contain the complete final training gate")
+    if not all(bool(value) for value in conditions.values()):
+        raise RuntimeError("summary contains a failed or missing training gate condition")
+    recommended = summary.get("recommended_config")
+    if not recommended or marker.get("recommended_config") != recommended:
+        raise RuntimeError("training-ready recommended config mismatch")
+    snapshot = summary.get("input_snapshot_after")
+    if not isinstance(snapshot, Mapping):
+        raise RuntimeError("summary input_snapshot_after is missing")
+    if marker.get("input_snapshot_digest") != audit_state_digest(snapshot):
+        raise RuntimeError("training-ready input snapshot digest mismatch")
+    if summary.get("input_snapshot_digest") != marker.get("input_snapshot_digest"):
+        raise RuntimeError("summary input snapshot digest mismatch")
+    output_dir = audit_dir.parent
+    paths = AuditPaths(output_dir, audit_dir.name)
+    live_snapshot = audit_input_snapshot(
+        paths,
+        read_jsonl(paths.unique_images),
+        read_jsonl(paths.merged),
+        read_jsonl(paths.task_samples),
+    )
+    if live_snapshot != snapshot:
+        raise RuntimeError("live manifest/detections no longer match training-ready snapshot")
+    return {
+        "training_ready": True,
+        "recommended_config": recommended,
+        "audit_state_digest": marker["audit_state_digest"],
+        "input_snapshot_digest": marker["input_snapshot_digest"],
+        "summary_file_digest": marker["summary_file_digest"],
+    }
 
 
 def initialize_crop_audit_v3(
@@ -3063,6 +3227,8 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
     paths = AuditPaths(
         args.output_dir, str(getattr(args, "crop_audit_name", "crop_audit_v3"))
     )
+    marker_path = paths.crop_audit / "training_ready.json"
+    invalidate_training_ready_marker(marker_path)
     detection_rows = read_jsonl(paths.merged)
     detections = {str(row["image_id"]): row for row in detection_rows}
     unique = read_jsonl(paths.unique_images)
@@ -3082,8 +3248,6 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
     supervision_audit, supervision_rows = build_cross_task_supervision_audit(
         samples, overlap
     )
-    if supervision_audit["same_content_cross_train_val_count"] != 0:
-        raise RuntimeError("same-content train/val leakage must be zero before crop audit")
     audit_state = initialize_crop_audit_v3(
         args, paths, unique, input_snapshot=input_snapshot
     )
@@ -3307,6 +3471,7 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
                 [row for row in details if row["task"] == task]
             )
         region_details = [row for row in details if row["task"] in REGION_TASKS]
+        by_scope["REGION_ALL"] = aggregate_scope(region_details)
         by_density = {
             density: aggregate_scope(
                 [row for row in region_details if row["detection_density"] == density]
@@ -3585,63 +3750,180 @@ def run_crop_audit(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "roundtrip_gate_excluded": True,
     }
-    if content_scope["gt_box_containment_recall"] != 1.0:
-        raise AssertionError("ui_content_missing full-image containment must be 100%")
-    if summary["content_missing_checks"]["normalized_gt_mismatch_count"] != 0:
-        raise AssertionError("ui_content_missing normalized GT must be reused verbatim")
-    gate = dict(candidate_gates[selected_name])
-    gate.update(
-        {
-            "passes": bool(candidate_gates[selected_name]["passes"]),
-            "training_ready": bool(candidate_gates[selected_name]["passes"]),
-            "training_started": False,
-        }
-    )
-    summary["next_stage_gate"] = gate
-    if gate["passes"]:
-        atomic_write_json(
-            paths.crop_audit / "training_ready.json",
-            {
-                "training_ready": True,
-                "recommended_config": selected_name,
-                "training_started": False,
-                "audit_state_digest": state_digest,
-            },
-        )
     input_snapshot_after = audit_input_snapshot(
         paths, unique, detection_rows, samples
     )
-    if input_snapshot_after != input_snapshot:
-        raise RuntimeError("manifest or merged detections changed during crop-only audit")
+    input_snapshot_unchanged = input_snapshot_after == input_snapshot
     summary["input_snapshot_after"] = input_snapshot_after
-    summary["input_snapshot_unchanged"] = True
+    summary["input_snapshot_unchanged"] = input_snapshot_unchanged
+    summary["input_snapshot_digest"] = audit_state_digest(input_snapshot_after)
+    summary["audit_state_digest"] = state_digest
+    summary["metric_definitions"] = METRIC_DEFINITIONS
+    provisional_gate = build_final_training_gate(
+        candidate_gates[selected_name],
+        same_content_cross_train_val_count=int(
+            supervision_audit["same_content_cross_train_val_count"]
+        ),
+        content_missing_recall=float(
+            content_scope["gt_box_containment_recall"]
+        ),
+        content_missing_normalized_gt_mismatch_count=int(
+            summary["content_missing_checks"]["normalized_gt_mismatch_count"]
+        ),
+        input_snapshot_unchanged=input_snapshot_unchanged,
+        all_reports_written_successfully=False,
+    )
+    summary["next_stage_gate"] = provisional_gate
+    summary["training_ready"] = False
+    # Leave a fail-closed summary on disk while report generation is in flight.
+    # If any later writer raises, no valid marker exists and this provisional
+    # summary names all currently failed conditions, including reports=false.
+    atomic_write_json(paths.crop_audit / "summary.json", summary)
 
     atomic_write_jsonl(
         paths.crop_audit / "cross_task_supervision.jsonl", supervision_rows
     )
-    atomic_write_json(paths.crop_audit / "summary.json", summary)
     write_statistics_csv(paths.crop_audit / "statistics.csv", report_details)
     atomic_write_jsonl(paths.crop_audit / "task_aware_manifest.jsonl", report_details)
     atomic_write_jsonl(paths.crop_audit / "gt_failures.jsonl", report_failures)
     atomic_write_json(
         paths.crop_audit / "materialization_summary.json", summary["materialization"]
     )
+    from render_ui5_crop_failures import (
+        EXPECTED_FAILURES_BY_DENSITY,
+        EXPECTED_FAILURES_BY_TASK,
+        render_failure_visualizations,
+    )
+
+    strict_current_audit = expected_unique == 17281
+    if strict_current_audit and selected_name != "TA_CTX015_H050":
+        raise RuntimeError(
+            "the 17,281-image v3 refresh must select TA_CTX015_H050; "
+            f"found {selected_name}"
+        )
+    summary["failure_visualizations"] = render_failure_visualizations(
+        output_dir=paths.output,
+        crop_audit_name=paths.crop_audit_name,
+        config_name=selected_name,
+        expected_failures=107 if strict_current_audit else len(report_failures),
+        expected_partial=87 if strict_current_audit else sum(
+            row["failure_type"] == "partial_intersection" for row in report_failures
+        ),
+        expected_uncovered=20 if strict_current_audit else sum(
+            row["failure_type"] == "uncovered" for row in report_failures
+        ),
+        expected_by_task=EXPECTED_FAILURES_BY_TASK if strict_current_audit else None,
+        expected_by_density=(
+            EXPECTED_FAILURES_BY_DENSITY if strict_current_audit else None
+        ),
+        resume=resume,
+    )
+    visualized_failure_rows = read_jsonl(
+        paths.crop_audit / "gt_failures_visualized.jsonl"
+    )
     material_reporter.update(
         len(unique), detail="阶段 2/2 完成，正在写唯一 Excel 与机器可读报告", force=True
     )
+    required_before_excel = [
+        paths.crop_audit / "cross_task_supervision.jsonl",
+        paths.crop_audit / "statistics.csv",
+        paths.crop_audit / "task_aware_manifest.jsonl",
+        paths.crop_audit / "gt_failures.jsonl",
+        paths.crop_audit / "gt_failures_visualized.jsonl",
+        paths.crop_audit / "failure_diagnosis_summary.json",
+        paths.crop_audit / "materialization_summary.json",
+        paths.crop_audit / "failure_visualizations" / "gallery" / "index.html",
+        paths.crop_audit / "failure_visualizations" / "gallery" / "uncovered_all.html",
+        paths.crop_audit / "failure_visualizations" / "gallery" / "representative_partial.html",
+        paths.crop_audit / "failure_visualizations" / "gallery" / "diagnosis_summary.html",
+    ]
+    for name in candidate_names:
+        candidate_root = paths.crop_audit / f"candidate_{name}"
+        required_before_excel.extend(
+            [
+                candidate_root / "task_aware_manifest.jsonl",
+                candidate_root / "gt_failures.jsonl",
+                candidate_root / "anomalies.json",
+            ]
+        )
+    required_before_excel.extend(
+        selected_root / "preview" / f"{task}.jsonl" for task in TASK_NAMES
+    )
+    missing_reports = [str(path) for path in required_before_excel if not path.is_file()]
+    reports_ready_for_excel = not missing_reports
+    final_gate = build_final_training_gate(
+        candidate_gates[selected_name],
+        same_content_cross_train_val_count=int(
+            supervision_audit["same_content_cross_train_val_count"]
+        ),
+        content_missing_recall=float(
+            content_scope["gt_box_containment_recall"]
+        ),
+        content_missing_normalized_gt_mismatch_count=int(
+            summary["content_missing_checks"]["normalized_gt_mismatch_count"]
+        ),
+        input_snapshot_unchanged=input_snapshot_unchanged,
+        all_reports_written_successfully=reports_ready_for_excel,
+    )
+    summary["next_stage_gate"] = final_gate
+    summary["training_ready"] = final_gate["passes"]
+    summary["report_write_check"] = {
+        "required_before_excel": [str(path.resolve()) for path in required_before_excel],
+        "missing_before_excel": missing_reports,
+    }
     write_excel_report(
         paths.crop_audit / "ui5_crop_audit.xlsx",
         summary,
         overlap,
         report_details,
-        report_failures,
+        visualized_failure_rows,
     )
+    excel_path = paths.crop_audit / "ui5_crop_audit.xlsx"
+    if not excel_path.is_file():
+        raise RuntimeError(f"Excel report was not written: {excel_path}")
+    # Recompute with the Excel existence included, then atomically publish the
+    # final summary.  training_ready.json is intentionally the final write.
+    final_gate = build_final_training_gate(
+        candidate_gates[selected_name],
+        same_content_cross_train_val_count=int(
+            supervision_audit["same_content_cross_train_val_count"]
+        ),
+        content_missing_recall=float(
+            content_scope["gt_box_containment_recall"]
+        ),
+        content_missing_normalized_gt_mismatch_count=int(
+            summary["content_missing_checks"]["normalized_gt_mismatch_count"]
+        ),
+        input_snapshot_unchanged=input_snapshot_unchanged,
+        all_reports_written_successfully=(reports_ready_for_excel and excel_path.is_file()),
+    )
+    summary["next_stage_gate"] = final_gate
+    summary["training_ready"] = final_gate["passes"]
+    summary["report_write_check"]["excel"] = str(excel_path.resolve())
+    summary["report_write_check"]["all_reports_written_successfully"] = bool(
+        final_gate["conditions"]["all_reports_written_successfully"]
+    )
+    summary_path = paths.crop_audit / "summary.json"
+    atomic_write_json(summary_path, summary)
+    if final_gate["passes"]:
+        atomic_write_json(
+            marker_path,
+            {
+                "training_ready": True,
+                "recommended_config": selected_name,
+                "training_started": False,
+                "audit_state_digest": state_digest,
+                "input_snapshot_digest": audit_state_digest(input_snapshot_after),
+                "summary_file_digest": content_fingerprint(summary_path),
+                "created_after_all_checks": True,
+            },
+        )
     material_reporter.update(
         len(unique),
         status="completed",
         detail=(
             f"crop-only v3 完成；materialized={selected_name}，"
-            f"training_ready={gate['passes']}，OCR/icon 未运行"
+            f"training_ready={final_gate['passes']}，OCR/icon 未运行"
         ),
         force=True,
     )
