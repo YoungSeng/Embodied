@@ -146,3 +146,53 @@ logging, and exit-code propagation, then delegate training parameters to
 An interrupted run resumes from the newest complete checkpoint in the same
 `OUTPUT_DIR`, including optimizer, scheduler, random state, and packed
 dataloader state.
+
+
+### Eval
+```
+cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+
+BASE=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/hf_home/hub/models--nvidia--LocateAnything-3B/snapshots/c32291ca5e996f5a7a485845b4f57a233936bba0
+RUN_DIR=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_models/locany-3b-ui-cpt-v4-h20x2-formal
+CKPT=${RUN_DIR}/checkpoint-替换成实际STEP
+RECIPE=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4/recipe/locany_cpt_train.json
+
+CUDA_VISIBLE_DEVICES=0 \
+/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python \
+scripts/eval_locany_cpt_learning.py \
+  --checkpoint "$CKPT" \
+  --base-model "$BASE" \
+  --processor-path "$BASE" \
+  --recipe "$RECIPE" \
+  --output-dir "${RUN_DIR}/eval/$(basename "$CKPT")" \
+  --samples-per-task 1 \
+  --device cuda:0 \
+  --attn-implementation sdpa \
+  --max-new-tokens 1024
+```
+
+```
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+
+BASE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/hf_home/hub/models--nvidia--LocateAnything-3B/snapshots/c32291ca5e996f5a7a485845b4f57a233936bba0
+RUN_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_models/locany-3b-ui-cpt-v4-a100x4-formal
+CKPT=${RUN_DIR}/checkpoint-1234
+RECIPE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4/recipe/locany_cpt_train.json
+
+test -f scripts/eval_locany_cpt_learning.py
+test -d "${CKPT}"
+
+CUDA_VISIBLE_DEVICES=0 \
+/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python \
+scripts/eval_locany_cpt_learning.py \
+  --checkpoint "${CKPT}" \
+  --base-model "${BASE}" \
+  --processor-path "${BASE}" \
+  --recipe "${RECIPE}" \
+  --output-dir "${RUN_DIR}/eval/$(basename "${CKPT}")" \
+  --samples-per-task 1 \
+  --device cuda:0 \
+  --attn-implementation sdpa \
+  --vision-attn-implementation flash_attention_2 \
+  --max-new-tokens 1024
+```
