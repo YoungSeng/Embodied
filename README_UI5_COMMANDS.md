@@ -1,8 +1,123 @@
 # LocateAnything UI5 常用命令
 
-检测 crop 审计的分阶段启动方式见
-[README_UI5_CROP_AUDIT.md](README_UI5_CROP_AUDIT.md)。该流程关闭 CPT，完成审计前不得启动
-full image / full+crop / 推理 crop 三组训练对照。
+## v4.1 当前执行顺序
+
+先完成 [README_UI5_CROP_AUDIT.md](README_UI5_CROP_AUDIT.md) 顶部的唯一一条
+`shell/run_ui5_gt_repair.sh` 命令。只有新目录
+`crop_audit_v4_gt_repair/training_ready.json` 生成且下面的独立校验通过，才允许跑 20-step
+smoke；smoke checkpoint 可恢复后，才提交正式训练。不要一次把三条命令同时后台启动。
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+
+UI5_AUDIT_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
+UI5_CROP_META=${UI5_AUDIT_DIR}/training_recipes/ui_defect_5class_train_full_plus_crop.json
+
+python scripts/validate_ui5_crop_training_ready.py \
+  --audit-dir "${UI5_AUDIT_DIR}" \
+  --recipe "${UI5_CROP_META}"
+```
+
+校验不仅看 marker 是否存在，还会重新比较 audit state、input snapshot、summary、排除清单、
+recipe/JSONL/recipe summary 的 digest。任何一项变化都会在 torchrun 前拒绝启动，不能静默
+回退到全图 META_PATH。
+
+## v4.1 A800 四卡 20-step crop smoke
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+
+UI5_AUDIT_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
+
+python scripts/run_locany_ui5_local_debug.py \
+  --machine a800 \
+  --gpus 4 \
+  --cuda-devices 0,1,2,3 \
+  --max-num-tokens 12800 \
+  --max-steps 20 \
+  --save-steps 20 \
+  --use-detection-crops \
+  --crop-audit-dir "${UI5_AUDIT_DIR}" \
+  --crop-train-mode full_plus_crop \
+  --run-name locany-ui5-v4-gtcrop-smoke20
+```
+
+训练启动日志必须显示：
+
+- `UI5_USE_DETECTION_CROPS=1`；
+- 最终 `META_PATH` 以 `ui_defect_5class_train_full_plus_crop.json` 结尾；
+- full/crop/GT-repair/excluded 记录数；
+- 至少一个 `manual_gt_repair` crop 路径和多个 `raw_detector` crop 路径；
+- 四卡 `MAX_NUM_TOKENS=12800`、`GRADIENT_ACCUMULATION_STEPS=2`；
+- 环境 preflight 通过。
+
+完成后校验可恢复 checkpoint：
+
+```bash
+python scripts/locany_ui5_checkpoint.py validate \
+  --checkpoint work_dirs/locany-ui5-v4-gtcrop-smoke20/checkpoint-20 \
+  --mode resume \
+  --expected-ranks 4
+```
+
+只有输出包含 `"valid": true`，且 `training_args.bin` 非空、DeepSpeed model/optimizer、
+trainer state 和 4 个 dataloader rank state 均完整，才进入正式训练。环境 pre/post fingerprint
+也必须一致。
+
+## v4.1 A800 四卡正式 crop 训练
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+
+UI5_AUDIT_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
+
+python scripts/submit_locany_ui5.py \
+  --machine a800 \
+  --resource-group aiai_locate \
+  --gpus 4 \
+  --max-num-tokens 12800 \
+  --install-system-runtime-deps \
+  --use-detection-crops \
+  --crop-audit-dir "${UI5_AUDIT_DIR}" \
+  --crop-train-mode full_plus_crop \
+  --enable-eval \
+  --eval-at-start \
+  --eval-interval-steps 1000 \
+  --max-steps 16000 \
+  --save-steps 4000 \
+  --run-name locany-ui5-v4-gtcrop-a800x4
+```
+
+这条命令的评测默认仍是 full-image，适合作为 `full+crop` 训练对照。如果要跑第三组
+“full+crop 训练，并在推理/评测时使用无遗漏重叠切图”，在同一命令中额外添加：
+
+```bash
+--eval-inference-crop-mode lossless_tiling
+```
+
+`lossless_tiling` 不读取 GT repair：1–10 个普通矩形 tile 的并集覆盖原图 100%，最后一行和
+最后一列贴齐边界，局部预测先映射回原图再跨 tile 去重；`ui_content_missing` 始终保留完整
+原图。必须使用不同 `--run-name` 区分两组评测。
+
+如改为八卡，只改：
+
+```text
+--gpus 8 --max-num-tokens 25600
+```
+
+八卡固定 `GRADIENT_ACCUMULATION_STEPS=1`；crop recipe、marker、评测和 checkpoint 规则不变。
+
+运行时依赖修复来源为 `de30357f73b6b393840efcb7eb3ca37182e86cc4`，checkpoint/SIGBUS
+修复来源为 `ed5add660608b93ed4f9d5c68efb1c04478aa6bd`；crop 分支完成实现提交为
+`a0ee63abbf7ec702a5891e4f9bb4bcd1b5a02dbb`，进度实现提交为
+`b353b6d2c41a1751dab3bee8bb1a5cb7bd9ea727`。
+
+---
+
+## 以下为旧版全图训练和运行排障命令
+
+以下内容保留用于历史对照。v4.1 crop 训练不要使用旧工程目录或下面不带
+`--use-detection-crops` 的命令替代上面的 smoke/正式命令。
 
 先进入工程并激活现有环境：
 

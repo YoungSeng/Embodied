@@ -1,19 +1,158 @@
-# UI5 检测 Crop 审计（CPT disabled）
+# UI5 Crop v4.1：GT 修复、训练接线与无遗漏推理切图
 
-代码分支为 `locany-ui5-det-crop-v1`，从当时最新的 `origin/locany-cpt-v1` 创建。
-本轮修改前的实现提交是 `114797b638c5b9229aed9a2045539e557f6f62c8`；脚本启动时会检查
-所需 locany-cpt 基线仍是当前 HEAD 的祖先，不要求 HEAD 恰好停在某个旧提交。
-本轮只复用已更新的 Detail Pyramid、relation/gate、BF16 修复和 UI5 训练/评测基础设施：
+当前分支是 `locany-ui5-det-crop-v1`，CPT 数据与 CPT 训练入口保持关闭。v4.1 只读取已经
+完成的 17,281 张唯一图片 manifest、OCR/icon JSONL 和 `crop_audit_v3`，不会重新运行
+PP-OCRv5、OmniParser，也不会覆盖 `crop_audit_v3` 或原始 `detections.jsonl`。
 
-- 不加载 CPT 数据；
-- 不开放 CPT 训练入口；
-- 不启动正式训练；
-- crop 覆盖率高只说明方案可用，不代表训练效果一定提升。
+当前代码提交：
 
-`ui-region-parser` 保持为同级独立工具仓库，固定在
-`06eaebf8eb4ea01e61b690f2ff972bf614915918`。审计入口只复用它的 detector 类和
-cropper 几何函数，不使用其基于 basename 的 annotation/image 聚合，也不会在全量检测时
-保存 combined/stage 可视化。
+- v4.1 主实现：`a0ee63abbf7ec702a5891e4f9bb4bcd1b5a02dbb`；
+- 实时进度与 ETA：`b353b6d2c41a1751dab3bee8bb1a5cb7bd9ea727`；
+- 从 `locany-cpt-v1` 功能等价移植的运行时修复来源：
+  `de30357f73b6b393840efcb7eb3ca37182e86cc4`；
+- 从 `locany-cpt-v1` 功能等价移植的 SIGBUS/checkpoint 修复来源：
+  `ed5add660608b93ed4f9d5c68efb1c04478aa6bd`。
+
+这里没有整体 merge 或覆盖 `locany-cpt-v1`。crop audit、training-ready、recipe、运行时
+preflight 和 checkpoint 完整性逻辑均已合并保留。`ui-region-parser` 仍是同级独立仓库，固定在
+`06eaebf8eb4ea01e61b690f2ff972bf614915918`。
+
+## 现在只需要先跑这一条
+
+在 A800/YG 内网机器的 crop worktree 中执行：
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+
+UI5_OUTPUT_ROOT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_crop_audit_20260825
+UI5_BASE_META=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied/data/ui_defect_locany_v3/recipe/ui_defect_5class_train.json
+
+bash shell/run_ui5_gt_repair.sh \
+  --output-dir "${UI5_OUTPUT_ROOT}" \
+  --parser-root ../ui-region-parser \
+  --base-meta "${UI5_BASE_META}" \
+  --source-audit-name crop_audit_v3 \
+  --crop-audit-name crop_audit_v4_gt_repair \
+  --expected-unique-images 17281 \
+  --resume
+```
+
+旧工程中的 base meta 只作为只读输入，不需要复制整个 `data/`，也不要 `mkdir data` 后期待
+脚本自动补齐数据。若新 worktree 已经有同一份 `data/ui_defect_locany_v3`，可以把
+`UI5_BASE_META` 改为新 worktree 内的绝对路径。
+
+这一条 wrapper 会按顺序完成：
+
+1. 校验 v3、17,281 个 image id、原始 detection digest 和 107 个原始失败；
+2. 排除唯一已确认错误标注，并保存独立证据目录；
+3. 对 106 个有效失败执行仅限训练集、仅限对应 task/sample 的 GT repair；
+4. 重跑 CPU geometry，复用或生成普通矩形 crop，生成 106 张四联图；
+5. 写 summary、CSV、Excel 和 task-aware manifest；
+6. 生成 full-only 与 full+crop recipe；
+7. 所有 19 项 gate 通过后，最后原子写入 `training_ready.json`。
+
+它不会启动训练。它也不会调用 prepare/text/icon/merge；开头应打印：
+
+```text
+detector_stages_executed=[]; OCR/icon/merge disabled
+```
+
+## 实时看进度和剩余时间
+
+当前终端会每 10 秒打印完成数、百分比、速度、耗时和 ETA，依次显示：
+
+```text
+gt-repair-geometry
+gt-repair-materialize
+gt-repair-visualizations
+gt-repair-reports
+gt-repair-recipe
+```
+
+`--resume` 开始时还会打印已复用的 geometry shard、crop 和四联图数量。另一个终端可查看
+最后一次原子状态快照：
+
+```bash
+watch -n 2 'python -m json.tool \
+  work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair/run_status.json'
+```
+
+ETA 只按本轮真正需要处理的未完成项计算。刚启动或全部复用时速度为 0，ETA 显示
+`--:--:--` 或很快完成是正常现象。
+
+## v4.1 输出与指标语义
+
+新结果只写入：
+
+```text
+work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair/
+  excluded_annotation_cases/
+  gt_repair_visualizations/
+  candidate_TA_CTX015_H050_GT_REPAIR/
+  training_recipes/
+  gt_repair_detections.jsonl
+  gt_repair_actions.jsonl
+  excluded_training_samples.jsonl
+  task_aware_manifest.jsonl
+  materialization_summary.json
+  summary.json
+  statistics.csv
+  ui5_crop_audit.xlsx
+  training_ready.json
+```
+
+报告必须同时保留两套口径：
+
+- `raw_detector_region_gt_recall = 17691 / 17798 = 99.3988%`，这是未使用 GT repair 的
+  原始 detector crop 结果；
+- `training_materialization_gt_recall_after_repair = 17797 / 17797 = 100%`，只表示排除
+  1 个错误标注后，训练物化 crop 完整覆盖清洗后的训练 GT；它不代表 OCR/icon detector
+  具有 100% 泛化召回率。
+
+`sample_3a3922c5762298f04c8d` 只从 `ui_text_overflow` 训练记录中排除；同一图片在其他任务的
+监督仍保留。GT repair 严禁进入 val、test 和真实推理。
+
+## 如需单独重建 recipe
+
+上面的 wrapper 已经自动执行本节。只有 audit 已完成、仅需重建 recipe 时才单独运行：
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+
+UI5_PROJECT_ROOT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+UI5_AUDIT_DIR=${UI5_PROJECT_ROOT}/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
+
+python scripts/build_ui5_crop_training_recipe.py \
+  --audit-dir "${UI5_AUDIT_DIR}" \
+  --base-meta "${UI5_PROJECT_ROOT}/data/ui_defect_locany_v3/recipe/ui_defect_5class_train.json" \
+  --task-aware-manifest "${UI5_AUDIT_DIR}/task_aware_manifest.jsonl" \
+  --excluded-samples "${UI5_AUDIT_DIR}/excluded_training_samples.jsonl" \
+  --mode full_plus_crop \
+  --output-dir "${UI5_AUDIT_DIR}/training_recipes" \
+  --require-valid-gt-recall 1.0
+
+test -s "${UI5_AUDIT_DIR}/training_recipes/ui_defect_5class_train_full_plus_crop.json"
+test -s "${UI5_AUDIT_DIR}/training_recipes/ui_defect_5class_train_full_plus_crop.jsonl"
+test -s "${UI5_AUDIT_DIR}/training_recipes/recipe_summary.json"
+test -s "${UI5_AUDIT_DIR}/training_ready.json"
+```
+
+如果新 worktree 没有 `data/ui_defect_locany_v3`，仍应把 `--base-meta` 换成旧工程中的绝对
+路径，不要复制内网数据。
+
+## 运行状态说明
+
+代码和单元测试已在本地完成；公司内网的 v4 全量 crop、17,797 GT 验收、20-step 四卡
+训练 smoke 和正式训练仍必须由上述集群命令实际执行。本 README 不把本地代码测试冒充为
+A800 实跑结果。完整 smoke 和正式训练命令见
+[README_UI5_COMMANDS.md](README_UI5_COMMANDS.md)。
+
+---
+
+## 以下是 v3 原始检测审计历史说明
+
+以下章节保留用于追溯最初 OCR/icon 和 A/B/C、task-aware 参数审计。已有 detection 完整时，
+执行 v4.1 不需要重新运行这些命令。
 
 ## 1. 一次性准备仓库
 
