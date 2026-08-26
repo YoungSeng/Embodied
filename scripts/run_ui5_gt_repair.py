@@ -64,6 +64,12 @@ EXPECTED_VALID_REPAIRS = 106
 EXPECTED_REGION_GT_TOTAL_RAW = 17798
 EXPECTED_REGION_GT_CONTAINED_RAW = 17691
 EXPECTED_REGION_GT_TOTAL_CLEAN = 17797
+EXPECTED_VALID_REPAIRS_BY_TASK = {
+    "ui_occlusion": 46,
+    "ui_cropping": 23,
+    "ui_text_ellipsis": 35,
+    "ui_text_overflow": 2,
+}
 V4_GATE_CONDITIONS = V4_FINAL_TRAINING_GATE_CONDITIONS
 
 
@@ -194,7 +200,7 @@ def _context_box(gt: Sequence[int], width: int, height: int, ratio: float) -> li
 
 
 def make_repair_detection(
-    failure: Mapping[str, Any], *, audit_source: str
+    failure: Mapping[str, Any], *, audit_source: str, split: str
 ) -> dict[str, Any]:
     return {
         "bbox": [int(value) for value in failure["gt_bbox"]],
@@ -203,7 +209,7 @@ def make_repair_detection(
         "sample_id": str(failure["sample_id"]),
         "gt_index": int(failure["gt_index"]),
         "failure_type": str(failure["failure_type"]),
-        "split": "train",
+        "split": split,
         "audit_source": audit_source,
     }
 
@@ -225,8 +231,14 @@ def repair_sample_geometry(
     original_boxes = [list(map(int, box)) for box in source_result["crop_boxes"]]
     boxes = [list(box) for box in original_boxes]
     failures = [dict(row) for row in source_result.get("failures", [])]
+    split = str(sample.get("split", ""))
+    if failures and split != "train":
+        raise RuntimeError(
+            f"GT repair is training-only; refusing sample={sample['sample_id']} split={split!r}"
+        )
     repair_detections = [
-        make_repair_detection(row, audit_source=source_audit_name) for row in failures
+        make_repair_detection(row, audit_source=source_audit_name, split=split)
+        for row in failures
     ]
     actions: list[dict[str, Any]] = []
 
@@ -372,6 +384,60 @@ def build_exclusion_evidence(
     matching = [
         row for (sample_id, _), row in visualized.items() if sample_id == excluded_sample_id
     ]
+    if len(matching) != 1:
+        raise ValueError(
+            f"expected one visualized failure for excluded sample, found {len(matching)}"
+        )
+    failure = matching[0]
+    evidence = (
+        target_audit
+        / "excluded_annotation_cases"
+        / EXCLUDED_TASK
+        / excluded_sample_id
+    )
+    evidence.mkdir(parents=True, exist_ok=True)
+    gt_record_path = evidence / "gt_record.json"
+    if gt_record_path.is_file():
+        existing = json.loads(gt_record_path.read_text(encoding="utf-8"))
+        excluded_at = existing["excluded_at"]
+    else:
+        excluded_at = datetime.now(timezone.utc).isoformat()
+    gt_record = {
+        "sample_id": excluded_sample_id,
+        "image_id": sample["image_id"],
+        "task": sample["task"],
+        "gt_index": int(failure["gt_index"]),
+        "gt_bbox": failure["gt_bbox"],
+        "manual_conclusion": "annotation_error",
+        "excluded_at": excluded_at,
+        "audit_source": source_audit.name,
+        "source_data_deleted": False,
+    }
+    atomic_write_json(gt_record_path, gt_record)
+    atomic_write_json(evidence / "task_sample_record.json", sample)
+    visualization = Path(str(failure["visualization_4panel"])).resolve(strict=True)
+    shutil.copy2(visualization, evidence / "visualization_4panel.png")
+    source_image = Path(str(sample["canonical_path"])).resolve(strict=True)
+    with open_raw_image(source_image) as image:
+        atomic_save_png(image, evidence / "source_image.png")
+    _atomic_write_text(
+        evidence / "README.md",
+        "# UI5 text overflow 标注排除证据\n\n"
+        f"`{excluded_sample_id}` 的 `ui_text_overflow` GT 经人工复核存在标注问题，"
+        "因此只从该任务训练数据中排除。原始图片、原始 JSONL、v3 audit 和其他任务监督均未删除或修改。\n",
+    )
+    if not source_image.is_file():
+        raise AssertionError("source image disappeared while copying evidence")
+    return [
+        {
+            "sample_id": excluded_sample_id,
+            "image_id": sample["image_id"],
+            "task": EXCLUDED_TASK,
+            "reason": "annotation_error",
+            "evidence_dir": str(evidence.resolve()),
+            "source_records": sample.get("source_records", []),
+        }
+    ]
 
 
 def _detection_bbox(row: Mapping[str, Any]) -> list[int] | None:
@@ -487,60 +553,6 @@ def render_repair_visualizations(
         "<p>These views use saved detector JSONL only. GT repair is forbidden in validation, test and inference.</p>"
         + "\n".join(gallery_rows),
     )
-    if len(matching) != 1:
-        raise ValueError(
-            f"expected one visualized failure for excluded sample, found {len(matching)}"
-        )
-    failure = matching[0]
-    evidence = (
-        target_audit
-        / "excluded_annotation_cases"
-        / EXCLUDED_TASK
-        / excluded_sample_id
-    )
-    evidence.mkdir(parents=True, exist_ok=True)
-    gt_record_path = evidence / "gt_record.json"
-    if gt_record_path.is_file():
-        existing = json.loads(gt_record_path.read_text(encoding="utf-8"))
-        excluded_at = existing["excluded_at"]
-    else:
-        excluded_at = datetime.now(timezone.utc).isoformat()
-    gt_record = {
-        "sample_id": excluded_sample_id,
-        "image_id": sample["image_id"],
-        "task": sample["task"],
-        "gt_index": int(failure["gt_index"]),
-        "gt_bbox": failure["gt_bbox"],
-        "manual_conclusion": "annotation_error",
-        "excluded_at": excluded_at,
-        "audit_source": source_audit.name,
-        "source_data_deleted": False,
-    }
-    atomic_write_json(gt_record_path, gt_record)
-    atomic_write_json(evidence / "task_sample_record.json", sample)
-    visualization = Path(str(failure["visualization_4panel"])).resolve(strict=True)
-    shutil.copy2(visualization, evidence / "visualization_4panel.png")
-    source_image = Path(str(sample["canonical_path"])).resolve(strict=True)
-    with open_raw_image(source_image) as image:
-        atomic_save_png(image, evidence / "source_image.png")
-    _atomic_write_text(
-        evidence / "README.md",
-        "# UI5 text overflow 标注排除证据\n\n"
-        f"`{excluded_sample_id}` 的 `ui_text_overflow` GT 经人工复核存在标注问题，"
-        "因此只从该任务训练数据中排除。原始图片、原始 JSONL、v3 audit 和其他任务监督均未删除或修改。\n",
-    )
-    if not source_image.is_file():
-        raise AssertionError("source image disappeared while copying evidence")
-    return [
-        {
-            "sample_id": excluded_sample_id,
-            "image_id": sample["image_id"],
-            "task": EXCLUDED_TASK,
-            "reason": "annotation_error",
-            "evidence_dir": str(evidence.resolve()),
-            "source_records": sample.get("source_records", []),
-        }
-    ]
 
 
 def _geometry_shard_valid(
@@ -594,6 +606,40 @@ def _candidate_summary(details: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         },
         "by_scope": by_scope,
     }
+
+
+def validate_repair_inventory(
+    detections: Sequence[Mapping[str, Any]],
+    actions: Sequence[Mapping[str, Any]],
+    *,
+    expected_count: int,
+    expected_by_task: Mapping[str, int] | None = None,
+) -> None:
+    def key(row: Mapping[str, Any]) -> tuple[str, str, int]:
+        return str(row["task"]), str(row["sample_id"]), int(row["gt_index"])
+
+    detection_keys = [key(row) for row in detections]
+    action_keys = [key(row) for row in actions]
+    if len(detection_keys) != expected_count or len(set(detection_keys)) != expected_count:
+        raise ValueError(
+            f"expected {expected_count} unique valid repair detections, found "
+            f"rows={len(detection_keys)} unique={len(set(detection_keys))}"
+        )
+    if len(action_keys) != expected_count or set(action_keys) != set(detection_keys):
+        raise ValueError("repair actions do not map one-to-one to repair detections")
+    if any(row.get("source") != "manual_gt_repair" for row in detections):
+        raise ValueError("repair detection source must be manual_gt_repair")
+    if any(row.get("split") != "train" for row in detections):
+        raise ValueError("GT repair is forbidden outside the training split")
+    if expected_by_task is not None:
+        counts = defaultdict(int)
+        for task, _, _ in detection_keys:
+            counts[task] += 1
+        if dict(sorted(counts.items())) != dict(sorted(expected_by_task.items())):
+            raise ValueError(
+                f"valid repair task distribution changed: actual={dict(counts)}, "
+                f"expected={dict(expected_by_task)}"
+            )
 
 
 def _build_v4_gate(
@@ -889,14 +935,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     geometry_by_image = {str(row["image_id"]): row for row in geometry_rows}
     repair_detections = [row for record in geometry_rows for row in record["repair_detections"]]
     repair_actions = [row for record in geometry_rows for row in record["repair_actions"]]
-    if len(repair_detections) != args.expected_valid_repairs:
-        raise ValueError(
-            f"expected {args.expected_valid_repairs} valid repair detections, found {len(repair_detections)}"
-        )
-    if len(repair_actions) != args.expected_valid_repairs:
-        raise ValueError(
-            f"expected {args.expected_valid_repairs} repair actions, found {len(repair_actions)}"
-        )
+    validate_repair_inventory(
+        repair_detections,
+        repair_actions,
+        expected_count=args.expected_valid_repairs,
+        expected_by_task=(
+            EXPECTED_VALID_REPAIRS_BY_TASK
+            if args.expected_unique_images == 17281
+            else None
+        ),
+    )
     atomic_write_jsonl(target_audit / "gt_repair_detections.jsonl", repair_detections)
     atomic_write_jsonl(target_audit / "gt_repair_actions.jsonl", repair_actions)
 
@@ -941,6 +989,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     material_by_image = {str(row["image_id"]): row for row in material_rows}
     if len(material_by_image) != len(unique):
         raise ValueError("v4 materialization does not cover every unique image")
+
+    source_results_by_sample: dict[str, dict[str, Any]] = {}
+    for source_shard in source_shards:
+        for source_record in read_jsonl(source_shard):
+            for result in source_record["sample_results"]:
+                source_results_by_sample[str(result["sample_id"])] = dict(result)
+    repaired_results_by_sample = {
+        str(result["sample_id"]): {**result, "image_id": str(record["image_id"])}
+        for record in geometry_rows
+        for result in record["sample_results"]
+    }
+    render_repair_visualizations(
+        target_audit=target_audit,
+        actions=repair_actions,
+        unique_by_id=unique_by_id,
+        detections=detections,
+        source_results_by_sample=source_results_by_sample,
+        repaired_results_by_sample=repaired_results_by_sample,
+    )
+    if not all(Path(str(row["visualization_4panel"])).is_file() for row in repair_actions):
+        raise AssertionError("one or more GT repair four-panel visualizations are missing")
+    # Geometry shards remain resumable and immutable.  The flattened action
+    # report is republished with evidence paths after all 106 images exist.
+    atomic_write_jsonl(target_audit / "gt_repair_actions.jsonl", repair_actions)
 
     details: list[dict[str, Any]] = []
     post_failures: list[dict[str, Any]] = []
@@ -990,6 +1062,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "_ui5_sample_id": sample_id,
                         "_ui5_image_id": image_id,
                         "_ui5_task": sample["task"],
+                        "_ui5_split": sample.get("split"),
                         "_ui5_record_kind": "crop",
                         "_ui5_crop_source": crop_source,
                         "_ui5_crop_bbox": row["crop_bbox"],
@@ -1047,8 +1120,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         target_audit / "task_aware_manifest.jsonl",
         target_audit / "gt_failures.jsonl",
         target_audit / "gt_failures_visualized.jsonl",
+        target_audit / "gt_repair_visualizations" / "gallery" / "index.html",
     ]
     reports_written = all(path.is_file() for path in required_reports)
+    reports_written = reports_written and all(
+        path.stat().st_size > 0
+        for path in required_reports
+        if path.name not in {"gt_failures.jsonl", "gt_failures_visualized.jsonl"}
+    )
+    reports_written = reports_written and all(
+        Path(str(row["visualization_4panel"])).is_file() for row in repair_actions
+    )
     gate = _build_v4_gate(
         details=details,
         region=region,

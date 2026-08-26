@@ -37,6 +37,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tasks", nargs="+", choices=TASKS, default=list(TASKS))
     parser.add_argument("--max-images-per-task", type=int, default=0)
     parser.add_argument(
+        "--inference-crop-mode",
+        choices=("full_image", "lossless_tiling"),
+        default="full_image",
+    )
+    parser.add_argument("--tile-max-count", type=int, default=10)
+    parser.add_argument("--tile-target-long-side", type=int, default=1600)
+    parser.add_argument("--tile-overlap-ratio", type=float, default=0.10)
+    parser.add_argument("--tile-nms-iou", type=float, default=0.50)
+    parser.add_argument(
         "--relation-gate-mode", choices=("observe", "hard"), default="observe"
     )
     parser.add_argument("--relation-gate-threshold", type=float, default=None)
@@ -129,6 +138,16 @@ def build_command(
         "--fail-fast",
         "--relation-gate-mode",
         args.relation_gate_mode,
+        "--inference-crop-mode",
+        args.inference_crop_mode,
+        "--tile-max-count",
+        str(args.tile_max_count),
+        "--tile-target-long-side",
+        str(args.tile_target_long_side),
+        "--tile-overlap-ratio",
+        str(args.tile_overlap_ratio),
+        "--tile-nms-iou",
+        str(args.tile_nms_iou),
     ]
     if args.relation_gate_threshold is not None:
         command.extend(
@@ -176,6 +195,14 @@ def main() -> int:
         raise ValueError("--max-images-per-task cannot be negative")
     if args.failure_log_lines < 0:
         raise ValueError("--failure-log-lines cannot be negative")
+    if not 1 <= args.tile_max_count <= 10:
+        raise ValueError("--tile-max-count must be in [1, 10]")
+    if args.tile_target_long_side <= 0:
+        raise ValueError("--tile-target-long-side must be positive")
+    if not 0 < args.tile_overlap_ratio < 1:
+        raise ValueError("--tile-overlap-ratio must be in (0, 1)")
+    if not 0 <= args.tile_nms_iou <= 1:
+        raise ValueError("--tile-nms-iou must be in [0, 1]")
     args.checkpoint = args.checkpoint.expanduser().resolve()
     args.processor_path = args.processor_path.expanduser().resolve()
     args.input_dir = args.input_dir.expanduser().resolve()
@@ -237,6 +264,12 @@ def main() -> int:
     print("===== UI5 parallel inference scheduler =====")
     print(f"physical GPUs       : {','.join(gpus)}")
     print(f"logical device      : cuda:0 in every subprocess")
+    print(
+        "inference crop     : "
+        f"{args.inference_crop_mode} (max={args.tile_max_count}, "
+        f"long_side={args.tile_target_long_side}, overlap={args.tile_overlap_ratio}, "
+        f"nms={args.tile_nms_iou}, GT repair=disabled)"
+    )
     for task in ordered:
         source = "runtime profile" if previous_profile.get("tasks", {}).get(task) else "sample count"
         print(

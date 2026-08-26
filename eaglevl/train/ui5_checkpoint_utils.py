@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -10,6 +11,25 @@ from typing import Any
 
 
 CHECKPOINT_PATTERN = re.compile(r"^checkpoint-(\d+)$")
+
+
+def atomic_save_with_fsync(save_callable, obj: Any, target: str | Path, *args, **kwargs):
+    """Publish a torch-style binary only after a durable non-empty temp write."""
+
+    destination = Path(target)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+    try:
+        result = save_callable(obj, temporary, *args, **kwargs)
+        with temporary.open("rb+") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+        if temporary.stat().st_size <= 0:
+            raise RuntimeError(f"atomic save produced an empty file: {temporary}")
+        os.replace(temporary, destination)
+        return result
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def checkpoint_step(path: Path) -> int:

@@ -8,6 +8,8 @@ import textwrap
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from types import ModuleType
+from unittest import mock
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,12 +18,14 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import collect_ui5_metrics
+import check_locany_environment
 import locany_ui5_checkpoint
 import locany_ui5_common
 import patch_locany_checkpoint
 import preflight_locany_runtime
 import run_locany_ui5_local_debug
 import submit_locany_ui5
+from eaglevl.train.ui5_checkpoint_utils import atomic_save_with_fsync
 
 
 class RuntimeConfigTests(unittest.TestCase):
@@ -254,6 +258,93 @@ class RuntimeConfigTests(unittest.TestCase):
     def test_preflight_uses_distinct_libgl_exit_code(self) -> None:
         self.assertEqual(preflight_locany_runtime.EXIT_LIBGL_MISSING, 42)
 
+    def test_preflight_libgl_error_has_distinct_code_and_fix_hint(self) -> None:
+        original_import = __import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "cv2":
+                raise ImportError("libGL.so.1: cannot open shared object file")
+            return original_import(name, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                preflight_locany_runtime,
+                "parse_args",
+                return_value=Namespace(processor_path=Path("model"), skip_processor=False),
+            ),
+            mock.patch("builtins.__import__", side_effect=fake_import),
+            mock.patch("builtins.print") as printer,
+        ):
+            code = preflight_locany_runtime.main()
+        self.assertEqual(code, preflight_locany_runtime.EXIT_LIBGL_MISSING)
+        rendered = " ".join(str(call.args[0]) for call in printer.call_args_list if call.args)
+        self.assertIn("libgl1", rendered)
+        self.assertIn("libglib2.0-0", rendered)
+
+    def test_preflight_reports_processor_path_and_preserves_failure_type(self) -> None:
+        cv2 = ModuleType("cv2")
+        cv2.__version__ = "test"
+        cv2.__file__ = "cv2.so"
+        transformers = ModuleType("transformers")
+
+        class FakeProcessor:
+            @classmethod
+            def from_pretrained(cls, path, **kwargs):
+                raise ValueError(f"bad local processor: {path}; {kwargs}")
+
+        transformers.AutoProcessor = FakeProcessor
+        with tempfile.TemporaryDirectory() as temporary:
+            processor_path = Path(temporary)
+            with (
+                mock.patch.object(
+                    preflight_locany_runtime,
+                    "parse_args",
+                    return_value=Namespace(
+                        processor_path=processor_path, skip_processor=False
+                    ),
+                ),
+                mock.patch.dict(sys.modules, {"cv2": cv2, "transformers": transformers}),
+                mock.patch("builtins.print") as printer,
+            ):
+                code = preflight_locany_runtime.main()
+        self.assertEqual(code, preflight_locany_runtime.EXIT_PROCESSOR_FAILED)
+        rendered = " ".join(str(call.args[0]) for call in printer.call_args_list if call.args)
+        self.assertIn(str(processor_path.resolve()), rendered)
+        self.assertIn("ValueError", rendered)
+
+    def test_environment_pre_post_fingerprint_change_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            first = {
+                "schema_version": 1,
+                "fingerprint_sha256": "a",
+                "stable": {
+                    "packages": {"torch": "1", "transformers": "1", "deepspeed": "1"}
+                },
+            }
+            changed = {
+                **first,
+                "fingerprint_sha256": "b",
+            }
+            with (
+                mock.patch.object(
+                    check_locany_environment,
+                    "parse_args",
+                    return_value=Namespace(output_dir=output, phase="pre", allow_change=False),
+                ),
+                mock.patch.object(check_locany_environment, "collect_environment", return_value=first),
+            ):
+                self.assertEqual(check_locany_environment.main(), 0)
+            with (
+                mock.patch.object(
+                    check_locany_environment,
+                    "parse_args",
+                    return_value=Namespace(output_dir=output, phase="post", allow_change=False),
+                ),
+                mock.patch.object(check_locany_environment, "collect_environment", return_value=changed),
+            ):
+                self.assertEqual(check_locany_environment.main(), 46)
+
     def test_h20_render_uses_h20_resources(self) -> None:
         args = Namespace(
             machine="h20",
@@ -296,6 +387,31 @@ class CheckpointTests(unittest.TestCase):
         (checkpoint / "config.json").write_text("{}", encoding="utf-8")
         (checkpoint / "model.safetensors").write_bytes(b"weights")
         return checkpoint
+
+    def test_training_args_atomic_publish_rejects_zero_byte_and_cleans_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "training_args.bin"
+
+            def empty_save(_obj, path):
+                Path(path).touch()
+
+            with self.assertRaisesRegex(RuntimeError, "empty file"):
+                atomic_save_with_fsync(empty_save, object(), target)
+            self.assertFalse(target.exists())
+            self.assertEqual(list(target.parent.glob(".training_args.bin.tmp-*")), [])
+
+    def test_training_args_atomic_publish_replaces_only_after_nonempty_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "training_args.bin"
+            target.write_bytes(b"old")
+
+            def save(_obj, path):
+                Path(path).write_bytes(b"new-training-args")
+                return "saved"
+
+            self.assertEqual(atomic_save_with_fsync(save, object(), target), "saved")
+            self.assertEqual(target.read_bytes(), b"new-training-args")
+            self.assertEqual(list(target.parent.glob(".training_args.bin.tmp-*")), [])
 
     def test_sharded_model_requires_every_indexed_shard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -53,6 +53,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Smoke evaluation limit per UI5 task; omitted/0 keeps the full set",
     )
+    parser.add_argument(
+        "--eval-inference-crop-mode",
+        choices=("full_image", "lossless_tiling"),
+        default="full_image",
+    )
+    parser.add_argument("--eval-tile-max-count", type=int, default=10)
+    parser.add_argument("--eval-tile-target-long-side", type=int, default=1600)
+    parser.add_argument("--eval-tile-overlap-ratio", type=float, default=0.10)
+    parser.add_argument("--eval-tile-nms-iou", type=float, default=0.50)
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--learning-rate", default="2e-5")
     parser.add_argument("--version", default="v4")
@@ -179,6 +188,17 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "ENABLE_EVAL": "1" if args.enable_eval else "0",
         "EVAL_AT_START": "1" if args.eval_at_start else "0",
         "EVAL_FAIL_POLICY": args.eval_fail_policy,
+        "EVAL_INFERENCE_CROP_MODE": getattr(
+            args, "eval_inference_crop_mode", "full_image"
+        ),
+        "EVAL_TILE_MAX_COUNT": str(getattr(args, "eval_tile_max_count", 10)),
+        "EVAL_TILE_TARGET_LONG_SIDE": str(
+            getattr(args, "eval_tile_target_long_side", 1600)
+        ),
+        "EVAL_TILE_OVERLAP_RATIO": str(
+            getattr(args, "eval_tile_overlap_ratio", 0.10)
+        ),
+        "EVAL_TILE_NMS_IOU": str(getattr(args, "eval_tile_nms_iou", 0.50)),
         "RELATION_GATE_MODE": getattr(args, "relation_gate_mode", "observe"),
         "INSTALL_SYSTEM_RUNTIME_DEPS": (
             "1" if getattr(args, "install_system_runtime_deps", True) else "0"
@@ -296,6 +316,11 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "EVAL_INTERVAL_STEPS",
         "EVAL_MAX_IMAGES_PER_TASK",
         "EVAL_FAIL_POLICY",
+        "EVAL_INFERENCE_CROP_MODE",
+        "EVAL_TILE_MAX_COUNT",
+        "EVAL_TILE_TARGET_LONG_SIDE",
+        "EVAL_TILE_OVERLAP_RATIO",
+        "EVAL_TILE_NMS_IOU",
         "INSTALL_SYSTEM_RUNTIME_DEPS",
         "UI5_USE_DETECTION_CROPS",
         "UI5_CROP_AUDIT_DIR",
@@ -394,6 +419,11 @@ def main() -> int:
         "EVAL_AT_START",
         "EVAL_INTERVAL_STEPS",
         "EVAL_MAX_IMAGES_PER_TASK",
+        "EVAL_INFERENCE_CROP_MODE",
+        "EVAL_TILE_MAX_COUNT",
+        "EVAL_TILE_TARGET_LONG_SIDE",
+        "EVAL_TILE_OVERLAP_RATIO",
+        "EVAL_TILE_NMS_IOU",
         "INSTALL_SYSTEM_RUNTIME_DEPS",
         "UI5_USE_DETECTION_CROPS",
         "UI5_CROP_AUDIT_DIR",

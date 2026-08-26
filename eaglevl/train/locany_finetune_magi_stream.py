@@ -86,7 +86,7 @@ from eaglevl.train.ui_defect_data import (
     is_positive_ui_defect,
 )
 from eaglevl.train.ui5_excel_logger import UI5ExcelLogger, TRAIN_TASKS
-from eaglevl.train.ui5_checkpoint_utils import validate_checkpoint
+from eaglevl.train.ui5_checkpoint_utils import atomic_save_with_fsync, validate_checkpoint
 from dotenv import load_dotenv
 load_dotenv()
 from transformers.trainer_pt_utils import LabelSmoother
@@ -427,7 +427,9 @@ class LazySupervisedDatasetMTP(Dataset):
                 for defect_type in range(5)
             }
             for logical_index, raw_index in enumerate(self.active_indices):
-                record = index_records[raw_index]
+                # ``raw_index`` addresses LazyJsonlLoader, not the compact
+                # ``index_records`` list (which may already be exclusion-filtered).
+                record = self.lazy_loader[raw_index]
                 defect_type = identify_ui_defect_task(record)[1]
                 label = "positive" if is_positive_ui_defect(record) else "negative"
                 self._balanced_logical_buckets[defect_type][label].append(logical_index)
@@ -1638,13 +1640,9 @@ class StreamPackingMTPTrainer(Trainer):
             temporary_target = None
             try:
                 if stage == "training_args.bin" and destination_is_path:
-                    temporary_target = f"{target_text}.tmp-{os.getpid()}"
-                    result = original_torch_save(
-                        obj, temporary_target, *args, **kwargs
+                    result = atomic_save_with_fsync(
+                        original_torch_save, obj, target_text, *args, **kwargs
                     )
-                    with open(temporary_target, "rb+") as handle:
-                        os.fsync(handle.fileno())
-                    os.replace(temporary_target, target_text)
                 else:
                     result = original_torch_save(obj, destination, *args, **kwargs)
             except BaseException as exc:

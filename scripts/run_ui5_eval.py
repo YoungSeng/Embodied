@@ -33,6 +33,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     parser.add_argument("--max-images-per-task", type=int, default=0)
     parser.add_argument(
+        "--inference-crop-mode",
+        choices=("full_image", "lossless_tiling"),
+        default="full_image",
+    )
+    parser.add_argument("--tile-max-count", type=int, default=10)
+    parser.add_argument("--tile-target-long-side", type=int, default=1600)
+    parser.add_argument("--tile-overlap-ratio", type=float, default=0.10)
+    parser.add_argument("--tile-nms-iou", type=float, default=0.50)
+    parser.add_argument(
         "--relation-gate-mode", choices=("observe", "hard"), default="observe"
     )
     parser.add_argument("--relation-gate-threshold", type=float, default=None)
@@ -132,7 +141,8 @@ def main() -> int:
     args.output_dir = args.output_dir.expanduser().resolve()
     args.scorer_root = args.scorer_root.expanduser().resolve()
 
-    prediction_dir = args.output_dir / f"inference-checkpoint-{args.step}-full"
+    prediction_suffix = "full" if args.inference_crop_mode == "full_image" else "lossless-tiling"
+    prediction_dir = args.output_dir / f"inference-checkpoint-{args.step}-{prediction_suffix}"
     history_dir = args.output_dir / "evaluation"
     raw_evaluation_root = history_dir / "raw"
     attempt_stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -154,6 +164,8 @@ def main() -> int:
         "max_num_tokens": args.max_num_tokens,
         "max_num_tokens_scope": "per_rank_packed_batch",
         "relation_gate_mode": args.relation_gate_mode,
+        "inference_crop_mode": args.inference_crop_mode,
+        "gt_repair_used_for_inference": False,
         "checkpoint": str(args.checkpoint),
         "prediction_dir": str(prediction_dir),
         "evaluation_run_dir": str(evaluation_run_dir),
@@ -215,6 +227,16 @@ def main() -> int:
             str(runtime_profile),
             "--relation-gate-mode",
             args.relation_gate_mode,
+            "--inference-crop-mode",
+            args.inference_crop_mode,
+            "--tile-max-count",
+            str(args.tile_max_count),
+            "--tile-target-long-side",
+            str(args.tile_target_long_side),
+            "--tile-overlap-ratio",
+            str(args.tile_overlap_ratio),
+            "--tile-nms-iou",
+            str(args.tile_nms_iou),
         ]
         existing_manifest = prediction_dir / "_run_manifest.json"
         overwrite_for_gate_mode_change = False
@@ -224,7 +246,19 @@ def main() -> int:
                 previous_mode = previous_manifest.get("generation", {}).get(
                     "relation_gate_mode"
                 )
-                overwrite_for_gate_mode_change = previous_mode != args.relation_gate_mode
+                previous_crop = previous_manifest.get("inference_crop", {})
+                expected_crop = {
+                    "mode": args.inference_crop_mode,
+                    "max_tiles": args.tile_max_count,
+                    "target_long_side": args.tile_target_long_side,
+                    "overlap_ratio": args.tile_overlap_ratio,
+                    "nms_iou": args.tile_nms_iou,
+                    "gt_repair_allowed": False,
+                }
+                overwrite_for_gate_mode_change = (
+                    previous_mode != args.relation_gate_mode
+                    or previous_crop != expected_crop
+                )
             except (OSError, json.JSONDecodeError):
                 overwrite_for_gate_mode_change = True
         if overwrite_for_gate_mode_change:

@@ -706,9 +706,29 @@ class ResumeAndExcelTest(unittest.TestCase):
         }
         metric = aggregate_scope([detail])
         empty = aggregate_scope([])
-        summary = {"configs": {}}
+        summary = {
+            "configs": {},
+            "repair_metrics": {
+                "raw_detector_region_gt_contained": 17691,
+                "raw_detector_region_gt_total": 17798,
+                "raw_detector_region_gt_recall": 17691 / 17798,
+                "raw_failure_count": 107,
+                "excluded_annotation_count": 1,
+                "repaired_valid_failure_count": 106,
+                "training_materialization_gt_contained_after_repair": 17797,
+                "training_materialization_gt_total_after_repair": 17797,
+                "training_materialization_gt_recall_after_repair": 1.0,
+                "post_repair_partial_count": 0,
+                "post_repair_uncovered_count": 0,
+                "interpretation": "training materialization only",
+            },
+        }
         for config in CONFIGS:
-            by_scope = {"ALL": metric, **{task: (metric if task == TASK_NAMES[0] else empty) for task in TASK_NAMES}}
+            by_scope = {
+                "ALL": metric,
+                "REGION_ALL": metric,
+                **{task: (metric if task == TASK_NAMES[0] else empty) for task in TASK_NAMES},
+            }
             summary["configs"][config] = {"by_scope": by_scope}
         matrix = {task: {other: int(task == other) for other in TASK_NAMES} for task in TASK_NAMES}
         jaccard = {task: {other: float(task == other) for other in TASK_NAMES} for task in TASK_NAMES}
@@ -727,6 +747,18 @@ class ResumeAndExcelTest(unittest.TestCase):
                 excel_row = dict(zip(headers, values))
                 self.assertEqual(excel_row["gt_contained_count"], metric["gt_contained_count"])
                 self.assertAlmostEqual(excel_row["pixel_reduction_ratio"], metric["pixel_reduction_ratio"])
+                region_rows = [
+                    dict(zip(headers, row))
+                    for row in workbook["summary"].iter_rows(min_row=2, values_only=True)
+                    if row[headers.index("scope")] == "REGION_ALL"
+                ]
+                self.assertTrue(region_rows)
+                self.assertAlmostEqual(
+                    region_rows[0]["raw_detector_region_gt_recall"], 17691 / 17798
+                )
+                self.assertEqual(
+                    region_rows[0]["training_materialization_gt_recall_after_repair"], 1.0
+                )
                 self.assertEqual(tuple(workbook.sheetnames), ("summary", "task_overlap", "image_detail", "gt_failures", "config_compare"))
             finally:
                 workbook.close()

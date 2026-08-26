@@ -238,6 +238,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 "_ui5_sample_id": sample_id,
                 "_ui5_image_id": sample["image_id"],
                 "_ui5_task": task,
+                "_ui5_split": sample.get("split"),
                 "_ui5_record_kind": "full_image",
                 "_ui5_crop_source": None,
             }
@@ -261,6 +262,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 and record.get("_ui5_task") == EXCLUDED_TASK
             ):
                 raise ValueError("excluded text-overflow sample reached crop records")
+            if record.get("_ui5_crop_source") == "manual_gt_repair" and record.get(
+                "_ui5_split"
+            ) != "train":
+                raise RuntimeError("manual_gt_repair reached validation/test recipe")
             crop_records.append(record)
     if not crop_records:
         raise ValueError("full_plus_crop recipe would contain zero crop records")
@@ -349,6 +354,18 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 
     selected_meta = combined_meta if args.mode == "full_plus_crop" else full_meta
     conditions = dict(summary["next_stage_gate"]["conditions"])
+    final_report_files = (
+        audit_dir / "summary.json",
+        audit_dir / "audit_state.json",
+        audit_dir / "materialization_summary.json",
+        audit_dir / "statistics.csv",
+        audit_dir / "ui5_crop_audit.xlsx",
+        audit_dir / "task_aware_manifest.jsonl",
+        audit_dir / "gt_repair_detections.jsonl",
+        audit_dir / "gt_repair_actions.jsonl",
+        audit_dir / "excluded_training_samples.jsonl",
+        audit_dir / "gt_repair_visualizations" / "gallery" / "index.html",
+    )
     conditions.update(
         {
             "excluded_sample_absent_from_text_overflow_recipe": not any(
@@ -361,6 +378,14 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 for path in (full_meta, combined_meta, combined_jsonl, recipe_summary_path)
             ),
             "crop_training_recipe_contains_crop_records": len(crop_records) > 0,
+            "all_reports_written_successfully": all(
+                path.is_file() and path.stat().st_size > 0 for path in final_report_files
+            ),
+            "gt_repair_not_applied_to_val_test": not any(
+                row.get("_ui5_crop_source") == "manual_gt_repair"
+                and row.get("_ui5_split") != "train"
+                for row in crop_records
+            ),
         }
     )
     if set(conditions) != V4_GATE_CONDITIONS:

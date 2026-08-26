@@ -221,6 +221,13 @@ def resolve_runtime_config(
     eval_fail_policy = str(_env_value(env, "EVAL_FAIL_POLICY", "stop")).lower()
     if eval_fail_policy not in {"stop", "warn"}:
         raise ValueError("EVAL_FAIL_POLICY must be 'stop' or 'warn'")
+    eval_inference_crop_mode = str(
+        _env_value(env, "EVAL_INFERENCE_CROP_MODE", "full_image")
+    ).lower()
+    if eval_inference_crop_mode not in {"full_image", "lossless_tiling"}:
+        raise ValueError(
+            "EVAL_INFERENCE_CROP_MODE must be full_image or lossless_tiling"
+        )
 
     base_model = str(
         _env_value(
@@ -331,6 +338,15 @@ def resolve_runtime_config(
         "EVAL_AT_START": int(eval_at_start),
         "EVAL_INTERVAL_STEPS": eval_interval,
         "EVAL_FAIL_POLICY": eval_fail_policy,
+        "EVAL_INFERENCE_CROP_MODE": eval_inference_crop_mode,
+        "EVAL_TILE_MAX_COUNT": int(_env_value(env, "EVAL_TILE_MAX_COUNT", 10)),
+        "EVAL_TILE_TARGET_LONG_SIDE": int(
+            _env_value(env, "EVAL_TILE_TARGET_LONG_SIDE", 1600)
+        ),
+        "EVAL_TILE_OVERLAP_RATIO": float(
+            _env_value(env, "EVAL_TILE_OVERLAP_RATIO", 0.10)
+        ),
+        "EVAL_TILE_NMS_IOU": float(_env_value(env, "EVAL_TILE_NMS_IOU", 0.50)),
         "INSTALL_SYSTEM_RUNTIME_DEPS": int(
             parse_bool(
                 _env_value(env, "INSTALL_SYSTEM_RUNTIME_DEPS", "0"),
@@ -355,6 +371,14 @@ def resolve_runtime_config(
         raise ValueError("RELATION_GATE_THRESHOLD must be in [0, 1]")
     if resolved["RELATION_GATE_MODE"] not in {"observe", "hard"}:
         raise ValueError("RELATION_GATE_MODE must be observe or hard")
+    if not 1 <= resolved["EVAL_TILE_MAX_COUNT"] <= 10:
+        raise ValueError("EVAL_TILE_MAX_COUNT must be in [1, 10]")
+    if resolved["EVAL_TILE_TARGET_LONG_SIDE"] <= 0:
+        raise ValueError("EVAL_TILE_TARGET_LONG_SIDE must be positive")
+    if not 0 < resolved["EVAL_TILE_OVERLAP_RATIO"] < 1:
+        raise ValueError("EVAL_TILE_OVERLAP_RATIO must be in (0, 1)")
+    if not 0 <= resolved["EVAL_TILE_NMS_IOU"] <= 1:
+        raise ValueError("EVAL_TILE_NMS_IOU must be in [0, 1]")
     if not 0.0 <= resolved["RELATION_FOCAL_BETA"] < 1.0:
         raise ValueError("RELATION_FOCAL_BETA must be in [0, 1)")
     if resolved["RELATION_FOCAL_GAMMA"] < 0.0:

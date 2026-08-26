@@ -2154,11 +2154,20 @@ def write_excel_report(
         "gt_gain_over_1_25_ratio", "gt_gain_over_1_5_ratio", "gt_gain_over_2_0_ratio",
         "empty_detection_fallback_images", "forced_merge_images", "detector_boundary_cut_count",
         "roundtrip_error_over_1_count", "anomaly_event_count",
+        "raw_detector_region_gt_contained", "raw_detector_region_gt_total",
+        "raw_detector_region_gt_recall", "raw_failure_count",
+        "excluded_annotation_count", "repaired_valid_failure_count",
+        "training_materialization_gt_contained_after_repair",
+        "training_materialization_gt_total_after_repair",
+        "training_materialization_gt_recall_after_repair",
+        "post_repair_partial_count", "post_repair_uncovered_count",
+        "post_repair_metric_interpretation",
         "gt_recall_denominator_definition", "positive_success_denominator_definition",
         "near_full_denominator_definition", "gain_denominator_definition",
         "negative_samples_definition",
     ]
     summary_sheet.append(summary_headers)
+    repair_metrics = summary.get("repair_metrics", {})
     for config_name in candidate_summaries:
         scopes = ["ALL"]
         if "REGION_ALL" in candidate_summaries[config_name]["by_scope"]:
@@ -2166,6 +2175,7 @@ def write_excel_report(
         scopes.extend(TASK_NAMES)
         for scope in scopes:
             metric = candidate_summaries[config_name]["by_scope"][scope]
+            show_repair = scope == "REGION_ALL" and bool(repair_metrics)
             summary_sheet.append(
                 [
                     config_name, scope, metric["samples"], metric["positive_samples"],
@@ -2181,6 +2191,18 @@ def write_excel_report(
                     metric["gt_gain_over_2_0_ratio"], metric["empty_detection_fallback_images"],
                     metric["forced_merge_images"], metric["detector_boundary_cut_count"],
                     metric["roundtrip_error_over_1_count"], metric["anomaly_event_count"],
+                    repair_metrics.get("raw_detector_region_gt_contained") if show_repair else None,
+                    repair_metrics.get("raw_detector_region_gt_total") if show_repair else None,
+                    repair_metrics.get("raw_detector_region_gt_recall") if show_repair else None,
+                    repair_metrics.get("raw_failure_count") if show_repair else None,
+                    repair_metrics.get("excluded_annotation_count") if show_repair else None,
+                    repair_metrics.get("repaired_valid_failure_count") if show_repair else None,
+                    repair_metrics.get("training_materialization_gt_contained_after_repair") if show_repair else None,
+                    repair_metrics.get("training_materialization_gt_total_after_repair") if show_repair else None,
+                    repair_metrics.get("training_materialization_gt_recall_after_repair") if show_repair else None,
+                    repair_metrics.get("post_repair_partial_count") if show_repair else None,
+                    repair_metrics.get("post_repair_uncovered_count") if show_repair else None,
+                    repair_metrics.get("interpretation") if show_repair else None,
                     METRIC_DEFINITIONS["gt_box_containment_recall"],
                     METRIC_DEFINITIONS["positive_sample_success_rate"],
                     METRIC_DEFINITIONS["near_full_image_ratio"],
@@ -2343,7 +2365,8 @@ def write_excel_report(
         "gt_box_containment_recall", "positive_sample_success_rate", "partial_only_gt_ratio",
         "union_area_mean", "union_area_p50", "union_area_p90", "pixel_reduction_ratio",
         "near_full_image_ratio", "gt_gain_over_1_25_ratio", "gt_gain_over_1_5_ratio",
-        "gt_gain_over_2_0_ratio", "union_area_ratio",
+        "gt_gain_over_2_0_ratio", "union_area_ratio", "raw_detector_region_gt_recall",
+        "training_materialization_gt_recall_after_repair",
     }
     for sheet in (summary_sheet, detail_sheet, compare_sheet):
         headers = {cell.value: cell.column for cell in sheet[1]}
