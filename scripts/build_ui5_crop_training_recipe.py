@@ -157,6 +157,14 @@ def _validate_crop_record(record: Mapping[str, Any]) -> None:
             raise ValueError(f"crop label is outside normalized coordinate space: {values}")
         if values[2] <= values[0] or values[3] <= values[1]:
             raise ValueError(f"crop label has zero/negative area: {values}")
+    if record.get("_ui5_crop_source") == "manual_gt_repair":
+        repair_indices = record.get("_ui5_manual_repair_gt_indices")
+        if not isinstance(repair_indices, list) or not repair_indices:
+            raise ValueError(
+                "manual_gt_repair crop does not identify the repaired GT indices it covers"
+            )
+        if any(not isinstance(index, int) or index < 0 for index in repair_indices):
+            raise ValueError(f"invalid manual repair GT indices: {repair_indices!r}")
 
 
 def _recipe_entry(
@@ -291,6 +299,34 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     if not any(row.get("_ui5_crop_source") == "raw_detector" for row in crop_records):
         raise ValueError("crop recipe contains no ordinary detector crop record")
 
+    repair_actions_path = audit_dir / "gt_repair_actions.jsonl"
+    repair_actions = read_jsonl(repair_actions_path)
+    expected_repair_keys = {
+        (str(action["sample_id"]), int(action["gt_index"])) for action in repair_actions
+    }
+    if len(expected_repair_keys) != len(repair_actions):
+        raise ValueError("gt_repair_actions.jsonl contains duplicate sample/GT repair keys")
+    expected_repair_count = int(
+        summary["repair_metrics"].get("repaired_valid_failure_count", len(repair_actions))
+    )
+    if len(expected_repair_keys) != expected_repair_count:
+        raise ValueError(
+            "GT repair action count differs from summary: "
+            f"actions={len(expected_repair_keys)}, summary={expected_repair_count}"
+        )
+    mapped_repair_keys = {
+        (str(record["_ui5_sample_id"]), int(gt_index))
+        for record in crop_records
+        if record.get("_ui5_crop_source") == "manual_gt_repair"
+        for gt_index in record["_ui5_manual_repair_gt_indices"]
+    }
+    missing_repair_keys = expected_repair_keys - mapped_repair_keys
+    if missing_repair_keys:
+        raise RuntimeError(
+            f"{len(missing_repair_keys)} GT repair actions do not map to a manual repair "
+            f"training crop; first={sorted(missing_repair_keys)[:20]}"
+        )
+
     all_referenced_images = [
         Path(str(row["image"])).resolve() for row in (*full_records, *crop_records)
     ]
@@ -349,6 +385,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "gt_repair_crop_records": sum(
             row.get("_ui5_crop_source") == "manual_gt_repair" for row in crop_records
         ),
+        "gt_repair_action_count": len(expected_repair_keys),
+        "gt_repair_action_mapped_count": len(
+            expected_repair_keys.intersection(mapped_repair_keys)
+        ),
+        "all_gt_repair_actions_mapped": expected_repair_keys <= mapped_repair_keys,
         "records_by_task": dict(sorted(counts_by_task.items())),
         "positive_negative_records": {
             f"{kind}_{polarity}": count

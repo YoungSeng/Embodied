@@ -47,7 +47,11 @@ python scripts/run_locany_ui5_local_debug.py \
 - `UI5_USE_DETECTION_CROPS=1`；
 - 最终 `META_PATH` 以 `ui_defect_5class_train_full_plus_crop.json` 结尾；
 - full/crop/GT-repair/excluded 记录数；
+- recipe 校验显示 `gt_repair_action_count=106` 且
+  `gt_repair_action_mapped_count=106`；
 - 至少一个 `manual_gt_repair` crop 路径和多个 `raw_detector` crop 路径；
+- dataloader 平衡日志显示 `manual_gt_repair retention after balancing`，其中 record 与
+  repair GT key 均为完整的 `X/X`；
 - 四卡 `MAX_NUM_TOKENS=12800`、`GRADIENT_ACCUMULATION_STEPS=2`；
 - 环境 preflight 通过。
 

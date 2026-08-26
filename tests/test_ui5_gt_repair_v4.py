@@ -28,6 +28,7 @@ from run_ui5_crop_audit import (  # noqa: E402
     V4_FINAL_TRAINING_GATE_CONDITIONS,
     atomic_write_json,
     atomic_write_jsonl,
+    validate_recipe_repair_mapping_summary,
 )
 from ui5_lossless_tiling import (  # noqa: E402
     assert_lossless_coverage,
@@ -391,6 +392,8 @@ class RecipeBuilderTests(unittest.TestCase):
                             "_ui5_split": "train",
                             "_ui5_record_kind": "crop",
                             "_ui5_crop_source": "raw_detector",
+                            "_ui5_contained_gt_indices": [0],
+                            "_ui5_manual_repair_gt_indices": [],
                             "_ui5_training_eligible": True,
                         },
                         {
@@ -402,6 +405,8 @@ class RecipeBuilderTests(unittest.TestCase):
                             "_ui5_split": "train",
                             "_ui5_record_kind": "crop",
                             "_ui5_crop_source": "manual_gt_repair",
+                            "_ui5_contained_gt_indices": [0],
+                            "_ui5_manual_repair_gt_indices": [0],
                             "_ui5_training_eligible": True,
                         },
                     ],
@@ -435,7 +440,10 @@ class RecipeBuilderTests(unittest.TestCase):
                 "recommended_config": gt_repair.REPAIR_CONFIG,
                 "audit_state_digest": gt_repair.audit_state_digest(state),
                 "input_snapshot_digest": "snapshot",
-                "repair_metrics": {"training_materialization_gt_recall_after_repair": 1.0},
+                "repair_metrics": {
+                    "training_materialization_gt_recall_after_repair": 1.0,
+                    "repaired_valid_failure_count": 1,
+                },
                 "next_stage_gate": {"conditions": conditions},
             },
         )
@@ -443,11 +451,14 @@ class RecipeBuilderTests(unittest.TestCase):
             audit / "materialization_summary.json",
             audit / "statistics.csv",
             audit / "gt_repair_detections.jsonl",
-            audit / "gt_repair_actions.jsonl",
             audit / "gt_repair_visualizations" / "gallery" / "index.html",
         ):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("test\n", encoding="utf-8")
+        atomic_write_jsonl(
+            audit / "gt_repair_actions.jsonl",
+            [{"sample_id": "sample_valid", "gt_index": 0, "task": "ui_text_overflow"}],
+        )
         if include_excel:
             (audit / "ui5_crop_audit.xlsx").write_bytes(b"xlsx")
         return Namespace(
@@ -467,6 +478,9 @@ class RecipeBuilderTests(unittest.TestCase):
             self.assertEqual(result["full_image_records"], 1)
             self.assertEqual(result["crop_records"], 2)
             self.assertEqual(result["gt_repair_crop_records"], 1)
+            self.assertEqual(result["gt_repair_action_count"], 1)
+            self.assertEqual(result["gt_repair_action_mapped_count"], 1)
+            self.assertTrue(result["all_gt_repair_actions_mapped"])
             combined = [
                 json.loads(line)
                 for line in (args.output_dir / "ui_defect_5class_train_full_plus_crop.jsonl")
@@ -485,11 +499,27 @@ class RecipeBuilderTests(unittest.TestCase):
                 marker["excluded_samples_digest"], content_fingerprint(args.excluded_samples)
             )
             self.assertTrue(marker["created_after_all_checks"])
+            validated_counts = validate_recipe_repair_mapping_summary(
+                json.loads(
+                    (args.output_dir / "recipe_summary.json").read_text(encoding="utf-8")
+                )
+            )
+            self.assertEqual(validated_counts, (1, 1))
 
     def test_missing_report_fails_closed_and_leaves_no_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             args = self._make_fixture(Path(temporary), include_excel=False)
             with self.assertRaisesRegex(RuntimeError, "final training gate failed"):
+                recipe_builder.build(args)
+            self.assertFalse((args.audit_dir / "training_ready.json").exists())
+
+    def test_unmapped_gt_repair_action_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            args = self._make_fixture(Path(temporary))
+            manifest = gt_repair.read_jsonl(args.task_aware_manifest)
+            manifest[0]["training_records"][1]["_ui5_manual_repair_gt_indices"] = [1]
+            atomic_write_jsonl(args.task_aware_manifest, manifest)
+            with self.assertRaisesRegex(RuntimeError, "do not map"):
                 recipe_builder.build(args)
             self.assertFalse((args.audit_dir / "training_ready.json").exists())
 

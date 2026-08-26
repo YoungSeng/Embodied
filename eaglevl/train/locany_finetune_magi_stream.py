@@ -415,12 +415,69 @@ class LazySupervisedDatasetMTP(Dataset):
                 records_per_class=ui_records_per_class,
                 negative_to_positive_ratio=ui_negative_to_positive_ratio,
             )
+            required_manual_local_indices = {
+                index
+                for index, record in enumerate(index_records)
+                if record.get("_ui5_crop_source") == "manual_gt_repair"
+            }
+            required_manual_gt_keys = set()
+            for index in required_manual_local_indices:
+                record = index_records[index]
+                repair_gt_indices = record.get("_ui5_manual_repair_gt_indices")
+                if not isinstance(repair_gt_indices, list) or not repair_gt_indices:
+                    raise RuntimeError(
+                        f"[Dataset] {self.ds_name} manual_gt_repair record lacks "
+                        f"repair GT mapping: sample_id={record.get('_ui5_sample_id')}"
+                    )
+                required_manual_gt_keys.update(
+                    (str(record.get("_ui5_sample_id")), int(gt_index))
+                    for gt_index in repair_gt_indices
+                )
+            missing_manual_local_indices = required_manual_local_indices - set(
+                selected_local_indices
+            )
+            if missing_manual_local_indices:
+                missing_records = [
+                    {
+                        "sample_id": index_records[index].get("_ui5_sample_id"),
+                        "task": index_records[index].get("_ui5_task"),
+                        "repair_gt_indices": index_records[index].get(
+                            "_ui5_manual_repair_gt_indices", []
+                        ),
+                    }
+                    for index in sorted(missing_manual_local_indices)[:20]
+                ]
+                raise RuntimeError(
+                    f"[Dataset] {self.ds_name} balanced UI index dropped required "
+                    f"manual_gt_repair records: {missing_records}"
+                )
+            selected_manual_gt_keys = {
+                (str(index_records[index].get("_ui5_sample_id")), int(gt_index))
+                for index in selected_local_indices
+                if index_records[index].get("_ui5_crop_source") == "manual_gt_repair"
+                for gt_index in index_records[index]["_ui5_manual_repair_gt_indices"]
+            }
+            missing_manual_gt_keys = required_manual_gt_keys - selected_manual_gt_keys
+            if missing_manual_gt_keys:
+                raise RuntimeError(
+                    f"[Dataset] {self.ds_name} balanced UI index dropped required repair GT "
+                    f"mappings: {sorted(missing_manual_gt_keys)[:20]}"
+                )
             self.active_indices = [
                 candidate_indices[index] for index in selected_local_indices
             ]
             logger.info(
                 f"[Dataset] {self.ds_name} balanced to {len(self.active_indices)} records "
                 f"({len(self.active_indices) // 5} per class)."
+            )
+            logger.info(
+                "[Dataset] %s manual_gt_repair retention after balancing: "
+                "records=%s/%s repair_gt_keys=%s/%s",
+                self.ds_name,
+                len(required_manual_local_indices),
+                len(required_manual_local_indices),
+                len(selected_manual_gt_keys),
+                len(required_manual_gt_keys),
             )
             self._balanced_logical_buckets = {
                 defect_type: {"positive": [], "negative": []}

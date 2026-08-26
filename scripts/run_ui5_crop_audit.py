@@ -2480,6 +2480,26 @@ def build_final_training_gate(
     }
 
 
+def validate_recipe_repair_mapping_summary(
+    recipe_payload: Mapping[str, Any],
+) -> tuple[int, int]:
+    """Fail closed unless every audited repair action maps to a training crop."""
+    repair_action_count = int(recipe_payload.get("gt_repair_action_count", 0))
+    mapped_repair_action_count = int(
+        recipe_payload.get("gt_repair_action_mapped_count", 0)
+    )
+    if repair_action_count <= 0:
+        raise RuntimeError("v4 crop recipe contains no GT repair action mappings")
+    if (
+        mapped_repair_action_count != repair_action_count
+        or recipe_payload.get("all_gt_repair_actions_mapped") is not True
+    ):
+        raise RuntimeError(
+            "v4 crop recipe does not map every GT repair action to a training crop"
+        )
+    return repair_action_count, mapped_repair_action_count
+
+
 def validate_training_ready_marker(
     audit_dir: Path, *, recipe_path: Path | None = None
 ) -> dict[str, Any]:
@@ -2607,6 +2627,9 @@ def validate_training_ready_marker(
         recipe_payload = json.loads(recipe_summary.read_text(encoding="utf-8"))
         if int(recipe_payload.get("crop_records", 0)) <= 0:
             raise RuntimeError("v4 crop recipe contains no crop records")
+        repair_action_count, mapped_repair_action_count = (
+            validate_recipe_repair_mapping_summary(recipe_payload)
+        )
         result.update(
             {
                 "schema_version": marker_schema,
@@ -2618,6 +2641,8 @@ def validate_training_ready_marker(
                 "gt_repair_crop_records": int(
                     recipe_payload["gt_repair_crop_records"]
                 ),
+                "gt_repair_action_count": repair_action_count,
+                "gt_repair_action_mapped_count": mapped_repair_action_count,
                 "excluded_records": int(recipe_payload["excluded_records"]),
             }
         )

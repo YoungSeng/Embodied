@@ -101,9 +101,11 @@ def build_balanced_ui_indices(
 ) -> List[int]:
     """Build exactly ``records_per_class`` indices per UI task.
 
-    Sampling is with replacement for the minority side.  With the default 1:2
-    effective positive/negative ratio this strongly oversamples text overflow
-    while preserving the requested 88,020-record epoch size.
+    Sampling is with replacement for the minority side.  Every
+    ``manual_gt_repair`` record is pinned once inside its task/polarity quota;
+    ordinary records fill the remaining quota.  With the default 1:2 effective
+    positive/negative ratio this strongly oversamples text overflow while
+    preserving the requested 88,020-record epoch size.
     """
     if records_per_class <= 0:
         raise ValueError("records_per_class must be positive")
@@ -142,9 +144,31 @@ def build_balanced_ui_indices(
     def sample_bucket(values: List[int], count: int) -> List[int]:
         if not values:
             raise ValueError("Cannot balance a task with an empty positive or negative bucket")
-        if count <= len(values):
-            return rng.sample(values, count)
-        return [rng.choice(values) for _ in range(count)]
+        required = [
+            index
+            for index in values
+            if records[index].get("_ui5_crop_source") == "manual_gt_repair"
+        ]
+        if len(required) > count:
+            raise ValueError(
+                "UI balancing quota is smaller than the number of required "
+                f"manual_gt_repair records: required={len(required)}, quota={count}"
+            )
+        required_set = set(required)
+        ordinary = [index for index in values if index not in required_set]
+        remaining = count - len(required)
+        if remaining == 0:
+            return required
+        if not ordinary:
+            raise ValueError(
+                "Cannot fill the remaining UI balancing quota without resampling "
+                "manual_gt_repair records"
+            )
+        if remaining <= len(ordinary):
+            sampled = rng.sample(ordinary, remaining)
+        else:
+            sampled = [rng.choice(ordinary) for _ in range(remaining)]
+        return [*required, *sampled]
 
     result: List[int] = []
     for defect_type in sorted(buckets):
@@ -153,4 +177,15 @@ def build_balanced_ui_indices(
         result.extend(sample_bucket(positive, positive_count))
         result.extend(sample_bucket(negative, negative_count))
     rng.shuffle(result)
+    required_indices = {
+        index
+        for index, record in enumerate(records)
+        if record.get("_ui5_crop_source") == "manual_gt_repair"
+    }
+    missing_required = required_indices - set(result)
+    if missing_required:
+        raise RuntimeError(
+            "UI balancing dropped required manual_gt_repair records: "
+            f"{sorted(missing_required)[:20]}"
+        )
     return result

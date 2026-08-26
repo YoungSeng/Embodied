@@ -1165,6 +1165,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 for box, source in zip(result["crop_boxes"], result["crop_provenance"])
             }
             training_records = []
+            repaired_gt_indices = {
+                int(action["gt_index"]) for action in result["repair_actions"]
+            }
             for row in preview:
                 if sample["task"] == "ui_content_missing":
                     # The full-image record is already retained by the base
@@ -1185,6 +1188,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "_ui5_crop_source": crop_source,
                         "_ui5_crop_bbox": row["crop_bbox"],
                         "_ui5_contained_gt_indices": row["contained_gt_indices"],
+                        "_ui5_manual_repair_gt_indices": sorted(
+                            repaired_gt_indices.intersection(row["contained_gt_indices"])
+                        ),
                         "_ui5_training_eligible": True,
                     }
                 )

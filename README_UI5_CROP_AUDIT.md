@@ -48,7 +48,8 @@ bash shell/run_ui5_gt_repair.sh \
 3. 对 106 个有效失败执行仅限训练集、仅限对应 task/sample 的 GT repair；
 4. 重跑 CPU geometry，复用或生成普通矩形 crop，生成 106 张四联图；
 5. 写 summary、CSV、Excel 和 task-aware manifest；
-6. 生成 full-only 与 full+crop recipe；
+6. 生成 full-only 与 full+crop recipe，并逐一确认 106 个 repair action 都映射到至少一个
+   `manual_gt_repair` 训练 crop；
 7. 所有 19 项 gate 通过后，最后原子写入 `training_ready.json`。
 
 它不会启动训练。它也不会调用 prepare/text/icon/merge；开头应打印：
@@ -111,6 +112,17 @@ work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair/
 
 `sample_3a3922c5762298f04c8d` 只从 `ui_text_overflow` 训练记录中排除；同一图片在其他任务的
 监督仍保留。GT repair 严禁进入 val、test 和真实推理。
+
+训练数据平衡不会再随机丢弃 repair crop：每个 task/正负 bucket 先固定放入全部
+`_ui5_crop_source=manual_gt_repair` 记录，再用普通记录补足 quota。平衡完成后 dataloader
+会同时校验 repair record 和 `(sample_id, gt_index)` 映射；任一缺失都会 fail closed。
+`recipe_summary.json` 应显示：
+
+```text
+gt_repair_action_count=106
+gt_repair_action_mapped_count=106
+all_gt_repair_actions_mapped=true
+```
 
 ## 如需单独重建 recipe
 
