@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import shutil
 import sys
 import tempfile
 import unittest
@@ -520,6 +521,38 @@ class RecipeBuilderTests(unittest.TestCase):
             manifest[0]["training_records"][1]["_ui5_manual_repair_gt_indices"] = [1]
             atomic_write_jsonl(args.task_aware_manifest, manifest)
             with self.assertRaisesRegex(RuntimeError, "do not map"):
+                recipe_builder.build(args)
+            self.assertFalse((args.audit_dir / "training_ready.json").exists())
+
+    def test_byte_identical_source_tree_alias_maps_without_basename_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self._make_fixture(root)
+            base_payload = json.loads(args.base_meta.read_text(encoding="utf-8"))
+            original = Path(base_payload["ui_text_overflow"]["annotation"][0])
+            alias = root / "moved_tree" / "renamed_source.jsonl"
+            alias.parent.mkdir(parents=True)
+            shutil.copyfile(original, alias)
+            base_payload["ui_text_overflow"]["annotation"] = [str(alias)]
+            atomic_write_json(args.base_meta, base_payload)
+
+            result = recipe_builder.build(args)
+            self.assertEqual(result["source_mapping_exact_records"], 0)
+            self.assertEqual(result["source_mapping_content_alias_records"], 2)
+
+    def test_different_source_content_does_not_fall_back_to_line_number(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self._make_fixture(root)
+            base_payload = json.loads(args.base_meta.read_text(encoding="utf-8"))
+            original = Path(base_payload["ui_text_overflow"]["annotation"][0])
+            alias = root / "moved_tree" / "renamed_source.jsonl"
+            alias.parent.mkdir(parents=True)
+            alias.write_bytes(original.read_bytes() + b"\n")
+            base_payload["ui_text_overflow"]["annotation"] = [str(alias)]
+            atomic_write_json(args.base_meta, base_payload)
+
+            with self.assertRaisesRegex(ValueError, "byte-identical source-file fingerprint"):
                 recipe_builder.build(args)
             self.assertFalse((args.audit_dir / "training_ready.json").exists())
 

@@ -122,12 +122,23 @@ def _iter_base_records(
                 yield entry, annotation, line_no, record
 
 
-def _source_record_map(
+def _source_record_maps(
     manifest_rows: Sequence[Mapping[str, Any]],
     parent_task_samples: Sequence[Mapping[str, Any]],
-) -> dict[tuple[str, int], Mapping[str, Any]]:
+) -> tuple[
+    dict[tuple[str, int], Mapping[str, Any]],
+    dict[tuple[str, int], Mapping[str, Any]],
+]:
+    """Index source rows by exact path and by byte-identical file content.
+
+    The content map permits a read-only dataset tree to move without falling
+    back to basename or line-number-only identity.  Ambiguous content aliases
+    fail closed.
+    """
     final_sample_ids = {str(row["sample_id"]) for row in manifest_rows}
-    mapping: dict[tuple[str, int], Mapping[str, Any]] = {}
+    exact_mapping: dict[tuple[str, int], Mapping[str, Any]] = {}
+    content_mapping: dict[tuple[str, int], Mapping[str, Any]] = {}
+    fingerprint_cache: dict[Path, str] = {}
     for sample in parent_task_samples:
         sample_id = str(sample["sample_id"])
         # The excluded sample is deliberately absent from the repaired task
@@ -135,11 +146,35 @@ def _source_record_map(
         if sample_id not in final_sample_ids and sample_id != EXCLUDED_SAMPLE_ID:
             continue
         for source in sample.get("source_records", []):
-            key = (str(Path(str(source["source_file"])).resolve()), int(source["line_no"]))
-            if key in mapping and mapping[key]["sample_id"] != sample_id:
-                raise ValueError(f"source record maps to multiple task samples: {key}")
-            mapping[key] = sample
-    return mapping
+            source_path = Path(str(source["source_file"])).expanduser().resolve()
+            line_no = int(source["line_no"])
+            exact_key = (str(source_path), line_no)
+            if (
+                exact_key in exact_mapping
+                and exact_mapping[exact_key]["sample_id"] != sample_id
+            ):
+                raise ValueError(
+                    f"source record maps to multiple task samples: {exact_key}"
+                )
+            exact_mapping[exact_key] = sample
+            if source_path not in fingerprint_cache:
+                fingerprint_cache[source_path] = (
+                    content_fingerprint(source_path) if source_path.is_file() else ""
+                )
+            fingerprint = fingerprint_cache[source_path]
+            if not fingerprint:
+                continue
+            content_key = (fingerprint, line_no)
+            if (
+                content_key in content_mapping
+                and content_mapping[content_key]["sample_id"] != sample_id
+            ):
+                raise ValueError(
+                    "byte-identical source files map the same line to multiple task "
+                    f"samples: fingerprint={fingerprint}, line={line_no}"
+                )
+            content_mapping[content_key] = sample
+    return exact_mapping, content_mapping
 
 
 def _validate_crop_record(record: Mapping[str, Any]) -> None:
@@ -215,7 +250,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     if len(exclusions) != 1 or exclusions[0]["sample_id"] != EXCLUDED_SAMPLE_ID:
         raise ValueError("v4 recipe requires exactly the confirmed annotation exclusion")
     parent_task_samples = read_jsonl(audit_dir.parent / "manifest" / "task_samples.jsonl")
-    source_map = _source_record_map(manifest_rows, parent_task_samples)
+    source_exact_map, source_content_map = _source_record_maps(
+        manifest_rows, parent_task_samples
+    )
     reporter = ProgressReporter(
         stage="gt-repair-recipe",
         total=len(parent_task_samples) + len(manifest_rows),
@@ -229,10 +266,24 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     full_records: list[dict[str, Any]] = []
     unmatched: list[tuple[str, int]] = []
     excluded_matches = 0
+    source_mapping_exact_records = 0
+    source_mapping_content_alias_records = 0
+    annotation_fingerprints: dict[Path, str] = {}
     for entry, annotation, line_no, raw_record in _iter_base_records(base_meta):
         processed += 1
         key = (str(annotation.resolve()), line_no)
-        sample = source_map.get(key)
+        sample = source_exact_map.get(key)
+        if sample is not None:
+            source_mapping_exact_records += 1
+        else:
+            annotation_path = annotation.resolve(strict=True)
+            annotation_fingerprint = annotation_fingerprints.get(annotation_path)
+            if annotation_fingerprint is None:
+                annotation_fingerprint = content_fingerprint(annotation_path)
+                annotation_fingerprints[annotation_path] = annotation_fingerprint
+            sample = source_content_map.get((annotation_fingerprint, line_no))
+            if sample is not None:
+                source_mapping_content_alias_records += 1
         if sample is None:
             unmatched.append(key)
             reporter.update(processed, detail="匹配 full-image 训练记录")
@@ -269,7 +320,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         reporter.update(processed, detail="匹配 full-image 训练记录")
     if unmatched:
         raise ValueError(
-            f"{len(unmatched)} base-meta records do not map to the task-aware manifest; "
+            f"{len(unmatched)} base-meta records do not map to the task-aware manifest "
+            "by exact path or byte-identical source-file fingerprint; "
             f"first={unmatched[:5]}"
         )
     if excluded_matches < 1:
@@ -396,6 +448,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             for (kind, polarity), count in sorted(positive_by_kind.items())
         },
         "excluded_records": excluded_matches,
+        "source_mapping_exact_records": source_mapping_exact_records,
+        "source_mapping_content_alias_records": source_mapping_content_alias_records,
         "excluded_sample_ids": [EXCLUDED_SAMPLE_ID],
         "all_referenced_images_exist": not missing_images,
         "full_only_meta": str(full_meta.resolve()),

@@ -41,6 +41,13 @@ bash shell/run_ui5_gt_repair.sh \
 脚本自动补齐数据。若新 worktree 已经有同一份 `data/ui_defect_locany_v3`，可以把
 `UI5_BASE_META` 改为新 worktree 内的绝对路径。
 
+base meta 内部可能仍记录旧的 `.../code/Eagle/Embodied/...` JSONL 绝对路径，而 v3 manifest
+记录的是 `.../code/Eagle_LocateUI5_v4/Embodied/...`。recipe builder 会先按绝对路径匹配；
+路径不同则只允许使用“整个源 JSONL 字节内容完全相同 + 同一行号”的内容指纹别名匹配。
+它不会使用 basename 或单独行号猜测。`recipe_summary.json` 会分别记录
+`source_mapping_exact_records` 和 `source_mapping_content_alias_records`；文件内容不一致仍会
+直接报错。
+
 这一条 wrapper 会按顺序完成：
 
 1. 校验 v3、17,281 个 image id、原始 detection digest 和 107 个原始失败；
