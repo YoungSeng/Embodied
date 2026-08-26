@@ -169,6 +169,37 @@ def resolve_runtime_config(
             join_runtime_path(training_data_dir, "recipe", "ui_defect_5class_train.json"),
         )
     )
+    use_detection_crops = parse_bool(
+        _env_value(env, "UI5_USE_DETECTION_CROPS", "0"),
+        name="UI5_USE_DETECTION_CROPS",
+    )
+    crop_audit_dir = str(_env_value(env, "UI5_CROP_AUDIT_DIR", ""))
+    crop_train_mode = str(
+        _env_value(
+            env,
+            "UI5_CROP_TRAIN_MODE",
+            "full_plus_crop" if use_detection_crops else "full_only",
+        )
+    )
+    if crop_train_mode not in {"full_only", "full_plus_crop"}:
+        raise ValueError("UI5_CROP_TRAIN_MODE must be full_only or full_plus_crop")
+    if use_detection_crops and crop_train_mode != "full_plus_crop":
+        raise ValueError(
+            "UI5_USE_DETECTION_CROPS=1 requires UI5_CROP_TRAIN_MODE=full_plus_crop"
+        )
+    if use_detection_crops and not crop_audit_dir:
+        raise ValueError("UI5_USE_DETECTION_CROPS=1 requires UI5_CROP_AUDIT_DIR")
+    crop_meta_path = str(_env_value(env, "UI5_CROP_META_PATH", ""))
+    if crop_audit_dir:
+        if not crop_meta_path:
+            crop_meta_path = join_runtime_path(
+                crop_audit_dir,
+                "training_recipes",
+                f"ui_defect_5class_train_{crop_train_mode}.json",
+            )
+        meta_path = crop_meta_path
+    elif crop_meta_path:
+        raise ValueError("UI5_CROP_META_PATH requires UI5_CROP_AUDIT_DIR")
     eval_input_dir = str(
         _env_value(
             env,
@@ -236,6 +267,10 @@ def resolve_runtime_config(
         "TRAINING_DATA_DIR": training_data_dir,
         "TRAINING_DATA_SOURCE_DIR": training_data_source_dir,
         "META_PATH": meta_path,
+        "UI5_USE_DETECTION_CROPS": int(use_detection_crops),
+        "UI5_CROP_AUDIT_DIR": crop_audit_dir,
+        "UI5_CROP_TRAIN_MODE": crop_train_mode,
+        "UI5_CROP_META_PATH": crop_meta_path,
         "EVAL_INPUT_DIR": eval_input_dir,
         "OUTPUT_BASE": output_base,
         "RUN_NAME": run_name,
@@ -296,6 +331,12 @@ def resolve_runtime_config(
         "EVAL_AT_START": int(eval_at_start),
         "EVAL_INTERVAL_STEPS": eval_interval,
         "EVAL_FAIL_POLICY": eval_fail_policy,
+        "INSTALL_SYSTEM_RUNTIME_DEPS": int(
+            parse_bool(
+                _env_value(env, "INSTALL_SYSTEM_RUNTIME_DEPS", "0"),
+                name="INSTALL_SYSTEM_RUNTIME_DEPS",
+            )
+        ),
         "EVAL_MAX_IMAGES_PER_TASK": int(
             _env_value(env, "EVAL_MAX_IMAGES_PER_TASK", 0)
         ),

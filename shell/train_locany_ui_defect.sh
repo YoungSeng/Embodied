@@ -12,6 +12,10 @@ MODEL_PATH="${MODEL_PATH:-nvidia/LocateAnything-3B}"
 DATA_VERSION="${DATA_VERSION:-v3}"
 DATA_DIR="${DATA_DIR:-${PROJECT_ROOT}/data/ui_defect_locany_${DATA_VERSION}}"
 META_PATH="${META_PATH:-${DATA_DIR}/recipe/ui_defect_5class_train.json}"
+UI5_USE_DETECTION_CROPS="${UI5_USE_DETECTION_CROPS:-0}"
+UI5_CROP_AUDIT_DIR="${UI5_CROP_AUDIT_DIR:-}"
+UI5_CROP_TRAIN_MODE="${UI5_CROP_TRAIN_MODE:-}"
+UI5_CROP_META_PATH="${UI5_CROP_META_PATH:-}"
 
 OUTPUT_BASE="${OUTPUT_BASE:-${PROJECT_ROOT}/work_dirs}"
 RUN_NAME="${RUN_NAME:-locateanything-3b-ui-defect-5class-full}"
@@ -45,27 +49,64 @@ else
   echo "[INFO] MODEL_PATH is not a local directory; treating it as a Hub model id: ${MODEL_PATH}"
 fi
 
-if [[ ! -f "${META_PATH}" ]]; then
-  echo "[ERROR] META_PATH does not exist: ${META_PATH}" >&2
+# Resolve crop mode and the final meta before any environment preflight or
+# torchrun.  Crop runs never silently fall back to the default full-image meta.
+if [[ "${UI5_USE_DETECTION_CROPS}" != "0" && "${UI5_USE_DETECTION_CROPS}" != "1" ]]; then
+  echo "[ERROR] UI5_USE_DETECTION_CROPS must be 0 or 1." >&2
   exit 1
 fi
-
-# Crop-augmented training is fail-closed.  Full-image-only training is unchanged;
-# any run that opts into detector crops must supply the audited directory and
-# pass live audit-state/input-snapshot/summary digest validation.
-UI5_USE_DETECTION_CROPS="${UI5_USE_DETECTION_CROPS:-0}"
-UI5_CROP_AUDIT_DIR="${UI5_CROP_AUDIT_DIR:-}"
+if [[ -z "${UI5_CROP_TRAIN_MODE}" ]]; then
+  if [[ "${UI5_USE_DETECTION_CROPS}" == "1" ]]; then
+    UI5_CROP_TRAIN_MODE="full_plus_crop"
+  else
+    UI5_CROP_TRAIN_MODE="full_only"
+  fi
+fi
+if [[ "${UI5_CROP_TRAIN_MODE}" != "full_only" && "${UI5_CROP_TRAIN_MODE}" != "full_plus_crop" ]]; then
+  echo "[ERROR] UI5_CROP_TRAIN_MODE must be full_only or full_plus_crop." >&2
+  exit 1
+fi
+if [[ "${UI5_USE_DETECTION_CROPS}" == "1" && "${UI5_CROP_TRAIN_MODE}" != "full_plus_crop" ]]; then
+  echo "[ERROR] UI5_USE_DETECTION_CROPS=1 requires UI5_CROP_TRAIN_MODE=full_plus_crop." >&2
+  exit 1
+fi
 if [[ "${UI5_USE_DETECTION_CROPS}" == "1" || -n "${UI5_CROP_AUDIT_DIR}" ]]; then
   if [[ -z "${UI5_CROP_AUDIT_DIR}" ]]; then
     echo "[ERROR] UI5_USE_DETECTION_CROPS=1 requires UI5_CROP_AUDIT_DIR." >&2
     exit 1
   fi
-  python "${PROJECT_ROOT}/scripts/validate_ui5_crop_training_ready.py" \
-    --audit-dir "${UI5_CROP_AUDIT_DIR}" || {
+  if [[ -z "${UI5_CROP_META_PATH}" ]]; then
+    UI5_CROP_META_PATH="${UI5_CROP_AUDIT_DIR}/training_recipes/ui_defect_5class_train_${UI5_CROP_TRAIN_MODE}.json"
+  fi
+  if [[ ! -s "${UI5_CROP_META_PATH}" ]]; then
+    echo "[ERROR] Audited crop recipe is missing or empty: ${UI5_CROP_META_PATH}" >&2
+    exit 1
+  fi
+  UI5_AUDIT_PYTHON="${ENV_DIR:-}/bin/python"
+  if [[ ! -x "${UI5_AUDIT_PYTHON}" ]]; then
+    UI5_AUDIT_PYTHON="$(command -v python || true)"
+  fi
+  if [[ -z "${UI5_AUDIT_PYTHON}" ]]; then
+    echo "[ERROR] Cannot find Python for crop marker validation." >&2
+    exit 1
+  fi
+  "${UI5_AUDIT_PYTHON}" "${PROJECT_ROOT}/scripts/validate_ui5_crop_training_ready.py" \
+    --audit-dir "${UI5_CROP_AUDIT_DIR}" \
+    --recipe "${UI5_CROP_META_PATH}" || {
       echo "[ERROR] Crop training-ready validation failed; refusing to start training." >&2
       exit 1
     }
+  META_PATH="${UI5_CROP_META_PATH}"
+elif [[ -n "${UI5_CROP_META_PATH}" ]]; then
+  echo "[ERROR] UI5_CROP_META_PATH requires UI5_CROP_AUDIT_DIR." >&2
+  exit 1
 fi
+if [[ ! -s "${META_PATH}" ]]; then
+  echo "[ERROR] Final META_PATH does not exist or is empty: ${META_PATH}" >&2
+  exit 1
+fi
+export UI5_USE_DETECTION_CROPS UI5_CROP_AUDIT_DIR UI5_CROP_TRAIN_MODE
+export UI5_CROP_META_PATH META_PATH
 
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-deepspeed_configs/zero_stage2_config.json}"
 if [[ ! -f "${DEEPSPEED_CONFIG}" ]]; then
@@ -314,6 +355,10 @@ echo "============================================================"
 echo "PROJECT_ROOT                  : ${PROJECT_ROOT}"
 echo "MODEL_PATH                    : ${MODEL_PATH}"
 echo "META_PATH                     : ${META_PATH}"
+echo "UI5_USE_DETECTION_CROPS       : ${UI5_USE_DETECTION_CROPS}"
+echo "UI5_CROP_AUDIT_DIR            : ${UI5_CROP_AUDIT_DIR:-<none>}"
+echo "UI5_CROP_TRAIN_MODE           : ${UI5_CROP_TRAIN_MODE}"
+echo "UI5_CROP_META_PATH            : ${UI5_CROP_META_PATH:-<none>}"
 echo "OUTPUT_DIR                    : ${OUTPUT_DIR}"
 echo "GPU_NAME                      : ${GPU_NAME}"
 echo "CUDA_VISIBLE_DEVICES          : ${CUDA_VISIBLE_DEVICES}"
@@ -341,6 +386,15 @@ echo "REPORT_TO                     : ${REPORT_TO}"
 echo "MASTER_PORT                   : ${MASTER_PORT}"
 echo "LOG_FILE                      : ${LOG_FILE}"
 echo "============================================================"
+
+ENVIRONMENT_AUDIT_COMMAND=(
+  "${ENV_DIR}/bin/python" "${PROJECT_ROOT}/scripts/check_locany_environment.py"
+  --output-dir "${OUTPUT_DIR}"
+)
+if [[ "${ALLOW_RUNTIME_ENVIRONMENT_CHANGE:-0}" == "1" ]]; then
+  ENVIRONMENT_AUDIT_COMMAND+=(--allow-change)
+fi
+"${ENVIRONMENT_AUDIT_COMMAND[@]}" --phase pre
 
 cleanup_gpu_monitor() {
   stop_gpu_monitor
@@ -418,10 +472,22 @@ fi
 TRAIN_EXIT_CODE="${TRAIN_PIPESTATUS[0]}"
 stop_gpu_monitor
 
+ENVIRONMENT_AUDIT_EXIT_CODE=0
+if "${ENVIRONMENT_AUDIT_COMMAND[@]}" --phase post; then
+  :
+else
+  ENVIRONMENT_AUDIT_EXIT_CODE=$?
+  echo "[LOCANY ENVIRONMENT ERROR] post-training environment audit failed with exit_code=${ENVIRONMENT_AUDIT_EXIT_CODE}" >&2
+  if (( TRAIN_EXIT_CODE == 0 )); then
+    TRAIN_EXIT_CODE="${ENVIRONMENT_AUDIT_EXIT_CODE}"
+  fi
+fi
+
 {
   print_gpu_memory_summary
   echo
   echo "TRAIN_EXIT_CODE: ${TRAIN_EXIT_CODE}"
+  echo "ENVIRONMENT_AUDIT_EXIT_CODE: ${ENVIRONMENT_AUDIT_EXIT_CODE}"
   if (( TRAIN_EXIT_CODE == 0 )); then
     echo "TRAIN_STATUS: SUCCESS"
   else

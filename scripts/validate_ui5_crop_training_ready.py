@@ -13,12 +13,18 @@ from run_ui5_crop_audit import validate_training_ready_marker
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audit-dir", type=Path, required=True)
+    parser.add_argument(
+        "--recipe",
+        type=Path,
+        default=None,
+        help="Require this exact audited recipe path and digest (v4)",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    result = validate_training_ready_marker(args.audit_dir)
+    result = validate_training_ready_marker(args.audit_dir, recipe_path=args.recipe)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

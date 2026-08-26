@@ -19,6 +19,7 @@ import collect_ui5_metrics
 import locany_ui5_checkpoint
 import locany_ui5_common
 import patch_locany_checkpoint
+import preflight_locany_runtime
 import run_locany_ui5_local_debug
 import submit_locany_ui5
 
@@ -230,8 +231,28 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertIn("mnt: /mnt/bn/intelligent-service-yg/", rendered)
         self.assertIn('MAX_NUM_TOKENS: "12800"', rendered)
         self.assertIn('EVAL_MAX_IMAGES_PER_TASK: "10"', rendered)
+        self.assertIn('INSTALL_SYSTEM_RUNTIME_DEPS: "1"', rendered)
         self.assertNotIn("@@", rendered)
         self.assertEqual(runtime["ENABLE_EVAL"], 0)
+        self.assertEqual(runtime["INSTALL_SYSTEM_RUNTIME_DEPS"], 1)
+
+    def test_formal_runtime_dependency_install_can_be_disabled(self) -> None:
+        args = submit_locany_ui5.parse_args(
+            [
+                "--machine",
+                "a800",
+                "--gpus",
+                "4",
+                "--no-install-system-runtime-deps",
+                "--render-only",
+            ]
+        )
+        rendered, runtime = submit_locany_ui5.render_job(args)
+        self.assertIn('INSTALL_SYSTEM_RUNTIME_DEPS: "0"', rendered)
+        self.assertEqual(runtime["INSTALL_SYSTEM_RUNTIME_DEPS"], 0)
+
+    def test_preflight_uses_distinct_libgl_exit_code(self) -> None:
+        self.assertEqual(preflight_locany_runtime.EXIT_LIBGL_MISSING, 42)
 
     def test_h20_render_uses_h20_resources(self) -> None:
         args = Namespace(
@@ -276,15 +297,81 @@ class CheckpointTests(unittest.TestCase):
         (checkpoint / "model.safetensors").write_bytes(b"weights")
         return checkpoint
 
+    def test_sharded_model_requires_every_indexed_shard(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint-1000"
+            checkpoint.mkdir()
+            (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+            (checkpoint / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "weight_map": {
+                            "a": "model-00001-of-00002.safetensors",
+                            "b": "model-00002-of-00002.safetensors",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (checkpoint / "model-00001-of-00002.safetensors").write_bytes(b"one")
+            self.assertFalse(
+                locany_ui5_checkpoint.validate_checkpoint(
+                    checkpoint, mode="eval"
+                )["valid"]
+            )
+            (checkpoint / "model-00002-of-00002.safetensors").write_bytes(b"two")
+            self.assertTrue(
+                locany_ui5_checkpoint.validate_checkpoint(
+                    checkpoint, mode="eval"
+                )["valid"]
+            )
+
     def make_resume_checkpoint(self, root: Path, step: int) -> Path:
         checkpoint = self.make_eval_checkpoint(root, step)
+        (checkpoint / "training_args.bin").write_bytes(b"training-arguments")
         (checkpoint / "trainer_state.json").write_text(
             json.dumps({"global_step": step}), encoding="utf-8"
         )
         state_dir = checkpoint / f"global_step{step}"
         state_dir.mkdir()
         (state_dir / "mp_rank_00_model_states.pt").write_bytes(b"state")
+        (state_dir / "zero_pp_rank_0_mp_rank_00_optim_states.pt").write_bytes(
+            b"optimizer"
+        )
         return checkpoint
+
+    def test_zero_byte_training_args_is_eval_only_not_resumable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = self.make_eval_checkpoint(Path(temporary), 1000)
+            (checkpoint / "training_args.bin").touch()
+            report = locany_ui5_checkpoint.validate_checkpoint(
+                checkpoint, mode="resume"
+            )
+            self.assertFalse(report["valid"])
+            self.assertIn("missing or empty training_args.bin", report["errors"])
+            self.assertTrue(
+                locany_ui5_checkpoint.validate_checkpoint(
+                    checkpoint, mode="eval"
+                )["valid"]
+            )
+
+    def test_deepspeed_optimizer_state_is_required_not_just_model_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = self.make_eval_checkpoint(Path(temporary), 1000)
+            (checkpoint / "training_args.bin").write_bytes(b"args")
+            (checkpoint / "trainer_state.json").write_text(
+                json.dumps({"global_step": 1000}), encoding="utf-8"
+            )
+            state_dir = checkpoint / "global_step1000"
+            state_dir.mkdir()
+            (state_dir / "mp_rank_00_model_states.pt").write_bytes(b"state")
+            report = locany_ui5_checkpoint.validate_checkpoint(
+                checkpoint, mode="resume"
+            )
+            self.assertFalse(report["valid"])
+            self.assertIn(
+                "missing optimizer/DeepSpeed optimizer state", report["errors"]
+            )
 
     def test_checkpoint_zero_is_not_a_training_resume_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -328,6 +415,31 @@ class CheckpointTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(completed.stdout.strip(), "0")
+
+    def test_latest_resume_never_falls_back_past_newer_incomplete_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            self.make_resume_checkpoint(output, 1000)
+            broken = self.make_eval_checkpoint(output, 2000)
+            (broken / "training_args.bin").touch()
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "locany_ui5_checkpoint.py"),
+                    "latest",
+                    "--output-dir",
+                    str(output),
+                    "--require-resume",
+                    "--field",
+                    "step",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "0")
+            self.assertTrue(broken.is_dir(), "validator must never delete user data")
 
     def test_patch_is_idempotent_and_force_refreshes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -165,6 +165,18 @@ FINAL_TRAINING_GATE_CONDITIONS = frozenset(
         "all_reports_written_successfully",
     }
 )
+V4_FINAL_TRAINING_GATE_CONDITIONS = FINAL_TRAINING_GATE_CONDITIONS | frozenset(
+    {
+        "excluded_annotation_count_equals_1",
+        "excluded_sample_absent_from_text_overflow_recipe",
+        "valid_gt_post_repair_recall_equals_1",
+        "post_repair_partial_count_zero",
+        "post_repair_uncovered_count_zero",
+        "crop_training_recipe_written_successfully",
+        "crop_training_recipe_contains_crop_records",
+        "gt_repair_not_applied_to_val_test",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -2445,7 +2457,9 @@ def build_final_training_gate(
     }
 
 
-def validate_training_ready_marker(audit_dir: Path) -> dict[str, Any]:
+def validate_training_ready_marker(
+    audit_dir: Path, *, recipe_path: Path | None = None
+) -> dict[str, Any]:
     """Validate marker digests against live audit inputs before crop training."""
     audit_dir = audit_dir.resolve(strict=True)
     marker_path = audit_dir / "training_ready.json"
@@ -2479,7 +2493,13 @@ def validate_training_ready_marker(audit_dir: Path) -> dict[str, Any]:
     if gate.get("passes") is not True or gate.get("training_ready") is not True:
         raise RuntimeError("summary next-stage gate does not pass")
     conditions = gate.get("conditions", {})
-    if set(conditions) != FINAL_TRAINING_GATE_CONDITIONS:
+    marker_schema = int(marker.get("schema_version", 1))
+    expected_conditions = (
+        V4_FINAL_TRAINING_GATE_CONDITIONS
+        if marker_schema >= 2
+        else FINAL_TRAINING_GATE_CONDITIONS
+    )
+    if set(conditions) != expected_conditions:
         raise RuntimeError("summary does not contain the complete final training gate")
     if not all(bool(value) for value in conditions.values()):
         raise RuntimeError("summary contains a failed or missing training gate condition")
@@ -2503,13 +2523,82 @@ def validate_training_ready_marker(audit_dir: Path) -> dict[str, Any]:
     )
     if live_snapshot != snapshot:
         raise RuntimeError("live manifest/detections no longer match training-ready snapshot")
-    return {
+    result = {
         "training_ready": True,
         "recommended_config": recommended,
         "audit_state_digest": marker["audit_state_digest"],
         "input_snapshot_digest": marker["input_snapshot_digest"],
         "summary_file_digest": marker["summary_file_digest"],
     }
+    if recipe_path is not None and marker_schema < 2:
+        raise RuntimeError("crop training requires a v4 recipe-bound marker")
+    if marker_schema >= 2:
+        recipe_state = summary.get("recipe_state", {})
+        if recipe_state.get("written") is not True:
+            raise RuntimeError("v4 summary does not record a written crop recipe")
+        excluded_path = audit_dir / "excluded_training_samples.jsonl"
+        if not excluded_path.is_file():
+            raise RuntimeError("v4 excluded-sample manifest is missing")
+        if marker.get("excluded_samples_digest") != content_fingerprint(excluded_path):
+            raise RuntimeError("v4 excluded-sample manifest digest mismatch")
+        requested_recipe = recipe_path or Path(str(marker.get("training_recipe", "")))
+        bound_recipe = requested_recipe.expanduser().resolve(strict=True)
+        if audit_dir not in bound_recipe.parents:
+            raise RuntimeError("v4 training recipe must remain inside the audit directory")
+        approved = {
+            "full_only": (
+                Path(str(recipe_state.get("full_only_meta", ""))).resolve(strict=True),
+                str(recipe_state.get("full_only_recipe_digest", "")),
+            ),
+            "full_plus_crop": (
+                Path(str(recipe_state.get("full_plus_crop_meta", ""))).resolve(strict=True),
+                str(recipe_state.get("full_plus_crop_recipe_digest", "")),
+            ),
+        }
+        matched_modes = [
+            mode for mode, (path, _) in approved.items() if path == bound_recipe
+        ]
+        if len(matched_modes) != 1:
+            raise RuntimeError("requested crop recipe is not one of the audited recipes")
+        train_mode = matched_modes[0]
+        expected_recipe_digest = approved[train_mode][1]
+        if not expected_recipe_digest or expected_recipe_digest != content_fingerprint(bound_recipe):
+            raise RuntimeError("v4 crop training recipe digest mismatch")
+        full_only_jsonl = Path(
+            str(recipe_state.get("full_only_jsonl", ""))
+        ).resolve(strict=True)
+        combined_jsonl = Path(
+            str(recipe_state.get("full_plus_crop_jsonl", ""))
+        ).resolve(strict=True)
+        if marker.get("full_only_recipe_digest") != content_fingerprint(approved["full_only"][0]):
+            raise RuntimeError("v4 full-only recipe digest mismatch")
+        if marker.get("full_only_recipe_jsonl_digest") != content_fingerprint(full_only_jsonl):
+            raise RuntimeError("v4 full-only recipe JSONL digest mismatch")
+        if marker.get("training_recipe_jsonl_digest") != content_fingerprint(combined_jsonl):
+            raise RuntimeError("v4 full+crop recipe JSONL digest mismatch")
+        recipe_summary = Path(
+            str(recipe_state.get("recipe_summary", ""))
+        ).resolve(strict=True)
+        if marker.get("recipe_summary_digest") != content_fingerprint(recipe_summary):
+            raise RuntimeError("v4 recipe summary digest mismatch")
+        recipe_payload = json.loads(recipe_summary.read_text(encoding="utf-8"))
+        if int(recipe_payload.get("crop_records", 0)) <= 0:
+            raise RuntimeError("v4 crop recipe contains no crop records")
+        result.update(
+            {
+                "schema_version": marker_schema,
+                "crop_train_mode": train_mode,
+                "training_recipe": str(bound_recipe),
+                "training_recipe_digest": expected_recipe_digest,
+                "full_image_records": int(recipe_payload["full_image_records"]),
+                "crop_records": int(recipe_payload["crop_records"]),
+                "gt_repair_crop_records": int(
+                    recipe_payload["gt_repair_crop_records"]
+                ),
+                "excluded_records": int(recipe_payload["excluded_records"]),
+            }
+        )
+    return result
 
 
 def initialize_crop_audit_v3(

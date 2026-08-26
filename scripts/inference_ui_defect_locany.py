@@ -88,6 +88,7 @@ from PIL import Image, ImageDraw, ImageFont
 from transformers import AutoConfig, AutoModel, AutoProcessor, AutoTokenizer
 
 from eaglevl.model.locany.relation_modules import UI_RELATION_PROMPT_SPECS
+from ui5_lossless_tiling import generate_lossless_tiles, merge_tile_predictions
 
 
 PROMPT_TEMPLATE = (
@@ -372,6 +373,19 @@ def parse_args() -> argparse.Namespace:
         help="每个任务最多处理多少张；0 表示全部，可用于 smoke test",
     )
     parser.add_argument(
+        "--inference-crop-mode",
+        choices=("full_image", "lossless_tiling"),
+        default="full_image",
+        help=(
+            "推理图像模式；lossless_tiling 使用不依赖 GT 的重叠矩形切图，"
+            "局部预测先回写原图坐标再跨 tile 去重"
+        ),
+    )
+    parser.add_argument("--tile-max-count", type=int, default=10)
+    parser.add_argument("--tile-target-long-side", type=int, default=1600)
+    parser.add_argument("--tile-overlap-ratio", type=float, default=0.10)
+    parser.add_argument("--tile-nms-iou", type=float, default=0.50)
+    parser.add_argument(
         "--local-files-only",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -476,6 +490,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--repetition-penalty 必须大于 0")
     if args.max_images_per_task < 0:
         parser.error("--max-images-per-task 不能小于 0")
+    if not 1 <= args.tile_max_count <= 10:
+        parser.error("--tile-max-count 必须位于 [1, 10]")
+    if args.tile_target_long_side <= 0:
+        parser.error("--tile-target-long-side 必须大于 0")
+    if not 0 < args.tile_overlap_ratio < 1:
+        parser.error("--tile-overlap-ratio 必须位于 (0, 1)")
+    if not 0 <= args.tile_nms_iou <= 1:
+        parser.error("--tile-nms-iou 必须位于 [0, 1]")
     if args.compat_confidence is not None and not 0 <= args.compat_confidence <= 1:
         parser.error("--compat-confidence 必须位于 [0, 1]")
     if args.relation_gate_threshold is not None and not 0 <= args.relation_gate_threshold <= 1:
@@ -964,9 +986,18 @@ class LocateAnythingInferencer:
                 **common_kwargs,
             )
         except Exception as exc:
+            dependency_hint = (
+                "检测到缺少 libGL.so.1；请在当前任务容器安装 "
+                "libgl1 libglib2.0-0。"
+                if "libGL.so.1" in str(exc)
+                else "若是配置文件缺失再检查 --processor-path；若是 ImportError/OSError，"
+                "请先检查当前容器运行时依赖。"
+            )
             raise RuntimeError(
-                "加载 tokenizer/processor 失败。若训练 checkpoint 未保存这些文件，请用 "
-                "--processor-path 显式指向本地 nvidia/LocateAnything-3B 目录。"
+                "加载 tokenizer/processor 失败。\n"
+                f"processor_path={processor_source}\n"
+                f"原始异常={type(exc).__name__}: {exc}\n"
+                f"{dependency_hint}"
             ) from exc
 
         if hasattr(self.processor, "tokenizer"):
@@ -1441,6 +1472,14 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "relation_gate_mode": args.relation_gate_mode,
             "relation_gate_threshold": args.relation_gate_threshold,
         },
+        "inference_crop": {
+            "mode": args.inference_crop_mode,
+            "max_tiles": args.tile_max_count,
+            "target_long_side": args.tile_target_long_side,
+            "overlap_ratio": args.tile_overlap_ratio,
+            "nms_iou": args.tile_nms_iou,
+            "gt_repair_allowed": False,
+        },
         "output": {
             "tag_filename": args.tag_filename,
             "compat_confidence": args.compat_confidence,
@@ -1462,6 +1501,7 @@ def manifest_identity(manifest: dict[str, Any]) -> dict[str, Any]:
             "prompt_template",
             "tasks",
             "generation",
+            "inference_crop",
             "output",
         )
     }
@@ -1587,6 +1627,141 @@ def build_raw_record(
     }
 
 
+def _pixels_to_normalized_1000(
+    bbox: Sequence[int], width: int, height: int
+) -> list[int]:
+    return [
+        round(int(bbox[0]) / width * 1000),
+        round(int(bbox[1]) / height * 1000),
+        round(int(bbox[2]) / width * 1000),
+        round(int(bbox[3]) / height * 1000),
+    ]
+
+
+def predict_with_lossless_tiles(
+    *,
+    args: argparse.Namespace,
+    inferencer: "LocateAnythingInferencer",
+    image: Image.Image,
+    task: TaskConfig,
+    sample_seed: int,
+) -> tuple[str, ParsedAnswer, list[dict[str, Any]], list[list[int]], dict[str, Any], list[dict[str, Any]]]:
+    """Run GT-free tiled inference and merge only after global coordinate mapping."""
+
+    width, height = image.size
+    tiling_task = f"ui_{task.task_name}"
+    tiles = generate_lossless_tiles(
+        width,
+        height,
+        task=tiling_task,
+        max_tiles=args.tile_max_count,
+        target_long_side=args.tile_target_long_side,
+        overlap_ratio=args.tile_overlap_ratio,
+    )
+    pending_predictions: list[dict[str, Any]] = []
+    tile_records: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    any_parse_error = False
+    for tile_index, tile in enumerate(tiles):
+        tile_image = image.crop(tuple(tile))
+        try:
+            set_sample_seed(sample_seed + tile_index)
+            answer = inferencer.predict(image=tile_image, question=task.prompt)
+            gate = dict(inferencer.last_ui_diagnostics)
+            parsed = parse_locateanything_answer(answer)
+            local_detections, local_boxes = build_yolo_compatible_detections(
+                parsed=parsed,
+                task=task,
+                width=tile[2] - tile[0],
+                height=tile[3] - tile[1],
+                compat_confidence=args.compat_confidence,
+            )
+            any_parse_error = any_parse_error or parsed.status == "parse_error"
+            warnings.extend(f"tile {tile_index}: {item}" for item in parsed.warnings)
+            for detection in local_detections:
+                pending_predictions.append(
+                    {
+                        "bbox": detection["bbox_2d"],
+                        "tile_bbox": tile,
+                        "label": detection["label"],
+                        "class_id": detection["class_id"],
+                        "confidence": detection["confidence"],
+                        "score": detection["confidence"]
+                        if detection["confidence"] is not None
+                        else 1.0,
+                        "source_tile_index": tile_index,
+                    }
+                )
+            tile_records.append(
+                {
+                    "tile_index": tile_index,
+                    "tile_bbox": tile,
+                    "answer": answer,
+                    "status": parsed.status,
+                    "local_pixel_boxes": local_boxes,
+                    "gate": gate,
+                }
+            )
+        finally:
+            tile_image.close()
+
+    merged = merge_tile_predictions(
+        pending_predictions,
+        image_size=(width, height),
+        iou_threshold=args.tile_nms_iou,
+    )
+    detections: list[dict[str, Any]] = []
+    pixel_boxes: list[list[int]] = []
+    for row in merged:
+        bbox = [int(round(value)) for value in row["bbox"]]
+        bbox[0] = max(0, min(width, bbox[0]))
+        bbox[1] = max(0, min(height, bbox[1]))
+        bbox[2] = max(0, min(width, bbox[2]))
+        bbox[3] = max(0, min(height, bbox[3]))
+        if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+            continue
+        pixel_boxes.append(bbox)
+        detections.append(
+            {
+                "bbox_2d": bbox,
+                "label": row["label"],
+                "class_id": row["class_id"],
+                "confidence": row.get("confidence"),
+                "source_tile_index": row["source_tile_index"],
+                "source_tile_bbox": row["source_tile_bbox"],
+            }
+        )
+    status = "defect" if detections else ("parse_error" if any_parse_error else "ok")
+    parsed = ParsedAnswer(
+        status=status,
+        normalized_boxes=[
+            _pixels_to_normalized_1000(box, width, height) for box in pixel_boxes
+        ],
+        refs=[],
+        has_none_token=not detections,
+        warnings=warnings,
+    )
+    tile_gates = [row["gate"] for row in tile_records]
+    gate_diagnostics = {
+        "available": any(bool(row.get("available")) for row in tile_gates),
+        "would_pass": any(bool(row.get("would_pass")) for row in tile_gates),
+        "gate_filtered": all(bool(row.get("gate_filtered")) for row in tile_gates),
+        "mode": "lossless_tiling",
+        "tile_count": len(tiles),
+        "tile_union_full_image": True,
+        "gt_repair_used": False,
+        "tile_gates": tile_gates,
+    }
+    return (
+        json.dumps(tile_records, ensure_ascii=False),
+        parsed,
+        detections,
+        pixel_boxes,
+        gate_diagnostics,
+        tile_records,
+    )
+
+
 def save_error_record(
     work: TaskWork,
     stem: str,
@@ -1668,21 +1843,37 @@ def run_one_task(
             set_sample_seed(sample_seed)
 
             inference_start = time.time()
-            answer = inferencer.predict(image=image, question=config.prompt)
+            if args.inference_crop_mode == "lossless_tiling":
+                (
+                    answer,
+                    parsed,
+                    detections,
+                    pixel_boxes,
+                    gate_diagnostics,
+                    tile_records,
+                ) = predict_with_lossless_tiles(
+                    args=args,
+                    inferencer=inferencer,
+                    image=image,
+                    task=config,
+                    sample_seed=sample_seed,
+                )
+            else:
+                answer = inferencer.predict(image=image, question=config.prompt)
+                gate_diagnostics = dict(inferencer.last_ui_diagnostics)
+                parsed = parse_locateanything_answer(answer)
+                detections, pixel_boxes = build_yolo_compatible_detections(
+                    parsed=parsed,
+                    task=config,
+                    width=width,
+                    height=height,
+                    compat_confidence=args.compat_confidence,
+                )
+                tile_records = []
             inference_elapsed = time.time() - inference_start
-            gate_diagnostics = dict(inferencer.last_ui_diagnostics)
 
             if args.print_raw_answer:
                 print(f"[RAW] {answer}")
-
-            parsed = parse_locateanything_answer(answer)
-            detections, pixel_boxes = build_yolo_compatible_detections(
-                parsed=parsed,
-                task=config,
-                width=width,
-                height=height,
-                compat_confidence=args.compat_confidence,
-            )
 
             # A normalized box can only disappear here on a degenerate tiny image.
             if parsed.status == "defect" and not detections:
@@ -1711,6 +1902,15 @@ def run_one_task(
                         gate_diagnostics=gate_diagnostics,
                     ),
                 )
+                if tile_records:
+                    raw_payload = json.loads(raw_path.read_text(encoding="utf-8"))
+                    raw_payload["inference_crop"] = {
+                        "mode": "lossless_tiling",
+                        "tiles": tile_records,
+                        "global_merge_iou": args.tile_nms_iou,
+                        "gt_repair_used": False,
+                    }
+                    atomic_write_json(raw_path, raw_payload)
 
             gate_path = work.output_dir / "gate" / f"{stem}{suffix}.json"
             gate_diagnostics.setdefault("p_defect", None)
@@ -1805,6 +2005,13 @@ def print_preflight(args: argparse.Namespace, works: Sequence[TaskWork]) -> None
     print(f"CUDA_VISIBLE_DEVICES    : {os.environ.get('CUDA_VISIBLE_DEVICES')}")
     print(f"device                  : {args.device}")
     print(f"generation_mode         : {args.generation_mode}")
+    print(f"inference_crop_mode     : {args.inference_crop_mode}")
+    if args.inference_crop_mode == "lossless_tiling":
+        print(
+            "lossless_tiling         : "
+            f"max={args.tile_max_count}, long_side={args.tile_target_long_side}, "
+            f"overlap={args.tile_overlap_ratio}, nms={args.tile_nms_iou}, GT repair=disabled"
+        )
     print(f"save_raw_answer         : {args.save_raw_answer}")
     print(f"save_visualization      : {args.save_visualization}")
     print(f"tag_filename            : {args.tag_filename}")

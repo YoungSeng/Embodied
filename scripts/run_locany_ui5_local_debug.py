@@ -38,6 +38,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--env-dir", type=Path, default=None)
     parser.add_argument("--base-model", type=Path, default=None)
     parser.add_argument("--meta-path", type=Path, default=None)
+    parser.add_argument("--use-detection-crops", action="store_true")
+    parser.add_argument("--crop-audit-dir", type=Path, default=None)
+    parser.add_argument(
+        "--crop-train-mode",
+        choices=("full_only", "full_plus_crop"),
+        default=None,
+    )
+    parser.add_argument("--crop-meta-path", type=Path, default=None)
     parser.add_argument("--training-data-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--output-base", type=Path, default=None)
@@ -102,8 +110,15 @@ def build_environment(
             "PIPELINE_MODE": "train",
             "RUN_NAME": run_name,
             "OUTPUT_BASE": str(output_base),
+            "UI5_USE_DETECTION_CROPS": "1" if args.use_detection_crops else "0",
+            "UI5_CROP_TRAIN_MODE": args.crop_train_mode
+            or ("full_plus_crop" if args.use_detection_crops else "full_only"),
+            "UI5_CROP_AUDIT_DIR": "",
+            "UI5_CROP_META_PATH": "",
         }
     )
+    if args.use_detection_crops and args.crop_audit_dir is None:
+        raise ValueError("--use-detection-crops requires --crop-audit-dir")
     optional_paths = {
         "ENV_DIR": args.env_dir,
         "BASE_MODEL": args.base_model,
@@ -111,6 +126,8 @@ def build_environment(
         "META_PATH": args.meta_path,
         "TRAINING_DATA_DIR": args.training_data_dir,
         "OUTPUT_DIR": args.output_dir,
+        "UI5_CROP_AUDIT_DIR": args.crop_audit_dir,
+        "UI5_CROP_META_PATH": args.crop_meta_path,
     }
     for key, value in optional_paths.items():
         if value is not None:
@@ -145,6 +162,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "MAX_STEPS",
         "SAVE_STEPS",
         "ENABLE_EVAL",
+        "UI5_USE_DETECTION_CROPS",
+        "UI5_CROP_AUDIT_DIR",
+        "UI5_CROP_TRAIN_MODE",
+        "UI5_CROP_META_PATH",
         "RUN_NAME",
         "OUTPUT_BASE",
     ):

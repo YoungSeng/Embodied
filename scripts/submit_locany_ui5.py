@@ -93,6 +93,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--relation-gate-mode", choices=("observe", "hard"), default="observe"
     )
     parser.add_argument("--relation-gate-threshold", type=float, default=None)
+    parser.add_argument(
+        "--use-detection-crops",
+        action="store_true",
+        help="Train from the audited full+crop recipe (requires --crop-audit-dir)",
+    )
+    parser.add_argument("--crop-audit-dir", default=None)
+    parser.add_argument(
+        "--crop-train-mode",
+        choices=("full_only", "full_plus_crop"),
+        default=None,
+    )
+    parser.add_argument("--crop-meta-path", default=None)
+    runtime_deps_group = parser.add_mutually_exclusive_group()
+    runtime_deps_group.add_argument(
+        "--install-system-runtime-deps",
+        dest="install_system_runtime_deps",
+        action="store_true",
+        help="Install libgl1/libglib2.0-0 inside the task container when cv2 needs them",
+    )
+    runtime_deps_group.add_argument(
+        "--no-install-system-runtime-deps",
+        dest="install_system_runtime_deps",
+        action="store_false",
+        help="Fail preflight instead of installing missing task-container libraries",
+    )
+    parser.set_defaults(install_system_runtime_deps=True)
     eval_group = parser.add_mutually_exclusive_group()
     eval_group.add_argument("--enable-eval", dest="enable_eval", action="store_true")
     eval_group.add_argument("--disable-eval", dest="enable_eval", action="store_false")
@@ -127,6 +153,10 @@ def render_template(template: str, replacements: dict[str, str]) -> str:
 def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
     env = dict(os.environ)
     resource_group = str(getattr(args, "resource_group", "default"))
+    use_detection_crops = bool(getattr(args, "use_detection_crops", False))
+    crop_train_mode = getattr(args, "crop_train_mode", None) or (
+        "full_plus_crop" if use_detection_crops else "full_only"
+    )
     cuda_devices = args.cuda_devices or ",".join(
         str(index) for index in range(args.gpus)
     )
@@ -150,6 +180,11 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "EVAL_AT_START": "1" if args.eval_at_start else "0",
         "EVAL_FAIL_POLICY": args.eval_fail_policy,
         "RELATION_GATE_MODE": getattr(args, "relation_gate_mode", "observe"),
+        "INSTALL_SYSTEM_RUNTIME_DEPS": (
+            "1" if getattr(args, "install_system_runtime_deps", True) else "0"
+        ),
+        "UI5_USE_DETECTION_CROPS": "1" if use_detection_crops else "0",
+        "UI5_CROP_TRAIN_MODE": crop_train_mode,
     }
     optional = {
         "MAX_NUM_TOKENS": args.max_num_tokens,
@@ -163,6 +198,8 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "RELATION_GATE_THRESHOLD": getattr(args, "relation_gate_threshold", None),
         "TRAINING_DATA_SOURCE_DIR": args.training_data_source_dir,
         "TRAINING_DATA_DIR": args.training_data_dir,
+        "UI5_CROP_AUDIT_DIR": getattr(args, "crop_audit_dir", None),
+        "UI5_CROP_META_PATH": getattr(args, "crop_meta_path", None),
     }
     env.update(explicit)
     eval_max_images = optional["EVAL_MAX_IMAGES_PER_TASK"]
@@ -259,6 +296,11 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "EVAL_INTERVAL_STEPS",
         "EVAL_MAX_IMAGES_PER_TASK",
         "EVAL_FAIL_POLICY",
+        "INSTALL_SYSTEM_RUNTIME_DEPS",
+        "UI5_USE_DETECTION_CROPS",
+        "UI5_CROP_AUDIT_DIR",
+        "UI5_CROP_TRAIN_MODE",
+        "UI5_CROP_META_PATH",
         "RUN_NAME",
         "PIPELINE_MODE",
     )
@@ -352,6 +394,12 @@ def main() -> int:
         "EVAL_AT_START",
         "EVAL_INTERVAL_STEPS",
         "EVAL_MAX_IMAGES_PER_TASK",
+        "INSTALL_SYSTEM_RUNTIME_DEPS",
+        "UI5_USE_DETECTION_CROPS",
+        "UI5_CROP_AUDIT_DIR",
+        "UI5_CROP_TRAIN_MODE",
+        "UI5_CROP_META_PATH",
+        "META_PATH",
     ):
         print(f"{key:28s}: {runtime[key]}")
     print(f"rendered_yaml               : {output_yaml}")

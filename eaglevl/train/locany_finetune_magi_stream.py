@@ -36,6 +36,7 @@ import transformers
 import traceback
 import socket
 from collections import defaultdict
+from pathlib import Path
 from eaglevl.dist_utils import init_dist
 
 import packaging.version as version
@@ -85,6 +86,7 @@ from eaglevl.train.ui_defect_data import (
     is_positive_ui_defect,
 )
 from eaglevl.train.ui5_excel_logger import UI5ExcelLogger, TRAIN_TASKS
+from eaglevl.train.ui5_checkpoint_utils import validate_checkpoint
 from dotenv import load_dotenv
 load_dotenv()
 from transformers.trainer_pt_utils import LabelSmoother
@@ -158,6 +160,65 @@ def get_rank():
     if not is_dist_avail_and_initialized():
         return 0
     return dist.get_rank()
+
+
+def training_args_serialization_preflight(training_args):
+    """Exercise the exact small ``torch.save`` that previously ended in SIGBUS.
+
+    Only rank 0 writes because Hugging Face also writes ``training_args.bin``
+    on the saving rank.  Failure is broadcast so the other ranks do not wait
+    indefinitely for a process that already exited with a Python exception.
+    """
+
+    error = None
+    if get_rank() == 0:
+        diagnostics_dir = Path(training_args.output_dir) / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        target = diagnostics_dir / f".training_args_preflight.{os.getpid()}.bin"
+        logger.info(
+            "[Checkpoint preflight] training_args.bin save START path=%s", target
+        )
+        try:
+            torch.save(training_args, target)
+            with open(target, "rb+") as handle:
+                os.fsync(handle.fileno())
+            size = target.stat().st_size
+            if size <= 0:
+                raise RuntimeError("torch.save produced an empty file")
+            restored = torch.load(target, map_location="cpu", weights_only=False)
+            if type(restored) is not type(training_args):
+                raise TypeError(
+                    "training arguments round-trip changed type: "
+                    f"saved={type(training_args)!r}, restored={type(restored)!r}"
+                )
+            logger.info(
+                "[Checkpoint preflight] training_args.bin save DONE "
+                "path=%s size_bytes=%s",
+                target,
+                size,
+            )
+        except BaseException as exc:
+            error = (
+                "TrainingArguments save/reload preflight failed on the checkpoint "
+                f"filesystem: path={target}; {type(exc).__name__}: {exc}"
+            )
+            logger.exception("[Checkpoint preflight] FAILED: %s", error)
+        finally:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "[Checkpoint preflight] could not remove temporary file %s: %s",
+                    target,
+                    exc,
+                )
+    if dist.is_available() and dist.is_initialized():
+        message = [error]
+        dist.broadcast_object_list(message, src=0)
+        error = message[0]
+        dist.barrier()
+    if error is not None:
+        raise RuntimeError(error)
 
 
 class LazyJsonlLoader:
@@ -250,6 +311,7 @@ class LazySupervisedDatasetMTP(Dataset):
         self.block_size = block_size
         self.data_augment = meta.get("data_augment", False)
         self.visual_prompt = bool(meta.get("visual_prompt", False))
+        self.ui5_crop_recipe = bool(meta.get("ui5_crop_recipe", False))
         self.balance_ui_defects = bool(meta.get("balance_ui_defects", balance_ui_defects))
 
         ann_paths = meta["annotation"]
@@ -270,18 +332,92 @@ class LazySupervisedDatasetMTP(Dataset):
         self.active_indices = list(range(original_num_rows))
         self._balanced_logical_buckets = None
 
+        exclusion_path = str(meta.get("excluded_samples", ""))
+        excluded_pairs = set()
+        excluded_ids = []
+        if exclusion_path:
+            exclusion_file = Path(exclusion_path).expanduser().resolve()
+            if not exclusion_file.is_file():
+                raise FileNotFoundError(
+                    f"[{self.ds_name}] excluded sample manifest is missing: {exclusion_file}"
+                )
+            with exclusion_file.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    exclusion = json.loads(line)
+                    sample_id = str(exclusion["sample_id"])
+                    task = str(exclusion["task"])
+                    excluded_pairs.add((sample_id, task))
+                    excluded_ids.append(sample_id)
+            before_exclusion = len(self.active_indices)
+            self.active_indices = [
+                index
+                for index in self.active_indices
+                if (
+                    str(self.lazy_loader[index].get("_ui5_sample_id", "")),
+                    str(self.lazy_loader[index].get("_ui5_task", "")),
+                )
+                not in excluded_pairs
+            ]
+            logger.info(
+                "[Dataset] %s exclusion manifest=%s before=%s after=%s "
+                "excluded_sample_ids=%s",
+                self.ds_name,
+                exclusion_file,
+                before_exclusion,
+                len(self.active_indices),
+                sorted(set(excluded_ids)),
+            )
+
+        crop_mode_enabled = _env_flag("UI5_USE_DETECTION_CROPS", False)
+        if crop_mode_enabled and not self.ui5_crop_recipe:
+            raise RuntimeError(
+                f"[{self.ds_name}] UI5_USE_DETECTION_CROPS=1 but selected dataset "
+                "is not an audited crop recipe"
+            )
+        if self.ui5_crop_recipe:
+            source_counts = defaultdict(int)
+            record_kind_counts = defaultdict(int)
+            examples = defaultdict(list)
+            for index in self.active_indices:
+                record = self.lazy_loader[index]
+                kind = str(record.get("_ui5_record_kind", "unknown"))
+                source = str(record.get("_ui5_crop_source") or "full_image")
+                record_kind_counts[kind] += 1
+                source_counts[source] += 1
+                if kind == "crop" and len(examples[source]) < 3:
+                    examples[source].append(str(record.get("image", "")))
+            crop_count = int(record_kind_counts.get("crop", 0))
+            if crop_count <= 0:
+                raise RuntimeError(
+                    f"[{self.ds_name}] audited crop recipe contains zero crop records"
+                )
+            logger.info(
+                "[Dataset] %s AUDITED CROP RECIPE loaded: record_kinds=%s "
+                "crop_sources=%s examples=%s",
+                self.ds_name,
+                dict(record_kind_counts),
+                dict(source_counts),
+                dict(examples),
+            )
+
         if self.balance_ui_defects:
             logger.info(
                 f"[Dataset] {self.ds_name} building balanced UI index: "
                 f"records_per_class={ui_records_per_class}, "
                 f"negative:positive={ui_negative_to_positive_ratio}:1"
             )
-            index_records = [self.lazy_loader[index] for index in range(original_num_rows)]
-            self.active_indices = build_balanced_ui_indices(
+            candidate_indices = list(self.active_indices)
+            index_records = [self.lazy_loader[index] for index in candidate_indices]
+            selected_local_indices = build_balanced_ui_indices(
                 index_records,
                 records_per_class=ui_records_per_class,
                 negative_to_positive_ratio=ui_negative_to_positive_ratio,
             )
+            self.active_indices = [
+                candidate_indices[index] for index in selected_local_indices
+            ]
             logger.info(
                 f"[Dataset] {self.ds_name} balanced to {len(self.active_indices)} records "
                 f"({len(self.active_indices) // 5} per class)."
@@ -296,12 +432,14 @@ class LazySupervisedDatasetMTP(Dataset):
                 label = "positive" if is_positive_ui_defect(record) else "negative"
                 self._balanced_logical_buckets[defect_type][label].append(logical_index)
         elif repeat_time < 1:
-            if original_num_rows > 0:
-                partial_len = int(original_num_rows * repeat_time)
+            if self.active_indices:
+                partial_len = int(len(self.active_indices) * repeat_time)
                 if partial_len > 0:
                     rnd = random.Random(10086)
-                    sampled_indices = set(rnd.sample(range(original_num_rows), partial_len))
-                    self.active_indices = [i for i in range(original_num_rows) if i in sampled_indices]
+                    sampled_indices = set(rnd.sample(self.active_indices, partial_len))
+                    self.active_indices = [
+                        index for index in self.active_indices if index in sampled_indices
+                    ]
                     logger.info(f"[Dataset] {self.ds_name} Downsampled to {len(self.active_indices)} samples.")
                 else:
                     self.active_indices = []
@@ -1236,6 +1374,78 @@ class DataloaderStateCallback(TrainerCallback):
         return control
 
 
+class CheckpointCompletionCallback(TrainerCallback):
+    """Validate every rank's resume state before declaring a save complete."""
+
+    def on_save(self, args, state, control, **kwargs):
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        rank = get_rank()
+        checkpoint_dir = osp.join(args.output_dir, f"checkpoint-{state.global_step}")
+        validation_error = None
+        if rank == 0:
+            try:
+                report = validate_checkpoint(
+                    Path(checkpoint_dir),
+                    mode="resume",
+                    expected_ranks=(dist.get_world_size() if dist.is_initialized() else 1),
+                )
+                if not report["valid"]:
+                    validation_error = (
+                        "Checkpoint save returned but resume validation failed: "
+                        f"checkpoint={checkpoint_dir}; errors={'; '.join(report['errors'])}"
+                    )
+                else:
+                    marker = osp.join(checkpoint_dir, "checkpoint_complete.json")
+                    temporary = f"{marker}.tmp-{os.getpid()}"
+                    payload = {
+                        "schema_version": 1,
+                        "global_step": int(state.global_step),
+                        "completed_at_unix": time.time(),
+                        "hostname": socket.gethostname(),
+                        "world_size": (
+                            dist.get_world_size() if dist.is_initialized() else 1
+                        ),
+                        "validation": report,
+                    }
+                    with open(temporary, "w", encoding="utf-8") as handle:
+                        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                        handle.write("\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, marker)
+                    logger.info(
+                        "[Checkpoint] COMPLETE step=%s path=%s details=%s warnings=%s",
+                        state.global_step,
+                        checkpoint_dir,
+                        report["details"],
+                        report["warnings"],
+                    )
+            except BaseException as exc:
+                validation_error = (
+                    "Checkpoint completion validation/marker failed: "
+                    f"checkpoint={checkpoint_dir}; {type(exc).__name__}: {exc}"
+                )
+                logger.exception("[Checkpoint] completion FAILED")
+            finally:
+                temporary_path = locals().get("temporary")
+                if temporary_path and osp.exists(temporary_path):
+                    try:
+                        os.remove(temporary_path)
+                    except OSError:
+                        logger.exception(
+                            "[Checkpoint] could not remove marker temporary file %s",
+                            temporary_path,
+                        )
+        if dist.is_available() and dist.is_initialized():
+            message = [validation_error]
+            dist.broadcast_object_list(message, src=0)
+            validation_error = message[0]
+        if validation_error is not None:
+            raise RuntimeError(validation_error)
+        return control
+
+
 class SegmentStopCallback(TrainerCallback):
     """Stop at an absolute global step and force a fully resumable checkpoint."""
 
@@ -1367,6 +1577,203 @@ class StreamPackingMTPTrainer(Trainer):
             self._snapshot_ui5_parameters()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
+
+    def _checkpoint_trace(self, output_dir, stage, event, **details):
+        """Fsync a compact breadcrumb before/after every checkpoint phase."""
+
+        if get_rank() != 0:
+            return
+        output_dir = output_dir or self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        record = {
+            "time_unix": time.time(),
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "rank": get_rank(),
+            "global_step": int(getattr(self.state, "global_step", 0)),
+            "stage": stage,
+            "event": event,
+            **details,
+        }
+        trace_path = osp.join(output_dir, "checkpoint_save_trace.jsonl")
+        with open(trace_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        logger.info(
+            "[Checkpoint] %s %s step=%s path=%s details=%s",
+            stage,
+            event,
+            record["global_step"],
+            output_dir,
+            details,
+        )
+
+    def _save(self, output_dir=None, state_dict=None):
+        """Trace model/processor and the exact ``training_args.bin`` write."""
+
+        output_dir = output_dir or self.args.output_dir
+        self._checkpoint_trace(output_dir, "model_and_training_args", "START")
+        original_torch_save = torch.save
+
+        def traced_torch_save(obj, destination, *args, **kwargs):
+            target = getattr(destination, "name", destination)
+            destination_is_path = isinstance(destination, (str, os.PathLike))
+            try:
+                target_text = os.fspath(target)
+            except TypeError:
+                target_text = repr(target)
+            stage = (
+                "training_args.bin"
+                if osp.basename(target_text) == "training_args.bin"
+                else "torch.save"
+            )
+            self._checkpoint_trace(
+                output_dir,
+                stage,
+                "START",
+                target=target_text,
+                object_type=f"{type(obj).__module__}.{type(obj).__name__}",
+            )
+            temporary_target = None
+            try:
+                if stage == "training_args.bin" and destination_is_path:
+                    temporary_target = f"{target_text}.tmp-{os.getpid()}"
+                    result = original_torch_save(
+                        obj, temporary_target, *args, **kwargs
+                    )
+                    with open(temporary_target, "rb+") as handle:
+                        os.fsync(handle.fileno())
+                    os.replace(temporary_target, target_text)
+                else:
+                    result = original_torch_save(obj, destination, *args, **kwargs)
+            except BaseException as exc:
+                self._checkpoint_trace(
+                    output_dir,
+                    stage,
+                    "FAILED",
+                    target=target_text,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                raise
+            finally:
+                if temporary_target and osp.exists(temporary_target):
+                    try:
+                        os.remove(temporary_target)
+                    except OSError:
+                        logger.exception(
+                            "[Checkpoint] could not remove temporary training args %s",
+                            temporary_target,
+                        )
+            size = None
+            try:
+                size = osp.getsize(target_text)
+            except (OSError, TypeError):
+                pass
+            self._checkpoint_trace(
+                output_dir,
+                stage,
+                "DONE",
+                target=target_text,
+                size_bytes=size,
+            )
+            return result
+
+        torch.save = traced_torch_save
+        try:
+            result = super()._save(output_dir=output_dir, state_dict=state_dict)
+        except BaseException as exc:
+            self._checkpoint_trace(
+                output_dir,
+                "model_and_training_args",
+                "FAILED",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        finally:
+            torch.save = original_torch_save
+        self._checkpoint_trace(output_dir, "model_and_training_args", "DONE")
+        return result
+
+    def _save_optimizer_and_scheduler(self, output_dir):
+        self._checkpoint_trace(output_dir, "optimizer_and_scheduler", "START")
+        try:
+            result = super()._save_optimizer_and_scheduler(output_dir)
+        except BaseException as exc:
+            self._checkpoint_trace(
+                output_dir,
+                "optimizer_and_scheduler",
+                "FAILED",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        self._checkpoint_trace(output_dir, "optimizer_and_scheduler", "DONE")
+        return result
+
+    def _save_rng_state(self, output_dir):
+        self._checkpoint_trace(output_dir, "rng_state", "START")
+        try:
+            result = super()._save_rng_state(output_dir)
+        except BaseException as exc:
+            self._checkpoint_trace(
+                output_dir,
+                "rng_state",
+                "FAILED",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        self._checkpoint_trace(output_dir, "rng_state", "DONE")
+        return result
+
+    def _save_checkpoint(self, model, trial, *args, **kwargs):
+        run_dir = self._get_output_dir(trial=trial)
+        checkpoint_dir = osp.join(run_dir, f"checkpoint-{self.state.global_step}")
+        self._checkpoint_trace(checkpoint_dir, "trainer_checkpoint", "START")
+        state_object = self.state
+        original_state_save = state_object.save_to_json
+
+        def traced_state_save(target):
+            self._checkpoint_trace(
+                checkpoint_dir,
+                "trainer_state.json",
+                "START",
+                target=os.fspath(target),
+            )
+            try:
+                result = original_state_save(target)
+            except BaseException as exc:
+                self._checkpoint_trace(
+                    checkpoint_dir,
+                    "trainer_state.json",
+                    "FAILED",
+                    target=os.fspath(target),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                raise
+            self._checkpoint_trace(
+                checkpoint_dir,
+                "trainer_state.json",
+                "DONE",
+                target=os.fspath(target),
+                size_bytes=(osp.getsize(target) if osp.isfile(target) else None),
+            )
+            return result
+
+        state_object.save_to_json = traced_state_save
+        try:
+            result = super()._save_checkpoint(model, trial, *args, **kwargs)
+        except BaseException as exc:
+            self._checkpoint_trace(
+                checkpoint_dir,
+                "trainer_checkpoint",
+                "FAILED",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        finally:
+            state_object.save_to_json = original_state_save
+        self._checkpoint_trace(checkpoint_dir, "trainer_checkpoint", "DONE")
+        return result
 
     def _reset_ui5_window(self):
         self._ui5_scalar = {
@@ -2386,6 +2793,8 @@ def main():
     )
     logger.info(f'Training parameters: {training_args}')
 
+    training_args_serialization_preflight(training_args)
+
     # Checkpoint detection
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
@@ -2676,6 +3085,7 @@ def main():
         )
     my_callbacks.append(MemoryLoggerCallback())
     my_callbacks.append(DataloaderStateCallback(train_dataset))
+    my_callbacks.append(CheckpointCompletionCallback())
     stop_after_step = int(os.environ.get("LOCANY_STOP_AFTER_STEP", "0"))
     if stop_after_step:
         if stop_after_step > training_args.max_steps:
