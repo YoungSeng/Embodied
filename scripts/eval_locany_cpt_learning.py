@@ -18,6 +18,7 @@ import gc
 import json
 import re
 import sys
+import shutil
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -113,6 +114,86 @@ def parse_args() -> argparse.Namespace:
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be positive")
     return args
+
+
+def ensure_checkpoint_remote_code(checkpoint: str, base_model: str) -> None:
+    """
+    Hugging Face trust_remote_code requires LocateAnything custom Python files
+    to exist beside config.json in the checkpoint directory.
+
+    Training checkpoints may contain weights/config.json but omit those source
+    files. Copy missing top-level *.py files from the original base-model
+    snapshot before loading the checkpoint.
+
+    IMPORTANT:
+      - Never overwrite checkpoint/config.json.
+      - Never copy model weights from the base model.
+      - Existing checkpoint Python files are preserved.
+    """
+    checkpoint_dir = Path(checkpoint).expanduser().resolve()
+    base_dir = Path(base_model).expanduser().resolve()
+
+    if not checkpoint_dir.is_dir():
+        raise RuntimeError(f"checkpoint directory does not exist: {checkpoint_dir}")
+
+    if not base_dir.is_dir():
+        raise RuntimeError(f"base model directory does not exist: {base_dir}")
+
+    checkpoint_config = checkpoint_dir / "config.json"
+    if not checkpoint_config.is_file():
+        raise RuntimeError(
+            f"checkpoint is missing config.json: {checkpoint_config}"
+        )
+
+    base_python_files = sorted(base_dir.glob("*.py"))
+    if not base_python_files:
+        raise RuntimeError(
+            f"base model contains no Hugging Face remote-code Python files: {base_dir}"
+        )
+
+    copied = []
+    existing = []
+
+    for source in base_python_files:
+        destination = checkpoint_dir / source.name
+
+        if destination.is_file() and destination.stat().st_size > 0:
+            existing.append(source.name)
+            continue
+
+        shutil.copy2(source, destination)
+        copied.append(source.name)
+
+    print("\n===== checkpoint remote-code preparation =====")
+    print(f"base model : {base_dir}")
+    print(f"checkpoint : {checkpoint_dir}")
+
+    if copied:
+        print(f"copied     : {', '.join(copied)}")
+    else:
+        print("copied     : none")
+
+    print(f"available  : {len(existing) + len(copied)} python files")
+
+    # Explicitly check the two files required by AutoConfig/AutoModel.
+    required = [
+        "configuration_locateanything.py",
+        "modeling_locateanything.py",
+    ]
+
+    missing = [
+        name
+        for name in required
+        if not (checkpoint_dir / name).is_file()
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "checkpoint remote code is still incomplete after copying from "
+            f"base model; missing={missing}"
+        )
+
+    print("remote code: OK")
 
 
 def _resolve_recipe_path(value: str, recipe: Path, relative_to_meta: bool) -> Path:
@@ -415,6 +496,12 @@ def preview(value: str, limit: int = 600) -> str:
 
 def main() -> int:
     args = parse_args()
+
+    ensure_checkpoint_remote_code(
+        checkpoint=args.checkpoint,
+        base_model=args.base_model,
+    )
+
     selected = None if args.tasks.strip().lower() == "all" else {
         value.strip() for value in args.tasks.split(",") if value.strip()
     }
