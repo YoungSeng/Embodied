@@ -13,6 +13,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from analyze_ui5_source_overlap import content_fingerprint
 from run_ui5_crop_audit import (
+    ProgressReporter,
     atomic_write_json,
     atomic_write_jsonl,
     audit_state_digest,
@@ -40,6 +41,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mode", choices=("full_only", "full_plus_crop"), default="full_plus_crop")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--require-valid-gt-recall", type=float, default=1.0)
+    parser.add_argument("--progress-interval-seconds", type=float, default=10.0)
     return parser.parse_args(argv)
 
 
@@ -206,19 +208,31 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("v4 recipe requires exactly the confirmed annotation exclusion")
     parent_task_samples = read_jsonl(audit_dir.parent / "manifest" / "task_samples.jsonl")
     source_map = _source_record_map(manifest_rows, parent_task_samples)
+    reporter = ProgressReporter(
+        stage="gt-repair-recipe",
+        total=len(parent_task_samples) + len(manifest_rows),
+        output_dir=audit_dir,
+        interval_seconds=getattr(args, "progress_interval_seconds", 10.0),
+        unit="records",
+    )
+    reporter.update(0, detail="读取 full-image 训练记录", force=True)
+    processed = 0
 
     full_records: list[dict[str, Any]] = []
     unmatched: list[tuple[str, int]] = []
     excluded_matches = 0
     for entry, annotation, line_no, raw_record in _iter_base_records(base_meta):
+        processed += 1
         key = (str(annotation.resolve()), line_no)
         sample = source_map.get(key)
         if sample is None:
             unmatched.append(key)
+            reporter.update(processed, detail="匹配 full-image 训练记录")
             continue
         sample_id, task = str(sample["sample_id"]), str(sample["task"])
         if sample_id == EXCLUDED_SAMPLE_ID and task == EXCLUDED_TASK:
             excluded_matches += 1
+            reporter.update(processed, detail=f"排除 {EXCLUDED_SAMPLE_ID}")
             continue
         record = dict(raw_record)
         raw_images = record.get("image")
@@ -244,6 +258,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
         full_records.append(record)
+        reporter.update(processed, detail="匹配 full-image 训练记录")
     if unmatched:
         raise ValueError(
             f"{len(unmatched)} base-meta records do not map to the task-aware manifest; "
@@ -267,6 +282,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             ) != "train":
                 raise RuntimeError("manual_gt_repair reached validation/test recipe")
             crop_records.append(record)
+        processed += 1
+        reporter.update(processed, detail="校验 crop 记录与图片路径")
     if not crop_records:
         raise ValueError("full_plus_crop recipe would contain zero crop records")
     if not any(row.get("_ui5_crop_source") == "manual_gt_repair" for row in crop_records):
@@ -438,6 +455,14 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "training_recipe": str(selected_meta.resolve()),
         "created_after_all_checks": True,
     }
+    reporter.update(
+        len(parent_task_samples) + len(manifest_rows),
+        status="completed",
+        detail="recipe 与 digest 已完成，下一步原子发布 training_ready marker",
+        force=True,
+    )
+    # This marker must remain the final write in the audit transaction.  The
+    # shell wrapper prints the user-facing completion line after this returns.
     atomic_write_json(marker_path, marker)
     return recipe_summary
 

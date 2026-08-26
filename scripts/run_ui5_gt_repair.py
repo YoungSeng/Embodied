@@ -25,6 +25,7 @@ from analyze_ui5_source_overlap import content_fingerprint
 from run_ui5_crop_audit import (
     AuditPaths,
     METRIC_DEFINITIONS,
+    ProgressReporter,
     REGION_TASKS,
     TASK_AWARE_CANDIDATES,
     TASK_NAMES,
@@ -39,6 +40,7 @@ from run_ui5_crop_audit import (
     digest_ids,
     load_parser_module,
     make_image_detail,
+    materialize_image_record,
     materialization_reuse_metrics,
     open_raw_image,
     planned_crop_paths,
@@ -86,6 +88,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-valid-repairs", type=int, default=EXPECTED_VALID_REPAIRS)
     parser.add_argument("--max-crops", type=int, default=10)
     parser.add_argument("--boundary-margin-ratio", type=float, default=0.01)
+    parser.add_argument("--progress-interval-seconds", type=float, default=10.0)
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args(argv)
 
@@ -469,13 +472,46 @@ def render_repair_visualizations(
     detections: Mapping[str, Mapping[str, Any]],
     source_results_by_sample: Mapping[str, Mapping[str, Any]],
     repaired_results_by_sample: Mapping[str, Mapping[str, Any]],
+    progress_interval_seconds: float = 10.0,
+    resume: bool = False,
 ) -> None:
     """Render training-only repair evidence without loading either detector."""
 
     root = target_audit / "gt_repair_visualizations"
     gallery_rows: list[str] = []
-    for action in actions:
+    output_paths = [
+        root
+        / str(action["task"])
+        / str(action["failure_type"])
+        / f"{action['sample_id']}__gt{int(action['gt_index'])}.png"
+        for action in actions
+    ]
+    reused = sum(resume and path.is_file() and path.stat().st_size > 0 for path in output_paths)
+    reporter = ProgressReporter(
+        stage="gt-repair-visualizations",
+        total=len(actions),
+        output_dir=target_audit,
+        interval_seconds=progress_interval_seconds,
+        initial_completed=reused,
+        unit="GT failures",
+    )
+    reporter.update(
+        reused,
+        detail=f"复用 {reused} 张已有四联图",
+        force=True,
+    )
+    completed = reused
+    for action, output in zip(actions, output_paths):
         sample_id = str(action["sample_id"])
+        action["visualization_4panel"] = str(output.resolve())
+        relative = output.relative_to(root).as_posix()
+        if resume and output.is_file() and output.stat().st_size > 0:
+            gallery_rows.append(
+                f'<article data-task="{action["task"]}" data-failure="{action["failure_type"]}">'
+                f"<h3>{sample_id} · GT {action['gt_index']}</h3>"
+                f'<a href="../{relative}"><img loading="lazy" src="../{relative}"></a></article>'
+            )
+            continue
         repaired = repaired_results_by_sample[sample_id]
         image_id = str(repaired["image_id"])
         source_result = source_results_by_sample[sample_id]
@@ -529,21 +565,15 @@ def render_repair_visualizations(
             f"GT={action['bbox']} | action={action['action']} | training only; inference GT repair disabled"
         )
         draw.text((5, title_height + display_height + 8), footer, fill="black", font=font)
-        output = (
-            root
-            / str(action["task"])
-            / str(action["failure_type"])
-            / f"{sample_id}__gt{int(action['gt_index'])}.png"
-        )
         atomic_save_png(canvas, output)
         canvas.close()
-        action["visualization_4panel"] = str(output.resolve())
-        relative = output.relative_to(root).as_posix()
         gallery_rows.append(
             f'<article data-task="{action["task"]}" data-failure="{action["failure_type"]}">'
             f"<h3>{sample_id} · GT {action['gt_index']}</h3>"
             f'<a href="../{relative}"><img loading="lazy" src="../{relative}"></a></article>'
         )
+        completed += 1
+        reporter.update(completed, detail=f"当前 {sample_id}")
     gallery = root / "gallery" / "index.html"
     _atomic_write_text(
         gallery,
@@ -553,6 +583,7 @@ def render_repair_visualizations(
         "<p>These views use saved detector JSONL only. GT repair is forbidden in validation, test and inference.</p>"
         + "\n".join(gallery_rows),
     )
+    reporter.update(len(actions), status="completed", detail="四联图与 gallery 已完成", force=True)
 
 
 def _geometry_shard_valid(
@@ -791,10 +822,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     config_root = target_audit / f"candidate_{args.repair_config}"
     geometry_dir = config_root / "geometry"
     geometry_dir.mkdir(parents=True, exist_ok=True)
+    reusable_geometry: dict[Path, bool] = {}
+    geometry_reused = 0
     for source_shard in source_shards:
         output_shard = geometry_dir / source_shard.name
         done = geometry_dir / f"{source_shard.stem}.done.json"
-        if args.resume and _geometry_shard_valid(source_shard, output_shard, done, state_digest):
+        valid = bool(
+            args.resume
+            and _geometry_shard_valid(source_shard, output_shard, done, state_digest)
+        )
+        reusable_geometry[source_shard] = valid
+        if valid:
+            geometry_reused += int(json.loads(done.read_text(encoding="utf-8"))["count"])
+    geometry_reporter = ProgressReporter(
+        stage="gt-repair-geometry",
+        total=len(unique),
+        output_dir=target_audit,
+        interval_seconds=args.progress_interval_seconds,
+        initial_completed=geometry_reused,
+        unit="images",
+    )
+    geometry_reporter.update(
+        geometry_reused,
+        detail=f"复用 {geometry_reused} 张已完成几何结果",
+        force=True,
+    )
+    geometry_completed = geometry_reused
+    for source_shard in source_shards:
+        output_shard = geometry_dir / source_shard.name
+        done = geometry_dir / f"{source_shard.stem}.done.json"
+        if reusable_geometry[source_shard]:
             continue
         output_rows = []
         for source_record in read_jsonl(source_shard):
@@ -916,6 +973,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "repair_actions": record_actions,
                 }
             )
+            geometry_completed += 1
+            geometry_reporter.update(
+                geometry_completed,
+                detail=f"{source_shard.name}，当前 {image_id}",
+            )
         atomic_write_jsonl(output_shard, output_rows)
         atomic_write_json(
             done,
@@ -926,6 +988,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "state_digest": state_digest,
             },
         )
+        geometry_reporter.update(
+            geometry_completed,
+            detail=f"{source_shard.name} 已原子落盘",
+            force=True,
+        )
+    geometry_reporter.update(
+        len(unique), status="completed", detail="几何结果完整", force=True
+    )
 
     geometry_rows = [
         row for shard in source_shards for row in read_jsonl(geometry_dir / shard.name)
@@ -951,19 +1021,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     material_dir = config_root / "materialized"
     material_dir.mkdir(parents=True, exist_ok=True)
     repaired_sample_ids = {str(row["sample_id"]) for row in repair_actions}
+    reusable_material: dict[Path, bool] = {}
+    material_reused = 0
     for source_shard in source_shards:
         geometry_shard = geometry_dir / source_shard.name
         output_shard = material_dir / source_shard.name
         done = material_dir / f"{source_shard.stem}.done.json"
-        if args.resume and _material_shard_valid(geometry_shard, output_shard, done, state_digest):
+        valid = bool(
+            args.resume
+            and _material_shard_valid(geometry_shard, output_shard, done, state_digest)
+        )
+        reusable_material[source_shard] = valid
+        if valid:
+            material_reused += int(json.loads(done.read_text(encoding="utf-8"))["count"])
+    material_reporter = ProgressReporter(
+        stage="gt-repair-materialize",
+        total=len(unique),
+        output_dir=target_audit,
+        interval_seconds=args.progress_interval_seconds,
+        initial_completed=material_reused,
+        unit="images",
+    )
+    material_reporter.update(
+        material_reused,
+        detail=f"复用 {material_reused} 张已有 crop",
+        force=True,
+    )
+    material_completed = material_reused
+    for source_shard in source_shards:
+        geometry_shard = geometry_dir / source_shard.name
+        output_shard = material_dir / source_shard.name
+        done = material_dir / f"{source_shard.stem}.done.json"
+        if reusable_material[source_shard]:
             continue
         output_rows = []
         for geometry in read_jsonl(geometry_shard):
             manifest = unique_by_id[str(geometry["image_id"])]
             # Reuse the established materializer: one image decode, one physical
             # PNG per unique bbox, task references remain independent.
-            from run_ui5_crop_audit import materialize_image_record
-
             output_rows.append(
                 materialize_image_record(
                     manifest=manifest,
@@ -971,6 +1066,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     config_root=config_root,
                     overview_sample_ids=repaired_sample_ids,
                 )
+            )
+            material_completed += 1
+            material_reporter.update(
+                material_completed,
+                detail=f"{source_shard.name}，当前 {geometry['image_id']}",
             )
         atomic_write_jsonl(output_shard, output_rows)
         atomic_write_json(
@@ -982,6 +1082,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "state_digest": state_digest,
             },
         )
+        material_reporter.update(
+            material_completed,
+            detail=f"{source_shard.name} 已原子落盘",
+            force=True,
+        )
+    material_reporter.update(
+        len(unique), status="completed", detail="crop 物化完整", force=True
+    )
 
     material_rows = [
         row for shard in source_shards for row in read_jsonl(material_dir / shard.name)
@@ -1007,6 +1115,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         detections=detections,
         source_results_by_sample=source_results_by_sample,
         repaired_results_by_sample=repaired_results_by_sample,
+        progress_interval_seconds=args.progress_interval_seconds,
+        resume=args.resume,
     )
     if not all(Path(str(row["visualization_4panel"])).is_file() for row in repair_actions):
         raise AssertionError("one or more GT repair four-panel visualizations are missing")
@@ -1018,7 +1128,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     post_failures: list[dict[str, Any]] = []
     task_manifest: list[dict[str, Any]] = []
     preview_by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for geometry in geometry_rows:
+    report_reporter = ProgressReporter(
+        stage="gt-repair-reports",
+        total=len(geometry_rows),
+        output_dir=target_audit,
+        interval_seconds=args.progress_interval_seconds,
+        unit="images",
+    )
+    report_reporter.update(0, detail="构建 task-aware manifest 与统计", force=True)
+    for geometry_index, geometry in enumerate(geometry_rows, 1):
         image_id = str(geometry["image_id"])
         sample_map = {str(row["sample_id"]): row for row in samples_by_image[image_id]}
         material = material_by_image[image_id]
@@ -1082,6 +1200,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "excluded": False,
                 }
             )
+        report_reporter.update(
+            geometry_index,
+            detail=f"构建报告数据，当前 {image_id}",
+        )
     if post_failures:
         raise AssertionError(f"post-repair geometry still has {len(post_failures)} GT failures")
     atomic_write_jsonl(target_audit / "task_aware_manifest.jsonl", task_manifest)
@@ -1205,6 +1327,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     atomic_write_json(target_audit / "materialization_summary.json", summary["materialization"])
     write_statistics_csv(target_audit / "statistics.csv", details)
     atomic_write_json(target_audit / "summary.json", summary)
+    report_reporter.update(
+        len(geometry_rows), detail="正在写 Excel（最后一个大文件）", force=True
+    )
     overlap_report = output_dir / "manifest" / "overlap" / "source_overlap.json"
     overlap_payload = json.loads(overlap_report.read_text(encoding="utf-8")) if overlap_report.is_file() else {}
     write_excel_report(
@@ -1213,6 +1338,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         overlap_payload,
         details,
         post_failures,
+    )
+    report_reporter.update(
+        len(geometry_rows), status="completed", detail="JSON/CSV/Excel 全部写入", force=True
     )
     if marker_path.exists():
         raise AssertionError("GT-repair stage must not publish training_ready.json before recipe")

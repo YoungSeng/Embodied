@@ -56,6 +56,7 @@ done
 cd "${PROJECT_ROOT}"
 echo "[UI5 v4] detector_stages_executed=[]; OCR/icon/merge disabled"
 echo "[UI5 v4] source audit=${SOURCE_AUDIT_NAME}; target audit=${CROP_AUDIT_NAME}"
+echo "[UI5 v4 阶段 1/2] GT repair geometry、crop 物化、可视化和报告"
 
 REPAIR_COMMAND=(
   "${PYTHON_BIN}" scripts/run_ui5_gt_repair.py
@@ -71,6 +72,7 @@ fi
 "${REPAIR_COMMAND[@]}"
 
 AUDIT_DIR="${OUTPUT_DIR}/${CROP_AUDIT_NAME}"
+echo "[UI5 v4 阶段 2/2] 生成 full/full+crop recipe，并在全部 gate 通过后最后写 marker"
 "${PYTHON_BIN}" scripts/build_ui5_crop_training_recipe.py \
   --audit-dir "${AUDIT_DIR}" \
   --base-meta "${BASE_META}" \
