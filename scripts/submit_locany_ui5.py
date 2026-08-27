@@ -60,6 +60,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--eval-parser-root", default=None)
     parser.add_argument("--eval-detector-cache", default=None)
+    parser.add_argument(
+        "--eval-detector-cache-mode", choices=("build", "readonly"), default="readonly"
+    )
+    parser.add_argument("--eval-scan-name", default="horizontal_scan_v2")
+    parser.add_argument("--eval-expected-unique-images", type=int, default=17281)
     parser.add_argument("--eval-text-python", default=None)
     parser.add_argument("--eval-icon-python", default=None)
     parser.add_argument("--eval-text-model-dir", default=None)
@@ -206,6 +211,13 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         ),
         "EVAL_DETECTOR_WORKERS_PER_GPU": str(
             getattr(args, "eval_detector_workers_per_gpu", 1)
+        ),
+        "EVAL_DETECTOR_CACHE_MODE": str(
+            getattr(args, "eval_detector_cache_mode", "readonly")
+        ),
+        "EVAL_SCAN_NAME": str(getattr(args, "eval_scan_name", "horizontal_scan_v2")),
+        "EVAL_EXPECTED_UNIQUE_IMAGES": str(
+            getattr(args, "eval_expected_unique_images", 17281)
         ),
         "EVAL_TILE_MAX_COUNT": str(getattr(args, "eval_tile_max_count", 10)),
         "EVAL_TILE_TARGET_LONG_SIDE": str(
@@ -357,6 +369,9 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "EVAL_INFERENCE_CROP_MODE",
         "EVAL_PARSER_ROOT",
         "EVAL_DETECTOR_CACHE",
+        "EVAL_DETECTOR_CACHE_MODE",
+        "EVAL_SCAN_NAME",
+        "EVAL_EXPECTED_UNIQUE_IMAGES",
         "EVAL_TEXT_PYTHON",
         "EVAL_ICON_PYTHON",
         "EVAL_TEXT_MODEL_DIR",
@@ -473,6 +488,9 @@ def main() -> int:
         "EVAL_INFERENCE_CROP_MODE",
         "EVAL_PARSER_ROOT",
         "EVAL_DETECTOR_CACHE",
+        "EVAL_DETECTOR_CACHE_MODE",
+        "EVAL_SCAN_NAME",
+        "EVAL_EXPECTED_UNIQUE_IMAGES",
         "EVAL_TEXT_PYTHON",
         "EVAL_ICON_PYTHON",
         "EVAL_ICON_MODEL",

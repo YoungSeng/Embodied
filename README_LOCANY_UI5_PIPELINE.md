@@ -259,27 +259,35 @@ python scripts/submit_locany_ui5.py \
 
 ## 五任务并行推理
 
-默认 `EVAL_INFERENCE_CROP_MODE=detector_scan`。第一次评测先在四张评测 GPU 上顺序完成
-PP-OCRv5 text detection 和 OmniParser icon detection，并把结果按内容唯一图片分 shard 落到：
+默认 `EVAL_INFERENCE_CROP_MODE=detector_scan` 且
+`EVAL_DETECTOR_CACHE_MODE=readonly`。PP-OCRv5 与 OmniParser 必须在训练前离线完成；训练中的
+step-0 和周期评测只校验并读取缓存，不再进入 detector pipeline。缓存目录为：
 
 ```text
-${OUTPUT_DIR}/evaluation/detector_scan_cache/
+${EVAL_DETECTOR_CACHE}/
   manifest/
   detections/{text,icon,merged}/
-  scan_crops/detector_scan_crops.jsonl
-  scan_crops/{summary.json,statistics.csv}
-  scan_crops/gallery/index.html
+  horizontal_scan_v2/detector_scan_crops.jsonl
+  horizontal_scan_v2/{summary.json,statistics.csv,eval_detector_cache_ready.json}
+  horizontal_scan_v2/gallery/index.html
 ```
 
-两个 detector 退出后才加载 LocateAnything 评测 worker；后续 checkpoint 使用 `--resume`
-校验并复用缓存，不重复检测。几何只读取 text/icon bbox 和图片尺寸：检测框按纵向邻近组成
-连通带，每个 crop 横向贯穿完整图片宽度，纵向重叠扫描；所有像素至少出现一次，任何 detector
-bbox 都不能被边界切开。左右有检测而中间目标漏检时，中间仍在同一横条内。评测/推理禁止
-读取训练 GT repair；`content_missing` 保留完整原图视图。
+离线构建时主进程和 icon worker 使用 LocateAnything Python，text worker 显式使用独立的
+UI5PaddleOCR Python；不要在两个环境之间互装 Torch/Paddle。两个 runtime preflight 均在 GPU
+worker 前执行。几何只读取 text/icon bbox 和图片尺寸：连续 core 精确覆盖整图，seam 优先选择
+附近 detector-free gap；无 gap 时使用 balanced fallback 和小范围 overlap。每个 crop 横向贯穿
+完整宽度，每个 detector bbox 至少被一张 crop 完整包含。多 crop plan 禁止完整原图、重复或
+嵌套 crop。评测/推理禁止读取训练 GT repair；`content_missing` 单独保留完整原图视图。
+
+`eval_detector_cache_ready.json` 在输入、detector shard、merged、几何 manifest、summary、CSV 和
+gallery 全部写入并通过门禁后最后原子生成。readonly 会重新校验 dataset/detector/geometry
+digest；缓存缺失、不完整或 digest 不一致时 fail closed，不回退现场 detector 或 full image。
+更改几何时使用新的 `EVAL_SCAN_NAME`，只重跑 CPU crop；raw detector shard 保持不变。
 
 正式运行前建议先按 [README_UI5_COMMANDS.md](README_UI5_COMMANDS.md) 的单命令预览方式选择
-少量测试图片，检查 gallery 和统计。若 Paddle 与训练环境不同，通过 `--eval-text-python` 指向
-独立 Paddle 环境；不得在正在训练使用的共享环境中现场安装或替换 Torch/Paddle 依赖。
+至少 200 张测试图片，按 sparse/medium/dense 检查 gallery 和统计。完整离线 cache/validator
+命令见 [README_UI5_COMMANDS.md](README_UI5_COMMANDS.md)。不得在正在训练使用的共享环境中
+现场安装或替换 Torch/Paddle 依赖。
 
 任务：
 

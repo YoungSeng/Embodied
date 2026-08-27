@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from locany_ui5_common import PROJECT_ROOT
+from ui5_eval_detector_cache import validate_eval_detector_cache
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +46,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tile-nms-iou", type=float, default=0.50)
     parser.add_argument("--eval-parser-root", type=Path, default=None)
     parser.add_argument("--eval-detector-cache", type=Path, default=None)
+    parser.add_argument(
+        "--eval-detector-cache-mode",
+        choices=("build", "readonly"),
+        default="readonly",
+    )
+    parser.add_argument("--eval-scan-name", default="horizontal_scan_v2")
+    parser.add_argument("--eval-expected-unique-images", type=int, default=17281)
     parser.add_argument("--eval-text-python", default=None)
     parser.add_argument("--eval-icon-python", default=None)
     parser.add_argument("--eval-text-model-dir", type=Path, default=None)
@@ -164,6 +173,10 @@ def main() -> int:
         raise ValueError("--scan-dense-band-ratio must be in (0, 1]")
     if args.scan_visualization_samples < 0:
         raise ValueError("--scan-visualization-samples cannot be negative")
+    if args.eval_expected_unique_images < 0:
+        raise ValueError("--eval-expected-unique-images cannot be negative")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.eval_scan_name):
+        raise ValueError("--eval-scan-name must be one safe directory name")
     args.project_root = args.project_root.expanduser().resolve()
     args.checkpoint = args.checkpoint.expanduser().resolve()
     args.base_model = args.base_model.expanduser().resolve()
@@ -215,6 +228,8 @@ def main() -> int:
             if args.inference_crop_mode == "detector_scan"
             else None
         ),
+        "detector_cache_mode": args.eval_detector_cache_mode,
+        "eval_scan_name": args.eval_scan_name,
         "checkpoint": str(args.checkpoint),
         "prediction_dir": str(prediction_dir),
         "evaluation_run_dir": str(evaluation_run_dir),
@@ -237,59 +252,69 @@ def main() -> int:
         detector_crop_manifest_digest: str | None = None
         if args.inference_crop_mode == "detector_scan":
             detector_crop_manifest = (
-                args.eval_detector_cache / "scan_crops" / "detector_scan_crops.jsonl"
+                args.eval_detector_cache / args.eval_scan_name / "detector_scan_crops.jsonl"
             )
-            if not args.eval_parser_root.is_dir():
-                raise FileNotFoundError(
-                    f"ui-region-parser does not exist: {args.eval_parser_root}"
-                )
-            current_stage = "prepare_detector_scan"
-            current_command = [
-                sys.executable,
-                str(args.project_root / "scripts" / "prepare_ui5_eval_detector_crops.py"),
-                "--stage", "all",
-                "--input-dir", str(args.input_dir),
-                "--output-dir", str(args.eval_detector_cache),
-                "--parser-root", str(args.eval_parser_root),
-                "--gpus", args.eval_gpu_devices,
-                "--workers-per-gpu", str(args.eval_detector_workers_per_gpu),
-                "--scan-max-crops", str(args.tile_max_count),
-                "--scan-target-height", str(args.scan_target_height),
-                "--scan-overlap-ratio", str(args.tile_overlap_ratio),
-                "--scan-vertical-link-ratio", str(args.scan_vertical_link_ratio),
-                "--scan-context-ratio", str(args.scan_context_ratio),
-                "--scan-min-context-image-ratio", str(args.scan_min_context_image_ratio),
-                "--scan-dense-band-ratio", str(args.scan_dense_band_ratio),
-                "--visualization-samples", str(args.scan_visualization_samples),
-                "--resume",
-            ]
-            if args.max_images_per_task:
-                current_command.extend(
-                    ["--max-images-per-task", str(args.max_images_per_task)]
-                )
-            if args.eval_text_python:
-                current_command.extend(["--text-python", args.eval_text_python])
-            if args.eval_icon_python:
-                current_command.extend(["--icon-python", args.eval_icon_python])
-            if args.eval_text_model_dir:
-                current_command.extend(
-                    ["--text-model-dir", str(args.eval_text_model_dir)]
-                )
-            if args.eval_icon_model:
-                current_command.extend(["--icon-model", str(args.eval_icon_model)])
-            if args.eval_detector_workers_per_gpu == 2:
-                current_command.append("--allow-two-processes-per-gpu")
-            if args.dry_run:
-                print(f"[DRY RUN:{current_stage}] {shlex.join(current_command)}")
-            else:
-                run_checked(current_command, cwd=args.project_root, stage=current_stage)
-                if not detector_crop_manifest.is_file():
+            if args.eval_detector_cache_mode == "build":
+                if not args.eval_parser_root.is_dir():
                     raise FileNotFoundError(
-                        f"detector scan preparation did not write {detector_crop_manifest}"
+                        f"ui-region-parser does not exist: {args.eval_parser_root}"
                     )
+                if not args.eval_text_python or not args.eval_icon_python:
+                    raise ValueError(
+                        "detector cache build requires explicit --eval-text-python and --eval-icon-python"
+                    )
+                current_stage = "build_detector_cache"
+                current_command = [
+                    sys.executable,
+                    str(args.project_root / "scripts" / "prepare_ui5_eval_detector_crops.py"),
+                    "--stage", "all",
+                    "--input-dir", str(args.input_dir),
+                    "--output-dir", str(args.eval_detector_cache),
+                    "--parser-root", str(args.eval_parser_root),
+                    "--gpus", args.eval_gpu_devices,
+                    "--workers-per-gpu", str(args.eval_detector_workers_per_gpu),
+                    "--text-python", args.eval_text_python,
+                    "--icon-python", args.eval_icon_python,
+                    "--scan-name", args.eval_scan_name,
+                    "--scan-max-crops", str(args.tile_max_count),
+                    "--scan-target-height", str(args.scan_target_height),
+                    "--scan-overlap-ratio", str(args.tile_overlap_ratio),
+                    "--visualization-samples", str(args.scan_visualization_samples),
+                    "--resume",
+                ]
+                if args.max_images_per_task:
+                    current_command.extend(
+                        ["--max-images-per-task", str(args.max_images_per_task)]
+                    )
+                if args.eval_text_model_dir:
+                    current_command.extend(["--text-model-dir", str(args.eval_text_model_dir)])
+                if args.eval_icon_model:
+                    current_command.extend(["--icon-model", str(args.eval_icon_model)])
+                if args.eval_detector_workers_per_gpu == 2:
+                    current_command.append("--allow-two-processes-per-gpu")
+                if args.dry_run:
+                    print(f"[DRY RUN:{current_stage}] {shlex.join(current_command)}")
+                else:
+                    run_checked(current_command, cwd=args.project_root, stage=current_stage)
+
+            if not args.dry_run:
+                current_stage = "validate_detector_cache_readonly"
+                marker = validate_eval_detector_cache(
+                    args.eval_detector_cache,
+                    scan_name=args.eval_scan_name,
+                    expected_unique_images=args.eval_expected_unique_images,
+                    require_ready=True,
+                    input_dir=args.input_dir,
+                )
                 detector_crop_manifest_digest = hashlib.sha256(
                     detector_crop_manifest.read_bytes()
                 ).hexdigest()
+                print(
+                    "detector cache: readonly validated | "
+                    f"scan={args.eval_scan_name} | images={marker['dataset']['content_unique_images']} | "
+                    f"manifest={detector_crop_manifest}",
+                    flush=True,
+                )
 
         if not args.skip_patch:
             current_stage = "patch"

@@ -53,7 +53,10 @@ class DetectorScanGeometryTest(unittest.TestCase):
             overlap_ratio=0.10,
         )
         self.assertEqual(plan["lossless_pixel_coverage_ratio"], 1.0)
-        self.assertEqual(plan["detector_boundary_cut_count"], 0)
+        # A seam may cross a detector on a dense row; containment, not the
+        # historical boundary-cut diagnostic, is the correctness gate.
+        self.assertEqual(plan["detector_bbox_containment_rate"], 1.0)
+        self.assertEqual(plan["uncontained_detector_bbox_count"], 0)
         self.assertTrue(all(tile[0] == 0 and tile[2] == 1200 for tile in plan["tiles"]))
         # Any pixel between left/right neighbours is included because every
         # scan spans the complete source width.
@@ -77,13 +80,16 @@ class DetectorScanGeometryTest(unittest.TestCase):
             plan = generate_detector_scan_plan(width, height, boxes)
             self.assertLessEqual(len(plan["tiles"]), 10)
             assert_lossless_coverage(width, height, plan["tiles"])
-            self.assertEqual(detector_boundary_cut_count(plan["tiles"], boxes), 0)
+            self.assertEqual(plan["detector_bbox_containment_rate"], 1.0)
+            self.assertEqual(plan["uncontained_detector_bbox_count"], 0)
 
-    def test_dense_connected_page_may_keep_one_full_view(self) -> None:
+    def test_dense_connected_page_is_balanced_instead_of_full_view(self) -> None:
         boxes = [[10, 50, 100, 950], [200, 900, 300, 1950], [400, 1900, 500, 2950]]
         plan = generate_detector_scan_plan(1000, 3000, boxes)
-        self.assertEqual(plan["tiles"], [[0, 0, 1000, 3000]])
-        self.assertEqual(plan["fallback_reason"], "dense_connected_band")
+        self.assertGreater(len(plan["tiles"]), 1)
+        self.assertNotIn([0, 0, 1000, 3000], plan["tiles"])
+        self.assertEqual(plan["detector_bbox_containment_rate"], 1.0)
+        self.assertEqual(plan["nested_tile_count"], 0)
 
     def test_content_missing_keeps_global_view_without_gt(self) -> None:
         plan = generate_detector_scan_plan(
@@ -92,21 +98,21 @@ class DetectorScanGeometryTest(unittest.TestCase):
         self.assertEqual(plan["tiles"], [[0, 0, 1000, 5000]])
         self.assertFalse(plan["gt_used"])
 
-    def test_detector_empty_page_falls_back_to_full_image(self) -> None:
+    def test_detector_empty_long_page_still_uses_balanced_scans(self) -> None:
         plan = generate_detector_scan_plan(1000, 5000, [])
-        self.assertEqual(plan["tiles"], [[0, 0, 1000, 5000]])
-        self.assertEqual(plan["fallback_reason"], "detector_empty_full_image")
+        self.assertGreater(len(plan["tiles"]), 1)
+        self.assertEqual(plan["lossless_pixel_coverage_ratio"], 1.0)
 
 
 class DetectorScanPipelineTest(unittest.TestCase):
-    def test_eval_pipeline_prepares_detector_cache_before_locany_workers(self) -> None:
+    def test_eval_pipeline_defaults_to_readonly_cache_before_locany_workers(self) -> None:
         source = (SCRIPTS / "run_ui5_eval.py").read_text(encoding="utf-8")
-        prepare_position = source.index("prepare_ui5_eval_detector_crops.py")
+        prepare_position = source.index('if args.eval_detector_cache_mode == "build"')
         inference_position = source.index("run_ui5_parallel_inference.py")
         self.assertLess(prepare_position, inference_position)
         self.assertIn("--detector-crop-manifest", source)
         self.assertIn('"--stage", "all"', source)
-        self.assertIn('"--resume"', source)
+        self.assertIn("detector cache: readonly validated", source)
         self.assertNotIn("manual_gt_repair", source)
 
     def test_crop_stage_writes_visualization_gallery_and_statistics_without_gt(self) -> None:
@@ -155,8 +161,40 @@ class DetectorScanPipelineTest(unittest.TestCase):
             (merged / "detections.jsonl").write_text(
                 json.dumps(detected) + "\n", encoding="utf-8"
             )
+            task_files = {}
+            for task_name in common.TASKS:
+                task_file = root / common.TASK_JSONL[task_name]
+                task_file.write_text(json.dumps({"images": [str(image_path)]}) + "\n", encoding="utf-8")
+                task_files[task_name] = str(task_file)
+            (manifest / "selection_config.json").write_text(
+                json.dumps({"task_files": task_files}), encoding="utf-8"
+            )
+            (root / "detections" / "detector_config.json").write_text(
+                json.dumps(
+                    {
+                        "parser_commit": "06eaebf8eb4ea01e61b690f2ff972bf614915918",
+                        "text": {"model_dir": None},
+                        "icon": {"model": "model.pt"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            for stage_name in ("text", "icon"):
+                stage_dir = root / "detections" / stage_name
+                stage_dir.mkdir(parents=True)
+                (stage_dir / "stage_summary.json").write_text(
+                    json.dumps({"images": 1, "workers": 1, "runtime": {"python": stage_name}}),
+                    encoding="utf-8",
+                )
+                (stage_dir / "shard_00000.jsonl").write_text(
+                    json.dumps({"image_id": "eval_1"}) + "\n", encoding="utf-8"
+                )
+                (stage_dir / "shard_00000.done.json").write_text(
+                    json.dumps({"stage": stage_name, "count": 1}), encoding="utf-8"
+                )
             args = argparse.Namespace(
                 output_dir=root,
+                scan_name="horizontal_scan_v2",
                 scan_max_crops=10,
                 scan_target_height=960,
                 scan_overlap_ratio=0.12,
@@ -164,6 +202,10 @@ class DetectorScanPipelineTest(unittest.TestCase):
                 scan_context_ratio=0.10,
                 scan_min_context_image_ratio=0.01,
                 scan_dense_band_ratio=0.80,
+                scan_detector_margin_ratio=0.003,
+                scan_seam_search_ratio=0.25,
+                scan_context_pixels=48,
+                scan_minimum_core_height_ratio=0.35,
                 visualization_samples=1,
                 save_preview_crops=True,
                 resume=True,
@@ -173,10 +215,11 @@ class DetectorScanPipelineTest(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertFalse(rows[0]["gt_used"])
             self.assertEqual(rows[0]["detector_boundary_cut_count"], 0)
-            self.assertTrue((root / "scan_crops" / "summary.json").is_file())
-            self.assertTrue((root / "scan_crops" / "statistics.csv").is_file())
-            self.assertTrue((root / "scan_crops" / "gallery" / "index.html").is_file())
-            self.assertTrue(list((root / "scan_crops" / "preview_crops").glob("*.png")))
+            self.assertTrue((root / "horizontal_scan_v2" / "summary.json").is_file())
+            self.assertTrue((root / "horizontal_scan_v2" / "statistics.csv").is_file())
+            self.assertTrue((root / "horizontal_scan_v2" / "gallery" / "index.html").is_file())
+            self.assertTrue((root / "horizontal_scan_v2" / "eval_detector_cache_ready.json").is_file())
+            self.assertTrue(list((root / "horizontal_scan_v2" / "preview_crops").glob("*.png")))
             original_draw = preparer._draw_preview
             try:
                 preparer._draw_preview = lambda *unused, **unused_kwargs: self.fail(
@@ -223,8 +266,8 @@ class DetectorScanPipelineTest(unittest.TestCase):
         self.assertTrue(config["EVAL_PARSER_ROOT"].endswith("ui-region-parser"))
         self.assertTrue(config["EVAL_ICON_MODEL"].endswith("icon_detect_v3/model.pt"))
         self.assertEqual(config["EVAL_DETECTOR_WORKERS_PER_GPU"], 1)
-        self.assertEqual(config["EVAL_SCAN_VERTICAL_LINK_RATIO"], 0.025)
-        self.assertEqual(config["EVAL_SCAN_CONTEXT_RATIO"], 0.20)
+        self.assertEqual(config["EVAL_DETECTOR_CACHE_MODE"], "readonly")
+        self.assertEqual(config["EVAL_SCAN_NAME"], "horizontal_scan_v2")
 
 
 if __name__ == "__main__":

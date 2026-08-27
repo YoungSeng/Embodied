@@ -9,8 +9,10 @@ cross-tile de-duplication.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
+from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -36,44 +38,122 @@ def _normalized_detector_boxes(
     return sorted(set(normalized), key=lambda box: (box[1], box[3], box[0], box[2]))
 
 
-def _vertical_connected_bands(
-    boxes: Sequence[BBox],
-    *,
-    height: int,
-    vertical_link_ratio: float,
-    context_ratio: float,
-    min_context_image_ratio: float,
+def _occupied_y_intervals(
+    boxes: Sequence[BBox], *, height: int, margin: int
 ) -> list[tuple[int, int]]:
-    """Collapse vertically adjacent detector boxes into protected scan bands.
+    """Return only genuinely overlapping/touching detector y projections.
 
-    X distance is deliberately ignored: two detected elements on the left and
-    right of the same row protect the complete horizontal strip between them.
-    This is the detector-only counterpart of the cropper connected graph.
+    The old implementation linked nearby rows and then padded a whole connected
+    component by 20% of its height.  On dense pages that turns most of the page
+    into one protected band.  Seam selection needs the much narrower notion of
+    detector occupancy used here.
     """
 
-    if not boxes:
-        return []
-    link_px = max(0, math.ceil(height * vertical_link_ratio))
-    components: list[list[int]] = []
-    for _x1, y1, _x2, y2 in boxes:
-        if components and y1 <= components[-1][1] + link_px:
-            components[-1][1] = max(components[-1][1], y2)
+    projected = sorted(
+        (max(0, box[1] - margin), min(height, box[3] + margin)) for box in boxes
+    )
+    merged: list[list[int]] = []
+    for start, end in projected:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
         else:
-            components.append([y1, y2])
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
 
-    protected: list[tuple[int, int]] = []
-    for y1, y2 in components:
-        component_height = max(1, y2 - y1)
-        padding = max(
-            math.ceil(component_height * context_ratio),
-            math.ceil(height * min_context_image_ratio),
-        )
-        band = (max(0, y1 - padding), min(height, y2 + padding))
-        if protected and band[0] <= protected[-1][1]:
-            protected[-1] = (protected[-1][0], max(protected[-1][1], band[1]))
+
+def _free_y_gaps(
+    occupied: Sequence[tuple[int, int]], *, height: int
+) -> list[tuple[int, int]]:
+    gaps: list[tuple[int, int]] = []
+    cursor = 0
+    for start, end in occupied:
+        if start > cursor:
+            gaps.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < height:
+        gaps.append((cursor, height))
+    return gaps
+
+
+def _choose_horizontal_seams(
+    *,
+    height: int,
+    count: int,
+    gaps: Sequence[tuple[int, int]],
+    search_ratio: float,
+    minimum_core_height: int,
+) -> tuple[list[int], list[str]]:
+    """Choose increasing, balanced seams, preferring nearby detector-free gaps."""
+
+    if count <= 1:
+        return [], []
+    target_core = height / count
+    window = target_core * search_ratio
+    seams: list[int] = []
+    sources: list[str] = []
+    used_gaps: set[int] = set()
+    for index in range(1, count):
+        desired = index * target_core
+        lower = (seams[-1] if seams else 0) + minimum_core_height
+        remaining = count - index
+        upper = height - remaining * minimum_core_height
+        candidates: list[tuple[float, int, int, int]] = []
+        for gap_index, (gap_start, gap_end) in enumerate(gaps):
+            if gap_index in used_gaps:
+                continue
+            allowed_start = max(gap_start, math.ceil(desired - window), lower)
+            allowed_end = min(gap_end, math.floor(desired + window), upper)
+            if allowed_end < allowed_start:
+                continue
+            candidate = int(round(min(max(desired, allowed_start), allowed_end)))
+            # Nearest is primary; a wider gap wins ties and is more robust to
+            # small detector-coordinate changes.
+            candidates.append(
+                (abs(candidate - desired), -(gap_end - gap_start), candidate, gap_index)
+            )
+        if candidates:
+            _, _, seam, gap_index = min(candidates)
+            used_gaps.add(gap_index)
+            source = "detector_gap"
         else:
-            protected.append(band)
-    return protected
+            seam = int(round(min(max(desired, lower), upper)))
+            source = "balanced_fallback"
+        if not lower <= seam <= upper:
+            raise AssertionError(
+                f"cannot create balanced seam {index}/{count}: {seam} not in [{lower}, {upper}]"
+            )
+        seams.append(seam)
+        sources.append(source)
+    if any(right <= left for left, right in zip(seams, seams[1:])):
+        raise AssertionError(f"horizontal seams are not strictly increasing: {seams}")
+    return seams, sources
+
+
+def _tile_relation_counts(tiles: Sequence[Sequence[int]]) -> tuple[int, int, int]:
+    duplicate = len(tiles) - len({tuple(map(int, tile)) for tile in tiles})
+    nested = 0
+    for index, left in enumerate(tiles):
+        for right in tiles[index + 1 :]:
+            if (
+                left[0] <= right[0]
+                and left[1] <= right[1]
+                and left[2] >= right[2]
+                and left[3] >= right[3]
+            ) or (
+                right[0] <= left[0]
+                and right[1] <= left[1]
+                and right[2] >= left[2]
+                and right[3] >= left[3]
+            ):
+                nested += 1
+    full_in_multi = 0
+    if len(tiles) > 1:
+        x1 = min(int(tile[0]) for tile in tiles)
+        y1 = min(int(tile[1]) for tile in tiles)
+        x2 = max(int(tile[2]) for tile in tiles)
+        y2 = max(int(tile[3]) for tile in tiles)
+        full_in_multi = sum(list(map(int, tile)) == [x1, y1, x2, y2] for tile in tiles)
+    return full_in_multi, duplicate, nested
 
 
 def detector_boundary_cut_count(
@@ -108,14 +188,20 @@ def generate_detector_scan_plan(
     context_ratio: float = 0.20,
     min_context_image_ratio: float = 0.015,
     dense_band_ratio: float = 0.80,
+    detector_margin_ratio: float = 0.003,
+    detector_margin_min: int = 2,
+    detector_margin_max: int = 12,
+    seam_search_ratio: float = 0.25,
+    context_pixels: int = 48,
+    minimum_core_height_ratio: float = 0.35,
 ) -> dict[str, Any]:
-    """Build GT-free, full-width horizontal scan crops.
+    """Build GT-free, balanced full-width horizontal scan crops.
 
-    A regular overlapping scan guarantees that every source pixel is present.
-    Detector boxes are then joined into vertical connected bands.  Tile edges
-    are expanded outwards whenever they would cross a band, so text/icons are
-    never cut and the undetected space between left/right neighbours remains in
-    the same full-width crop.  The result contains at most ten plain rectangles.
+    Continuous, non-overlapping cores partition the image exactly.  Their seams
+    prefer nearby detector-free gaps; when no such gap exists a balanced seam is
+    retained.  Small context and per-box containment expansion are applied only
+    after core construction, so dense pages do not balloon into several nested
+    near-full crops.
     """
 
     width, height = int(width), int(height)
@@ -132,54 +218,82 @@ def generate_detector_scan_plan(
     if not 0.0 < dense_band_ratio <= 1.0:
         raise ValueError("dense_band_ratio must be in (0, 1]")
 
+    if not 0 <= detector_margin_ratio <= 0.05:
+        raise ValueError("detector_margin_ratio must be in [0, 0.05]")
+    if not 0 <= detector_margin_min <= detector_margin_max:
+        raise ValueError("detector margin bounds are invalid")
+    if not 0 <= seam_search_ratio <= 0.5:
+        raise ValueError("seam_search_ratio must be in [0, 0.5]")
+    if context_pixels < 0:
+        raise ValueError("context_pixels cannot be negative")
+    if not 0 < minimum_core_height_ratio <= 1:
+        raise ValueError("minimum_core_height_ratio must be in (0, 1]")
+
     boxes = _normalized_detector_boxes(detector_boxes, width, height)
-    bands = _vertical_connected_bands(
-        boxes,
-        height=height,
-        vertical_link_ratio=vertical_link_ratio,
-        context_ratio=context_ratio,
-        min_context_image_ratio=min_context_image_ratio,
+    detector_margin = min(
+        detector_margin_max,
+        max(detector_margin_min, round(detector_margin_ratio * height)),
     )
+    occupied = _occupied_y_intervals(boxes, height=height, margin=detector_margin)
+    gaps = _free_y_gaps(occupied, height=height)
     normalized_task = str(task or "").removeprefix("ui_")
     fallback_reason: str | None = None
     if normalized_task == "content_missing":
         fallback_reason = "content_missing_requires_global_view"
-    elif not boxes:
-        fallback_reason = "detector_empty_full_image"
-    elif bands and max(end - start for start, end in bands) / height > dense_band_ratio:
-        fallback_reason = "dense_connected_band"
-    elif height <= target_tile_height:
+    elif height <= target_tile_height or max_tiles == 1:
         fallback_reason = "short_page_single_scan"
 
     if fallback_reason is not None:
         tiles = [[0, 0, width, height]]
+        seams: list[int] = []
+        seam_sources: list[str] = []
+        cores = [[0, height]]
     else:
-        row_count = min(max_tiles, max(2, math.ceil(height / target_tile_height)))
-        overlap_px = max(1, round(min(height, target_tile_height) * overlap_ratio))
-        spans = [list(span) for span in _axis_tiles(height, row_count, overlap_px)]
+        row_count = min(max_tiles, max(1, math.ceil(height / target_tile_height)))
+        minimum_core_height = max(
+            32,
+            min(
+                max(32, height // row_count),
+                round((height / row_count) * minimum_core_height_ratio),
+            ),
+        )
+        # Ensure the bound always permits the requested number of cores.
+        minimum_core_height = min(minimum_core_height, max(1, height // row_count))
+        seams, seam_sources = _choose_horizontal_seams(
+            height=height,
+            count=row_count,
+            gaps=gaps,
+            search_ratio=seam_search_ratio,
+            minimum_core_height=minimum_core_height,
+        )
+        core_edges = [0, *seams, height]
+        cores = [[left, right] for left, right in zip(core_edges, core_edges[1:])]
+        spans = [
+            [max(0, y1 - context_pixels), min(height, y2 + context_pixels)]
+            for y1, y2 in cores
+        ]
+        # Assign each detector box to exactly one balanced core by vertical
+        # center, then minimally expand that crop until the box is complete.
+        for box in boxes:
+            center = (box[1] + box[3]) / 2
+            owner = min(len(spans) - 1, bisect.bisect_right(seams, center))
+            spans[owner][0] = min(spans[owner][0], box[1])
+            spans[owner][1] = max(spans[owner][1], box[3])
+        tiles = [[0, int(y1), width, int(y2)] for y1, y2 in spans]
 
-        # Moving an edge outwards preserves lossless coverage.  Iterate because
-        # expanding through one protected band can expose an edge to another.
-        for span in spans:
-            changed = True
-            while changed:
-                changed = False
-                for band_start, band_end in bands:
-                    if band_start < span[0] < band_end:
-                        span[0] = band_start
-                        changed = True
-                    if band_start < span[1] < band_end:
-                        span[1] = band_end
-                        changed = True
-        # Exact duplicates occur on dense rows after boundary expansion; one
-        # physical crop is enough.  Do not drop merely overlapping scans.
-        unique_spans = list(dict.fromkeys((int(y1), int(y2)) for y1, y2 in spans))
-        tiles = [[0, y1, width, y2] for y1, y2 in unique_spans]
+        full_in_multi, duplicate, nested = _tile_relation_counts(tiles)
+        if full_in_multi or duplicate or nested:
+            # A detector bbox spanning almost the complete page can make a
+            # non-nested multi-plan mathematically impossible.  One full view
+            # is honest and lossless; ordinary dense pages never enter here.
+            tiles = [[0, 0, width, height]]
+            seams = []
+            seam_sources = []
+            cores = [[0, height]]
+            fallback_reason = "oversized_detector_requires_global_view"
 
     assert_lossless_coverage(width, height, tiles)
     cuts = detector_boundary_cut_count(tiles, boxes)
-    if cuts:
-        raise AssertionError(f"detector scan cut {cuts} detector boxes")
     not_contained = [
         list(box)
         for box in boxes
@@ -194,6 +308,22 @@ def generate_detector_scan_plan(
     if not_contained:
         raise AssertionError(f"detector boxes not contained by a scan: {not_contained[:5]}")
 
+    full_in_multi, duplicate, nested = _tile_relation_counts(tiles)
+    if full_in_multi or duplicate or nested:
+        raise AssertionError(
+            "invalid detector scan plan: "
+            f"full_in_multi={full_in_multi}, duplicate={duplicate}, nested={nested}"
+        )
+    contained_count = len(boxes) - len(not_contained)
+    seam_crossed = sum(
+        any(box[1] < seam < box[3] for seam in seams) for box in boxes
+    )
+    core_heights = [right - left for left, right in cores]
+    overlaps = [
+        max(0, int(left[3]) - int(right[1])) / height
+        for left, right in zip(tiles, tiles[1:])
+    ]
+
     original_area = width * height
     processed_area = sum((tile[2] - tile[0]) * (tile[3] - tile[1]) for tile in tiles)
     gains = [height / max(1, tile[3] - tile[1]) for tile in tiles]
@@ -202,8 +332,20 @@ def generate_detector_scan_plan(
         "tiles": tiles,
         "tile_count": len(tiles),
         "detector_box_count": len(boxes),
-        "connected_band_count": len(bands),
-        "protected_vertical_bands": [list(band) for band in bands],
+        "connected_band_count": len(occupied),
+        "protected_vertical_bands": [list(band) for band in occupied],
+        "detector_margin_pixels": detector_margin,
+        "horizontal_seams": seams,
+        "horizontal_seam_count": len(seams),
+        "seam_source": seam_sources,
+        "seam_source_counts": dict(sorted(Counter(seam_sources).items())),
+        "core_spans": cores,
+        "minimum_core_height": min(core_heights),
+        "maximum_core_height": max(core_heights),
+        "core_height_ratio": max(core_heights) / max(1, min(core_heights)),
+        "min_crop_height_ratio": min(tile[3] - tile[1] for tile in tiles) / height,
+        "max_crop_height_ratio": max(tile[3] - tile[1] for tile in tiles) / height,
+        "adjacent_overlap_ratio_mean": sum(overlaps) / len(overlaps) if overlaps else 0.0,
         "lossless_pixel_coverage_ratio": union_area(tiles) / original_area,
         "processed_pixel_ratio_with_overlap": processed_area / original_area,
         "mean_vertical_linear_gain": sum(gains) / len(gains),
@@ -213,6 +355,13 @@ def generate_detector_scan_plan(
             for tile in tiles
         ),
         "detector_boundary_cut_count": cuts,
+        "detector_bbox_contained_count": contained_count,
+        "detector_bbox_containment_rate": contained_count / len(boxes) if boxes else 1.0,
+        "uncontained_detector_bbox_count": len(not_contained),
+        "seam_crossed_detector_bbox_count": seam_crossed,
+        "full_tile_in_multi_plan_count": full_in_multi,
+        "duplicate_tile_count": duplicate,
+        "nested_tile_count": nested,
         "fallback_reason": fallback_reason,
         "gt_used": False,
     }

@@ -1150,6 +1150,10 @@ def detection_worker_command(args: argparse.Namespace, stage: str, worker_index:
         command.extend(("--text-model-dir", str(args.text_model_dir)))
     if args.icon_model:
         command.extend(("--icon-model", str(args.icon_model)))
+    if getattr(args, "text_python", None):
+        command.extend(("--text-python", str(args.text_python)))
+    if getattr(args, "icon_python", None):
+        command.extend(("--icon-python", str(args.icon_python)))
     if args.resume:
         command.append("--resume")
     if args.enable_mkldnn:
@@ -1290,6 +1294,89 @@ print("UI5_ICON_RUNTIME=" + json.dumps(payload, ensure_ascii=False))
     return payload
 
 
+def preflight_text_runtime(
+    python_executable: str,
+    *,
+    gpu: str,
+    parser_root: Path,
+    model_dir: Path | None,
+) -> dict[str, Any]:
+    """Validate Paddle/PaddleOCR/CUDA before any PP-OCR worker is started."""
+
+    probe = r"""
+import importlib.metadata
+import json
+import pathlib
+import sys
+import numpy
+import PIL
+import paddle
+import paddleocr
+from paddleocr import TextDetection
+
+parser_root = pathlib.Path(sys.argv[1])
+if not (parser_root / "ui_region_parser.py").is_file():
+    raise FileNotFoundError(parser_root / "ui_region_parser.py")
+sys.path.insert(0, str(parser_root))
+import ui_region_parser
+if not hasattr(ui_region_parser, "PaddleTextDetector"):
+    raise AttributeError("ui_region_parser.PaddleTextDetector is missing")
+payload = {
+    "paddle": paddle.__version__,
+    "paddleocr": importlib.metadata.version("paddleocr"),
+    "numpy": numpy.__version__,
+    "pillow": PIL.__version__,
+    "cuda_compiled": paddle.is_compiled_with_cuda(),
+    "cuda_device_count": paddle.device.cuda.device_count(),
+    "cuda_device": paddle.device.cuda.get_device_name(0) if paddle.device.cuda.device_count() else None,
+    "text_detection_api": TextDetection.__name__,
+    "parser_imported": True,
+    "model_dir": sys.argv[2] or None,
+}
+print("UI5_TEXT_RUNTIME=" + json.dumps(payload, ensure_ascii=False))
+"""
+    environment = os.environ.copy()
+    environment["CUDA_VISIBLE_DEVICES"] = gpu
+    result = subprocess.run(
+        [python_executable, "-c", probe, str(parser_root), str(model_dir or "")],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    if result.returncode != 0:
+        raise RuntimeError(
+            "text Python 环境预检失败；尚未启动 GPU worker。\n"
+            f"text_python: {python_executable}\n"
+            f"CUDA_VISIBLE_DEVICES: {gpu}\n"
+            "需要 UI5PaddleOCR 环境可导入 Paddle、PaddleOCR>=3 TextDetection，"
+            "且能看到请求的 CUDA GPU。不要向 LocateAnything 环境安装 PaddleOCR。\n"
+            "原始异常如下：\n"
+            f"{output or '(no subprocess output)'}"
+        )
+    prefix = "UI5_TEXT_RUNTIME="
+    payload_line = next(
+        (line for line in result.stdout.splitlines() if line.startswith(prefix)), None
+    )
+    if payload_line is None:
+        raise RuntimeError(f"text Python 预检没有返回版本信息：\n{output}")
+    payload = json.loads(payload_line[len(prefix) :])
+    if not payload.get("cuda_compiled") or int(payload.get("cuda_device_count", 0)) < 1:
+        raise RuntimeError(
+            "text Python 可以导入 Paddle，但该环境没有可用 CUDA。\n"
+            f"text_python: {python_executable}\n"
+            f"runtime: {json.dumps(payload, ensure_ascii=False)}"
+        )
+    print(
+        "[text 环境预检] "
+        f"python={python_executable} | paddle={payload['paddle']} | "
+        f"paddleocr={payload['paddleocr']} | GPU={payload['cuda_device']} | TextDetection=OK",
+        flush=True,
+    )
+    return payload
+
+
 def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
     paths = AuditPaths(args.output_dir)
     unique = read_jsonl(paths.unique_images)
@@ -1341,8 +1428,21 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
     if missing_gpus:
         raise ValueError(f"requested GPUs are unavailable: {missing_gpus}; available={sorted(available)}")
     runtime: dict[str, Any] = {"python": detection_python(args, stage)}
-    if stage == "icon":
-        config = detector_config(args)
+    config = detector_config(args)
+    if stage == "text":
+        runtime.update(
+            preflight_text_runtime(
+                detection_python(args, stage),
+                gpu=gpus[0],
+                parser_root=Path(args.parser_root),
+                model_dir=(
+                    Path(config["text"]["model_dir"])
+                    if config["text"]["model_dir"] is not None
+                    else None
+                ),
+            )
+        )
+    elif stage == "icon":
         runtime.update(
             preflight_icon_runtime(
                 detection_python(args, stage),

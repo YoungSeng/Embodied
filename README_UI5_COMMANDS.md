@@ -1,87 +1,129 @@
 # LocateAnything UI5 常用命令
 
-## 先看测试集横向 detector-scan crops（本轮新增）
+## 测试集水平 detector scan：先离线缓存，再只读评测
 
-训练中评测现在默认使用 `detector_scan`，不再默认把四个区域任务的整张原图直接送入模型。
-它先对测试集内容唯一图片各运行一次 PP-OCRv5 和 icon detector，再把 text/icon 框组成纵向
-连通带，生成 1–10 个横向贯穿整张图片宽度的重叠扫描 crop。这样左右两侧有检测、目标自身
-漏检时，中间区域仍随整条进入模型。crop 并集覆盖原图 100%，任何 detector bbox 都不会被
-边界切断；`ui_content_missing` 因需要全局结构，仍使用完整原图。全流程不读取测试 GT，也
-不会使用训练侧 `manual_gt_repair`。detector 完全无输出或连通带覆盖大部分页面时也保守回退
-整图；这两种回退会在统计中单独计数，不会为了减少 full-image 比例而强拆。
+四个区域任务共享同一套 GT-free 水平切图，`ui_content_missing` 单独使用完整原图。水平切图
+先建立连续、互补的 core，再把 seam 吸附到附近 detector-free gap；找不到空隙时保留平衡
+seam，并用有限 overlap 保证每个 text/icon bbox 至少完整进入一张 crop。多 crop plan 禁止
+整图与局部图并存、重复或互相包含。测试 GT、训练侧 crop 和 `manual_gt_repair` 均不参与。
 
-检测默认与训练 crop 审计一致：text long side 1920、box threshold 0.3；icon long side 1920、
-confidence 0.05。几何默认最多 10 条、目标高度 960、纵向 overlap 0.12；为贴近训练推荐
-`TA_CTX015_H050`，vertical link 0.025、context 0.20、最小图片 context 0.015。横向 crop
-本身覆盖完整宽度，因此不再单独应用 H050。先看样例统计后再决定是否调整这些纯几何参数。
+PP-OCRv5 与 icon detector 使用两个固定环境，不要互相安装依赖：
 
-先只选每任务 20 张（五任务同内容仍只检测一次）查看可视化和统计：
+```bash
+LA_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python
+TEXT_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/UI5PaddleOCR/bin/python
+```
+
+先扩大到每任务 200 张，再从实际 detector box 数的 sparse/medium/dense 三档各选最多 20 张：
 
 ```bash
 cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
 
-bash shell/run_ui5_eval_detector_preview.sh \
+LA_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python
+TEXT_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/UI5PaddleOCR/bin/python
+
+PYTHON_BIN="${LA_PY}" bash shell/run_ui5_eval_detector_preview.sh \
+  --input-dir /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data \
+  --parser-root ../ui-region-parser \
+  --output-dir work_dirs/ui5_eval_detector_preview_v2 \
+  --gpus 0,1,2,3 \
+  --workers-per-gpu 1 \
+  --text-python "${TEXT_PY}" \
+  --icon-python "${LA_PY}" \
+  --max-images-per-task 200 \
+  --visualization-samples 60 \
+  --scan-name horizontal_scan_v2 \
+  --resume
+```
+
+该命令内部按 `prepare → text → icon → merge → crop` 自动顺序执行，不需要手动跑五条命令。
+text 阶段显式使用 `TEXT_PY`，icon 阶段显式使用 `LA_PY`；两个 preflight 都在 GPU worker
+启动前完成。OCR 与 icon 不会同时常驻同一 GPU，`--resume` 会跳过已完成 shard。查看：
+
+```text
+work_dirs/ui5_eval_detector_preview_v2/horizontal_scan_v2/gallery/index.html
+work_dirs/ui5_eval_detector_preview_v2/horizontal_scan_v2/summary.json
+work_dirs/ui5_eval_detector_preview_v2/horizontal_scan_v2/statistics.csv
+work_dirs/ui5_eval_detector_preview_v2/horizontal_scan_v2/preview_crops/
+```
+
+如果已有 20 张 raw detections，只换几何 namespace，不重跑 text/icon：
+
+```bash
+"${LA_PY}" scripts/prepare_ui5_eval_detector_crops.py \
+  --stage crop \
   --input-dir /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data \
   --parser-root ../ui-region-parser \
   --output-dir work_dirs/ui5_eval_detector_preview_20260827 \
-  --gpus 0,1,2,3 \
-  --workers-per-gpu 1 \
-  --max-images-per-task 20 \
+  --scan-name horizontal_scan_v2 \
+  --scan-max-crops 10 \
+  --scan-target-height 960 \
   --visualization-samples 20 \
   --resume
 ```
 
-如果 Paddle 与训练 Torch 环境不同，只在同一条命令追加两个 Python 路径，不要改共享环境：
-
-```bash
---text-python /path/to/paddle_env/bin/python \
---icon-python /path/to/locany_env/bin/python
-```
-
-该命令内部按 `prepare → text → icon → merge → crop` 自动顺序执行，不需要手动跑五条命令。
-OCR 与 icon 不会同时常驻同一 GPU；`--resume` 会跳过已完成 shard。查看：
-
-```text
-work_dirs/ui5_eval_detector_preview_20260827/scan_crops/gallery/index.html
-work_dirs/ui5_eval_detector_preview_20260827/scan_crops/summary.json
-work_dirs/ui5_eval_detector_preview_20260827/scan_crops/statistics.csv
-work_dirs/ui5_eval_detector_preview_20260827/scan_crops/preview_crops/
-```
+raw 结果始终位于 `detections/{text,icon,merged}/`，不同几何版本写入不同 `--scan-name`
+目录，因此只改 CPU geometry 不会覆盖或重新运行 detector。
 
 另开终端可实时查看当前阶段、完成数、速度和 ETA：
 
 ```bash
-watch -n 5 'cat work_dirs/ui5_eval_detector_preview_20260827/run_status.json'
+watch -n 5 'cat work_dirs/ui5_eval_detector_preview_v2/run_status.json'
 ```
 
-确认样例合理后，正式 pipeline 不需要先单独跑预览命令。第一次 step-0 evaluation 会在
-`${OUTPUT_DIR}/evaluation/detector_scan_cache/` 对完整测试集建立检测缓存；后续 checkpoint 只
-验证并复用缓存。正式提交命令显式写法为：
+确认 preview 后，必须在训练前完成全量 17,281 张内容唯一图片的离线 cache。训练中的
+step-0/1000/2000 评测不会现场启动 PaddleOCR 或 icon worker：
 
 ```bash
-UI5_AUDIT_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
+EVAL_CACHE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v2
 
-python scripts/submit_locany_ui5.py \
+"${LA_PY}" scripts/prepare_ui5_eval_detector_crops.py \
+  --stage all \
+  --input-dir /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data \
+  --parser-root ../ui-region-parser \
+  --output-dir "${EVAL_CACHE}" \
+  --gpus 0,1,2,3 \
+  --workers-per-gpu 1 \
+  --text-python "${TEXT_PY}" \
+  --icon-python "${LA_PY}" \
+  --icon-model ../ui-region-parser/weights/icon_detect_v3/model.pt \
+  --scan-name horizontal_scan_v2 \
+  --scan-max-crops 10 \
+  --scan-target-height 960 \
+  --visualization-samples 60 \
+  --resume
+
+"${LA_PY}" scripts/validate_ui5_eval_detector_cache.py \
+  --cache-dir "${EVAL_CACHE}" \
+  --scan-name horizontal_scan_v2 \
+  --expected-unique-images 17281 \
+  --require-ready
+```
+
+ready marker 最后原子生成并绑定输入 JSONL、内容集合、parser、detector 配置与运行时、shard、
+merged detections、几何配置、scan manifest 和报告 digest。正式评测默认
+`--eval-detector-cache-mode readonly`；缓存缺失或 digest 改变时 fail closed，不回退现场检测或全图。
+主要门禁是像素覆盖率和 detector bbox 完整包含率均为 100%，以及 full-in-multi、duplicate、
+nested 均为 0。`detector_boundary_cut_count` 只保留为诊断项，不再单独代表切图正确。
+
+全量 validator 通过后，用同一 cache 做只读评测 smoke：
+
+```bash
+"${LA_PY}" scripts/submit_locany_ui5.py \
   --machine a800 \
   --resource-group aiai_locate \
   --gpus 4 \
-  --max-num-tokens 12800 \
-  --use-detection-crops \
-  --crop-audit-dir "${UI5_AUDIT_DIR}" \
-  --crop-train-mode full_plus_crop \
-  --enable-eval \
+  --eval-checkpoint /path/to/checkpoint \
+  --eval-step 1000 \
   --eval-inference-crop-mode detector_scan \
-  --eval-parser-root ../ui-region-parser \
-  --eval-icon-model ../ui-region-parser/weights/icon_detect_v3/model.pt \
-  --eval-interval-steps 1000 \
-  --max-steps 16000 \
-  --save-steps 4000 \
-  --run-name locany-ui5-v4-gtcrop-detector-scan-a800x4
+  --eval-detector-cache "${EVAL_CACHE}" \
+  --eval-detector-cache-mode readonly \
+  --eval-scan-name horizontal_scan_v2 \
+  --eval-max-images-per-task 20 \
+  --run-name locany-ui5-detector-scan-readonly-smoke
 ```
 
-若提交节点上的相对路径会变化，请给 `--eval-parser-root` 和 `--eval-icon-model` 使用集群绝对
-路径。PP-OCRv5 默认走 PaddleOCR 缓存/自动下载；icon 的 `model.pt` 必须存在。统计里的
-`lossless_pixel_coverage_ratio` 必须恒为 1、`detector_boundary_cut_count` 必须为 0。
+日志必须包含 `detector cache: readonly validated`，且不能出现 PaddleOCR/icon worker 启动日志。
 
 ## v4.1 当前执行顺序
 
@@ -94,6 +136,7 @@ smoke；smoke checkpoint 可恢复后，才提交正式训练。不要一次把�
 cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
 
 UI5_AUDIT_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
+EVAL_CACHE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v2
 UI5_CROP_META=${UI5_AUDIT_DIR}/training_recipes/ui_defect_5class_train_full_plus_crop.json
 
 python scripts/validate_ui5_crop_training_ready.py \
@@ -157,6 +200,7 @@ trainer state 和 4 个 dataloader rank state 均完整，才进入正式训练�
 cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
 
 UI5_AUDIT_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
+EVAL_CACHE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v2
 
 python scripts/submit_locany_ui5.py \
   --machine a800 \
@@ -170,6 +214,10 @@ python scripts/submit_locany_ui5.py \
   --enable-eval \
   --eval-at-start \
   --eval-interval-steps 1000 \
+  --eval-inference-crop-mode detector_scan \
+  --eval-detector-cache "${EVAL_CACHE}" \
+  --eval-detector-cache-mode readonly \
+  --eval-scan-name horizontal_scan_v2 \
   --max-steps 16000 \
   --save-steps 4000 \
   --run-name locany-ui5-v4-gtcrop-a800x4

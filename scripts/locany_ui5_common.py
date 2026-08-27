@@ -355,6 +355,15 @@ def resolve_runtime_config(
                 join_runtime_path(output_dir, "evaluation", "detector_scan_cache"),
             )
         ),
+        "EVAL_DETECTOR_CACHE_MODE": str(
+            _env_value(env, "EVAL_DETECTOR_CACHE_MODE", "readonly")
+        ).lower(),
+        "EVAL_SCAN_NAME": str(
+            _env_value(env, "EVAL_SCAN_NAME", "horizontal_scan_v2")
+        ),
+        "EVAL_EXPECTED_UNIQUE_IMAGES": int(
+            _env_value(env, "EVAL_EXPECTED_UNIQUE_IMAGES", 17281)
+        ),
         "EVAL_TEXT_PYTHON": str(_env_value(env, "EVAL_TEXT_PYTHON", "")),
         "EVAL_ICON_PYTHON": str(_env_value(env, "EVAL_ICON_PYTHON", "")),
         "EVAL_TEXT_MODEL_DIR": str(_env_value(env, "EVAL_TEXT_MODEL_DIR", "")),
@@ -433,6 +442,10 @@ def resolve_runtime_config(
         raise ValueError("EVAL_TILE_NMS_IOU must be in [0, 1]")
     if resolved["EVAL_DETECTOR_WORKERS_PER_GPU"] not in {1, 2}:
         raise ValueError("EVAL_DETECTOR_WORKERS_PER_GPU must be 1 or 2")
+    if resolved["EVAL_DETECTOR_CACHE_MODE"] not in {"build", "readonly"}:
+        raise ValueError("EVAL_DETECTOR_CACHE_MODE must be build or readonly")
+    if resolved["EVAL_EXPECTED_UNIQUE_IMAGES"] < 0:
+        raise ValueError("EVAL_EXPECTED_UNIQUE_IMAGES cannot be negative")
     if resolved["EVAL_SCAN_TARGET_HEIGHT"] <= 0:
         raise ValueError("EVAL_SCAN_TARGET_HEIGHT must be positive")
     for name in (
