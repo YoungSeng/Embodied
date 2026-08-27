@@ -7,6 +7,164 @@ UI CPT v2 的目标是把训练改造成可观测、可诊断、可比较的系�
 held-out、精确核对样本与监督 token、按任务计算 train/eval CE、用任务专属指标评估，
 并让 JSON/JSONL 成为唯一数据源。Excel 只是可选离线投影。
 
+## 0. 当前正式启动流程：A800 完整验收，H20 直接 formal
+
+当前执行策略固定为：
+
+```text
+YG smoke recipe
+→ YG A800×4 checkpoint-10→20 smoke
+→ YG A800 held-out eval
+→ YG A800 validator passed
+→ YG 全量 recipe 检查
+→ HL 全量 recipe
+→ H20×2 formal
+→ formal checkpoint 产生后再跑独立 held-out eval
+```
+
+H20 排队通常需要一到两天，因此不再把 H20 smoke/eval 作为 formal 启动前门禁。H20
+仍使用固定的 SDPA + 7268/7268/7268 + packing buffer 16 + 梯度累积 4。仓库命令中的
+`a100` 是历史 profile 标识；对应 Merlin YAML 实际申请 `A800_SXM_40GB`，不是 A100。
+
+下面各命令按顺序逐条执行。不要把 YG 生成的 recipe 复制到 HL；两边 JSONL 的绝对图片
+路径不同，必须分别生成。
+
+### 0.1 YG：生成 A800 smoke recipe
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+```
+
+当前已经有一次失败准备留下的部分文件，所以本次重跑使用 `OVERWRITE=1`：
+
+```bash
+OVERWRITE=1 \
+SOURCE_ROOT=/mnt/bn/intelligent-service-yg/dataset/gui/gui_base/sample/raw_data_v4.1_hl_norm1k/raw_data_v4.1_hl \
+DATA_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4_split_v2_smoke \
+bash shell/prepare_locany_cpt_v2.sh a100 smoke
+```
+
+成功标志是最后出现 `CPT_V2_DATA_READY=...`，且每任务打印 written、known_dropped、
+rejected。已确认的 ref/box 换行异常和退化框计入 `known_dropped`；其他异常仍计入
+`rejected`。训练启动后禁止再次覆盖这个目录。
+
+### 0.2 YG：提交四卡 A800 smoke
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+```
+
+```bash
+mlx job submitv2 --path locany_cpt_v4_a100x4_smoke_merlin.yaml
+```
+
+该 job 实际申请 `A800_SXM_40GB × 4`，先保存 checkpoint-10，再从 checkpoint-10
+自动 resume 到 checkpoint-20。必须等 job 正常完成后再执行下一步。
+
+### 0.3 YG：在 A800 上跑 held-out eval
+
+在可使用 A800 的节点执行。评测只使用 GPU 0，因此显式限制可见卡数为 1：
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+RUN_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_models/locany-3b-ui-cpt-v4-v2-a100x4-smoke \
+DATA_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4_split_v2_smoke \
+EVAL_MAX_PENDING=2 \
+EVAL_SAMPLES_PER_TASK=10 \
+bash shell/run_locany_cpt_eval_merlin.sh a100
+```
+
+这个命令依次消费 checkpoint-10 和 checkpoint-20，Base 结果只计算一次并缓存。成功时
+十任务 Base/checkpoint teacher-forced CE 均非空、inference error 为 0，并生成真实
+`cpt_eval_metrics.jsonl` 和三 sheet Excel。
+
+### 0.4 YG：执行 A800 最终 validator
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+```
+
+```bash
+/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python \
+scripts/validate_locany_cpt_smoke.py \
+--run a800=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_models/locany-3b-ui-cpt-v4-v2-a100x4-smoke \
+--require-eval \
+--eval-samples-per-task 10 \
+--output /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_models/locany-3b-ui-cpt-v4-v2-a100x4-smoke/diagnostics/cpt_smoke_validation.json
+```
+
+只有命令零退出且输出包含下面内容，才允许进入 HL formal：
+
+```json
+"status": "passed"
+```
+
+### 0.5 YG：额外生成并全量检查 formal recipe
+
+这一步不启动 A800 formal，只利用 YG 数据与图片路径对全量数据做转换、图片存在性检查、
+group split 和零泄漏验证：
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+```
+
+```bash
+SOURCE_ROOT=/mnt/bn/intelligent-service-yg/dataset/gui/gui_base/sample/raw_data_v4.1_hl_norm1k/raw_data_v4.1_hl \
+DATA_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4_split_v2 \
+bash shell/prepare_locany_cpt_v2.sh a100 formal
+```
+
+如果此前的 full recipe 准备也曾中途失败，确认没有任务使用该目录后，再在上述命令前添加
+`OVERWRITE=1`。
+
+### 0.6 HL：生成 H20 formal recipe
+
+先确保相同版本代码已经同步到 HL，然后执行：
+
+```bash
+cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+```
+
+```bash
+SOURCE_ROOT=/mnt/bn/intelligent-service-arnold-hl/dataset/gui/gui_base/sample/raw_data_v4.1_hl_norm1k/raw_data_v4.1_hl \
+DATA_DIR=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4_split_v2 \
+bash shell/prepare_locany_cpt_v2.sh h20 formal
+```
+
+必须看到 `CPT_V2_DATA_READY=...` 后再提交训练。
+
+### 0.7 HL：直接提交 H20×2 formal
+
+```bash
+cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+```
+
+```bash
+mlx job submitv2 --path locany_cpt_v4_h20x2_formal_merlin.yaml
+```
+
+这个主流程不再先提交 H20 smoke。formal 使用新的
+`RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x2-formal`，不会续训 checkpoint-1549/1860。
+
+### 0.8 HL：formal 产生 checkpoint 后提交 held-out eval
+
+评测不阻塞 formal 训练。每次希望消费一个 pending milestone checkpoint 时提交：
+
+```bash
+cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+```
+
+```bash
+mlx job submitv2 --path locany_cpt_v4_h20x1_eval_merlin.yaml
+```
+
+该 eval job 默认每次消费一个 pending checkpoint；有多个 checkpoint 时可重复提交。Base
+结果按同一 manifest/protocol 缓存，不会为每个 checkpoint 重复推理。
+
 ## 1. 数据准备与无泄漏切分
 
 默认按图片内容 SHA-256 生成 `group_id`，固定 seed `20260826`，以 group 为单位近似
@@ -32,7 +190,8 @@ python scripts/prepare_locany_cpt.py \
 train/val/val_fast、manifest 的命令；smoke 默认每任务先取 2000 条、val_fast 至少 10 条：
 
 ```bash
-bash shell/prepare_locany_cpt_v2.sh h20 smoke
+bash shell/prepare_locany_cpt_v2.sh a100 smoke
+bash shell/prepare_locany_cpt_v2.sh a100 formal
 bash shell/prepare_locany_cpt_v2.sh h20 formal
 ```
 
@@ -143,15 +302,15 @@ Merlin 入口：
 
 ```bash
 mlx job submitv2 --path locany_cpt_v4_a100x4_smoke_merlin.yaml
-mlx job submitv2 --path locany_cpt_v4_h20x2_smoke_merlin.yaml
 mlx job submitv2 --path locany_cpt_v4_a100x4_formal_merlin.yaml
 mlx job submitv2 --path locany_cpt_v4_h20x2_formal_merlin.yaml
 ```
 
-两份 smoke 都先在 step 10 强制保存并退出 segment，再从同一 checkpoint 自动 resume 到
-step 20，因此一个 job 同时覆盖多卡训练与断点续训。H20×2 默认每 rank packed-token 上限
-7268、单样本与序列上限也为 7268、SDPA、packing buffer 16、梯度累积 4；
-A800×4 默认 SDPA + 7268/7268/12800、梯度累积 2。`shell/run_locany_cpt.sh`
+当前 formal 启动前只要求 A800 smoke：它先在 step 10 强制保存并退出 segment，再从同一
+checkpoint 自动 resume 到 step 20，因此一个 job 同时覆盖多卡训练与断点续训。H20×2
+formal 默认每 rank packed-token 上限 7268、单样本与序列上限也为 7268、SDPA、
+packing buffer 16、梯度累积 4；A800×4 默认 SDPA + 7268/7268/12800、梯度累积 2。
+`shell/run_locany_cpt.sh`
 会先验证 train split，再将 split/length stats 复制到 run 的 `diagnostics/`。
 
 H20 的 Magi 8192/7280 已实测 OOM，Magi 6400 已出现 gather index 越界，因此 v2 H20
@@ -250,12 +409,16 @@ python scripts/eval_locany_cpt_learning.py \
   --teacher-forced
 ```
 
-独立 queue consumer 已接入 Merlin。H20 smoke 完成 checkpoint-10→20 后先提交 smoke
-评测；它会消费两个 pending checkpoint，每任务至少 10 条 held-out，并要求 Base 与
-checkpoint 的 teacher-forced CE 非空、inference error 为 0：
+独立 queue consumer 已接入。formal 启动前由 A800 smoke 完成 checkpoint-10→20 后的
+held-out 门禁；在 A800 节点上只暴露 GPU 0：
 
 ```bash
-mlx job submitv2 --path locany_cpt_v4_h20x1_smoke_eval_merlin.yaml
+CUDA_VISIBLE_DEVICES=0 \
+RUN_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_models/locany-3b-ui-cpt-v4-v2-a100x4-smoke \
+DATA_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4_split_v2_smoke \
+EVAL_MAX_PENDING=2 \
+EVAL_SAMPLES_PER_TASK=10 \
+bash shell/run_locany_cpt_eval_merlin.sh a100
 ```
 
 formal 训练期间按 checkpoint 提交下面的单卡 job；Base 结果按 manifest/protocol 缓存，
@@ -343,18 +506,16 @@ python -m unittest \
   tests.test_locany_cpt_merlin
 ```
 
-集群 smoke 还必须核对：20 step 正常、per-task sample/token/skip/CE 均存在、resume 后
-计数单调不重复、A800/H20 schema 相同、多 rank reduce 不死锁、原始 TorchElastic 异常可见，
-以及统计开启后 step time 增幅不超过 5%。这些结果必须来自真实 job 日志，不能由本地静态
-检查代替。
+集群启动前由 A800 smoke 核对：20 step 正常、per-task sample/token/skip/CE 均存在、
+resume 后计数单调不重复、多 rank reduce 不死锁、原始 TorchElastic 异常可见，以及统计
+开启后 step time 增幅不超过 5%。这些结果必须来自真实 job 日志，不能由本地静态检查代替。
 
-两个 job 完成后可自动核对 checkpoint-10→20 resume、rank state、对账、单调性、十任务 CE、
-eval queue、三表 Excel 和跨硬件 schema：
+A800 smoke/eval 完成后自动核对 checkpoint-10→20 resume、rank state、对账、单调性、
+十任务 CE、eval queue 和三表 Excel：
 
 ```bash
 python scripts/validate_locany_cpt_smoke.py \
   --run a800=/path/to/a800-smoke-run \
-  --run h20x2=/path/to/h20x2-smoke-run \
   --require-eval \
   --eval-samples-per-task 10 \
   --output /path/to/cpt_smoke_validation.json
