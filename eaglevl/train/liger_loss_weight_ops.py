@@ -93,6 +93,7 @@ def fused_linear_cross_entropy_forward(
     ignore_index=-100,
     label_smoothing=0.0,
     reduction="mean",
+    collect_token_losses=False,
 ):
     dtype = _input.dtype
     device = _input.device
@@ -121,6 +122,11 @@ def fused_linear_cross_entropy_forward(
     grad_bias = torch.zeros_like(bias, device=device) if bias is not None else None
     # we use fp32 for loss accumulator
     loss_1d = torch.zeros(BT, dtype=torch.float32, device=device)
+    diagnostic_loss_1d = (
+        torch.zeros(BT, dtype=torch.float32, device=device)
+        if collect_token_losses
+        else None
+    )
 
     # loss weight dtype
     loss_weight = loss_weight.to(_input.dtype) if loss_weight is not None else None
@@ -175,6 +181,15 @@ def fused_linear_cross_entropy_forward(
                 reduction=reduction,
                 BLOCK_SIZE=BLOCK_SIZE,
                 num_warps=32,
+            )
+        if diagnostic_loss_1d is not None:
+            # With reduction=mean the kernel normalizes this chunk by its own
+            # non-ignore count. Undo that normalization for offline per-task
+            # CE before the scalar-loss weighting below mutates loss_1d.
+            diagnostic_loss_1d[start_idx:end_idx].copy_(
+                loss_1d_slice.detach() * n_non_ignore
+                if reduction == "mean"
+                else loss_1d_slice.detach()
             )
         # if chunk_id == 0:
         #     print("logits_chunk[0]2", logits_chunk[0])
@@ -258,7 +273,7 @@ def fused_linear_cross_entropy_forward(
             #     print("grad_weight", grad_weight[0])
             #     print("grad_input", grad_input[0])
     loss = torch.sum(loss_1d)
-    return loss, grad_input, grad_weight, grad_bias
+    return loss, grad_input, grad_weight, grad_bias, diagnostic_loss_1d
 
 
 def fused_linear_cross_entropy_backward(
@@ -342,7 +357,7 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
         label_smoothing (float): The amount of smoothing when computing the loss, where 0.0 means no smoothing.
         reduction: reduction to apply
         """
-        loss, grad_input, grad_weight, grad_bias = fused_linear_cross_entropy_forward(
+        loss, grad_input, grad_weight, grad_bias, _ = fused_linear_cross_entropy_forward(
             _input, weight, target, bias, loss_weight, ignore_index, label_smoothing, reduction
         )
         # downcast to dtype and store for backward
@@ -363,12 +378,74 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
         return (grad_input, grad_weight, None, grad_bias, None, None, None, None)
 
 
+class LigerFusedLinearCrossEntropyWithTokenLossFunction(torch.autograd.Function):
+    """CPT diagnostic variant returning detached unreduced token CE."""
+
+    @staticmethod
+    @amp_custom_fwd
+    def forward(
+        ctx,
+        _input,
+        weight,
+        target,
+        bias=None,
+        loss_weight=None,
+        ignore_index=-100,
+        label_smoothing=0.0,
+        reduction="mean",
+    ):
+        loss, grad_input, grad_weight, grad_bias, token_losses = (
+            fused_linear_cross_entropy_forward(
+                _input,
+                weight,
+                target,
+                bias,
+                loss_weight,
+                ignore_index,
+                label_smoothing,
+                reduction,
+                collect_token_losses=True,
+            )
+        )
+        ctx.save_for_backward(
+            grad_input.detach(),
+            grad_weight.detach() if grad_weight is not None else None,
+            grad_bias.detach() if bias is not None else None,
+        )
+        token_losses = token_losses.detach()
+        ctx.mark_non_differentiable(token_losses)
+        return loss, token_losses
+
+    @staticmethod
+    @amp_custom_bwd
+    def backward(ctx, grad_output, _grad_token_losses):
+        grad_input, grad_weight, grad_bias = ctx.saved_tensors
+        grad_input, grad_weight, grad_bias = fused_linear_cross_entropy_backward(
+            grad_output, grad_input, grad_weight, grad_bias
+        )
+        return (grad_input, grad_weight, None, grad_bias, None, None, None, None)
+
+
 class LigerFusedLinearCrossEntropyLoss(CrossEntropyLoss):
     def __init__(self, *args, **kwargs):
         super(LigerFusedLinearCrossEntropyLoss, self).__init__(*args, **kwargs)
 
     def forward(self, lin_weight, _input, target, bias=None, loss_weight=None):
         return LigerFusedLinearCrossEntropyFunction.apply(
+            _input,
+            lin_weight,
+            target,
+            bias,
+            loss_weight,
+            self.ignore_index,
+            self.label_smoothing,
+            self.reduction,
+        )
+
+    def forward_with_token_losses(
+        self, lin_weight, _input, target, bias=None, loss_weight=None
+    ):
+        return LigerFusedLinearCrossEntropyWithTokenLossFunction.apply(
             _input,
             lin_weight,
             target,

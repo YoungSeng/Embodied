@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "run_name": "synthetic-cpt-v2-schema-example",
+  "world_size": 2,
+  "seed": 20260826,
+  "max_steps": 20000,
+  "max_num_tokens": 25600,
+  "max_num_tokens_per_sample": 8192,
+  "sampling": {
+    "mode": "sample_equal",
+    "size_alpha": 0.0,
+    "token_beta": 0.0,
+    "tasks": [
+      {"name": "ui_defect", "rows": 98, "probability": 0.5},
+      {"name": "vqa", "rows": 196, "probability": 0.5}
+    ]
+  },
+  "datasets": [
+    {"task": "ui_defect", "rows": 98, "groups": 90, "probability": 0.5},
+    {"task": "vqa", "rows": 196, "groups": 180, "probability": 0.5}
+  ]
+}

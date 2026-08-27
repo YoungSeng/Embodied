@@ -51,11 +51,13 @@ fi
 if [[ "${CPT_MODE}" == "smoke" ]]; then
   DATA_DIR="${DATA_DIR:-${WORKSPACE}/data/locany_cpt_v4_smoke}"
   RECIPE_NAME="${RECIPE_NAME:-locany_cpt_smoke.json}"
-  MAX_STEPS="${MAX_STEPS:-2}"
-  SAVE_STEPS="${SAVE_STEPS:-2}"
+  MAX_STEPS="${MAX_STEPS:-20}"
+  SAVE_STEPS="${SAVE_STEPS:-20}"
   SAVE_EVERY_N_HOURS="${SAVE_EVERY_N_HOURS:-0}"
   SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-2}"
   DEFAULT_WARMUP_STEPS=0
+  DEFAULT_CPT_METRICS_INTERVAL=5
+  DEFAULT_CPT_TABLE_INTERVAL=20
 else
   DATA_DIR="${DATA_DIR:-${WORKSPACE}/data/locany_cpt_v4}"
   RECIPE_NAME="${RECIPE_NAME:-locany_cpt_train.json}"
@@ -65,6 +67,8 @@ else
   SAVE_EVERY_N_HOURS="${SAVE_EVERY_N_HOURS:-12}"
   SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-20}"
   DEFAULT_WARMUP_STEPS=500
+  DEFAULT_CPT_METRICS_INTERVAL=100
+  DEFAULT_CPT_TABLE_INTERVAL=500
 fi
 
 META_PATH="${META_PATH:-${DATA_DIR}/recipe/${RECIPE_NAME}}"
@@ -86,9 +90,25 @@ fi
 
 export PATH="${ENV_DIR}/bin:${PATH}"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
-"${ENV_DIR}/bin/python" "${PROJECT_ROOT}/scripts/validate_locany_cpt.py" \
-  --recipe "${META_PATH}" \
+export CPT_SAMPLING_MODE="${CPT_SAMPLING_MODE:-sample_equal}"
+_LOCANY_VALIDATE_ARGS=(
+  --recipe "${META_PATH}"
   --records-per-dataset "${VALIDATE_RECORDS_PER_DATASET:-8}"
+  --require-split train
+)
+if [[ "${CPT_SAMPLING_MODE}" == "sample_equal" ]]; then
+  _LOCANY_VALIDATE_ARGS+=(--require-equal-weights)
+fi
+"${ENV_DIR}/bin/python" "${PROJECT_ROOT}/scripts/validate_locany_cpt.py" \
+  "${_LOCANY_VALIDATE_ARGS[@]}"
+
+mkdir -p "${OUTPUT_DIR}/diagnostics"
+for _LOCANY_CPT_DIAGNOSTIC in split_summary.json data_length_stats.json cpt_data_stats.json; do
+  if [[ -f "${DATA_DIR}/diagnostics/${_LOCANY_CPT_DIAGNOSTIC}" ]]; then
+    cp -f "${DATA_DIR}/diagnostics/${_LOCANY_CPT_DIAGNOSTIC}" \
+      "${OUTPUT_DIR}/diagnostics/${_LOCANY_CPT_DIAGNOSTIC}"
+  fi
+done
 
 export PROJECT_ROOT WORKSPACE ENV_DIR MODEL_PATH DATA_DIR META_PATH OUTPUT_BASE RUN_NAME OUTPUT_DIR
 export ATTN_IMPLEMENTATION MAX_SEQ_LENGTH MAX_NUM_TOKENS_PER_SAMPLE MAX_NUM_TOKENS
@@ -109,6 +129,13 @@ export FREEZE_BACKBONE="${FREEZE_BACKBONE:-False}"
 export FREEZE_MLP="${FREEZE_MLP:-False}"
 export ENABLE_UI_RELATION=False
 export BALANCE_UI_DEFECTS=False
+export LOCANY_CPT_MODE=1
+export CPT_SIZE_ALPHA="${CPT_SIZE_ALPHA:-}"
+export CPT_TOKEN_BETA="${CPT_TOKEN_BETA:-}"
+export CPT_MIN_TASK_PROB="${CPT_MIN_TASK_PROB:-0}"
+export CPT_MAX_TASK_PROB="${CPT_MAX_TASK_PROB:-1}"
+export CPT_METRICS_INTERVAL="${CPT_METRICS_INTERVAL:-${DEFAULT_CPT_METRICS_INTERVAL}}"
+export CPT_TABLE_INTERVAL="${CPT_TABLE_INTERVAL:-${DEFAULT_CPT_TABLE_INTERVAL}}"
 export LOCANY_ENABLE_MILESTONE_COPIES=0
 export WANDB_PROJECT="${WANDB_PROJECT:-locateanything-ui-cpt}"
 export CACHE_ROOT="${CACHE_ROOT:-/tmp/${USER:-$(id -un)}_locany_cpt_cache}"
@@ -126,6 +153,7 @@ echo "max_num_tokens_per_rank     : ${MAX_NUM_TOKENS}"
 echo "gradient_accumulation_steps : ${GRADIENT_ACCUMULATION_STEPS}"
 echo "max_steps                   : ${MAX_STEPS}"
 echo "save_every_hours            : ${SAVE_EVERY_N_HOURS}"
+echo "cpt_sampling_mode           : ${CPT_SAMPLING_MODE}"
 echo "================================="
 
 cd "${PROJECT_ROOT}"

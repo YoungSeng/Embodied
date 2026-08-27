@@ -13,8 +13,13 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from eaglevl.train.dataset_sampling import resolve_dataset_sampling_weight, resolve_recipe_entry_paths
+from eaglevl.train.cpt_sampling import (
+    assert_sampling_resume_compatible,
+    resolve_cpt_sampling,
+)
 from eaglevl.train.checkpoint_schedule import PeriodicCheckpointSchedule
 from prepare_locany_cpt import extract_image_size, extract_input_size, normalize_box, normalize_record
+from simulate_locany_cpt_sampling import simulate
 
 
 def _record(image: Path, prompt: str, answer: str, *, objects=None, record_id="sample"):
@@ -37,6 +42,84 @@ def _write_jsonl(path: Path, record: dict):
 
 
 class LocateAnythingCPTTest(unittest.TestCase):
+    def test_sampling_simulation_accounts_for_post_skip_exposure(self):
+        recipe = {
+            "locany_cpt_small": {
+                "cpt_task": "small",
+                "dataset_rows": 100,
+                "mean_total_supervised_tokens": 10,
+            },
+            "locany_cpt_large": {
+                "cpt_task": "large",
+                "dataset_rows": 400,
+                "mean_total_supervised_tokens": 20,
+            },
+        }
+        stats = {
+            "tasks": {
+                "small": {"rows": 100, "groups": 100, "oversize_rate": 0.1},
+                "large": {"rows": 400, "groups": 400, "oversize_rate": 0.0},
+            }
+        }
+        result = simulate(
+            recipe,
+            stats,
+            exposure=1000,
+            min_probability=0.0,
+            max_probability=1.0,
+        )
+        sample_equal = {
+            row["name"]: row
+            for row in result["modes"]["sample_equal"]["tasks"]
+        }
+        self.assertEqual(sample_equal["small"]["expected_attempted_samples"], 500)
+        self.assertEqual(sample_equal["small"]["expected_trained_samples"], 450)
+        self.assertLess(
+            sample_equal["small"]["post_skip_sample_share"],
+            sample_equal["large"]["post_skip_sample_share"],
+        )
+
+    def test_sample_equal_remains_the_default_independent_of_dataset_size(self):
+        config = resolve_cpt_sampling(
+            [
+                {"name": "small", "rows": 5667},
+                {"name": "large", "rows": 608896},
+            ]
+        )
+        self.assertEqual(config["mode"], "sample_equal")
+        self.assertEqual([task["probability"] for task in config["tasks"]], [0.5, 0.5])
+
+    def test_hybrid_increases_large_coverage_but_accounts_for_tokens(self):
+        config = resolve_cpt_sampling(
+            [
+                {"name": "small", "rows": 100, "mean_total_supervised_tokens": 100},
+                {"name": "large", "rows": 10000, "mean_total_supervised_tokens": 400},
+            ],
+            mode="hybrid",
+        )
+        probabilities = {task["name"]: task["probability"] for task in config["tasks"]}
+        self.assertGreater(probabilities["large"], probabilities["small"])
+        self.assertAlmostEqual(sum(probabilities.values()), 1.0)
+
+    def test_sampling_probability_clamps_and_resume_hash(self):
+        config = resolve_cpt_sampling(
+            [
+                {"name": "small", "rows": 1},
+                {"name": "large", "rows": 1000000},
+            ],
+            mode="sqrt_size",
+            min_task_prob=0.1,
+            max_task_prob=0.9,
+        )
+        probabilities = [task["probability"] for task in config["tasks"]]
+        self.assertAlmostEqual(probabilities[0], 0.1)
+        self.assertAlmostEqual(probabilities[1], 0.9)
+        assert_sampling_resume_compatible(config, dict(config))
+        changed = dict(config)
+        changed["config_hash"] = "different"
+        with self.assertRaisesRegex(RuntimeError, "changed across resume"):
+            assert_sampling_resume_compatible(config, changed)
+
     def test_explicit_sampling_weight_decouples_probability_from_size(self):
         self.assertEqual(resolve_dataset_sampling_weight({"sampling_weight": 1.0}, 5667), 1.0)
         self.assertEqual(resolve_dataset_sampling_weight({"sampling_weight": 1.0}, 608896), 1.0)
@@ -301,6 +384,7 @@ class LocateAnythingCPTTest(unittest.TestCase):
                     "--recipe-name",
                     "locany_cpt_smoke.json",
                     "--copy-images",
+                    "--no-split",
                 ],
                 text=True,
                 capture_output=True,

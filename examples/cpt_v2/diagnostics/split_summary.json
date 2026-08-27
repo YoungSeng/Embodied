@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "seed": 20260826,
+  "group_intersection": 0,
+  "tasks": {
+    "ui_defect": {
+      "train_rows": 98,
+      "val_rows": 2,
+      "val_fast_rows": 2,
+      "train_groups": 90,
+      "val_groups": 2
+    },
+    "vqa": {
+      "train_rows": 196,
+      "val_rows": 4,
+      "val_fast_rows": 4,
+      "train_groups": 180,
+      "val_groups": 4
+    }
+  }
+}

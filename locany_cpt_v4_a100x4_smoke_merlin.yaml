@@ -69,12 +69,15 @@ jobRunParams:
     MAX_NUM_TOKENS: "12800"
     PACKING_BUFFER_SIZE: "16"
     GRADIENT_ACCUMULATION_STEPS: "2"
-    MAX_STEPS: "2"
+    MAX_STEPS: "20"
     WARMUP_STEPS: "0"
     LEARNING_RATE: "5e-6"
-    SAVE_STEPS: "2"
+    SAVE_STEPS: "20"
     SAVE_EVERY_N_HOURS: "0"
     SAVE_TOTAL_LIMIT: "2"
+    CPT_METRICS_INTERVAL: "5"
+    CPT_TABLE_INTERVAL: "20"
+    CPT_SMOKE_RESUME_STEP: "10"
     REPORT_TO: "none"
 
 namespace: /user/sicheng.yang

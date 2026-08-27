@@ -37,6 +37,13 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
             "gpu: 2",
             'CUDA_DEVICES: "0,1"',
         ),
+        "locany_cpt_v4_h20x2_smoke_merlin.yaml": (
+            "shell/run_locany_cpt_merlin.sh h20 smoke",
+            "gpuv: NVIDIA_H20",
+            "clusterId: 20",
+            "gpu: 2",
+            'CUDA_DEVICES: "0,1"',
+        ),
     }
 
     def test_merlin_profiles_have_expected_resources_and_commands(self):
@@ -51,8 +58,11 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         smoke = (REPO_ROOT / "locany_cpt_v4_a100x4_smoke_merlin.yaml").read_text(
             encoding="utf-8"
         )
-        self.assertIn('MAX_STEPS: "2"', smoke)
-        self.assertIn('SAVE_STEPS: "2"', smoke)
+        self.assertIn('MAX_STEPS: "20"', smoke)
+        self.assertIn('CPT_METRICS_INTERVAL: "5"', smoke)
+        self.assertIn('CPT_TABLE_INTERVAL: "20"', smoke)
+        self.assertIn('CPT_SMOKE_RESUME_STEP: "10"', smoke)
+        self.assertIn('SAVE_STEPS: "20"', smoke)
         self.assertIn('MAX_NUM_TOKENS: "12800"', smoke)
 
         a100 = (REPO_ROOT / "locany_cpt_v4_a100x4_formal_merlin.yaml").read_text(
@@ -83,6 +93,13 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn('GRADIENT_ACCUMULATION_STEPS: "4"', h20x2)
         self.assertIn('MAX_NUM_TOKENS: "25600"', h20x2)
 
+        h20x2_smoke = (
+            REPO_ROOT / "locany_cpt_v4_h20x2_smoke_merlin.yaml"
+        ).read_text(encoding="utf-8")
+        self.assertIn('CPT_METRICS_INTERVAL: "5"', h20x2_smoke)
+        self.assertIn('CPT_TABLE_INTERVAL: "20"', h20x2_smoke)
+        self.assertIn('CPT_SMOKE_RESUME_STEP: "10"', h20x2_smoke)
+
     def test_formal_defaults_keep_four_card_rank_batch_and_twelve_hour_saves(self):
         launcher = (REPO_ROOT / "shell" / "run_locany_cpt.sh").read_text(encoding="utf-8")
         self.assertIn('GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"', launcher)
@@ -96,6 +113,8 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         )
         self.assertIn('expected_gpu_count = int(os.environ.get("GPU_COUNT", "4"))', merlin)
         self.assertIn('x${GPU_COUNT}-formal', merlin)
+        self.assertIn('run_training_phase "pre-resume-${SMOKE_RESUME_STEP}"', merlin)
+        self.assertIn('export LOCANY_SEGMENT_MODE=1', merlin)
 
     def test_disabled_ui_relation_skips_ui5_only_trainer_audits(self):
         launcher = (REPO_ROOT / "shell" / "run_locany_cpt.sh").read_text(
@@ -112,9 +131,15 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn(
             "if not self._ui5_enabled:\n            return optimizer", trainer
         )
-        self.assertIn(
-            "if not self._ui5_enabled:\n            return super().log", trainer
-        )
+        self.assertIn('if self._ui5_enabled and "grad_norm" in logs:', trainer)
+        self.assertIn("and step % self._cpt_metrics_interval == 0", trainer)
+        self.assertIn("self._write_cpt_metrics(step, logs)", trainer)
+        self.assertIn("if self._ui5_enabled and step in {1, 20, 100}:", trainer)
+        self.assertIn("@record\ndef main():", trainer)
+        self.assertIn("CPT resume dataloader state is missing", trainer)
+        self.assertIn("'version': 6", trainer)
+        self.assertIn("truncation=not self.cpt_enabled", trainer)
+        self.assertIn('"cpt_eval_queue.jsonl"', trainer)
 
 
 if __name__ == "__main__":

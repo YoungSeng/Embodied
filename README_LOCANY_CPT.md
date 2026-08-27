@@ -1,198 +1,318 @@
-# LocateAnything UI CPT
+# LocateAnything UI CPT v2
 
-This pipeline continues training `nvidia/LocateAnything-3B` on the UI v4.1
-caption, action, grounding, defect, OCR, referring, and VQA mixture.  It reuses
-the same model loader, image processor, online packing, DeepSpeed ZeRO-2,
-stateful dataloader resume, and `checkpoint-<global_step>` lifecycle as the
-current LocateAnything UI5 pipeline.
+本目录只说明 CPT。CPT 运行必须设置 `LOCANY_CPT_MODE=1`；新增统计、采样校验和
+UI5 检查旁路均受此开关保护，不改变 SFT 默认行为。
 
-## Data format
+UI CPT v2 的目标是把训练改造成可观测、可诊断、可比较的系统：按图片组切分
+held-out、精确核对样本与监督 token、按任务计算 train/eval CE、用任务专属指标评估，
+并让 JSON/JSONL 成为唯一数据源。Excel 只是可选离线投影。
 
-The raw files are streamed into ten task-family JSONL files.  Every output row
-uses LocateAnything's native structure:
+## 1. 数据准备与无泄漏切分
 
-```json
-{
-  "conversations": [
-    {"from": "human", "value": "<image>..."},
-    {"from": "gpt", "value": "..."}
-  ],
-  "image": "/absolute/or/root-relative/image.jpg",
-  "cpt_task": "single_grounding"
-}
-```
-
-Grounding answers use normalized `[0,1000]` coordinates:
-
-```text
-<ref>目标文字</ref><box><x1><y1><x2><y2></box>
-```
-
-Qwen-VL `<|object_ref_start|>/<|box_start|>` markers and structured
-`objects.bbox`/JSON `bbox_2d` targets are converted to this grammar.  Caption,
-action prediction, VQA, and region-function descriptions retain their natural
-language answers.
-
-## Balanced streaming
-
-The recipe writes `sampling_weight: 1.0` for every task family.  The online
-packer therefore samples each of the ten task families with probability 10%,
-independent of file size.  It does not truncate the 608K single-grounding set
-to the 5,667-example defect-set size, and it does not materialize repeated
-copies of small files.  Each task iterator still visits its own records and
-reshuffles when exhausted.
-
-## H20: prepare all data
-
-Run this once on the HL cluster:
-
-```bash
-cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
-
-python scripts/prepare_locany_cpt.py \
-  --source-root /mnt/bn/intelligent-service-arnold-hl/dataset/gui/gui_base/sample/raw_data_v4.1_hl_norm1k/raw_data_v4.1_hl \
-  --output-dir /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4 \
-  --recipe-name locany_cpt_train.json
-```
-
-The converter writes rejected row locations and reasons to `rejected.jsonl`.
-It fails when the rejected rate exceeds 0.1%.
-
-## A100: portable four-card smoke data
-
-On a node that can read the HL source, export eight rows per task and copy the
-referenced images into a small self-contained directory:
+默认按图片内容 SHA-256 生成 `group_id`，固定 seed `20260826`，以 group 为单位近似
+98%/2% 切分。同一图片派生的不同任务和 annotation row 只能进入同一 split；若多图记录
+与其他记录共享任意一张图片，会按共享图片的连通分量合并为同一 group，避免局部重叠泄漏。
+只有在全量内容哈希确实不可承受时才使用 `--group-id-mode path`；该模式会额外输出
+`diagnostics/path_duplicate_suspects.json`，列出同 basename、同尺寸但路径不同的候选，
+必须抽样复核，不能将它当成与内容哈希同等强度的零泄漏证据。
 
 ```bash
 python scripts/prepare_locany_cpt.py \
-  --source-root /mnt/bn/intelligent-service-arnold-hl/dataset/gui/gui_base/sample/raw_data_v4.1_hl_norm1k/raw_data_v4.1_hl \
-  --output-dir /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4_smoke \
-  --recipe-name locany_cpt_smoke.json \
-  --max-records-per-task 8 \
-  --copy-images
+  --source-root /path/to/raw_data_v4.1_hl \
+  --output-dir /path/to/locany_cpt_v4 \
+  --recipe-name locany_cpt_train.json \
+  --split-seed 20260826 \
+  --val-fraction 0.02 \
+  --val-fast-per-task 200 \
+  --group-id-mode sha256 \
+  --overwrite
 ```
 
-Copy the complete `locany_cpt_v4_smoke` directory to:
+输出包括：
 
-```text
-/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4_smoke
-```
+- `train/<task>.jsonl`、`val/<task>.jsonl`；
+- `recipe/locany_cpt_train.json`、`locany_cpt_val.json`、
+  `locany_cpt_val_fast.json`；
+- `diagnostics/split_manifest.jsonl`、`split_summary.json`、图片哈希缓存；
+- 被格式转换拒绝的行及真实原因。
 
-Because copied image paths are root-relative, no JSONL rewriting is needed
-after the directory moves.
-
-## Merlin submissions
-
-A100-profile smoke test on YG (the current YG Arnold resource enum is
-`A800_SXM_40GB`, four cards, SDPA):
+若已有规范化的未切分 recipe，可单独切分：
 
 ```bash
-cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
-mlx job submitv2 --path locany_cpt_v4_a100x4_smoke_merlin.yaml
+python scripts/split_locany_cpt.py \
+  --recipe /path/to/locany_cpt_all.json \
+  --output-dir /path/to/locany_cpt_v4 \
+  --seed 20260826 \
+  --val-fraction 0.02 \
+  --val-fast-per-task 200
 ```
 
-The default smoke run performs two optimizer steps and saves
-`checkpoint-2`.
-
-A100-profile formal training on YG:
-
-The complete prepared directory must exist at
-`/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4`
-before submission.
+全量验证必须读取 manifest；发现 group、record、图片内容哈希或规范化路径跨 split 时
+非零退出：
 
 ```bash
-cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
-mlx job submitv2 --path locany_cpt_v4_a100x4_formal_merlin.yaml
+python scripts/validate_locany_cpt.py \
+  --recipe /path/to/locany_cpt_v4/recipe/locany_cpt_train.json \
+  --records-per-dataset 0 \
+  --split-manifest /path/to/locany_cpt_v4/diagnostics/split_manifest.jsonl \
+  --require-split train \
+  --require-equal-weights
+
+python scripts/validate_locany_cpt.py \
+  --recipe /path/to/locany_cpt_v4/recipe/locany_cpt_val.json \
+  --records-per-dataset 0 \
+  --split-manifest /path/to/locany_cpt_v4/diagnostics/split_manifest.jsonl \
+  --require-split heldout
 ```
 
-H20 Magi formal training on HL:
+`val_fast` 不是取文件前 N 条，而是按 `seed + group_id + record_id` 的 hash 固定选择；
+VQA 和 UI defect 保持标签分层。
+
+## 2. 静态长度与采样模拟
+
+在训练前用真实 processor 统计 pre/post-MTP 长度、main/MTP token 及超限原因，并把
+每任务平均监督 token 写回 recipe，供 token-aware 策略使用：
 
 ```bash
-cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
-mlx job submitv2 --path locany_cpt_v4_h20x4_formal_merlin.yaml
+python scripts/analyze_locany_cpt_lengths.py \
+  --recipe /path/to/locany_cpt_v4/recipe/locany_cpt_train.json \
+  --processor /path/to/LocateAnything-3B \
+  --output /path/to/locany_cpt_v4/diagnostics/cpt_data_stats.json \
+  --block-size 6 \
+  --max-num-tokens-per-sample 8192
 ```
 
-H20 × 2 keeps the same per-rank `MAX_NUM_TOKENS=25600` and preserves the
-effective batch with gradient accumulation 4:
+静态分析同时写 `diagnostics/oversize_samples.jsonl`，逐条保存 task、record/group、
+source/line、pre/post-MTP 长度和超限原因。训练 JSONL 的
+`window_oversize_record_hashes`/`window_oversize_group_hashes` 记录该统计窗口首次出现的
+真实 runtime skip，可与 manifest 的稳定 ID 对照且 resume 后不会重复写。
+
+离线比较四种固定采样；这不会启动训练：
 
 ```bash
-cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
-mlx job submitv2 --path locany_cpt_v4_h20x2_formal_merlin.yaml
+python scripts/simulate_locany_cpt_sampling.py \
+  --recipe /path/to/locany_cpt_v4/recipe/locany_cpt_train.json \
+  --data-stats /path/to/locany_cpt_v4/diagnostics/cpt_data_stats.json \
+  --output /path/to/locany_cpt_v4/diagnostics/cpt_sampling_simulation.json \
+  --optimizer-steps 20000 \
+  --samples-per-step 23.57
 ```
 
-Formal defaults are full-parameter training, four GPUs, gradient accumulation
-2, learning rate `5e-6`, 20,000 optimizer steps, A100-profile `7268/12800`
-and H20 `8192/25600` per-sample/per-rank packed-token limits, and a checkpoint
-approximately every 12 hours. Trainer checkpoint directories always include
-the current optimizer global step, for example `checkpoint-4372`.
+采样统一使用 `p_i ∝ N_i^alpha × mu_i^(-beta)`：
 
-All defaults can be overridden without editing code:
+| `CPT_SAMPLING_MODE` | alpha | beta | 含义 |
+| --- | ---: | ---: | --- |
+| `sample_equal` | 0 | 0 | 任务样本等权，formal 默认 |
+| `sqrt_size` | 0.5 | 0 | 增加大任务覆盖 |
+| `token_balanced` | 0 | 1 | 近似任务监督 token 等权 |
+| `hybrid` | 0.5 | 0.5 | 覆盖与 token 平衡折中 |
+
+可覆盖 `CPT_SIZE_ALPHA`、`CPT_TOKEN_BETA`、`CPT_MIN_TASK_PROB`、
+`CPT_MAX_TASK_PROB`。概率在训练前固定并写入 run config；resume 时必须一致，训练中
+不会根据 rolling statistics 动态改权重。
+
+## 3. 训练和 smoke
+
+第一阶段 formal 保持 `CPT_SAMPLING_MODE=sample_equal`：
 
 ```bash
-RUN_NAME=locany-3b-ui-cpt-v4-h20x4-run2 \
-MAX_STEPS=30000 \
-LEARNING_RATE=3e-6 \
-SAVE_EVERY_N_HOURS=12 \
+CPT_SAMPLING_MODE=sample_equal \
+RUN_NAME=locany-3b-ui-cpt-v4-h20x2-formal \
 bash shell/run_locany_cpt.sh h20 formal
 ```
 
-The direct `bash shell/run_locany_cpt.sh ...` commands are retained for an
-already allocated interactive worker.  Normal smoke and formal runs should be
-submitted through the Merlin YAML files above. All YAMLs use
-`shell/run_locany_cpt_merlin.sh` for cache isolation, GPU-count-aware preflight,
-logging, and exit-code propagation, then delegate training parameters to
-`shell/run_locany_cpt.sh`.
+Merlin 入口：
 
-An interrupted run resumes from the newest complete checkpoint in the same
-`OUTPUT_DIR`, including optimizer, scheduler, random state, and packed
-dataloader state.
-
-
-### Eval
+```bash
+mlx job submitv2 --path locany_cpt_v4_a100x4_smoke_merlin.yaml
+mlx job submitv2 --path locany_cpt_v4_h20x2_smoke_merlin.yaml
+mlx job submitv2 --path locany_cpt_v4_a100x4_formal_merlin.yaml
+mlx job submitv2 --path locany_cpt_v4_h20x2_formal_merlin.yaml
 ```
-cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
 
-BASE=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/hf_home/hub/models--nvidia--LocateAnything-3B/snapshots/c32291ca5e996f5a7a485845b4f57a233936bba0
-RUN_DIR=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_models/locany-3b-ui-cpt-v4-h20x2-formal
-CKPT=${RUN_DIR}/checkpoint-替换成实际STEP
-RECIPE=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4/recipe/locany_cpt_train.json
+两份 smoke 都先在 step 10 强制保存并退出 segment，再从同一 checkpoint 自动 resume 到
+step 20，因此一个 job 同时覆盖多卡训练与断点续训。H20×2 默认每 rank packed-token 上限
+25600、梯度累积 4；A800×4 默认 12800、梯度累积 2。`shell/run_locany_cpt.sh`
+会先验证 train split，再将 split/length stats 复制到 run 的 `diagnostics/`。
 
-CUDA_VISIBLE_DEVICES=0 \
-/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python \
-scripts/eval_locany_cpt_learning.py \
+训练运行时只按区间写聚合统计，不逐样本打印：
+
+- `CPT_METRICS_INTERVAL=100`：JSONL 和常规 logger/W&B/TensorBoard 标量；
+- `CPT_TABLE_INTERVAL=500`：精确全局 unique coverage 和紧凑 per-task 表；
+- stream 底层日志仍为每 10,000 packed batch。
+
+## 4. 指标口径
+
+样本计数满足：
+
+```text
+attempted_samples = accepted_samples + oversize_skipped_samples
+```
+
+`attempted` 是 iterator 取出的样本，`accepted` 是通过单样本 post-MTP 上限的样本，
+`trained` 是实际进入 forward 的子样本，`packed_batches` 是产生的物理 packed batch。
+图片读取、processor 或 token 对齐异常不会伪装成 oversize skip，而会记录 task/record/source
+后抛出原始异常。
+
+监督 token 满足：
+
+```text
+total_supervised_tokens = main_supervised_tokens + mtp_supervised_tokens
+```
+
+packed sequence 内每个 loss token 都保留 task id 和 supervision kind。统计 CE 使用同一次
+forward 的 causal-shift unreduced CE，detach/no-grad 聚合，不做第二次 forward，也不改变
+反向传播 loss：
+
+- `train_main_token_ce`：main LM token CE；
+- `train_mtp_token_ce`：MTP token CE；
+- `train_total_token_ce`：两者按 token count 合并；
+- held-out teacher-forced 使用 `eval_main_token_ce`；train–val gap 始终比较 main CE。
+
+全局 CE 是 `sum(loss_sum) / sum(token_count)`，不是 rank mean 的均值。Unique record/group
+通过可合并 64-bit hash set 全局 union，不能将各 rank unique 数直接相加。
+
+覆盖率定义：
+
+```text
+effective_epoch = trained_samples / dataset_rows
+repeat_factor   = trained_samples / max(unique_record_count, 1)
+```
+
+全局 oversize rate >0.5% 或任一任务 >2% 只报警；token share/sample share >2 标记为
+`token_dominant`。不会自动扩大 token limit 或截断 ground truth。
+
+## 5. Resume
+
+Trainer checkpoint 保存 optimizer、scheduler、random state，以及每 rank 的
+`dataloader_state_rank<N>.pt`。CPT resume 会校验：
+
+- sampling config hash、各任务概率与 rows；
+- world size、worker 数、base seed、单样本/packed token 上限、buffer size；
+- metrics JSONL 不得领先所选 checkpoint；
+- dataloader state 必须存在且版本兼容。
+
+校验不通过时故意失败，避免静默从头取样造成重复计数。换 world size/worker 数或 sampling
+策略应使用新的 `OUTPUT_DIR`。TorchElastic 入口带 `@record`，rank 失败保留原始异常、文件、
+行号并以非零状态退出。
+
+每个通过完整性校验的 checkpoint 还会由 rank 0 去重追加
+`diagnostics/cpt_eval_queue.jsonl`，标记待独立 job 执行的 held-out val_fast 评测。
+
+## 6. Held-out 评测
+
+训练池只能显式标记为 `train_pool/domain_absorption`；best checkpoint 只看 held-out。
+推荐用独立 Merlin job 跑 generation，避免阻塞 formal training。
+
+```bash
+python scripts/eval_locany_cpt_learning.py \
   --checkpoint "$CKPT" \
   --base-model "$BASE" \
   --processor-path "$BASE" \
-  --recipe "$RECIPE" \
-  --output-dir "${RUN_DIR}/eval/$(basename "$CKPT")" \
-  --samples-per-task 1 \
+  --recipe /path/to/locany_cpt_v4/recipe/locany_cpt_val_fast.json \
+  --manifest /path/to/locany_cpt_v4/diagnostics/split_manifest.jsonl \
+  --eval-split heldout \
+  --subset-strategy hash \
+  --samples-per-task 200 \
+  --base-cache-dir "$RUN_DIR/eval/base_cache" \
+  --train-metrics-jsonl "$RUN_DIR/diagnostics/cpt_train_metrics.jsonl" \
+  --metrics-jsonl "$RUN_DIR/diagnostics/cpt_eval_metrics.jsonl" \
+  --output-dir "$RUN_DIR/eval/$(basename "$CKPT")" \
   --device cuda:0 \
-  --attn-implementation sdpa \
-  --max-new-tokens 1024
+  --attn-implementation magi \
+  --teacher-forced
 ```
 
+每个 checkpoint 输出 `predictions.jsonl`、`summary.json`、
+`errors_by_task.jsonl`、`qualitative_samples.md`，以及 50 条 referring_kg 人工语义复核模板。
+原始 prediction 与解析结果足以离线升级指标：
+
+```bash
+python scripts/recompute_locany_cpt_metrics.py \
+  --predictions "$RUN_DIR/eval/checkpoint-STEP/predictions.jsonl" \
+  --output-summary "$RUN_DIR/eval/checkpoint-STEP/summary.recomputed.json"
 ```
-cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
 
-BASE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/hf_home/hub/models--nvidia--LocateAnything-3B/snapshots/c32291ca5e996f5a7a485845b4f57a233936bba0
-RUN_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_models/locany-3b-ui-cpt-v4-a100x4-formal
-CKPT=${RUN_DIR}/checkpoint-1234
-RECIPE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4/recipe/locany_cpt_train.json
+primary metrics 分别为 caption ROUGE-L、agent action type+point、agent grounding point
+Hit@50、class-aware defect Macro-F1@0.5、all-elements one-to-one F1@0.5、single
+grounding Recall@0.5、OCR one-to-one label-aware F1@0.5、referring/referring_kg
+ROUGE-L、VQA 正确/错误 accuracy；Char-F1 均作为附属指标。Point 支持两种语法且坐标必须位于 `[0,1000]`；box
+采用一对一最大总 IoU 匹配，UI defect 只允许同类匹配。综合分数仅为十任务 primary 的
+等权 `heldout_task_macro_primary`。
 
-test -f scripts/eval_locany_cpt_learning.py
-test -d "${CKPT}"
+best checkpoint 依次按 held-out task-macro primary 最大、task-macro main CE 最小排序；
+关键弱任务相对历史 best 下降超过 3 个百分点时不自动标 best。少于完整十任务的 held-out
+结果、train-pool 指标均不能成为 best。
 
-CUDA_VISIBLE_DEVICES=0 \
-/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python \
-scripts/eval_locany_cpt_learning.py \
-  --checkpoint "${CKPT}" \
-  --base-model "${BASE}" \
-  --processor-path "${BASE}" \
-  --recipe "${RECIPE}" \
-  --output-dir "${RUN_DIR}/eval/$(basename "${CKPT}")" \
-  --samples-per-task 1 \
-  --device cuda:0 \
-  --attn-implementation sdpa \
-  --vision-attn-implementation flash_attention_2 \
-  --max-new-tokens 1024
+分析 train–val 曲线：
+
+```bash
+python scripts/analyze_locany_cpt_curves.py \
+  --train-metrics "$RUN_DIR/diagnostics/cpt_train_metrics.jsonl" \
+  --eval-metrics "$RUN_DIR/diagnostics/cpt_eval_metrics.jsonl" \
+  --output "$RUN_DIR/diagnostics/cpt_overfitting_analysis.json"
 ```
+
+至少三个 milestone 才判定趋势；两点不足以声称“没有过拟合”。
+
+## 7. JSON/JSONL 与 Excel
+
+Source of truth 只有：
+
+- `diagnostics/cpt_run_config.json`；
+- `diagnostics/cpt_data_stats.json`；
+- `diagnostics/cpt_train_metrics.jsonl`；
+- `diagnostics/cpt_eval_metrics.jsonl`。
+
+rank 0 原子写/追加这些文件。Excel 可随时离线重建：
+
+```bash
+python scripts/build_locany_cpt_excel.py \
+  --diagnostics-dir "$RUN_DIR/diagnostics" \
+  --output "$RUN_DIR/diagnostics/cpt_training_evaluation.xlsx"
+```
+
+工作簿严格只有 `Overview`、`TrainMetrics`、`EvalMetrics` 三个 sheet，冻结表头并启用筛选。
+缺失值保持空白，不写成 0。`openpyxl` 缺失或保存失败只产生 warning，不会终止训练。
+
+## 8. 验收
+
+本地 CPT 单测：
+
+```bash
+python -m unittest \
+  tests.test_cpt_split \
+  tests.test_cpt_observability \
+  tests.test_cpt_eval_metrics \
+  tests.test_cpt_checkpoint_selection \
+  tests.test_cpt_overfitting \
+  tests.test_cpt_excel \
+  tests.test_locany_cpt \
+  tests.test_locany_cpt_merlin
+```
+
+集群 smoke 还必须核对：20 step 正常、per-task sample/token/skip/CE 均存在、resume 后
+计数单调不重复、A800/H20 schema 相同、多 rank reduce 不死锁、原始 TorchElastic 异常可见，
+以及统计开启后 step time 增幅不超过 5%。这些结果必须来自真实 job 日志，不能由本地静态
+检查代替。
+
+两个 job 完成后可自动核对 checkpoint-10→20 resume、rank state、对账、单调性、十任务 CE、
+eval queue、三表 Excel 和跨硬件 schema：
+
+```bash
+python scripts/validate_locany_cpt_smoke.py \
+  --run a800=/path/to/a800-smoke-run \
+  --run h20x2=/path/to/h20x2-smoke-run \
+  --output /path/to/cpt_smoke_validation.json
+```
+
+常见失败含义：
+
+- `DummyOptim ... param_groups`：旧版 CPT 自定义 optimizer 路径；当前兼容层不再直接假定
+  DummyOptim 暴露 `param_groups`。
+- `UI modules ... no parameter update`：旧版将 UI5 专属断言用于 CPT；当前仅在 UI5 模块
+  真正启用时检查。
+- `immutable run configuration changed`：resume 的采样/world/token/数据配置与 checkpoint
+  不一致，需恢复原配置或换新输出目录。
+- `missing dataloader_state_rank...`：checkpoint 不完整，禁止静默重启数据流。
+- oversize warning：查 `pre_mtp_already_oversize` 与 `mtp_expansion_oversize`，不要直接截断答案。

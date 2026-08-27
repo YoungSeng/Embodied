@@ -19,7 +19,7 @@ import sys
 import warnings
 from contextlib import nullcontext
 import numpy as np
-from typing import Dict, Optional, List, Tuple, Any
+from typing import Dict, Optional, List, Tuple, Any, Mapping
 from dataclasses import dataclass, field
 
 import json
@@ -32,6 +32,7 @@ def _patched_torch_load(*args, **kwargs):
     return _original_torch_load(*args, **kwargs)
 torch.load = _patched_torch_load
 import torch.distributed as dist
+from torch.distributed.elastic.multiprocessing.errors import record
 import transformers
 import traceback
 import socket
@@ -67,6 +68,25 @@ from eaglevl.train.dataset_sampling import (
     resolve_recipe_entry_paths,
 )
 from eaglevl.train.optimizer_utils import optimizer_parameters
+from eaglevl.train.cpt_observability import (
+    CPT_ID_TO_TASK,
+    CPT_TASKS,
+    CPT_TASK_TO_ID,
+    add_sample_to_counter,
+    aggregate_token_losses,
+    empty_task_counter,
+    merge_task_counters,
+    restore_counter,
+    sample_length_metadata,
+    serializable_counter,
+    stable_hash64,
+    summarize_task_counter,
+    supervision_kinds,
+)
+from eaglevl.train.cpt_sampling import (
+    assert_sampling_resume_compatible,
+    resolve_cpt_sampling,
+)
 from PIL import Image, ImageFile, PngImagePlugin
 from torch.utils.data import Dataset, IterableDataset, DataLoader
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
@@ -312,6 +332,16 @@ class LazySupervisedDatasetMTP(Dataset):
         self.data_augment = meta.get("data_augment", False)
         self.visual_prompt = bool(meta.get("visual_prompt", False))
         self.balance_ui_defects = bool(meta.get("balance_ui_defects", balance_ui_defects))
+        self.cpt_enabled = _env_flag("LOCANY_CPT_MODE", default=False)
+        self.cpt_task = (
+            str(meta.get("cpt_task") or ds_name.removeprefix("locany_cpt_"))
+            if self.cpt_enabled
+            else None
+        )
+        if self.cpt_enabled and self.cpt_task not in CPT_TASK_TO_ID:
+            raise ValueError(f"Unknown CPT task for {ds_name}: {self.cpt_task!r}")
+        self.cpt_task_id = CPT_TASK_TO_ID.get(self.cpt_task, -1)
+        self.cpt_dataset_groups = int(meta.get("dataset_groups", 0) or 0)
 
         ann_paths = meta["annotation"]
         if not isinstance(ann_paths, (list, tuple)):
@@ -555,6 +585,10 @@ class LazySupervisedDatasetMTP(Dataset):
                 labels=targets,
                 attention_mask=input_ids.ne(tokenizer.pad_token_id),
                 position_ids=position_ids,
+                cpt_supervision_kind=torch.tensor(
+                    supervision_kinds(targets_out.tolist(), len_input_ids),
+                    dtype=torch.long,
+                ),
             )
 
         # ========= 分支 2：检测序列标记存在，使用原有的 box/ref-aware 逻辑 =========
@@ -640,6 +674,10 @@ class LazySupervisedDatasetMTP(Dataset):
             labels=targets,
             attention_mask=input_ids.ne(tokenizer.pad_token_id),
             position_ids=position_ids,
+            cpt_supervision_kind=torch.tensor(
+                supervision_kinds(targets_out.tolist(), len_input_ids),
+                dtype=torch.long,
+            ),
         )
 
     def _validate_image_token_alignment(self, input_ids: torch.Tensor, pixel_values, image_grid_hws) -> None:
@@ -675,7 +713,10 @@ class LazySupervisedDatasetMTP(Dataset):
             )
 
     def multi_modal_get_item(
-        self, messages: list, ui_targets: Optional[Dict[str, torch.Tensor]] = None
+        self,
+        messages: list,
+        ui_targets: Optional[Dict[str, torch.Tensor]] = None,
+        cpt_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, torch.Tensor]:
         message_text = self.processor.py_apply_chat_template(messages, tokenize=False)
         image_inputs, video_inputs = self.processor.process_vision_info(messages)
@@ -689,8 +730,14 @@ class LazySupervisedDatasetMTP(Dataset):
             ]
         
         inputs = self.processor(
-            text=message_text, images=image_inputs, videos=video_inputs,
-            return_tensors="pt", padding=False, truncation=True
+            text=message_text,
+            images=image_inputs,
+            videos=video_inputs,
+            return_tensors="pt",
+            padding=False,
+            # CPT must observe the real post-MTP length and explicitly skip an
+            # oversize sample.  Preserve historical SFT truncation elsewhere.
+            truncation=not self.cpt_enabled,
         )
         input_ids = inputs["input_ids"][0]
 
@@ -717,7 +764,66 @@ class LazySupervisedDatasetMTP(Dataset):
         )
         if ui_targets is not None:
             result.update(ui_targets)
+        if cpt_metadata is not None:
+            image_token_id = getattr(self.processor, "image_token_id", None)
+            if image_token_id is None:
+                image_token_id = self.processor.tokenizer.convert_tokens_to_ids(
+                    getattr(self.processor, "image_token", IMG_CONTEXT_TOKEN)
+                )
+            pre_mtp_length = int(inputs["input_ids"][0].numel())
+            vision_tokens = int(inputs["input_ids"][0].eq(image_token_id).sum().item())
+            lengths = sample_length_metadata(
+                result["labels"].tolist(),
+                pre_mtp_length=pre_mtp_length,
+                vision_tokens=vision_tokens,
+                ignore_index=IGNORE_TOKEN_ID,
+            )
+            result["cpt_task_token_ids"] = torch.full_like(
+                result["labels"], self.cpt_task_id, dtype=torch.long
+            )
+            result["cpt_supervision_kind"] = labels_dict["cpt_supervision_kind"]
+            result["_sample_task_ids"] = [self.cpt_task_id]
+            result["_sample_task_names"] = [self.cpt_task]
+            result["_sample_record_ids"] = [int(cpt_metadata["record_hash"])]
+            result["_sample_group_ids"] = [int(cpt_metadata["group_hash"])]
+            for key, value in lengths.items():
+                result[f"_sample_{key}"] = [int(value)]
         return result
+
+    def _cpt_record_metadata(self, data_item: dict, real_idx: int) -> dict[str, Any]:
+        record_id = data_item.get("cpt_record_id") or data_item.get("id")
+        if record_id is None:
+            record_id = f"{self.ds_name}:{real_idx}"
+        group_id = data_item.get("cpt_group_id")
+        if self.cpt_enabled and not group_id:
+            raise ValueError(
+                f"[{self.ds_name}] record={record_id!r} has no cpt_group_id; "
+                "prepare the group-level CPT split first"
+            )
+        return {
+            "record_id": str(record_id),
+            "group_id": str(group_id or record_id),
+            "record_hash": stable_hash64(record_id),
+            "group_hash": stable_hash64(group_id or record_id),
+            "source": data_item.get("cpt_source"),
+            "line": data_item.get("cpt_source_line"),
+        }
+
+    def _get_item_once(self, real_idx: int) -> Dict[str, torch.Tensor]:
+        data_item = self.lazy_loader[real_idx]
+        cpt_metadata = self._cpt_record_metadata(data_item, real_idx) if self.cpt_enabled else None
+        ui_targets = extract_ui_defect_targets(data_item, max_boxes=8)
+        processed = process_multimodal_sample(
+            data_item,
+            self.root,
+            self.max_frames,
+            self.target_fps,
+            self.video_total_pixels,
+            visual_prompt=self.visual_prompt,
+        )
+        return self.multi_modal_get_item(
+            processed, ui_targets=ui_targets, cpt_metadata=cpt_metadata
+        )
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         retry_count = 0
@@ -726,18 +832,24 @@ class LazySupervisedDatasetMTP(Dataset):
         seed = int(idx + 10086)
         random.seed(seed)
         np.random.seed(seed)
+
+        if self.cpt_enabled:
+            real_idx = self.active_indices[current_idx % self._length]
+            try:
+                return self._get_item_once(real_idx)
+            except Exception as exc:
+                raw = self.lazy_loader[real_idx]
+                record_id = raw.get("cpt_record_id") or raw.get("id") or f"{self.ds_name}:{real_idx}"
+                raise RuntimeError(
+                    f"CPT sample failure: task={self.cpt_task}, "
+                    f"record_id={record_id}, source={raw.get('cpt_source')}, "
+                    f"line={raw.get('cpt_source_line')}: {type(exc).__name__}: {exc}"
+                ) from exc
         
         while retry_count <= 10:
             real_idx = self.active_indices[(current_idx + retry_count) % self._length]
             try:
-                data_item = self.lazy_loader[real_idx]
-                ui_targets = extract_ui_defect_targets(data_item, max_boxes=8)
-                data_item = process_multimodal_sample(
-                    data_item, self.root, self.max_frames, 
-                    self.target_fps, self.video_total_pixels,
-                    visual_prompt=self.visual_prompt,
-                )
-                return self.multi_modal_get_item(data_item, ui_targets=ui_targets)
+                return self._get_item_once(real_idx)
             except Exception as e:
                 tb = traceback.format_exc()
                 logger.warning(f"[{self.ds_name}] idx {real_idx} failed: {e}\n{tb}")
@@ -835,6 +947,7 @@ class WorkerState:
     sample_rng_state: tuple
     samples_produced: int
     batches_produced: int
+    cpt_task_counters: Dict[str, dict]
     current_batch_locations: List[Tuple[int, int]]
     buffer_locations: List[Tuple[int, int]]
     
@@ -844,6 +957,10 @@ class WorkerState:
             'sample_rng_state': self.sample_rng_state,
             'samples_produced': self.samples_produced,
             'batches_produced': self.batches_produced,
+            'cpt_task_counters': {
+                task: serializable_counter(counter)
+                for task, counter in self.cpt_task_counters.items()
+            },
             'current_batch_locations': self.current_batch_locations,
             'buffer_locations': self.buffer_locations,
         }
@@ -864,6 +981,10 @@ class WorkerState:
             sample_rng_state=sample_rng_state,
             samples_produced=d.get('samples_produced', 0),
             batches_produced=d.get('batches_produced', 0),
+            cpt_task_counters={
+                task: restore_counter(counter)
+                for task, counter in d.get('cpt_task_counters', {}).items()
+            },
             current_batch_locations=d.get('current_batch_locations', []),
             buffer_locations=d.get('buffer_locations', []),
         )
@@ -884,6 +1005,7 @@ class StreamPackedDatasetMTP(IterableDataset):
         log_freq: int = 10000,
         base_seed: int = 42,
         buffer_size: int = 32,
+        cpt_sampling_config: Optional[dict] = None,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -895,6 +1017,14 @@ class StreamPackedDatasetMTP(IterableDataset):
         self.log_freq = log_freq
         self.base_seed = base_seed
         self.buffer_size = buffer_size
+        self.cpt_enabled = _env_flag("LOCANY_CPT_MODE", default=False)
+        self.cpt_sampling_config = copy.deepcopy(cpt_sampling_config)
+        self._cpt_trained_counters = {
+            task: empty_task_counter() for task in CPT_TASKS
+        }
+        self._cpt_ce_counters = {
+            task: empty_task_counter() for task in CPT_TASKS
+        }
 
         if dataset_weight is None:
             dataset_weight = [1] * len(datasets)
@@ -903,6 +1033,8 @@ class StreamPackedDatasetMTP(IterableDataset):
         
         self._worker_states: Dict[str, dict] = {}
         self._resume_states: Dict[str, dict] = {}
+        self._saved_num_workers: Optional[int] = None
+        self._configured_num_workers: Optional[int] = None
         
         if get_rank() == 0:
             ds_info = '\n'.join([f'  {ds.ds_name}: weight={w*100:.2f}%, len={len(ds)}' 
@@ -915,22 +1047,142 @@ class StreamPackedDatasetMTP(IterableDataset):
                        f'  data_rank={data_rank}, data_world_size={data_world_size}\n'
                        f'Datasets:\n{ds_info}')
 
+    def _stream_resume_config(self) -> dict:
+        return {
+            "base_seed": int(self.base_seed),
+            "data_world_size": int(self.data_world_size),
+            "max_num_tokens_per_sample": int(self.max_num_tokens_per_sample),
+            "max_num_tokens": int(self.max_num_tokens),
+            "buffer_size": int(self.buffer_size),
+            "datasets": [
+                {
+                    "name": dataset.ds_name,
+                    "task": dataset.cpt_task,
+                    "rows": len(dataset),
+                    "probability": float(probability),
+                }
+                for dataset, probability in zip(self.datasets, self.dataset_weight)
+            ],
+        }
+
     def state_dict(self) -> dict:
         return {
             'worker_states': copy.deepcopy(self._worker_states),
             'base_seed': self.base_seed,
-            'version': 4,
+            'stream_resume_config': self._stream_resume_config(),
+            'num_workers': (
+                self._configured_num_workers
+                if self._configured_num_workers is not None
+                else len(self._worker_states)
+            ),
+            'cpt_sampling_config': copy.deepcopy(self.cpt_sampling_config),
+            'cpt_trained_counters': {
+                task: serializable_counter(counter)
+                for task, counter in self._cpt_trained_counters.items()
+            },
+            'cpt_ce_counters': {
+                task: serializable_counter(counter)
+                for task, counter in self._cpt_ce_counters.items()
+            },
+            'version': 6,
         }
     
     def load_state_dict(self, state: dict):
         version = state.get('version', 1)
+        if self.cpt_enabled and version < 6:
+            raise RuntimeError(
+                "CPT resume requires dataloader state version >= 6; "
+                f"checkpoint has version={version}. Restart this v2 run from a clean output directory."
+            )
         if version < 3:
             logger.warning(f"Loading old state version {version}, perfect resume not available.")
+        saved_stream_config = state.get("stream_resume_config")
+        current_stream_config = self._stream_resume_config()
+        if self.cpt_enabled and saved_stream_config != current_stream_config:
+            raise RuntimeError(
+                "CPT stream configuration changed across resume: "
+                f"saved={saved_stream_config}, current={current_stream_config}"
+            )
+        saved_num_workers = state.get("num_workers")
+        self._saved_num_workers = (
+            int(saved_num_workers) if saved_num_workers is not None else None
+        )
         
         if 'worker_states' in state:
             self._resume_states = copy.deepcopy(state['worker_states'])
+            self._worker_states = copy.deepcopy(state['worker_states'])
             if get_rank() == 0:
                 logger.info(f"Loaded resume states for {len(self._resume_states)} workers")
+        saved_sampling = state.get("cpt_sampling_config")
+        if self.cpt_enabled and saved_sampling is not None:
+            assert_sampling_resume_compatible(self.cpt_sampling_config, saved_sampling)
+        for destination, key in (
+            (self._cpt_trained_counters, "cpt_trained_counters"),
+            (self._cpt_ce_counters, "cpt_ce_counters"),
+        ):
+            for task, counter in state.get(key, {}).items():
+                if task in destination:
+                    destination[task] = restore_counter(counter)
+
+    @staticmethod
+    def _sample_cpt_metadata(sample: dict, index: int = 0) -> dict[str, Any]:
+        return {
+            "task_id": int(sample["_sample_task_ids"][index]),
+            "task": str(sample["_sample_task_names"][index]),
+            "record_hash": int(sample["_sample_record_ids"][index]),
+            "group_hash": int(sample["_sample_group_ids"][index]),
+            "raw_text_tokens": int(sample["_sample_raw_text_tokens"][index]),
+            "vision_tokens": int(sample["_sample_vision_tokens"][index]),
+            "pre_mtp_seq_len": int(sample["_sample_pre_mtp_seq_len"][index]),
+            "post_mtp_seq_len": int(sample["_sample_post_mtp_seq_len"][index]),
+            "main_supervised_tokens": int(sample["_sample_main_supervised_tokens"][index]),
+            "mtp_supervised_tokens": int(sample["_sample_mtp_supervised_tokens"][index]),
+            "total_supervised_tokens": int(sample["_sample_total_supervised_tokens"][index]),
+        }
+
+    def record_trained_batch(self, batch: dict) -> None:
+        if not self.cpt_enabled or "_sample_task_ids" not in batch:
+            return
+        tasks_seen = set()
+        for index in range(len(batch["_sample_task_ids"])):
+            metadata = self._sample_cpt_metadata(batch, index)
+            counter = self._cpt_trained_counters[metadata["task"]]
+            add_sample_to_counter(counter, metadata, outcome="trained")
+            counter["packed_tokens"] += metadata["post_mtp_seq_len"]
+            tasks_seen.add(metadata["task"])
+        for task in tasks_seen:
+            self._cpt_trained_counters[task]["packed_batches"] += 1
+
+    def record_cpt_ce(self, values: Mapping[int, Mapping[str, Any]]) -> None:
+        if not self.cpt_enabled:
+            return
+        for task_id, metrics in values.items():
+            task = CPT_ID_TO_TASK[int(task_id)]
+            counter = self._cpt_ce_counters[task]
+            for key in (
+                "main_loss_sum",
+                "main_loss_tokens",
+                "mtp_loss_sum",
+                "mtp_loss_tokens",
+            ):
+                counter[key] += metrics[key]
+
+    def local_cpt_counters(self) -> dict[str, dict]:
+        output = {}
+        for task in CPT_TASKS:
+            worker_values = []
+            for state in self._worker_states.values():
+                counter = state.get("cpt_task_counters", {}).get(task)
+                if counter is not None:
+                    worker_values.append(counter)
+            output[task] = merge_task_counters(
+                [
+                    *worker_values,
+                    serializable_counter(self._cpt_trained_counters[task]),
+                    serializable_counter(self._cpt_ce_counters[task]),
+                ]
+            )
+        return output
 
     def _get_sample_length(self, sample: Optional[dict]) -> int:
         if sample is None:
@@ -950,6 +1202,8 @@ class StreamPackedDatasetMTP(IterableDataset):
         for k in batch:
             if k == '_sample_lengths':
                 result[k] = batch[k] + [sample_len]
+            elif k.startswith('_sample_'):
+                result[k] = batch[k] + sample[k]
             elif k == 'image_grid_hws':
                 if isinstance(batch[k], np.ndarray) and isinstance(sample[k], np.ndarray):
                     result[k] = np.concatenate([batch[k], sample[k]], axis=0)
@@ -1002,6 +1256,7 @@ class StreamPackedDatasetMTP(IterableDataset):
         samples_produced = 0
         batches_produced = 0
         skipped_count = 0
+        cpt_task_counters = {task: empty_task_counter() for task in CPT_TASKS}
         
         current_batch = None
         current_batch_locations: List[Tuple[int, int]] = []
@@ -1024,6 +1279,9 @@ class StreamPackedDatasetMTP(IterableDataset):
                 sample_rng.setstate(ws.sample_rng_state)
                 samples_produced = ws.samples_produced
                 batches_produced = ws.batches_produced
+                for task, counter in ws.cpt_task_counters.items():
+                    if task in cpt_task_counters:
+                        cpt_task_counters[task] = restore_counter(counter)
                 
                 if ws.current_batch_locations:
                     if is_main_log:
@@ -1036,6 +1294,10 @@ class StreamPackedDatasetMTP(IterableDataset):
                                 current_batch = self._merge_samples(current_batch, sample)
                                 current_batch_locations.append(loc)
                         except Exception as e:
+                            if self.cpt_enabled:
+                                raise RuntimeError(
+                                    f"[{worker_key}] CPT resume could not rebuild batch sample {loc}"
+                                ) from e
                             logger.warning(f'[{worker_key}] Failed to restore batch sample {loc}: {e}')
 
                 if ws.buffer_locations:
@@ -1048,6 +1310,10 @@ class StreamPackedDatasetMTP(IterableDataset):
                             if self._get_sample_length(sample) <= self.max_num_tokens_per_sample:
                                 buffer.append((sample, ds_idx, global_idx))
                         except Exception as e:
+                            if self.cpt_enabled:
+                                raise RuntimeError(
+                                    f"[{worker_key}] CPT resume could not rebuild buffer sample {loc}"
+                                ) from e
                             logger.warning(f'[{worker_key}] Failed to restore buffer sample {loc}: {e}')
                 
                 if is_main_log:
@@ -1056,6 +1322,8 @@ class StreamPackedDatasetMTP(IterableDataset):
             except Exception as e:
                 logger.error(f'[{worker_key}] Failed to resume: {e}')
                 traceback.print_exc()
+                if self.cpt_enabled:
+                    raise
                 current_batch = None
                 current_batch_locations = []
                 buffer = []
@@ -1067,6 +1335,7 @@ class StreamPackedDatasetMTP(IterableDataset):
                 sample_rng_state=sample_rng.getstate(),
                 samples_produced=samples_produced,
                 batches_produced=batches_produced,
+                cpt_task_counters=cpt_task_counters,
                 current_batch_locations=list(current_batch_locations),
                 buffer_locations=[(b[1], b[2]) for b in buffer],
             ).to_dict()
@@ -1078,9 +1347,36 @@ class StreamPackedDatasetMTP(IterableDataset):
                 try:
                     sample, global_idx = next(iterators[ds_idx])
                     samples_produced += 1
+                    metadata = (
+                        self._sample_cpt_metadata(sample)
+                        if self.cpt_enabled
+                        else None
+                    )
+                    if metadata is not None:
+                        add_sample_to_counter(
+                            cpt_task_counters[metadata["task"]],
+                            metadata,
+                            outcome="attempted",
+                        )
                     if self._get_sample_length(sample) > self.max_num_tokens_per_sample:
                         skipped_count += 1
+                        if metadata is not None:
+                            metadata["pre_mtp_oversize"] = (
+                                metadata["pre_mtp_seq_len"]
+                                > self.max_num_tokens_per_sample
+                            )
+                            add_sample_to_counter(
+                                cpt_task_counters[metadata["task"]],
+                                metadata,
+                                outcome="oversize",
+                            )
                         continue
+                    if metadata is not None:
+                        add_sample_to_counter(
+                            cpt_task_counters[metadata["task"]],
+                            metadata,
+                            outcome="accepted",
+                        )
                     return sample, ds_idx, global_idx
                 except StopIteration:
                     continue
@@ -1198,6 +1494,20 @@ def packed_collate_fn_mtp(features: List[dict], dataset: Optional[StreamPackedDa
         sub_sample_lengths=[sub_sample_lengths],
     )
 
+    if "cpt_task_token_ids" in feat or "cpt_supervision_kind" in feat:
+        if not (
+            "cpt_task_token_ids" in feat
+            and "cpt_supervision_kind" in feat
+            and feat["cpt_task_token_ids"].numel() == label_len
+            and feat["cpt_supervision_kind"].numel() == label_len
+        ):
+            raise ValueError("CPT task/supervision token metadata is not aligned with labels")
+        result["cpt_task_token_ids"] = feat["cpt_task_token_ids"].unsqueeze(0)
+        result["cpt_supervision_kind"] = feat["cpt_supervision_kind"].unsqueeze(0)
+        for key, value in feat.items():
+            if key.startswith("_sample_"):
+                result[key] = value
+
     for key in ("relation_family", "defect_type", "target_boxes", "target_box_mask"):
         if key in feat:
             result[key] = feat[key]
@@ -1243,6 +1553,8 @@ class StateAwareDataLoader:
                     self.dataset._worker_states[worker_key] = state_snapshot
 
             batch.pop('_batch_idx', None)
+            if self.dataset is not None:
+                self.dataset.record_trained_batch(batch)
             
             yield batch
 
@@ -1336,6 +1648,33 @@ class CheckpointCompletionCallback(TrainerCallback):
                         handle.write("\n")
                         handle.flush()
                         os.fsync(handle.fileno())
+                    if _env_flag("LOCANY_CPT_MODE", default=False):
+                        diagnostics = osp.join(args.output_dir, "diagnostics")
+                        os.makedirs(diagnostics, exist_ok=True)
+                        queue_path = osp.join(diagnostics, "cpt_eval_queue.jsonl")
+                        queued_steps = set()
+                        if osp.isfile(queue_path):
+                            with open(queue_path, "r", encoding="utf-8") as queue_handle:
+                                for line in queue_handle:
+                                    if line.strip():
+                                        queued_steps.add(int(json.loads(line)["step"]))
+                        if int(state.global_step) not in queued_steps:
+                            queue_row = {
+                                "schema_version": 1,
+                                "step": int(state.global_step),
+                                "checkpoint": checkpoint_dir,
+                                "split": "heldout",
+                                "recommended_recipe": "locany_cpt_val_fast.json",
+                                "status": "pending",
+                                "created_at_unix": time.time(),
+                            }
+                            with open(queue_path, "a", encoding="utf-8") as queue_handle:
+                                queue_handle.write(
+                                    json.dumps(queue_row, ensure_ascii=False, sort_keys=True)
+                                    + "\n"
+                                )
+                                queue_handle.flush()
+                                os.fsync(queue_handle.fileno())
                     os.replace(temporary, marker)
                     logger.info(
                         "[Checkpoint] COMPLETE step=%s path=%s details=%s warnings=%s",
@@ -1469,6 +1808,33 @@ class StreamPackingMTPTrainer(Trainer):
         self._ui5_enabled = bool(
             getattr(self.model, "enable_ui_relation", False)
         )
+        self._cpt_enabled = _env_flag("LOCANY_CPT_MODE", default=False)
+        self._cpt_metrics_interval = int(
+            os.environ.get("CPT_METRICS_INTERVAL", "100")
+        )
+        self._cpt_table_interval = int(
+            os.environ.get("CPT_TABLE_INTERVAL", "500")
+        )
+        if self._cpt_enabled and (
+            self._cpt_metrics_interval <= 0 or self._cpt_table_interval <= 0
+        ):
+            raise ValueError("CPT metrics/table intervals must be positive")
+        self._cpt_last_written_step = -1
+        self._cpt_last_numeric = None
+        self._cpt_unique_cache = {}
+        self._cpt_seen_oversize_record_hashes = {
+            task: set() for task in CPT_TASKS
+        }
+        self._cpt_seen_oversize_group_hashes = {
+            task: set() for task in CPT_TASKS
+        }
+        self._cpt_started_at = time.time()
+        self._cpt_last_write_time = self._cpt_started_at
+        self._cpt_metrics_path = osp.join(
+            self.args.output_dir, "diagnostics", "cpt_train_metrics.jsonl"
+        )
+        if self._cpt_enabled:
+            self._load_cpt_metrics_baseline()
         self._total_samples = 0
         self._sample_log_interval = sample_log_interval
         self._max_num_tokens = int(max_num_tokens)
@@ -1500,6 +1866,530 @@ class StreamPackingMTPTrainer(Trainer):
             self._snapshot_ui5_parameters()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
+        if self._cpt_enabled and self.is_world_process_zero():
+            self._write_cpt_run_config()
+
+    def _write_cpt_run_config(self):
+        diagnostics = osp.join(self.args.output_dir, "diagnostics")
+        os.makedirs(diagnostics, exist_ok=True)
+        datasets = []
+        if isinstance(self.train_dataset, StreamPackedDatasetMTP):
+            for dataset, probability in zip(
+                self.train_dataset.datasets, self.train_dataset.dataset_weight
+            ):
+                datasets.append(
+                    {
+                        "task": dataset.cpt_task,
+                        "rows": len(dataset),
+                        "groups": dataset.cpt_dataset_groups or None,
+                        "probability": probability,
+                    }
+                )
+        payload = {
+            "schema_version": 1,
+            "run_name": self.args.run_name,
+            "output_dir": self.args.output_dir,
+            "world_size": int(self.args.world_size),
+            "seed": int(self.args.seed),
+            "max_steps": int(self.args.max_steps),
+            "learning_rate": float(self.args.learning_rate),
+            "max_num_tokens": self._max_num_tokens,
+            "max_num_tokens_per_sample": getattr(
+                self.train_dataset, "max_num_tokens_per_sample", None
+            ),
+            "packing_buffer_size": getattr(self.train_dataset, "buffer_size", None),
+            "metrics_interval": self._cpt_metrics_interval,
+            "table_interval": self._cpt_table_interval,
+            "sampling": copy.deepcopy(
+                getattr(self.train_dataset, "cpt_sampling_config", None)
+            ),
+            "datasets": datasets,
+        }
+        path = osp.join(diagnostics, "cpt_run_config.json")
+        if osp.isfile(path):
+            with open(path, "r", encoding="utf-8") as handle:
+                previous = json.load(handle)
+            previous_sampling = (previous.get("sampling") or {}).get("config_hash")
+            current_sampling = (payload.get("sampling") or {}).get("config_hash")
+            immutable_fields = {
+                "sampling_config_hash": (previous_sampling, current_sampling),
+                "max_num_tokens": (
+                    previous.get("max_num_tokens"),
+                    payload.get("max_num_tokens"),
+                ),
+                "max_num_tokens_per_sample": (
+                    previous.get("max_num_tokens_per_sample"),
+                    payload.get("max_num_tokens_per_sample"),
+                ),
+                "packing_buffer_size": (
+                    previous.get("packing_buffer_size"),
+                    payload.get("packing_buffer_size"),
+                ),
+                "world_size": (
+                    previous.get("world_size"),
+                    payload.get("world_size"),
+                ),
+                "datasets": (previous.get("datasets"), payload.get("datasets")),
+            }
+            changed = {
+                key: {"previous": left, "current": right}
+                for key, (left, right) in immutable_fields.items()
+                if left != right
+            }
+            if changed:
+                raise RuntimeError(
+                    "CPT immutable run configuration changed in an existing output "
+                    f"directory: {changed}"
+                )
+            return
+        temporary = f"{path}.tmp-{os.getpid()}"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+
+    def _load_cpt_metrics_baseline(self):
+        """Restore rolling-window baselines without changing lifetime counters."""
+        if not osp.isfile(self._cpt_metrics_path):
+            return
+        latest = {}
+        try:
+            with open(self._cpt_metrics_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    task = row.get("task")
+                    if task in CPT_TASK_TO_ID:
+                        self._cpt_seen_oversize_record_hashes[task].update(
+                            int(value)
+                            for value in row.get("window_oversize_record_hashes", [])
+                        )
+                        self._cpt_seen_oversize_group_hashes[task].update(
+                            int(value)
+                            for value in row.get("window_oversize_group_hashes", [])
+                        )
+                    if task in CPT_TASK_TO_ID and (
+                        task not in latest
+                        or int(row.get("step") or -1)
+                        >= int(latest[task].get("step") or -1)
+                    ):
+                        latest[task] = row
+            if not latest:
+                return
+            numeric_keys = {
+                key
+                for key, value in empty_task_counter().items()
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+            }
+            self._cpt_last_numeric = {
+                task: {
+                    key: row[key]
+                    for key in numeric_keys
+                    if isinstance(row.get(key), (int, float))
+                }
+                for task, row in latest.items()
+            }
+            last_step = max(int(row.get("step") or -1) for row in latest.values())
+            self._cpt_last_written_step = last_step
+            self._cpt_unique_cache = {
+                task: (
+                    int(row["unique_record_count"]),
+                    int(row["unique_group_count"]),
+                )
+                for task, row in latest.items()
+                if isinstance(row.get("unique_record_count"), (int, float))
+                and isinstance(row.get("unique_group_count"), (int, float))
+            }
+            logger.info("Restored CPT metric baseline at step %s", last_step)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Invalid CPT metrics history at {self._cpt_metrics_path}: {exc}"
+            ) from exc
+
+    def _global_cpt_counters(self, include_unique: bool) -> dict[str, dict]:
+        if not isinstance(self.train_dataset, StreamPackedDatasetMTP):
+            return {task: empty_task_counter() for task in CPT_TASKS}
+        local = self.train_dataset.local_cpt_counters()
+        payload = {}
+        for task, counter in local.items():
+            value = serializable_counter(counter)
+            if not include_unique:
+                value["unique_record_hashes"] = []
+                value["unique_group_hashes"] = []
+            payload[task] = value
+        gathered = [payload]
+        if dist.is_available() and dist.is_initialized():
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, payload)
+        return {
+            task: merge_task_counters(
+                rank_payload[task] for rank_payload in gathered
+            )
+            for task in CPT_TASKS
+        }
+
+    @staticmethod
+    def _numeric_delta(current: Mapping[str, Any], previous: Mapping[str, Any]):
+        output = {}
+        for key, value in current.items():
+            if isinstance(value, (int, float)) and isinstance(
+                previous.get(key), (int, float)
+            ):
+                delta = value - previous[key]
+                output[key] = delta if delta >= 0 else None
+        return output
+
+    def _write_cpt_metrics(self, step: int, logs: Mapping[str, Any]):
+        include_unique = step % self._cpt_table_interval == 0
+        counters = self._global_cpt_counters(include_unique=include_unique)
+        peak_gpu_memory_mb = (
+            torch.cuda.max_memory_allocated() / (1024.0 ** 2)
+            if torch.cuda.is_available()
+            else 0.0
+        )
+        if dist.is_available() and dist.is_initialized():
+            peak_tensor = torch.tensor(
+                peak_gpu_memory_mb,
+                dtype=torch.float64,
+                device=(torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")),
+            )
+            dist.all_reduce(peak_tensor, op=dist.ReduceOp.MAX)
+            peak_gpu_memory_mb = float(peak_tensor.item())
+        local_physical = (
+            sum(
+                int(state.get("batches_produced", 0))
+                for state in self.train_dataset._worker_states.values()
+            )
+            if isinstance(self.train_dataset, StreamPackedDatasetMTP)
+            else 0
+        )
+        physical_tensor = torch.tensor(
+            local_physical,
+            dtype=torch.long,
+            device=(torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")),
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(physical_tensor, op=dist.ReduceOp.SUM)
+        physical_packed_batches = int(physical_tensor.item())
+        if not self.is_world_process_zero():
+            return {}
+        os.makedirs(osp.dirname(self._cpt_metrics_path), exist_ok=True)
+        dataset_info = {
+            dataset.cpt_task: (len(dataset), dataset.cpt_dataset_groups or None)
+            for dataset in self.train_dataset.datasets
+        }
+        if include_unique:
+            self._cpt_unique_cache = {
+                task: (
+                    len(counter["unique_record_hashes"]),
+                    len(counter["unique_group_hashes"]),
+                )
+                for task, counter in counters.items()
+            }
+        total_trained = sum(counter["trained_samples"] for counter in counters.values())
+        total_tokens = sum(
+            counter["total_supervised_tokens"] for counter in counters.values()
+        )
+        total_main_tokens = sum(
+            counter["main_supervised_tokens"] for counter in counters.values()
+        )
+        total_mtp_tokens = sum(
+            counter["mtp_supervised_tokens"] for counter in counters.values()
+        )
+        global_attempted = sum(
+            counter["attempted_samples"] for counter in counters.values()
+        )
+        global_accepted = sum(
+            counter["accepted_samples"] for counter in counters.values()
+        )
+        global_skipped = sum(
+            counter["oversize_skipped_samples"] for counter in counters.values()
+        )
+        global_main_loss_sum = sum(
+            counter["main_loss_sum"] for counter in counters.values()
+        )
+        global_main_loss_tokens = sum(
+            counter["main_loss_tokens"] for counter in counters.values()
+        )
+        global_mtp_loss_sum = sum(
+            counter["mtp_loss_sum"] for counter in counters.values()
+        )
+        global_mtp_loss_tokens = sum(
+            counter["mtp_loss_tokens"] for counter in counters.values()
+        )
+        # A mixed-task packed batch is counted once for each task it contains,
+        # so the task counters cannot recover the number of physical batches.
+        # Use the exact trained sample stream's per-rank dataloader snapshots.
+        global_packing_efficiency = (
+            sum(counter["packed_tokens"] for counter in counters.values())
+            / (physical_packed_batches * self._max_num_tokens)
+            if physical_packed_batches and self._max_num_tokens
+            else None
+        )
+        now = time.time()
+        window_seconds = max(now - self._cpt_last_write_time, 1.0e-9)
+        previous = self._cpt_last_numeric or {}
+        rows = []
+        new_oversize_hashes = {}
+        for task in CPT_TASKS:
+            dataset_rows, dataset_groups = dataset_info.get(task, (0, None))
+            summary = summarize_task_counter(
+                task,
+                counters[task],
+                dataset_rows=dataset_rows,
+                dataset_groups=dataset_groups,
+            )
+            unique = self._cpt_unique_cache.get(task)
+            if not include_unique and unique is None:
+                for key in (
+                    "unique_record_count",
+                    "unique_group_count",
+                    "row_coverage",
+                    "group_coverage",
+                    "repeat_factor",
+                ):
+                    summary[key] = None
+            elif unique is not None:
+                summary["unique_record_count"], summary["unique_group_count"] = unique
+                summary["row_coverage"] = unique[0] / dataset_rows if dataset_rows else None
+                summary["group_coverage"] = (
+                    unique[1] / dataset_groups if dataset_groups else None
+                )
+                summary["repeat_factor"] = summary["trained_samples"] / max(unique[0], 1)
+            sample_share = summary["trained_samples"] / total_trained if total_trained else 0.0
+            token_share = summary["total_supervised_tokens"] / total_tokens if total_tokens else 0.0
+            dominance = token_share / sample_share if sample_share else None
+            window = (
+                self._numeric_delta(counters[task], previous.get(task, {}))
+                if task in previous
+                else None
+            )
+            window_oversize_records = sorted(
+                set(counters[task]["oversize_record_hashes"])
+                - self._cpt_seen_oversize_record_hashes[task]
+            )
+            window_oversize_groups = sorted(
+                set(counters[task]["oversize_group_hashes"])
+                - self._cpt_seen_oversize_group_hashes[task]
+            )
+            new_oversize_hashes[task] = (
+                window_oversize_records,
+                window_oversize_groups,
+            )
+            row = {
+                "schema_version": 1,
+                "scope": "lifetime_global",
+                "step": step,
+                "epoch": self.state.epoch,
+                "task": task,
+                "learning_rate": logs.get("learning_rate"),
+                "global_loss": logs.get("loss"),
+                "global_attempted_samples": global_attempted,
+                "global_accepted_samples": global_accepted,
+                "global_trained_samples": total_trained,
+                "global_oversize_skipped_samples": global_skipped,
+                "global_main_supervised_tokens": total_main_tokens,
+                "global_mtp_supervised_tokens": total_mtp_tokens,
+                "global_total_supervised_tokens": total_tokens,
+                "global_train_main_token_ce": (
+                    global_main_loss_sum / global_main_loss_tokens
+                    if global_main_loss_tokens
+                    else None
+                ),
+                "global_train_mtp_token_ce": (
+                    global_mtp_loss_sum / global_mtp_loss_tokens
+                    if global_mtp_loss_tokens
+                    else None
+                ),
+                "global_train_total_token_ce": (
+                    (global_main_loss_sum + global_mtp_loss_sum)
+                    / (global_main_loss_tokens + global_mtp_loss_tokens)
+                    if global_main_loss_tokens + global_mtp_loss_tokens
+                    else None
+                ),
+                "sample_share": sample_share,
+                "main_token_share": (
+                    summary["main_supervised_tokens"] / total_main_tokens
+                    if total_main_tokens
+                    else 0.0
+                ),
+                "mtp_token_share": (
+                    summary["mtp_supervised_tokens"] / total_mtp_tokens
+                    if total_mtp_tokens
+                    else 0.0
+                ),
+                "total_token_share": token_share,
+                "token_dominance_ratio": dominance,
+                "token_dominant": dominance is not None and dominance > 2.0,
+                **summary,
+                "packing_efficiency": global_packing_efficiency,
+                "task_conditional_packing_efficiency": (
+                    summary["packed_tokens"]
+                    / (summary["packed_batches"] * self._max_num_tokens)
+                    if summary["packed_batches"] and self._max_num_tokens
+                    else None
+                ),
+                "window_seconds": window_seconds,
+                "samples_per_second": (
+                    window.get("trained_samples", 0) / window_seconds
+                    if window is not None
+                    else None
+                ),
+                "supervised_tokens_per_second": (
+                    window.get("total_supervised_tokens", 0) / window_seconds
+                    if window is not None
+                    else None
+                ),
+                "packed_tokens_per_second": (
+                    window.get("packed_tokens", 0) / window_seconds
+                    if window is not None
+                    else None
+                ),
+                "peak_gpu_memory_mb": peak_gpu_memory_mb or None,
+                "window": window,
+                "window_oversize_record_hashes": window_oversize_records,
+                "window_oversize_group_hashes": window_oversize_groups,
+            }
+            rows.append(row)
+        with open(self._cpt_metrics_path, "a", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        for task, (record_hashes, group_hashes) in new_oversize_hashes.items():
+            self._cpt_seen_oversize_record_hashes[task].update(record_hashes)
+            self._cpt_seen_oversize_group_hashes[task].update(group_hashes)
+        self._cpt_last_numeric = {
+            task: {
+                key: value
+                for key, value in counter.items()
+                if isinstance(value, (int, float))
+            }
+            for task, counter in counters.items()
+        }
+        self._cpt_last_write_time = now
+        if global_attempted and global_skipped / global_attempted > 0.005:
+            logger.warning(
+                "[CPT] global oversize skip rate %.3f%% exceeds 0.5%%",
+                global_skipped / global_attempted * 100.0,
+            )
+        for row in rows:
+            if row["oversize_skip_rate"] > 0.02:
+                logger.warning(
+                    "[CPT] task=%s oversize skip rate %.3f%% p95=%s p99=%s max=%s",
+                    row["task"],
+                    row["oversize_skip_rate"] * 100.0,
+                    row["oversize_p95_post_mtp_length"],
+                    row["oversize_p99_post_mtp_length"],
+                    row["oversize_max_post_mtp_length"],
+                )
+        if include_unique:
+            logger.info(
+                "[CPT metrics step=%s]\n%s",
+                step,
+                "\n".join(
+                    f"{row['task']:20s} trained={row['trained_samples']:8d} "
+                    f"skip={row['oversize_skip_rate']:.3%} "
+                    f"tokens={row['total_supervised_tokens']:10d} "
+                    f"CE={row['train_total_token_ce']} "
+                    f"coverage={row['row_coverage']} repeat={row['repeat_factor']}"
+                    for row in rows
+                ),
+            )
+            # Excel is an optional projection.  The helper imports openpyxl
+            # lazily and converts every failure into a warning.
+            from eaglevl.train.cpt_excel import build_cpt_workbook
+
+            build_cpt_workbook(osp.dirname(self._cpt_metrics_path))
+        tracker_metrics = {}
+        for row in rows:
+            task = row["task"]
+            for key in (
+                "sample_share",
+                "main_token_share",
+                "mtp_token_share",
+                "total_token_share",
+                "oversize_skip_rate",
+                "train_main_token_ce",
+                "train_mtp_token_ce",
+                "train_total_token_ce",
+                "effective_epoch",
+                "repeat_factor",
+                "samples_per_second",
+                "supervised_tokens_per_second",
+                "packing_efficiency",
+                "attempted_samples",
+                "accepted_samples",
+                "trained_samples",
+                "oversize_skipped_samples",
+                "main_supervised_tokens",
+                "mtp_supervised_tokens",
+                "total_supervised_tokens",
+                "unique_record_count",
+                "unique_group_count",
+                "row_coverage",
+                "group_coverage",
+                "avg_post_mtp_length",
+                "p95_post_mtp_length",
+                "token_dominance_ratio",
+                "packed_tokens_per_second",
+                "peak_gpu_memory_mb",
+            ):
+                value = row.get(key)
+                if isinstance(value, (int, float)):
+                    tracker_metrics[f"cpt/{task}/{key}"] = value
+        tracker_metrics.update(
+            {
+                "cpt/global/attempted_samples": global_attempted,
+                "cpt/global/accepted_samples": global_accepted,
+                "cpt/global/trained_samples": total_trained,
+                "cpt/global/oversize_skipped_samples": global_skipped,
+                "cpt/global/oversize_skip_rate": (
+                    global_skipped / global_attempted if global_attempted else 0.0
+                ),
+                "cpt/global/main_supervised_tokens": total_main_tokens,
+                "cpt/global/mtp_supervised_tokens": total_mtp_tokens,
+                "cpt/global/total_supervised_tokens": total_tokens,
+                "cpt/global/packing_efficiency": global_packing_efficiency,
+                "cpt/global/peak_gpu_memory_mb": peak_gpu_memory_mb or None,
+                "cpt/global/train_main_token_ce": (
+                    global_main_loss_sum / global_main_loss_tokens
+                    if global_main_loss_tokens
+                    else None
+                ),
+                "cpt/global/train_mtp_token_ce": (
+                    global_mtp_loss_sum / global_mtp_loss_tokens
+                    if global_mtp_loss_tokens
+                    else None
+                ),
+                "cpt/global/train_total_token_ce": (
+                    (global_main_loss_sum + global_mtp_loss_sum)
+                    / (global_main_loss_tokens + global_mtp_loss_tokens)
+                    if global_main_loss_tokens + global_mtp_loss_tokens
+                    else None
+                ),
+                "cpt/global/samples_per_second": sum(
+                    float(row.get("samples_per_second") or 0.0) for row in rows
+                ),
+                "cpt/global/supervised_tokens_per_second": sum(
+                    float(row.get("supervised_tokens_per_second") or 0.0)
+                    for row in rows
+                ),
+                "cpt/global/packed_tokens_per_second": sum(
+                    float(row.get("packed_tokens_per_second") or 0.0)
+                    for row in rows
+                ),
+            }
+        )
+        tracker_metrics = {
+            key: value
+            for key, value in tracker_metrics.items()
+            if isinstance(value, (int, float))
+        }
+        return tracker_metrics
 
     def _checkpoint_trace(self, output_dir, stage, event, **details):
         """Fsync a compact breadcrumb before/after every checkpoint phase."""
@@ -2236,12 +3126,38 @@ class StreamPackingMTPTrainer(Trainer):
         return_outputs=False,
         num_items_in_batch=None,
     ):
+        cpt_task_token_ids = inputs.pop("cpt_task_token_ids", None)
+        cpt_supervision_kind = inputs.pop("cpt_supervision_kind", None)
+        for key in list(inputs):
+            if key.startswith("_sample_"):
+                inputs.pop(key)
+        labels_for_cpt = inputs.get("labels")
+        if self._cpt_enabled and (
+            cpt_task_token_ids is None or cpt_supervision_kind is None
+        ):
+            raise RuntimeError(
+                "CPT batch is missing task-token/supervision-kind metadata"
+            )
         loss, outputs = super().compute_loss(
             model,
             inputs,
             return_outputs=True,
             num_items_in_batch=num_items_in_batch,
         )
+        if self._cpt_enabled:
+            token_losses = getattr(outputs, "cpt_token_losses", None)
+            if token_losses is None:
+                raise RuntimeError(
+                    "CPT observability is enabled but the model returned no per-token CE"
+                )
+            values = aggregate_token_losses(
+                token_losses,
+                labels_for_cpt,
+                cpt_task_token_ids,
+                cpt_supervision_kind,
+                ignore_index=IGNORE_TOKEN_ID,
+            )
+            self.train_dataset.record_cpt_ce(values)
         if self._ui5_enabled:
             self._capture_ui5_batch(outputs, inputs)
         return (loss, outputs) if return_outputs else loss
@@ -2548,13 +3464,24 @@ class StreamPackingMTPTrainer(Trainer):
             torch.cuda.reset_peak_memory_stats()
 
     def log(self, logs, start_time=None):
-        if not self._ui5_enabled:
-            return super().log(logs, start_time)
-        if "grad_norm" in logs:
+        if self._ui5_enabled and "grad_norm" in logs:
             self._add_ui5_scalar("grad_norm", logs["grad_norm"])
-        result = super().log(logs, start_time)
         step = int(self.state.global_step)
-        if step in {1, 20, 100}:
+        tracker_metrics = {}
+        if (
+            self._cpt_enabled
+            and step > 0
+            and step % self._cpt_metrics_interval == 0
+            and step != self._cpt_last_written_step
+        ):
+            # Every rank must participate because this routine performs a
+            # distributed all-gather; only rank 0 writes the JSONL.
+            tracker_metrics = self._write_cpt_metrics(step, logs)
+            self._cpt_last_written_step = step
+        combined_logs = dict(logs)
+        combined_logs.update(tracker_metrics)
+        result = super().log(combined_logs, start_time)
+        if self._ui5_enabled and step in {1, 20, 100}:
             self._capture_ui5_parameter_updates()
             if step == 20:
                 required_groups = {"relation", "image_gate", "slot_gate"}
@@ -2570,7 +3497,7 @@ class StreamPackingMTPTrainer(Trainer):
                         "UI modules had effective supervision but no parameter update "
                         f"through optimizer step 20: {failed_groups}"
                     )
-        if (
+        if self._ui5_enabled and (
             step > 0
             and step % 100 == 0
             and step != self._ui5_last_flushed_step
@@ -2578,7 +3505,7 @@ class StreamPackingMTPTrainer(Trainer):
             self._flush_ui5_excel(step, logs)
             self._ui5_last_flushed_step = step
             self._save_ui5_window_state()
-        elif "train_runtime" in logs:
+        elif self._ui5_enabled and "train_runtime" in logs:
             # Persist a partial 100-step window at a clean segment/final stop.
             self._save_ui5_window_state()
         return result
@@ -2588,6 +3515,19 @@ class StreamPackingMTPTrainer(Trainer):
             raise ValueError("Trainer: training requires a train_dataset.")
         
         from torch.utils.data import DataLoader
+
+        logical_workers = max(1, int(self.args.dataloader_num_workers))
+        if (
+            self._cpt_enabled
+            and self.train_dataset._saved_num_workers is not None
+            and self.train_dataset._saved_num_workers != logical_workers
+        ):
+            raise RuntimeError(
+                "CPT dataloader worker count changed across resume: "
+                f"saved={self.train_dataset._saved_num_workers}, current={logical_workers}"
+            )
+        if isinstance(self.train_dataset, StreamPackedDatasetMTP):
+            self.train_dataset._configured_num_workers = logical_workers
         
         pad_id = 0
         if self.processing_class is not None and hasattr(self.processing_class, 'tokenizer'):
@@ -2618,6 +3558,7 @@ def build_stream_packed_dataset_mtp(
     
     datasets = []
     dataset_weights = []
+    cpt_sampling_tasks = []
     
     for ds_name, meta in ds_collections.items():
         meta = resolve_recipe_entry_paths(meta, data_args.meta_path)
@@ -2643,6 +3584,15 @@ def build_stream_packed_dataset_mtp(
             
             weight = resolve_dataset_sampling_weight(meta, len(ds))
             dataset_weights.append(weight)
+            cpt_sampling_tasks.append(
+                {
+                    "name": ds.cpt_task or ds_name,
+                    "rows": len(ds),
+                    "mean_total_supervised_tokens": meta.get(
+                        "mean_total_supervised_tokens"
+                    ),
+                }
+            )
             
             logger.info(
                 f'Added dataset: {ds_name}, length={len(ds)}, '
@@ -2659,6 +3609,41 @@ def build_stream_packed_dataset_mtp(
         raise ValueError("No valid datasets found!")
 
     buffer_size = getattr(data_args, 'packing_buffer_size', 32)
+    cpt_sampling_config = None
+    if _env_flag("LOCANY_CPT_MODE", default=False):
+        task_names = [dataset.cpt_task for dataset in datasets]
+        duplicates = sorted(
+            task for task in set(task_names) if task_names.count(task) > 1
+        )
+        missing = sorted(set(CPT_TASKS).difference(task_names))
+        unexpected = sorted(set(task_names).difference(CPT_TASKS))
+        if duplicates or missing or unexpected:
+            raise ValueError(
+                "CPT recipe must contain exactly one dataset for each canonical task: "
+                f"duplicates={duplicates}, missing={missing}, unexpected={unexpected}"
+            )
+
+        def optional_float(name):
+            value = os.environ.get(name)
+            return None if value is None or not value.strip() else float(value)
+
+        cpt_sampling_config = resolve_cpt_sampling(
+            cpt_sampling_tasks,
+            mode=os.environ.get("CPT_SAMPLING_MODE", "sample_equal"),
+            size_alpha=optional_float("CPT_SIZE_ALPHA"),
+            token_beta=optional_float("CPT_TOKEN_BETA"),
+            min_task_prob=float(os.environ.get("CPT_MIN_TASK_PROB", "0")),
+            max_task_prob=float(os.environ.get("CPT_MAX_TASK_PROB", "1")),
+        )
+        probabilities = {
+            task["name"]: float(task["probability"])
+            for task in cpt_sampling_config["tasks"]
+        }
+        dataset_weights = [probabilities[dataset.cpt_task] for dataset in datasets]
+        logger.warning(
+            "[CPT sampling] %s",
+            json.dumps(cpt_sampling_config, ensure_ascii=False, sort_keys=True),
+        )
 
     return StreamPackedDatasetMTP(
         tokenizer=processor.tokenizer,
@@ -2671,9 +3656,11 @@ def build_stream_packed_dataset_mtp(
         log_freq=10000,
         base_seed=base_seed,
         buffer_size=buffer_size,
+        cpt_sampling_config=cpt_sampling_config,
     )
 
 
+@record
 def main():
     launcher = os.environ.get('LAUNCHER', 'slurm')
     init_dist(launcher=launcher, backend='nccl')
@@ -2882,6 +3869,12 @@ def main():
         processor = LocateAnythingProcessor(tokenizer=tokenizer, image_processor=image_processor, **processor_config)
         
     model.neftune_alpha = data_args.neftune_alpha
+    # The fused loss emits detached per-token CE only for CPT diagnostics.
+    # Keeping the flag off by default preserves the SFT forward contract and
+    # avoids the diagnostic buffer allocation in non-CPT jobs.
+    model._cpt_observability_enabled = _env_flag(
+        "LOCANY_CPT_MODE", default=False
+    )
     if getattr(model, "enable_ui_relation", False):
         validation_report = model.validate_ui_relation_parameters()
         logger.info("Validated UI relation parameters without mutation: %s", validation_report)
@@ -3057,10 +4050,38 @@ def main():
                     train_dataset.load_state_dict(dataloader_state)
                     logger.info(f"Rank {rank}: Loaded dataloader state from {dataloader_state_path}")
                 except Exception as e:
+                    if _env_flag("LOCANY_CPT_MODE", default=False):
+                        raise RuntimeError(
+                            f"Rank {rank}: CPT resume requires valid dataloader state: "
+                            f"{dataloader_state_path}"
+                        ) from e
                     logger.warning(f"Rank {rank}: Failed to load dataloader state: {e}")
                     traceback.print_exc()
             else:
+                if _env_flag("LOCANY_CPT_MODE", default=False):
+                    raise FileNotFoundError(
+                        f"Rank {rank}: CPT resume dataloader state is missing: "
+                        f"{dataloader_state_path}"
+                    )
                 logger.warning(f"Rank {rank}: No dataloader state found at {dataloader_state_path}")
+
+            if _env_flag("LOCANY_CPT_MODE", default=False):
+                checkpoint_name = osp.basename(osp.normpath(str(checkpoint)))
+                checkpoint_step = (
+                    int(checkpoint_name.rsplit("checkpoint-", 1)[1])
+                    if "checkpoint-" in checkpoint_name
+                    else None
+                )
+                if (
+                    checkpoint_step is not None
+                    and trainer._cpt_last_written_step > checkpoint_step
+                ):
+                    raise RuntimeError(
+                        "CPT metrics history is ahead of the resume checkpoint; "
+                        f"metrics_step={trainer._cpt_last_written_step}, "
+                        f"checkpoint_step={checkpoint_step}. Use a new output directory "
+                        "or resume the latest complete checkpoint."
+                    )
 
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         segment_mode = _env_flag("LOCANY_SEGMENT_MODE", default=False)

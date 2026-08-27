@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "max_num_tokens_per_sample": 8192,
+  "tasks": {
+    "ui_defect": {
+      "rows": 98,
+      "groups": 90,
+      "oversize_rate": 0.01,
+      "oversize_reasons": {"mtp_expansion": 1},
+      "lengths": {
+        "pre_mtp_seq_len": {"p50": 1200, "p95": 3500, "p99": 7000, "max": 7900},
+        "post_mtp_seq_len": {"p50": 1800, "p95": 5200, "p99": 8300, "max": 8300},
+        "total_supervised_tokens": {"mean": 420.0}
+      }
+    },
+    "vqa": {
+      "rows": 196,
+      "groups": 180,
+      "oversize_rate": 0.0,
+      "oversize_reasons": {},
+      "lengths": {
+        "pre_mtp_seq_len": {"p50": 900, "p95": 1400, "p99": 1800, "max": 2100},
+        "post_mtp_seq_len": {"p50": 1050, "p95": 1700, "p99": 2200, "max": 2500},
+        "total_supervised_tokens": {"mean": 120.0}
+      }
+    }
+  }
+}

@@ -136,6 +136,7 @@ class UIDefectModelOutput(CausalLMOutputWithPast):
     loss_reconstructed: Optional[torch.Tensor] = None
     loss_reconstruction_error: Optional[torch.Tensor] = None
     attention_active: Optional[torch.Tensor] = None
+    cpt_token_losses: Optional[torch.Tensor] = None
     global_visual_cache: Optional[Any] = None
 
 
@@ -589,6 +590,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         attention_contribution = None
         loss_reconstructed = None
         loss_reconstruction_error = None
+        cpt_token_losses = None
         logits = None
         if labels is not None:
             shift_hidden_states = hidden_states[..., :-1, :].contiguous()
@@ -611,7 +613,12 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 shift_loss_weight = shift_loss_weight.view(-1)
 
             liger_loss_fn = LigerFusedLinearCrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction='mean')
-            lm_loss = liger_loss_fn(lm_head_weight, shift_hidden_states, shift_labels)
+            if bool(getattr(self, "_cpt_observability_enabled", False)):
+                lm_loss, cpt_token_losses = liger_loss_fn.forward_with_token_losses(
+                    lm_head_weight, shift_hidden_states, shift_labels
+                )
+            else:
+                lm_loss = liger_loss_fn(lm_head_weight, shift_hidden_states, shift_labels)
             loss = lm_loss
             if relation_output is not None:
                 if relation_output.image_gate_loss is not None:
@@ -684,6 +691,8 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             attention_contribution = attention_contribution * 0.0
             loss_reconstructed = loss_reconstructed * 0.0
             loss_reconstruction_error = loss_reconstruction_error * 0.0
+            if cpt_token_losses is not None:
+                cpt_token_losses = cpt_token_losses * 0.0
         
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -773,6 +782,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 if labels is not None
                 else None
             ),
+            cpt_token_losses=cpt_token_losses,
             global_visual_cache=global_visual_cache,
         )
 

@@ -716,6 +716,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-error-rate", type=float, default=0.001)
     parser.add_argument("--progress-every", type=int, default=10000)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--no-split",
+        action="store_true",
+        help="only normalize the combined pool (intended for converter smoke tests)",
+    )
+    parser.add_argument("--split-seed", type=int, default=20260826)
+    parser.add_argument("--val-fraction", type=float, default=0.02)
+    parser.add_argument("--val-fast-per-task", type=int, default=200)
+    parser.add_argument("--group-id-mode", choices=("sha256", "path"), default="sha256")
     return parser.parse_args()
 
 
@@ -775,6 +784,10 @@ def main() -> int:
                                 source_root=source_root,
                                 check_images=not args.skip_image_check,
                             )
+                            normalized["cpt_source"] = str(
+                                source_file.relative_to(source_root).as_posix()
+                            )
+                            normalized["cpt_source_line"] = line_number
                             if args.copy_images:
                                 make_portable(normalized, images_dir, output_dir)
                             output_handle.write(json.dumps(normalized, ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -783,7 +796,7 @@ def main() -> int:
                                 stats[task].grounding_records += 1
                             else:
                                 stats[task].natural_language_records += 1
-                        except Exception as exc:
+                        except NormalizeError as exc:
                             stats[task].rejected_records += 1
                             rejected_handle.write(
                                 json.dumps(
@@ -798,6 +811,12 @@ def main() -> int:
                                 )
                                 + "\n"
                             )
+                        except Exception as exc:
+                            raise RuntimeError(
+                                "unexpected CPT preparation failure: "
+                                f"task={task}, source={source_file}, line={line_number}, "
+                                f"error={type(exc).__name__}: {exc}"
+                            ) from exc
                         if args.progress_every and stats[task].source_records % args.progress_every == 0:
                             print(
                                 f"[{task}] read={stats[task].source_records:,} "
@@ -850,17 +869,37 @@ def main() -> int:
             "paths_relative_to_meta": True,
             "repeat_time": 1.0,
             "sampling_weight": 1.0,
+            "cpt_task": task,
+            "cpt_split": "all",
             "data_augment": False,
         }
-    recipe_path = recipe_dir / args.recipe_name
+    combined_recipe_name = args.recipe_name if args.no_split else "locany_cpt_all.json"
+    recipe_path = recipe_dir / combined_recipe_name
     recipe_dir.mkdir(parents=True, exist_ok=True)
     recipe_path.write_text(json.dumps(recipe, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    split_summary = None
+    if not args.no_split:
+        from split_locany_cpt import split_recipe
+
+        split_summary = split_recipe(
+            recipe_path,
+            output_dir,
+            seed=args.split_seed,
+            val_fraction=args.val_fraction,
+            val_fast_per_task=args.val_fast_per_task,
+            group_id_mode=args.group_id_mode,
+            train_recipe_name=args.recipe_name,
+        )
+        recipe_path = recipe_dir / args.recipe_name
 
     manifest = {
         "format": "LocateAnything conversations/image with <ref>/<box> coordinates in [0,1000]",
         "sampling": "equal task-family sampling via sampling_weight=1.0",
         "source_root": str(source_root),
         "recipe": str(recipe_path),
+        "combined_recipe": str(recipe_dir / combined_recipe_name),
+        "split": split_summary,
         "portable_images": bool(args.copy_images),
         "max_records_per_task": args.max_records_per_task,
         "tasks": {task: asdict(item) for task, item in stats.items()},

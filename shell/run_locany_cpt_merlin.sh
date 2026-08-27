@@ -17,11 +17,6 @@ if [[ "${CPT_MODE}" != "smoke" && "${CPT_MODE}" != "formal" ]]; then
   echo "CPT mode must be smoke or formal, got: ${CPT_MODE}" >&2
   exit 2
 fi
-if [[ "${MACHINE_TYPE}" == "h20" && "${CPT_MODE}" != "formal" ]]; then
-  echo "Only the formal H20 Merlin profile is defined." >&2
-  exit 2
-fi
-
 case "${MACHINE_TYPE}" in
   a100)
     WORKSPACE="${WORKSPACE:-/mnt/bn/intelligent-service-yg/logging/sicheng_workspace}"
@@ -92,7 +87,7 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 
 if [[ "${CPT_MODE}" == "smoke" ]]; then
-  export RUN_NAME="${RUN_NAME:-locany-3b-ui-cpt-v4-a100x4-smoke-${JOB_ID}}"
+  export RUN_NAME="${RUN_NAME:-locany-3b-ui-cpt-v4-${MACHINE_TYPE}x${GPU_COUNT}-smoke-${JOB_ID}}"
   export REPORT_TO="${REPORT_TO:-none}"
 else
   export RUN_NAME="${RUN_NAME:-locany-3b-ui-cpt-v4-${MACHINE_TYPE}x${GPU_COUNT}-formal}"
@@ -155,20 +150,59 @@ if not torch.cuda.is_available() or torch.cuda.device_count() != expected_gpu_co
         f"found {torch.cuda.device_count()}"
     )
 if machine == "h20" and importlib.util.find_spec("magi_attention") is None:
-    raise SystemExit("H20 formal profile requires magi_attention")
+    raise SystemExit("H20 CPT profile requires magi_attention")
 PY
 
 df -h /tmp "${FILESYSTEM_ROOT}" || true
 nvidia-smi
 
 LAUNCH_LOG="${SHARED_RUNTIME_DIR}/launcher.log"
-echo "===== Start ${MACHINE_TYPE} ${CPT_MODE} ====="
-set +e
-bash "${PROJECT_ROOT}/shell/run_locany_cpt.sh" "${MACHINE_TYPE}" "${CPT_MODE}" \
-  2>&1 | tee -a "${LAUNCH_LOG}"
-TRAIN_EXIT_CODE="${PIPESTATUS[0]}"
-set -e
 
-echo "TRAIN_EXIT_CODE=${TRAIN_EXIT_CODE}"
+run_training_phase() {
+  local phase_name="$1"
+  local phase_exit_code
+  echo "===== Start ${MACHINE_TYPE} ${CPT_MODE} phase=${phase_name} ====="
+  set +e
+  bash "${PROJECT_ROOT}/shell/run_locany_cpt.sh" "${MACHINE_TYPE}" "${CPT_MODE}" \
+    2>&1 | tee -a "${LAUNCH_LOG}"
+  phase_exit_code="${PIPESTATUS[0]}"
+  set -e
+  echo "TRAIN_PHASE=${phase_name} EXIT_CODE=${phase_exit_code}"
+  return "${phase_exit_code}"
+}
+
+SMOKE_RESUME_STEP="${CPT_SMOKE_RESUME_STEP:-0}"
+if [[ "${CPT_MODE}" == "smoke" && "${SMOKE_RESUME_STEP}" -gt 0 ]]; then
+  export LOCANY_SEGMENT_MODE=1
+  export LOCANY_STOP_AFTER_STEP="${SMOKE_RESUME_STEP}"
+  if run_training_phase "pre-resume-${SMOKE_RESUME_STEP}"; then
+    :
+  else
+    TRAIN_EXIT_CODE=$?
+    echo "TRAIN_EXIT_CODE=${TRAIN_EXIT_CODE}"
+    echo "LAUNCH_LOG=${LAUNCH_LOG}"
+    exit "${TRAIN_EXIT_CODE}"
+  fi
+  unset LOCANY_STOP_AFTER_STEP
+  if run_training_phase "post-resume"; then
+    :
+  else
+    TRAIN_EXIT_CODE=$?
+    echo "TRAIN_EXIT_CODE=${TRAIN_EXIT_CODE}"
+    echo "LAUNCH_LOG=${LAUNCH_LOG}"
+    exit "${TRAIN_EXIT_CODE}"
+  fi
+else
+  if run_training_phase "single"; then
+    :
+  else
+    TRAIN_EXIT_CODE=$?
+    echo "TRAIN_EXIT_CODE=${TRAIN_EXIT_CODE}"
+    echo "LAUNCH_LOG=${LAUNCH_LOG}"
+    exit "${TRAIN_EXIT_CODE}"
+  fi
+fi
+
+echo "TRAIN_EXIT_CODE=0"
 echo "LAUNCH_LOG=${LAUNCH_LOG}"
-exit "${TRAIN_EXIT_CODE}"
+exit 0
