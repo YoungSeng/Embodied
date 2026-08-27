@@ -1115,15 +1115,16 @@ def detection_python(args: argparse.Namespace, stage: str) -> str:
 
 
 def detection_worker_command(args: argparse.Namespace, stage: str, worker_index: int, worker_count: int) -> list[str]:
+    worker_script = Path(
+        getattr(args, "detector_worker_script", None) or Path(__file__).resolve()
+    )
     command = [
         detection_python(args, stage),
-        str(Path(__file__).resolve()),
+        str(worker_script),
         "--stage", "_worker",
         "--detector-stage", stage,
         "--worker-index", str(worker_index),
         "--worker-count", str(worker_count),
-        "--source-dir", str(args.source_dir),
-        "--locany-data-dir", str(args.locany_data_dir),
         "--parser-root", str(args.parser_root),
         "--output-dir", str(args.output_dir),
         "--gpus", args.gpus,
@@ -1138,6 +1139,13 @@ def detection_worker_command(args: argparse.Namespace, stage: str, worker_index:
         "--icon-long-side", str(args.icon_long_side),
         "--icon-confidence", str(args.icon_confidence),
     ]
+    # The training crop audit worker historically required these two inputs.
+    # Detector-only evaluation caches deliberately have no training/source
+    # annotation dependency and use their own worker entrypoint.
+    if getattr(args, "source_dir", None) is not None:
+        command.extend(("--source-dir", str(args.source_dir)))
+    if getattr(args, "locany_data_dir", None) is not None:
+        command.extend(("--locany-data-dir", str(args.locany_data_dir)))
     if args.text_model_dir:
         command.extend(("--text-model-dir", str(args.text_model_dir)))
     if args.icon_model:
@@ -1147,6 +1155,55 @@ def detection_worker_command(args: argparse.Namespace, stage: str, worker_index:
     if args.enable_mkldnn:
         command.append("--enable-mkldnn")
     return command
+
+
+def print_detector_only_preflight(
+    args: argparse.Namespace,
+    *,
+    unique_count: int,
+    detector_stage: str | None,
+) -> None:
+    parser_root = Path(args.parser_root).resolve(strict=True)
+    parser_head = git_output(parser_root, "rev-parse", "HEAD")
+    if parser_head != PARSER_COMMIT:
+        raise RuntimeError(f"parser must be {PARSER_COMMIT}, found {parser_head}")
+    config = detector_config(args)
+    if (
+        detector_stage in {"text", "all"}
+        and config["text"]["model_dir"] is not None
+        and not Path(config["text"]["model_dir"]).is_dir()
+    ):
+        raise FileNotFoundError(f"missing PP-OCRv5 model directory: {config['text']['model_dir']}")
+    if detector_stage in {"icon", "all"} and not Path(config["icon"]["model"]).is_file():
+        raise FileNotFoundError(f"missing icon detector weights: {config['icon']['model']}")
+    print("=== UI5 evaluation detector preflight (GT disabled) ===", flush=True)
+    print(f"unique_test_images : {unique_count}", flush=True)
+    print(f"parser_commit      : {parser_head}", flush=True)
+    print(f"detector_stage     : {detector_stage or 'resume validation only'}", flush=True)
+    print(f"text_model         : {config['text']['model_dir'] or 'PP-OCRv5 auto-download/cache'}", flush=True)
+    print(f"icon_model         : {config['icon']['model']}", flush=True)
+    print(f"output_dir         : {Path(args.output_dir).resolve(strict=False)}", flush=True)
+
+
+def print_stage_preflight(
+    args: argparse.Namespace,
+    *,
+    unique_count: int,
+    detector_stage: str | None,
+) -> None:
+    if getattr(args, "detector_only_mode", False):
+        print_detector_only_preflight(
+            args,
+            unique_count=unique_count,
+            detector_stage=detector_stage,
+        )
+    else:
+        print_preflight(
+            args,
+            unique_count=unique_count,
+            readable_count=unique_count,
+            detector_stage=detector_stage,
+        )
 
 
 def preflight_icon_runtime(
@@ -1245,12 +1302,7 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
     if args.resume and unique and baseline_completed == len(unique):
         # A fully completed stage must not import or initialize its model again.
         # This also lets merge/crop reuse immutable detections after GPU envs are released.
-        print_preflight(
-            args,
-            unique_count=len(unique),
-            readable_count=len(unique),
-            detector_stage=None,
-        )
+        print_stage_preflight(args, unique_count=len(unique), detector_stage=None)
         reporter = ProgressReporter(
             stage=stage,
             total=len(unique),
@@ -1265,7 +1317,7 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
             force=True,
         )
         return
-    print_preflight(args, unique_count=len(unique), readable_count=len(unique), detector_stage=stage)
+    print_stage_preflight(args, unique_count=len(unique), detector_stage=stage)
     if args.workers_per_gpu == 2 and not args.allow_two_processes_per_gpu:
         raise ValueError(
             "2 processes/GPU requires --allow-two-processes-per-gpu after the 2,000-image "

@@ -38,9 +38,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-images-per-task", type=int, default=0)
     parser.add_argument(
         "--inference-crop-mode",
-        choices=("full_image", "lossless_tiling"),
+        choices=("full_image", "lossless_tiling", "detector_scan"),
         default="full_image",
     )
+    parser.add_argument("--detector-crop-manifest", type=Path, default=None)
     parser.add_argument("--tile-max-count", type=int, default=10)
     parser.add_argument("--tile-target-long-side", type=int, default=1600)
     parser.add_argument("--tile-overlap-ratio", type=float, default=0.10)
@@ -149,6 +150,11 @@ def build_command(
         "--tile-nms-iou",
         str(args.tile_nms_iou),
     ]
+    detector_crop_manifest = getattr(args, "detector_crop_manifest", None)
+    if detector_crop_manifest is not None:
+        command.extend(
+            ["--detector-crop-manifest", str(detector_crop_manifest)]
+        )
     if args.relation_gate_threshold is not None:
         command.extend(
             ["--relation-gate-threshold", str(args.relation_gate_threshold)]
@@ -208,6 +214,14 @@ def main() -> int:
     args.input_dir = args.input_dir.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
     args.inference_script = args.inference_script.expanduser().resolve()
+    if args.inference_crop_mode == "detector_scan":
+        if args.detector_crop_manifest is None:
+            raise ValueError("detector_scan requires --detector-crop-manifest")
+        args.detector_crop_manifest = args.detector_crop_manifest.expanduser().resolve(
+            strict=True
+        )
+    elif args.detector_crop_manifest is not None:
+        raise ValueError("--detector-crop-manifest is only valid with detector_scan")
     if args.runtime_profile is not None:
         args.runtime_profile = args.runtime_profile.expanduser().resolve()
     for path, label in (

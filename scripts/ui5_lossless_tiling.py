@@ -18,6 +18,217 @@ from typing import Any, Iterable, Mapping, Sequence
 BBox = tuple[int, int, int, int]
 
 
+def _normalized_detector_boxes(
+    boxes: Iterable[Sequence[int] | Mapping[str, Any]],
+    width: int,
+    height: int,
+) -> list[BBox]:
+    normalized: list[BBox] = []
+    for item in boxes:
+        raw = item.get("bbox") if isinstance(item, Mapping) else item
+        if raw is None or len(raw) != 4:
+            continue
+        x1, y1, x2, y2 = (int(round(float(value))) for value in raw)
+        x1, x2 = sorted((max(0, min(width, x1)), max(0, min(width, x2))))
+        y1, y2 = sorted((max(0, min(height, y1)), max(0, min(height, y2))))
+        if x2 > x1 and y2 > y1:
+            normalized.append((x1, y1, x2, y2))
+    return sorted(set(normalized), key=lambda box: (box[1], box[3], box[0], box[2]))
+
+
+def _vertical_connected_bands(
+    boxes: Sequence[BBox],
+    *,
+    height: int,
+    vertical_link_ratio: float,
+    context_ratio: float,
+    min_context_image_ratio: float,
+) -> list[tuple[int, int]]:
+    """Collapse vertically adjacent detector boxes into protected scan bands.
+
+    X distance is deliberately ignored: two detected elements on the left and
+    right of the same row protect the complete horizontal strip between them.
+    This is the detector-only counterpart of the cropper connected graph.
+    """
+
+    if not boxes:
+        return []
+    link_px = max(0, math.ceil(height * vertical_link_ratio))
+    components: list[list[int]] = []
+    for _x1, y1, _x2, y2 in boxes:
+        if components and y1 <= components[-1][1] + link_px:
+            components[-1][1] = max(components[-1][1], y2)
+        else:
+            components.append([y1, y2])
+
+    protected: list[tuple[int, int]] = []
+    for y1, y2 in components:
+        component_height = max(1, y2 - y1)
+        padding = max(
+            math.ceil(component_height * context_ratio),
+            math.ceil(height * min_context_image_ratio),
+        )
+        band = (max(0, y1 - padding), min(height, y2 + padding))
+        if protected and band[0] <= protected[-1][1]:
+            protected[-1] = (protected[-1][0], max(protected[-1][1], band[1]))
+        else:
+            protected.append(band)
+    return protected
+
+
+def detector_boundary_cut_count(
+    tiles: Sequence[Sequence[int]], detector_boxes: Sequence[Sequence[int]]
+) -> int:
+    """Count detector boxes crossed by any saved tile boundary."""
+
+    cuts = 0
+    for box in detector_boxes:
+        x1, y1, x2, y2 = map(int, box)
+        if any(
+            (x1 < int(tile[0]) < x2)
+            or (x1 < int(tile[2]) < x2)
+            or (y1 < int(tile[1]) < y2)
+            or (y1 < int(tile[3]) < y2)
+            for tile in tiles
+        ):
+            cuts += 1
+    return cuts
+
+
+def generate_detector_scan_plan(
+    width: int,
+    height: int,
+    detector_boxes: Iterable[Sequence[int] | Mapping[str, Any]],
+    *,
+    task: str | None = None,
+    max_tiles: int = 10,
+    target_tile_height: int = 960,
+    overlap_ratio: float = 0.12,
+    vertical_link_ratio: float = 0.025,
+    context_ratio: float = 0.20,
+    min_context_image_ratio: float = 0.015,
+    dense_band_ratio: float = 0.80,
+) -> dict[str, Any]:
+    """Build GT-free, full-width horizontal scan crops.
+
+    A regular overlapping scan guarantees that every source pixel is present.
+    Detector boxes are then joined into vertical connected bands.  Tile edges
+    are expanded outwards whenever they would cross a band, so text/icons are
+    never cut and the undetected space between left/right neighbours remains in
+    the same full-width crop.  The result contains at most ten plain rectangles.
+    """
+
+    width, height = int(width), int(height)
+    if width <= 0 or height <= 0:
+        raise ValueError("image width and height must be positive")
+    if not 1 <= int(max_tiles) <= 10:
+        raise ValueError("max_tiles must be in [1, 10]")
+    if target_tile_height <= 0:
+        raise ValueError("target_tile_height must be positive")
+    if not 0.0 < overlap_ratio < 1.0:
+        raise ValueError("overlap_ratio must be in (0, 1)")
+    if min(vertical_link_ratio, context_ratio, min_context_image_ratio) < 0:
+        raise ValueError("link/context ratios cannot be negative")
+    if not 0.0 < dense_band_ratio <= 1.0:
+        raise ValueError("dense_band_ratio must be in (0, 1]")
+
+    boxes = _normalized_detector_boxes(detector_boxes, width, height)
+    bands = _vertical_connected_bands(
+        boxes,
+        height=height,
+        vertical_link_ratio=vertical_link_ratio,
+        context_ratio=context_ratio,
+        min_context_image_ratio=min_context_image_ratio,
+    )
+    normalized_task = str(task or "").removeprefix("ui_")
+    fallback_reason: str | None = None
+    if normalized_task == "content_missing":
+        fallback_reason = "content_missing_requires_global_view"
+    elif not boxes:
+        fallback_reason = "detector_empty_full_image"
+    elif bands and max(end - start for start, end in bands) / height > dense_band_ratio:
+        fallback_reason = "dense_connected_band"
+    elif height <= target_tile_height:
+        fallback_reason = "short_page_single_scan"
+
+    if fallback_reason is not None:
+        tiles = [[0, 0, width, height]]
+    else:
+        row_count = min(max_tiles, max(2, math.ceil(height / target_tile_height)))
+        overlap_px = max(1, round(min(height, target_tile_height) * overlap_ratio))
+        spans = [list(span) for span in _axis_tiles(height, row_count, overlap_px)]
+
+        # Moving an edge outwards preserves lossless coverage.  Iterate because
+        # expanding through one protected band can expose an edge to another.
+        for span in spans:
+            changed = True
+            while changed:
+                changed = False
+                for band_start, band_end in bands:
+                    if band_start < span[0] < band_end:
+                        span[0] = band_start
+                        changed = True
+                    if band_start < span[1] < band_end:
+                        span[1] = band_end
+                        changed = True
+        # Exact duplicates occur on dense rows after boundary expansion; one
+        # physical crop is enough.  Do not drop merely overlapping scans.
+        unique_spans = list(dict.fromkeys((int(y1), int(y2)) for y1, y2 in spans))
+        tiles = [[0, y1, width, y2] for y1, y2 in unique_spans]
+
+    assert_lossless_coverage(width, height, tiles)
+    cuts = detector_boundary_cut_count(tiles, boxes)
+    if cuts:
+        raise AssertionError(f"detector scan cut {cuts} detector boxes")
+    not_contained = [
+        list(box)
+        for box in boxes
+        if not any(
+            tile[0] <= box[0]
+            and tile[1] <= box[1]
+            and tile[2] >= box[2]
+            and tile[3] >= box[3]
+            for tile in tiles
+        )
+    ]
+    if not_contained:
+        raise AssertionError(f"detector boxes not contained by a scan: {not_contained[:5]}")
+
+    original_area = width * height
+    processed_area = sum((tile[2] - tile[0]) * (tile[3] - tile[1]) for tile in tiles)
+    gains = [height / max(1, tile[3] - tile[1]) for tile in tiles]
+    return {
+        "mode": "detector_scan",
+        "tiles": tiles,
+        "tile_count": len(tiles),
+        "detector_box_count": len(boxes),
+        "connected_band_count": len(bands),
+        "protected_vertical_bands": [list(band) for band in bands],
+        "lossless_pixel_coverage_ratio": union_area(tiles) / original_area,
+        "processed_pixel_ratio_with_overlap": processed_area / original_area,
+        "mean_vertical_linear_gain": sum(gains) / len(gains),
+        "max_vertical_linear_gain": max(gains),
+        "near_full_tile_count": sum(
+            ((tile[2] - tile[0]) * (tile[3] - tile[1])) / original_area > 0.8
+            for tile in tiles
+        ),
+        "detector_boundary_cut_count": cuts,
+        "fallback_reason": fallback_reason,
+        "gt_used": False,
+    }
+
+
+def generate_detector_scan_tiles(
+    width: int,
+    height: int,
+    detector_boxes: Iterable[Sequence[int] | Mapping[str, Any]],
+    **kwargs: Any,
+) -> list[list[int]]:
+    return generate_detector_scan_plan(
+        width, height, detector_boxes, **kwargs
+    )["tiles"]
+
+
 def _axis_tiles(length: int, count: int, overlap_px: int) -> list[tuple[int, int]]:
     if length <= 0:
         raise ValueError("axis length must be positive")

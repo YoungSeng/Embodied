@@ -259,6 +259,28 @@ python scripts/submit_locany_ui5.py \
 
 ## 五任务并行推理
 
+默认 `EVAL_INFERENCE_CROP_MODE=detector_scan`。第一次评测先在四张评测 GPU 上顺序完成
+PP-OCRv5 text detection 和 OmniParser icon detection，并把结果按内容唯一图片分 shard 落到：
+
+```text
+${OUTPUT_DIR}/evaluation/detector_scan_cache/
+  manifest/
+  detections/{text,icon,merged}/
+  scan_crops/detector_scan_crops.jsonl
+  scan_crops/{summary.json,statistics.csv}
+  scan_crops/gallery/index.html
+```
+
+两个 detector 退出后才加载 LocateAnything 评测 worker；后续 checkpoint 使用 `--resume`
+校验并复用缓存，不重复检测。几何只读取 text/icon bbox 和图片尺寸：检测框按纵向邻近组成
+连通带，每个 crop 横向贯穿完整图片宽度，纵向重叠扫描；所有像素至少出现一次，任何 detector
+bbox 都不能被边界切开。左右有检测而中间目标漏检时，中间仍在同一横条内。评测/推理禁止
+读取训练 GT repair；`content_missing` 保留完整原图视图。
+
+正式运行前建议先按 [README_UI5_COMMANDS.md](README_UI5_COMMANDS.md) 的单命令预览方式选择
+少量测试图片，检查 gallery 和统计。若 Paddle 与训练环境不同，通过 `--eval-text-python` 指向
+独立 Paddle 环境；不得在正在训练使用的共享环境中现场安装或替换 Torch/Paddle 依赖。
+
 任务：
 
 ```text
@@ -286,10 +308,10 @@ CUDA_VISIBLE_DEVICES=<physical GPU>
 
 ## 自动评分与输出
 
-每个 step 的预测目录：
+每个 step 的预测目录（默认 detector-scan）：
 
 ```text
-${OUTPUT_DIR}/inference-checkpoint-${STEP}-full/
+${OUTPUT_DIR}/inference-checkpoint-${STEP}-detector-scan/
 ```
 
 原始评分结果：

@@ -55,13 +55,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--eval-inference-crop-mode",
-        choices=("full_image", "lossless_tiling"),
-        default="full_image",
+        choices=("full_image", "lossless_tiling", "detector_scan"),
+        default="detector_scan",
     )
+    parser.add_argument("--eval-parser-root", default=None)
+    parser.add_argument("--eval-detector-cache", default=None)
+    parser.add_argument("--eval-text-python", default=None)
+    parser.add_argument("--eval-icon-python", default=None)
+    parser.add_argument("--eval-text-model-dir", default=None)
+    parser.add_argument("--eval-icon-model", default=None)
+    parser.add_argument("--eval-detector-workers-per-gpu", type=int, choices=(1, 2), default=1)
     parser.add_argument("--eval-tile-max-count", type=int, default=10)
     parser.add_argument("--eval-tile-target-long-side", type=int, default=1600)
     parser.add_argument("--eval-tile-overlap-ratio", type=float, default=0.10)
     parser.add_argument("--eval-tile-nms-iou", type=float, default=0.50)
+    parser.add_argument("--eval-scan-target-height", type=int, default=960)
+    parser.add_argument("--eval-scan-vertical-link-ratio", type=float, default=0.025)
+    parser.add_argument("--eval-scan-context-ratio", type=float, default=0.20)
+    parser.add_argument("--eval-scan-min-context-image-ratio", type=float, default=0.015)
+    parser.add_argument("--eval-scan-dense-band-ratio", type=float, default=0.80)
+    parser.add_argument("--eval-scan-visualization-samples", type=int, default=20)
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--learning-rate", default="2e-5")
     parser.add_argument("--version", default="v4")
@@ -189,7 +202,10 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "EVAL_AT_START": "1" if args.eval_at_start else "0",
         "EVAL_FAIL_POLICY": args.eval_fail_policy,
         "EVAL_INFERENCE_CROP_MODE": getattr(
-            args, "eval_inference_crop_mode", "full_image"
+            args, "eval_inference_crop_mode", "detector_scan"
+        ),
+        "EVAL_DETECTOR_WORKERS_PER_GPU": str(
+            getattr(args, "eval_detector_workers_per_gpu", 1)
         ),
         "EVAL_TILE_MAX_COUNT": str(getattr(args, "eval_tile_max_count", 10)),
         "EVAL_TILE_TARGET_LONG_SIDE": str(
@@ -199,6 +215,22 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
             getattr(args, "eval_tile_overlap_ratio", 0.10)
         ),
         "EVAL_TILE_NMS_IOU": str(getattr(args, "eval_tile_nms_iou", 0.50)),
+        "EVAL_SCAN_TARGET_HEIGHT": str(getattr(args, "eval_scan_target_height", 960)),
+        "EVAL_SCAN_VERTICAL_LINK_RATIO": str(
+            getattr(args, "eval_scan_vertical_link_ratio", 0.025)
+        ),
+        "EVAL_SCAN_CONTEXT_RATIO": str(
+            getattr(args, "eval_scan_context_ratio", 0.20)
+        ),
+        "EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO": str(
+            getattr(args, "eval_scan_min_context_image_ratio", 0.015)
+        ),
+        "EVAL_SCAN_DENSE_BAND_RATIO": str(
+            getattr(args, "eval_scan_dense_band_ratio", 0.80)
+        ),
+        "EVAL_SCAN_VISUALIZATION_SAMPLES": str(
+            getattr(args, "eval_scan_visualization_samples", 20)
+        ),
         "RELATION_GATE_MODE": getattr(args, "relation_gate_mode", "observe"),
         "INSTALL_SYSTEM_RUNTIME_DEPS": (
             "1" if getattr(args, "install_system_runtime_deps", True) else "0"
@@ -220,6 +252,12 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "TRAINING_DATA_DIR": args.training_data_dir,
         "UI5_CROP_AUDIT_DIR": getattr(args, "crop_audit_dir", None),
         "UI5_CROP_META_PATH": getattr(args, "crop_meta_path", None),
+        "EVAL_PARSER_ROOT": getattr(args, "eval_parser_root", None),
+        "EVAL_DETECTOR_CACHE": getattr(args, "eval_detector_cache", None),
+        "EVAL_TEXT_PYTHON": getattr(args, "eval_text_python", None),
+        "EVAL_ICON_PYTHON": getattr(args, "eval_icon_python", None),
+        "EVAL_TEXT_MODEL_DIR": getattr(args, "eval_text_model_dir", None),
+        "EVAL_ICON_MODEL": getattr(args, "eval_icon_model", None),
     }
     env.update(explicit)
     eval_max_images = optional["EVAL_MAX_IMAGES_PER_TASK"]
@@ -317,10 +355,23 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "EVAL_MAX_IMAGES_PER_TASK",
         "EVAL_FAIL_POLICY",
         "EVAL_INFERENCE_CROP_MODE",
+        "EVAL_PARSER_ROOT",
+        "EVAL_DETECTOR_CACHE",
+        "EVAL_TEXT_PYTHON",
+        "EVAL_ICON_PYTHON",
+        "EVAL_TEXT_MODEL_DIR",
+        "EVAL_ICON_MODEL",
+        "EVAL_DETECTOR_WORKERS_PER_GPU",
         "EVAL_TILE_MAX_COUNT",
         "EVAL_TILE_TARGET_LONG_SIDE",
         "EVAL_TILE_OVERLAP_RATIO",
         "EVAL_TILE_NMS_IOU",
+        "EVAL_SCAN_TARGET_HEIGHT",
+        "EVAL_SCAN_VERTICAL_LINK_RATIO",
+        "EVAL_SCAN_CONTEXT_RATIO",
+        "EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO",
+        "EVAL_SCAN_DENSE_BAND_RATIO",
+        "EVAL_SCAN_VISUALIZATION_SAMPLES",
         "INSTALL_SYSTEM_RUNTIME_DEPS",
         "UI5_USE_DETECTION_CROPS",
         "UI5_CROP_AUDIT_DIR",
@@ -420,10 +471,21 @@ def main() -> int:
         "EVAL_INTERVAL_STEPS",
         "EVAL_MAX_IMAGES_PER_TASK",
         "EVAL_INFERENCE_CROP_MODE",
+        "EVAL_PARSER_ROOT",
+        "EVAL_DETECTOR_CACHE",
+        "EVAL_TEXT_PYTHON",
+        "EVAL_ICON_PYTHON",
+        "EVAL_ICON_MODEL",
+        "EVAL_DETECTOR_WORKERS_PER_GPU",
         "EVAL_TILE_MAX_COUNT",
         "EVAL_TILE_TARGET_LONG_SIDE",
         "EVAL_TILE_OVERLAP_RATIO",
         "EVAL_TILE_NMS_IOU",
+        "EVAL_SCAN_TARGET_HEIGHT",
+        "EVAL_SCAN_VERTICAL_LINK_RATIO",
+        "EVAL_SCAN_CONTEXT_RATIO",
+        "EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO",
+        "EVAL_SCAN_DENSE_BAND_RATIO",
         "INSTALL_SYSTEM_RUNTIME_DEPS",
         "UI5_USE_DETECTION_CROPS",
         "UI5_CROP_AUDIT_DIR",

@@ -222,11 +222,11 @@ def resolve_runtime_config(
     if eval_fail_policy not in {"stop", "warn"}:
         raise ValueError("EVAL_FAIL_POLICY must be 'stop' or 'warn'")
     eval_inference_crop_mode = str(
-        _env_value(env, "EVAL_INFERENCE_CROP_MODE", "full_image")
+        _env_value(env, "EVAL_INFERENCE_CROP_MODE", "detector_scan")
     ).lower()
-    if eval_inference_crop_mode not in {"full_image", "lossless_tiling"}:
+    if eval_inference_crop_mode not in {"full_image", "lossless_tiling", "detector_scan"}:
         raise ValueError(
-            "EVAL_INFERENCE_CROP_MODE must be full_image or lossless_tiling"
+            "EVAL_INFERENCE_CROP_MODE must be full_image, lossless_tiling, or detector_scan"
         )
 
     base_model = str(
@@ -339,6 +339,40 @@ def resolve_runtime_config(
         "EVAL_INTERVAL_STEPS": eval_interval,
         "EVAL_FAIL_POLICY": eval_fail_policy,
         "EVAL_INFERENCE_CROP_MODE": eval_inference_crop_mode,
+        "EVAL_PARSER_ROOT": str(
+            _env_value(
+                env,
+                "EVAL_PARSER_ROOT",
+                join_runtime_path(str(Path(project_root).parent), "ui-region-parser")
+                if not project_root.startswith("/")
+                else posixpath.join(posixpath.dirname(project_root), "ui-region-parser"),
+            )
+        ),
+        "EVAL_DETECTOR_CACHE": str(
+            _env_value(
+                env,
+                "EVAL_DETECTOR_CACHE",
+                join_runtime_path(output_dir, "evaluation", "detector_scan_cache"),
+            )
+        ),
+        "EVAL_TEXT_PYTHON": str(_env_value(env, "EVAL_TEXT_PYTHON", "")),
+        "EVAL_ICON_PYTHON": str(_env_value(env, "EVAL_ICON_PYTHON", "")),
+        "EVAL_TEXT_MODEL_DIR": str(_env_value(env, "EVAL_TEXT_MODEL_DIR", "")),
+        "EVAL_ICON_MODEL": str(
+            _env_value(
+                env,
+                "EVAL_ICON_MODEL",
+                join_runtime_path(
+                    str(_env_value(env, "EVAL_PARSER_ROOT", posixpath.join(posixpath.dirname(project_root), "ui-region-parser"))),
+                    "weights",
+                    "icon_detect_v3",
+                    "model.pt",
+                ),
+            )
+        ),
+        "EVAL_DETECTOR_WORKERS_PER_GPU": int(
+            _env_value(env, "EVAL_DETECTOR_WORKERS_PER_GPU", 1)
+        ),
         "EVAL_TILE_MAX_COUNT": int(_env_value(env, "EVAL_TILE_MAX_COUNT", 10)),
         "EVAL_TILE_TARGET_LONG_SIDE": int(
             _env_value(env, "EVAL_TILE_TARGET_LONG_SIDE", 1600)
@@ -347,6 +381,24 @@ def resolve_runtime_config(
             _env_value(env, "EVAL_TILE_OVERLAP_RATIO", 0.10)
         ),
         "EVAL_TILE_NMS_IOU": float(_env_value(env, "EVAL_TILE_NMS_IOU", 0.50)),
+        "EVAL_SCAN_TARGET_HEIGHT": int(
+            _env_value(env, "EVAL_SCAN_TARGET_HEIGHT", 960)
+        ),
+        "EVAL_SCAN_VERTICAL_LINK_RATIO": float(
+            _env_value(env, "EVAL_SCAN_VERTICAL_LINK_RATIO", 0.025)
+        ),
+        "EVAL_SCAN_CONTEXT_RATIO": float(
+            _env_value(env, "EVAL_SCAN_CONTEXT_RATIO", 0.20)
+        ),
+        "EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO": float(
+            _env_value(env, "EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO", 0.015)
+        ),
+        "EVAL_SCAN_DENSE_BAND_RATIO": float(
+            _env_value(env, "EVAL_SCAN_DENSE_BAND_RATIO", 0.80)
+        ),
+        "EVAL_SCAN_VISUALIZATION_SAMPLES": int(
+            _env_value(env, "EVAL_SCAN_VISUALIZATION_SAMPLES", 20)
+        ),
         "INSTALL_SYSTEM_RUNTIME_DEPS": int(
             parse_bool(
                 _env_value(env, "INSTALL_SYSTEM_RUNTIME_DEPS", "0"),
@@ -379,6 +431,19 @@ def resolve_runtime_config(
         raise ValueError("EVAL_TILE_OVERLAP_RATIO must be in (0, 1)")
     if not 0 <= resolved["EVAL_TILE_NMS_IOU"] <= 1:
         raise ValueError("EVAL_TILE_NMS_IOU must be in [0, 1]")
+    if resolved["EVAL_DETECTOR_WORKERS_PER_GPU"] not in {1, 2}:
+        raise ValueError("EVAL_DETECTOR_WORKERS_PER_GPU must be 1 or 2")
+    if resolved["EVAL_SCAN_TARGET_HEIGHT"] <= 0:
+        raise ValueError("EVAL_SCAN_TARGET_HEIGHT must be positive")
+    for name in (
+        "EVAL_SCAN_VERTICAL_LINK_RATIO",
+        "EVAL_SCAN_CONTEXT_RATIO",
+        "EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO",
+    ):
+        if resolved[name] < 0:
+            raise ValueError(f"{name} cannot be negative")
+    if not 0 < resolved["EVAL_SCAN_DENSE_BAND_RATIO"] <= 1:
+        raise ValueError("EVAL_SCAN_DENSE_BAND_RATIO must be in (0, 1]")
     if not 0.0 <= resolved["RELATION_FOCAL_BETA"] < 1.0:
         raise ValueError("RELATION_FOCAL_BETA must be in [0, 1)")
     if resolved["RELATION_FOCAL_GAMMA"] < 0.0:
@@ -396,6 +461,7 @@ GPU_PARITY_ALLOWED_DIFFERENCES = frozenset(
         "GRADIENT_ACCUMULATION_STEPS",
         "RUN_NAME",
         "OUTPUT_DIR",
+        "EVAL_DETECTOR_CACHE",
     }
 )
 

@@ -88,7 +88,11 @@ from PIL import Image, ImageDraw, ImageFont
 from transformers import AutoConfig, AutoModel, AutoProcessor, AutoTokenizer
 
 from eaglevl.model.locany.relation_modules import UI_RELATION_PROMPT_SPECS
-from ui5_lossless_tiling import generate_lossless_tiles, merge_tile_predictions
+from ui5_lossless_tiling import (
+    assert_lossless_coverage,
+    generate_lossless_tiles,
+    merge_tile_predictions,
+)
 
 
 PROMPT_TEMPLATE = (
@@ -374,12 +378,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--inference-crop-mode",
-        choices=("full_image", "lossless_tiling"),
+        choices=("full_image", "lossless_tiling", "detector_scan"),
         default="full_image",
         help=(
             "推理图像模式；lossless_tiling 使用不依赖 GT 的重叠矩形切图，"
-            "局部预测先回写原图坐标再跨 tile 去重"
+            "detector_scan 读取预先落盘的 OCR/icon 横向连通扫描 crops；"
+            "两者都先把局部预测回写原图坐标再跨 tile 去重"
         ),
+    )
+    parser.add_argument(
+        "--detector-crop-manifest",
+        default=None,
+        help="detector_scan 模式必需的 detector_scan_crops.jsonl；不得包含 GT repair",
     )
     parser.add_argument("--tile-max-count", type=int, default=10)
     parser.add_argument("--tile-target-long-side", type=int, default=1600)
@@ -1478,6 +1488,10 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "target_long_side": args.tile_target_long_side,
             "overlap_ratio": args.tile_overlap_ratio,
             "nms_iou": args.tile_nms_iou,
+            "detector_crop_manifest": args.detector_crop_manifest,
+            "detector_crop_manifest_digest": getattr(
+                args, "detector_crop_manifest_digest", None
+            ),
             "gt_repair_allowed": False,
         },
         "output": {
@@ -1645,19 +1659,25 @@ def predict_with_lossless_tiles(
     image: Image.Image,
     task: TaskConfig,
     sample_seed: int,
+    tiles_override: Sequence[Sequence[int]] | None = None,
+    crop_mode: str = "lossless_tiling",
 ) -> tuple[str, ParsedAnswer, list[dict[str, Any]], list[list[int]], dict[str, Any], list[dict[str, Any]]]:
     """Run GT-free tiled inference and merge only after global coordinate mapping."""
 
     width, height = image.size
     tiling_task = f"ui_{task.task_name}"
-    tiles = generate_lossless_tiles(
-        width,
-        height,
-        task=tiling_task,
-        max_tiles=args.tile_max_count,
-        target_long_side=args.tile_target_long_side,
-        overlap_ratio=args.tile_overlap_ratio,
-    )
+    if tiles_override is None:
+        tiles = generate_lossless_tiles(
+            width,
+            height,
+            task=tiling_task,
+            max_tiles=args.tile_max_count,
+            target_long_side=args.tile_target_long_side,
+            overlap_ratio=args.tile_overlap_ratio,
+        )
+    else:
+        tiles = [list(map(int, tile)) for tile in tiles_override]
+        assert_lossless_coverage(width, height, tiles)
     pending_predictions: list[dict[str, Any]] = []
     tile_records: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -1746,7 +1766,7 @@ def predict_with_lossless_tiles(
         "available": any(bool(row.get("available")) for row in tile_gates),
         "would_pass": any(bool(row.get("would_pass")) for row in tile_gates),
         "gate_filtered": all(bool(row.get("gate_filtered")) for row in tile_gates),
-        "mode": "lossless_tiling",
+        "mode": crop_mode,
         "tile_count": len(tiles),
         "tile_union_full_image": True,
         "gt_repair_used": False,
@@ -1760,6 +1780,44 @@ def predict_with_lossless_tiles(
         gate_diagnostics,
         tile_records,
     )
+
+
+def load_detector_scan_index(path: Path) -> tuple[dict[str, dict[str, Any]], str]:
+    """Load a detector-only scan manifest and index every source-path alias."""
+
+    if not path.is_file():
+        raise FileNotFoundError(f"detector crop manifest does not exist: {path}")
+    payload = path.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    index: dict[str, dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid detector crop JSON at {path}:{line_no}: {exc}") from exc
+            if row.get("mode") != "detector_scan" or row.get("gt_used") is not False:
+                raise ValueError(
+                    f"detector crop manifest row {line_no} is not GT-free detector_scan"
+                )
+            width, height = int(row["width"]), int(row["height"])
+            tiles = row.get("tiles") or []
+            assert_lossless_coverage(width, height, tiles)
+            if int(row.get("detector_boundary_cut_count", -1)) != 0:
+                raise ValueError(f"detector crop row {line_no} cuts detector boxes")
+            aliases = list(row.get("image_paths") or [])
+            aliases.append(row["image_path"])
+            for alias in aliases:
+                key = str(Path(alias).expanduser().resolve(strict=False))
+                previous = index.get(key)
+                if previous is not None and previous["image_id"] != row["image_id"]:
+                    raise ValueError(f"detector crop path alias collision: {key}")
+                index[key] = row
+    if not index:
+        raise ValueError(f"detector crop manifest is empty: {path}")
+    return index, digest
 
 
 def save_error_record(
@@ -1843,7 +1901,26 @@ def run_one_task(
             set_sample_seed(sample_seed)
 
             inference_start = time.time()
-            if args.inference_crop_mode == "lossless_tiling":
+            if args.inference_crop_mode in {"lossless_tiling", "detector_scan"}:
+                tiles_override = None
+                if args.inference_crop_mode == "detector_scan":
+                    if config.task_name == "content_missing":
+                        # The global task keeps one complete view; it still uses
+                        # no GT and shares the same detector cache validation.
+                        tiles_override = [[0, 0, width, height]]
+                    else:
+                        key = str(Path(image_path).expanduser().resolve(strict=False))
+                        scan = args.detector_scan_index.get(key)
+                        if scan is None:
+                            raise KeyError(
+                                f"test image is absent from detector crop manifest: {key}"
+                            )
+                        if (int(scan["width"]), int(scan["height"])) != (width, height):
+                            raise ValueError(
+                                f"detector crop dimensions changed for {key}: "
+                                f"manifest={scan['width']}x{scan['height']}, image={width}x{height}"
+                            )
+                        tiles_override = scan["tiles"]
                 (
                     answer,
                     parsed,
@@ -1857,6 +1934,8 @@ def run_one_task(
                     image=image,
                     task=config,
                     sample_seed=sample_seed,
+                    tiles_override=tiles_override,
+                    crop_mode=args.inference_crop_mode,
                 )
             else:
                 answer = inferencer.predict(image=image, question=config.prompt)
@@ -1905,9 +1984,13 @@ def run_one_task(
                 if tile_records:
                     raw_payload = json.loads(raw_path.read_text(encoding="utf-8"))
                     raw_payload["inference_crop"] = {
-                        "mode": "lossless_tiling",
+                        "mode": args.inference_crop_mode,
                         "tiles": tile_records,
                         "global_merge_iou": args.tile_nms_iou,
+                        "detector_crop_manifest": args.detector_crop_manifest,
+                        "detector_crop_manifest_digest": getattr(
+                            args, "detector_crop_manifest_digest", None
+                        ),
                         "gt_repair_used": False,
                     }
                     atomic_write_json(raw_path, raw_payload)
@@ -2006,12 +2089,15 @@ def print_preflight(args: argparse.Namespace, works: Sequence[TaskWork]) -> None
     print(f"device                  : {args.device}")
     print(f"generation_mode         : {args.generation_mode}")
     print(f"inference_crop_mode     : {args.inference_crop_mode}")
-    if args.inference_crop_mode == "lossless_tiling":
+    if args.inference_crop_mode in {"lossless_tiling", "detector_scan"}:
         print(
-            "lossless_tiling         : "
+            f"{args.inference_crop_mode:24s}: "
             f"max={args.tile_max_count}, long_side={args.tile_target_long_side}, "
             f"overlap={args.tile_overlap_ratio}, nms={args.tile_nms_iou}, GT repair=disabled"
         )
+    if args.inference_crop_mode == "detector_scan":
+        print(f"detector_crop_manifest : {args.detector_crop_manifest}")
+        print(f"detector_manifest_sha  : {args.detector_crop_manifest_digest}")
     print(f"save_raw_answer         : {args.save_raw_answer}")
     print(f"save_visualization      : {args.save_visualization}")
     print(f"tag_filename            : {args.tag_filename}")
@@ -2047,6 +2133,18 @@ def main() -> int:
         if args.summary_path
         else args.output_dir / "_summary.json"
     )
+    args.detector_scan_index = {}
+    args.detector_crop_manifest_digest = None
+    if args.inference_crop_mode == "detector_scan":
+        if not args.detector_crop_manifest:
+            raise ValueError("detector_scan requires --detector-crop-manifest")
+        detector_manifest = Path(args.detector_crop_manifest).expanduser().resolve(strict=True)
+        args.detector_scan_index, args.detector_crop_manifest_digest = load_detector_scan_index(
+            detector_manifest
+        )
+        args.detector_crop_manifest = str(detector_manifest)
+    elif args.detector_crop_manifest:
+        raise ValueError("--detector-crop-manifest is only valid with detector_scan")
 
     if not args.input_dir.is_dir():
         raise FileNotFoundError(f"输入目录不存在：{args.input_dir}")

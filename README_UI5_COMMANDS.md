@@ -1,5 +1,88 @@
 # LocateAnything UI5 常用命令
 
+## 先看测试集横向 detector-scan crops（本轮新增）
+
+训练中评测现在默认使用 `detector_scan`，不再默认把四个区域任务的整张原图直接送入模型。
+它先对测试集内容唯一图片各运行一次 PP-OCRv5 和 icon detector，再把 text/icon 框组成纵向
+连通带，生成 1–10 个横向贯穿整张图片宽度的重叠扫描 crop。这样左右两侧有检测、目标自身
+漏检时，中间区域仍随整条进入模型。crop 并集覆盖原图 100%，任何 detector bbox 都不会被
+边界切断；`ui_content_missing` 因需要全局结构，仍使用完整原图。全流程不读取测试 GT，也
+不会使用训练侧 `manual_gt_repair`。detector 完全无输出或连通带覆盖大部分页面时也保守回退
+整图；这两种回退会在统计中单独计数，不会为了减少 full-image 比例而强拆。
+
+检测默认与训练 crop 审计一致：text long side 1920、box threshold 0.3；icon long side 1920、
+confidence 0.05。几何默认最多 10 条、目标高度 960、纵向 overlap 0.12；为贴近训练推荐
+`TA_CTX015_H050`，vertical link 0.025、context 0.20、最小图片 context 0.015。横向 crop
+本身覆盖完整宽度，因此不再单独应用 H050。先看样例统计后再决定是否调整这些纯几何参数。
+
+先只选每任务 20 张（五任务同内容仍只检测一次）查看可视化和统计：
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+
+bash shell/run_ui5_eval_detector_preview.sh \
+  --input-dir /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data \
+  --parser-root ../ui-region-parser \
+  --output-dir work_dirs/ui5_eval_detector_preview_20260827 \
+  --gpus 0,1,2,3 \
+  --workers-per-gpu 1 \
+  --max-images-per-task 20 \
+  --visualization-samples 20 \
+  --resume
+```
+
+如果 Paddle 与训练 Torch 环境不同，只在同一条命令追加两个 Python 路径，不要改共享环境：
+
+```bash
+--text-python /path/to/paddle_env/bin/python \
+--icon-python /path/to/locany_env/bin/python
+```
+
+该命令内部按 `prepare → text → icon → merge → crop` 自动顺序执行，不需要手动跑五条命令。
+OCR 与 icon 不会同时常驻同一 GPU；`--resume` 会跳过已完成 shard。查看：
+
+```text
+work_dirs/ui5_eval_detector_preview_20260827/scan_crops/gallery/index.html
+work_dirs/ui5_eval_detector_preview_20260827/scan_crops/summary.json
+work_dirs/ui5_eval_detector_preview_20260827/scan_crops/statistics.csv
+work_dirs/ui5_eval_detector_preview_20260827/scan_crops/preview_crops/
+```
+
+另开终端可实时查看当前阶段、完成数、速度和 ETA：
+
+```bash
+watch -n 5 'cat work_dirs/ui5_eval_detector_preview_20260827/run_status.json'
+```
+
+确认样例合理后，正式 pipeline 不需要先单独跑预览命令。第一次 step-0 evaluation 会在
+`${OUTPUT_DIR}/evaluation/detector_scan_cache/` 对完整测试集建立检测缓存；后续 checkpoint 只
+验证并复用缓存。正式提交命令显式写法为：
+
+```bash
+UI5_AUDIT_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
+
+python scripts/submit_locany_ui5.py \
+  --machine a800 \
+  --resource-group aiai_locate \
+  --gpus 4 \
+  --max-num-tokens 12800 \
+  --use-detection-crops \
+  --crop-audit-dir "${UI5_AUDIT_DIR}" \
+  --crop-train-mode full_plus_crop \
+  --enable-eval \
+  --eval-inference-crop-mode detector_scan \
+  --eval-parser-root ../ui-region-parser \
+  --eval-icon-model ../ui-region-parser/weights/icon_detect_v3/model.pt \
+  --eval-interval-steps 1000 \
+  --max-steps 16000 \
+  --save-steps 4000 \
+  --run-name locany-ui5-v4-gtcrop-detector-scan-a800x4
+```
+
+若提交节点上的相对路径会变化，请给 `--eval-parser-root` 和 `--eval-icon-model` 使用集群绝对
+路径。PP-OCRv5 默认走 PaddleOCR 缓存/自动下载；icon 的 `model.pt` 必须存在。统计里的
+`lossless_pixel_coverage_ratio` 必须恒为 1、`detector_boundary_cut_count` 必须为 0。
+
 ## v4.1 当前执行顺序
 
 先完成 [README_UI5_CROP_AUDIT.md](README_UI5_CROP_AUDIT.md) 顶部的唯一一条
@@ -92,16 +175,15 @@ python scripts/submit_locany_ui5.py \
   --run-name locany-ui5-v4-gtcrop-a800x4
 ```
 
-这条命令的评测默认仍是 full-image，适合作为 `full+crop` 训练对照。如果要跑第三组
-“full+crop 训练，并在推理/评测时使用无遗漏重叠切图”，在同一命令中额外添加：
+这条命令现在默认使用上述 `detector_scan` 评测。若要保留旧的全图或纯规则网格对照，显式
+设置以下之一，并使用不同的 `--run-name`：
 
 ```bash
+--eval-inference-crop-mode full_image
 --eval-inference-crop-mode lossless_tiling
 ```
 
-`lossless_tiling` 不读取 GT repair：1–10 个普通矩形 tile 的并集覆盖原图 100%，最后一行和
-最后一列贴齐边界，局部预测先映射回原图再跨 tile 去重；`ui_content_missing` 始终保留完整
-原图。必须使用不同 `--run-name` 区分两组评测。
+三种模式的局部预测都会先映射回原图再做跨 tile 去重；任何评测模式都禁止读取 GT repair。
 
 如改为八卡，只改：
 
