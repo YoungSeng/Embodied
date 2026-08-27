@@ -93,6 +93,7 @@ FORBIDDEN_MARKERS = ("<|box_start|>", "<|box_end|>", "<|object_ref_start|>", "<|
 class TaskStats:
     source_records: int = 0
     written_records: int = 0
+    known_dropped_records: int = 0
     rejected_records: int = 0
     grounding_records: int = 0
     natural_language_records: int = 0
@@ -100,6 +101,14 @@ class TaskStats:
 
 class NormalizeError(ValueError):
     pass
+
+
+class KnownDataDrop(NormalizeError):
+    """A malformed annotation that is safe to exclude but must stay observable."""
+
+    def __init__(self, category: str, message: str):
+        super().__init__(message)
+        self.category = category
 
 
 def classify_source(relative_path: Path) -> str:
@@ -466,7 +475,10 @@ def normalize_box(
         y1, y2 = y1 / height * 1000.0, y2 / height * 1000.0
     result = tuple(max(0, min(1000, int(round(value)))) for value in (x1, y1, x2, y2))
     if result[0] >= result[2] or result[1] >= result[3]:
-        raise NormalizeError(f"invalid or degenerate bbox after normalization: {box} -> {result}")
+        raise KnownDataDrop(
+            "invalid_or_degenerate_bbox",
+            f"invalid or degenerate bbox after normalization: {box} -> {result}",
+        )
     return result  # type: ignore[return-value]
 
 
@@ -603,7 +615,10 @@ def canonicalize_tabular_grounding(text: str) -> str:
 def validate_grounding_target(text: str) -> None:
     box_count = len(LOCANY_BOX_RE.findall(text))
     if box_count and len(LOCANY_REF_BOX_RE.findall(text)) != box_count:
-        raise NormalizeError("grounding answer contains a box without a canonical <ref>...</ref> pair")
+        raise KnownDataDrop(
+            "noncanonical_ref_box_pair",
+            "grounding answer contains a box without a canonical <ref>...</ref> pair",
+        )
 
 
 def validate_locany_text(text: str, role: str) -> None:
@@ -796,6 +811,23 @@ def main() -> int:
                                 stats[task].grounding_records += 1
                             else:
                                 stats[task].natural_language_records += 1
+                        except KnownDataDrop as exc:
+                            stats[task].known_dropped_records += 1
+                            rejected_handle.write(
+                                json.dumps(
+                                    {
+                                        "task": task,
+                                        "source": str(source_file),
+                                        "line": line_number,
+                                        "id": raw.get("id") if isinstance(raw, dict) else None,
+                                        "disposition": "known_data_drop",
+                                        "category": exc.category,
+                                        "reason": f"{type(exc).__name__}: {exc}",
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            )
                         except NormalizeError as exc:
                             stats[task].rejected_records += 1
                             rejected_handle.write(
@@ -805,6 +837,8 @@ def main() -> int:
                                         "source": str(source_file),
                                         "line": line_number,
                                         "id": raw.get("id") if isinstance(raw, dict) else None,
+                                        "disposition": "unexpected_normalize_reject",
+                                        "category": None,
                                         "reason": f"{type(exc).__name__}: {exc}",
                                     },
                                     ensure_ascii=False,
@@ -820,7 +854,9 @@ def main() -> int:
                         if args.progress_every and stats[task].source_records % args.progress_every == 0:
                             print(
                                 f"[{task}] read={stats[task].source_records:,} "
-                                f"written={stats[task].written_records:,} rejected={stats[task].rejected_records:,}",
+                                f"written={stats[task].written_records:,} "
+                                f"known_dropped={stats[task].known_dropped_records:,} "
+                                f"rejected={stats[task].rejected_records:,}",
                                 flush=True,
                             )
                 if stop_task:
@@ -850,14 +886,17 @@ def main() -> int:
         raise
 
     total_source = sum(item.source_records for item in stats.values())
+    total_known_dropped = sum(item.known_dropped_records for item in stats.values())
     total_rejected = sum(item.rejected_records for item in stats.values())
     empty = [task for task, item in stats.items() if item.written_records == 0]
     if empty:
         raise SystemExit(f"no valid records for tasks: {empty}")
+    known_drop_rate = total_known_dropped / max(total_source, 1)
     error_rate = total_rejected / max(total_source, 1)
     if error_rate > args.max_error_rate:
         raise SystemExit(
-            f"rejected rate {error_rate:.6%} exceeds --max-error-rate={args.max_error_rate:.6%}; "
+            f"unexpected rejected rate {error_rate:.6%} exceeds "
+            f"--max-error-rate={args.max_error_rate:.6%}; "
             f"inspect {rejected_path}"
         )
 
@@ -904,6 +943,8 @@ def main() -> int:
         "max_records_per_task": args.max_records_per_task,
         "tasks": {task: asdict(item) for task, item in stats.items()},
         "total_written": sum(item.written_records for item in stats.values()),
+        "total_known_dropped": total_known_dropped,
+        "known_drop_rate": known_drop_rate,
         "total_rejected": total_rejected,
         "rejected_rate": error_rate,
     }
@@ -915,6 +956,7 @@ def main() -> int:
     for task, item in stats.items():
         print(
             f"{task:24s} written={item.written_records:9,d} "
+            f"known_dropped={item.known_dropped_records:6,d} "
             f"rejected={item.rejected_records:6,d} weight=1.0"
         )
     return 0

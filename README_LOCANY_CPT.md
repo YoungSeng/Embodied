@@ -47,6 +47,13 @@ bash shell/prepare_locany_cpt_v2.sh h20 formal
 - `diagnostics/split_manifest.jsonl`、`split_summary.json`、图片哈希缓存；
 - 被格式转换拒绝的行及真实原因。
 
+数据中两类已确认无法形成有效监督的 annotation 会直接排除：非规范的
+`<ref>...</ref><box>...</box>` 配对（包括换行导致的 ref/box 脱离），以及归一化后宽或高
+为 0 的退化框。它们仍逐条写入 `rejected.jsonl`，标记
+`disposition=known_data_drop` 和具体 `category`，并汇总为 manifest 的
+`total_known_dropped/known_drop_rate`；这两类不计入 `--max-error-rate`。其他
+NormalizeError 继续计入 `total_rejected/rejected_rate`，未知运行时异常仍直接失败。
+
 若已有规范化的未切分 recipe，可单独切分：
 
 ```bash

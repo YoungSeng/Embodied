@@ -373,6 +373,41 @@ class LocateAnythingCPTTest(unittest.TestCase):
             for relative, row in rows.items():
                 _write_jsonl(source / relative, row)
 
+            # These two malformed annotations are explicitly safe data drops:
+            # a box separated from its canonical ref/box pair and a zero-height
+            # box.  Their high fixture rate must not trip --max-error-rate.
+            multi_path = source / "grounding/multi/category_9_mul_train_n.jsonl"
+            with multi_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        _record(
+                            image,
+                            "<image>标注所有 UI 元素。",
+                            "换行标签\n<box><52><100><174><200></box>",
+                            record_id="known-drop-noncanonical",
+                        ),
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+                handle.write(
+                    json.dumps(
+                        _record(
+                            image,
+                            "<image>标注所有 UI 元素。",
+                            "旧格式",
+                            objects={
+                                "ref": ["bad box"],
+                                "bbox": [[52, 875, 174, 875]],
+                                "bbox_type": "norm1000",
+                            },
+                            record_id="known-drop-degenerate",
+                        ),
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
             prepare = subprocess.run(
                 [
                     sys.executable,
@@ -391,6 +426,25 @@ class LocateAnythingCPTTest(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(prepare.returncode, 0, prepare.stdout + prepare.stderr)
+
+            manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["total_known_dropped"], 2)
+            self.assertEqual(manifest["total_rejected"], 0)
+            self.assertEqual(
+                manifest["tasks"]["all_ui_elements"]["known_dropped_records"], 2
+            )
+            rejected_rows = [
+                json.loads(line)
+                for line in (output / "rejected.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                {row["category"] for row in rejected_rows},
+                {"noncanonical_ref_box_pair", "invalid_or_degenerate_bbox"},
+            )
+            self.assertEqual(
+                {row["disposition"] for row in rejected_rows},
+                {"known_data_drop"},
+            )
 
             recipe_path = output / "recipe" / "locany_cpt_smoke.json"
             recipe = json.loads(recipe_path.read_text(encoding="utf-8"))
