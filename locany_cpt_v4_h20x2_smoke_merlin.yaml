@@ -1,7 +1,7 @@
-# Merlin smoke test: LocateAnything-3B UI CPT, HL H20 x2 Magi profile.
+# Merlin smoke test: LocateAnything-3B UI CPT v2, HL H20 x2 safe SDPA profile.
 # Submit: mlx job submitv2 --path locany_cpt_v4_h20x2_smoke_merlin.yaml
 
-caption: 'LocateAnything UI CPT Smoke - H20x2'
+caption: 'LocateAnything UI CPT v2 Smoke - H20x2 SDPA'
 
 jobDefVersion:
   entrypointMode: FULL_SCRIPT
@@ -15,7 +15,7 @@ jobDefVersion:
     imageVid: d8ap37f1enlcr23291ug
 
   lazyDownloadCode: true
-  name: 'locany-cpt-v4-h20x2-smoke'
+  name: 'locany-cpt-v4-v2-h20x2-smoke'
 
   resource:
     arnoldConfig:
@@ -61,13 +61,14 @@ jobRunParams:
   envsList:
     CUDA_DEVICES: "0,1"
     GPU_COUNT: "2"
-    DATA_DIR: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4_smoke"
+    DATA_DIR: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4_split_v2_smoke"
     RECIPE_NAME: "locany_cpt_smoke.json"
-    ATTN_IMPLEMENTATION: "magi"
-    MAX_SEQ_LENGTH: "8192"
-    MAX_NUM_TOKENS_PER_SAMPLE: "8192"
-    MAX_NUM_TOKENS: "25600"
-    PACKING_BUFFER_SIZE: "32"
+    RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-smoke"
+    ATTN_IMPLEMENTATION: "sdpa"
+    MAX_SEQ_LENGTH: "7268"
+    MAX_NUM_TOKENS_PER_SAMPLE: "7268"
+    MAX_NUM_TOKENS: "7268"
+    PACKING_BUFFER_SIZE: "16"
     GRADIENT_ACCUMULATION_STEPS: "4"
     MAX_STEPS: "20"
     WARMUP_STEPS: "0"

@@ -19,7 +19,7 @@ held-out、精确核对样本与监督 token、按任务计算 train/eval CE、�
 ```bash
 python scripts/prepare_locany_cpt.py \
   --source-root /path/to/raw_data_v4.1_hl \
-  --output-dir /path/to/locany_cpt_v4 \
+  --output-dir /path/to/locany_cpt_v4_split_v2 \
   --recipe-name locany_cpt_train.json \
   --split-seed 20260826 \
   --val-fraction 0.02 \
@@ -27,6 +27,17 @@ python scripts/prepare_locany_cpt.py \
   --group-id-mode sha256 \
   --overwrite
 ```
+
+集群上不要复用上一轮的 `locany_cpt_v4`。仓库提供了可直接生成并完整校验
+train/val/val_fast、manifest 的命令；smoke 默认每任务先取 2000 条、val_fast 至少 10 条：
+
+```bash
+bash shell/prepare_locany_cpt_v2.sh h20 smoke
+bash shell/prepare_locany_cpt_v2.sh h20 formal
+```
+
+已有同名 v2 目录时命令会拒绝覆盖；只有明确要重建时才设置 `OVERWRITE=1`。A800
+文件系统使用 `a100` 参数；若原始数据不在默认位置，显式设置 `SOURCE_ROOT`。
 
 输出包括：
 
@@ -117,7 +128,7 @@ python scripts/simulate_locany_cpt_sampling.py \
 
 ```bash
 CPT_SAMPLING_MODE=sample_equal \
-RUN_NAME=locany-3b-ui-cpt-v4-h20x2-formal \
+RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x2-formal \
 bash shell/run_locany_cpt.sh h20 formal
 ```
 
@@ -132,8 +143,14 @@ mlx job submitv2 --path locany_cpt_v4_h20x2_formal_merlin.yaml
 
 两份 smoke 都先在 step 10 强制保存并退出 segment，再从同一 checkpoint 自动 resume 到
 step 20，因此一个 job 同时覆盖多卡训练与断点续训。H20×2 默认每 rank packed-token 上限
-25600、梯度累积 4；A800×4 默认 12800、梯度累积 2。`shell/run_locany_cpt.sh`
+7268、单样本与序列上限也为 7268、SDPA、packing buffer 16、梯度累积 4；
+A800×4 默认 SDPA + 7268/7268/12800、梯度累积 2。`shell/run_locany_cpt.sh`
 会先验证 train split，再将 split/length stats 复制到 run 的 `diagnostics/`。
+
+H20 的 Magi 8192/7280 已实测 OOM，Magi 6400 已出现 gather index 越界，因此 v2 H20
+smoke/formal 均不再把 Magi 或 25600 作为默认值。所有 v2 YAML 使用全新的
+`DATA_DIR=.../locany_cpt_v4_split_v2[_smoke]` 与带 `v2` 的 `RUN_NAME`；新实验从原始
+LocateAnything-3B checkpoint 开始，checkpoint-1549/1860 仅用于对照评测，禁止自动续训。
 
 训练运行时只按区间写聚合统计，不逐样本打印：
 
@@ -197,7 +214,9 @@ Trainer checkpoint 保存 optimizer、scheduler、random state，以及每 rank 
 行号并以非零状态退出。
 
 每个通过完整性校验的 checkpoint 还会由 rank 0 去重追加
-`diagnostics/cpt_eval_queue.jsonl`，标记待独立 job 执行的 held-out val_fast 评测。
+`diagnostics/cpt_eval_queue.jsonl`，标记待独立 job 执行的 held-out val_fast 评测。完成标记
+会先原子落盘、随后才发布 queue row，避免评测器抢到尚未完成的 checkpoint。queue row
+具有 pending/running/completed/failed 状态；失败项只能显式设置 `EVAL_RETRY_FAILED=1` 重试。
 
 ## 6. Held-out 评测
 
@@ -219,8 +238,31 @@ python scripts/eval_locany_cpt_learning.py \
   --metrics-jsonl "$RUN_DIR/diagnostics/cpt_eval_metrics.jsonl" \
   --output-dir "$RUN_DIR/eval/$(basename "$CKPT")" \
   --device cuda:0 \
-  --attn-implementation magi \
+  --attn-implementation sdpa \
+  --vision-attn-implementation sdpa \
   --teacher-forced
+```
+
+独立 queue consumer 已接入 Merlin。H20 smoke 完成 checkpoint-10→20 后先提交 smoke
+评测；它会消费两个 pending checkpoint，每任务至少 10 条 held-out，并要求 Base 与
+checkpoint 的 teacher-forced CE 非空、inference error 为 0：
+
+```bash
+mlx job submitv2 --path locany_cpt_v4_h20x1_smoke_eval_merlin.yaml
+```
+
+formal 训练期间按 checkpoint 提交下面的单卡 job；Base 结果按 manifest/protocol 缓存，
+同一验证集不会重复推理：
+
+```bash
+mlx job submitv2 --path locany_cpt_v4_h20x1_eval_merlin.yaml
+```
+
+也可在已经分配的单卡机器上消费指定 run：
+
+```bash
+RUN_DIR=/path/to/run DATA_DIR=/path/to/locany_cpt_v4_split_v2 \
+  bash shell/run_locany_cpt_eval_merlin.sh h20
 ```
 
 每个 checkpoint 输出 `predictions.jsonl`、`summary.json`、
@@ -287,6 +329,9 @@ python -m unittest \
   tests.test_cpt_checkpoint_selection \
   tests.test_cpt_overfitting \
   tests.test_cpt_excel \
+  tests.test_cpt_evaluator_end_to_end \
+  tests.test_cpt_eval_queue \
+  tests.test_cpt_smoke_validation \
   tests.test_locany_cpt \
   tests.test_locany_cpt_merlin
 ```
@@ -303,8 +348,14 @@ eval queue、三表 Excel 和跨硬件 schema：
 python scripts/validate_locany_cpt_smoke.py \
   --run a800=/path/to/a800-smoke-run \
   --run h20x2=/path/to/h20x2-smoke-run \
+  --require-eval \
+  --eval-samples-per-task 10 \
   --output /path/to/cpt_smoke_validation.json
 ```
+
+`--require-eval` 还会确认最终 checkpoint 的 queue 状态为 completed、十任务
+`eval_token_ce` 非空、推理错误为 0、task-macro 完整；启用 Excel 校验时还要求
+`CPTEvalMetrics` 表至少包含十任务加一行 macro，而不只是存在空的 sheet。
 
 常见失败含义：
 

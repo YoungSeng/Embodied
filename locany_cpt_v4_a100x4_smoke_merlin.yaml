@@ -3,7 +3,7 @@
 # the training profile remains named "a100" for compatibility.
 # Submit: mlx job submitv2 --path locany_cpt_v4_a100x4_smoke_merlin.yaml
 
-caption: 'LocateAnything UI CPT Smoke - A100 profile x4'
+caption: 'LocateAnything UI CPT v2 Smoke - A100 profile x4'
 
 jobDefVersion:
   entrypointMode: FULL_SCRIPT
@@ -17,7 +17,7 @@ jobDefVersion:
     imageVid: d8ap37f1enlcr23291ug
 
   lazyDownloadCode: true
-  name: 'locany-cpt-v4-a100x4-smoke'
+  name: 'locany-cpt-v4-v2-a100x4-smoke'
 
   resource:
     arnoldConfig:
@@ -61,8 +61,9 @@ jobRunParams:
 
   envsList:
     CUDA_DEVICES: "0,1,2,3"
-    DATA_DIR: "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4_smoke"
+    DATA_DIR: "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4_split_v2_smoke"
     RECIPE_NAME: "locany_cpt_smoke.json"
+    RUN_NAME: "locany-3b-ui-cpt-v4-v2-a100x4-smoke"
     ATTN_IMPLEMENTATION: "sdpa"
     MAX_SEQ_LENGTH: "7268"
     MAX_NUM_TOKENS_PER_SAMPLE: "7268"

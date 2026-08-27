@@ -458,17 +458,6 @@ def teacher_forced_main_ce(
         "labels": labels.to(inferencer.device),
         "return_dict": True,
     }
-
-
-def score_result(example: Example, prediction: str, error: str | None) -> dict[str, Any]:
-    metrics = score_task(example.task, prediction, example.target)
-    if error:
-        metrics["evaluation_error"] = 1.0
-        metrics["primary_metric"] = 0.0
-        primary_name = metrics.get("primary_name")
-        if isinstance(primary_name, str):
-            metrics[primary_name] = 0.0
-    return metrics
     attention_mask = inputs.get("attention_mask")
     if attention_mask is not None:
         model_inputs["attention_mask"] = attention_mask.to(inferencer.device)
@@ -498,6 +487,17 @@ def score_result(example: Example, prediction: str, error: str | None) -> dict[s
         "teacher_forced_main_tokens": token_count,
         "teacher_forced_main_token_ce": ce,
     }
+
+
+def score_result(example: Example, prediction: str, error: str | None) -> dict[str, Any]:
+    metrics = score_task(example.task, prediction, example.target)
+    if error:
+        metrics["evaluation_error"] = 1.0
+        metrics["primary_metric"] = 0.0
+        primary_name = metrics.get("primary_name")
+        if isinstance(primary_name, str):
+            metrics[primary_name] = 0.0
+    return metrics
 
 
 def run_model(

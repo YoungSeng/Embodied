@@ -79,19 +79,26 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
             self.assertIn('SAVE_STEPS: "1000000000"', text)
         self.assertIn('MAX_NUM_TOKENS: "12800"', a100)
         self.assertIn('ATTN_IMPLEMENTATION: "sdpa"', a100)
-        self.assertIn('MAX_NUM_TOKENS: "25600"', h20)
-        self.assertIn('ATTN_IMPLEMENTATION: "magi"', h20)
+        self.assertIn('MAX_SEQ_LENGTH: "7268"', h20)
+        self.assertIn('MAX_NUM_TOKENS_PER_SAMPLE: "7268"', h20)
+        self.assertIn('MAX_NUM_TOKENS: "7268"', h20)
+        self.assertIn('PACKING_BUFFER_SIZE: "16"', h20)
+        self.assertIn('ATTN_IMPLEMENTATION: "sdpa"', h20)
 
         h20x2 = (REPO_ROOT / "locany_cpt_v4_h20x2_formal_merlin.yaml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("caption: 'LocateAnything UI CPT Formal - H20x2'", h20x2)
-        self.assertIn("name: 'locany-cpt-v4-h20x2-formal'", h20x2)
+        self.assertIn("caption: 'LocateAnything UI CPT v2 Formal - H20x2 SDPA'", h20x2)
+        self.assertIn("name: 'locany-cpt-v4-v2-h20x2-formal'", h20x2)
         self.assertIn("cpu: 40", h20x2)
         self.assertIn("memory: 460800", h20x2)
         self.assertIn('GPU_COUNT: "2"', h20x2)
         self.assertIn('GRADIENT_ACCUMULATION_STEPS: "4"', h20x2)
-        self.assertIn('MAX_NUM_TOKENS: "25600"', h20x2)
+        self.assertIn('ATTN_IMPLEMENTATION: "sdpa"', h20x2)
+        self.assertIn('MAX_SEQ_LENGTH: "7268"', h20x2)
+        self.assertIn('MAX_NUM_TOKENS_PER_SAMPLE: "7268"', h20x2)
+        self.assertIn('MAX_NUM_TOKENS: "7268"', h20x2)
+        self.assertIn('PACKING_BUFFER_SIZE: "16"', h20x2)
 
         h20x2_smoke = (
             REPO_ROOT / "locany_cpt_v4_h20x2_smoke_merlin.yaml"
@@ -99,10 +106,20 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn('CPT_METRICS_INTERVAL: "5"', h20x2_smoke)
         self.assertIn('CPT_TABLE_INTERVAL: "20"', h20x2_smoke)
         self.assertIn('CPT_SMOKE_RESUME_STEP: "10"', h20x2_smoke)
+        self.assertIn('RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-smoke"', h20x2_smoke)
+        for text in (h20x2, h20x2_smoke):
+            self.assertIn("locany_cpt_v4_split_v2", text)
+            self.assertNotIn('ATTN_IMPLEMENTATION: "magi"', text)
+            self.assertNotIn('MAX_NUM_TOKENS: "25600"', text)
 
     def test_formal_defaults_keep_four_card_rank_batch_and_twelve_hour_saves(self):
         launcher = (REPO_ROOT / "shell" / "run_locany_cpt.sh").read_text(encoding="utf-8")
-        self.assertIn('GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"', launcher)
+        self.assertIn('DEFAULT_GRADIENT_ACCUMULATION_STEPS=4', launcher)
+        self.assertIn('DEFAULT_GRADIENT_ACCUMULATION_STEPS=2', launcher)
+        self.assertIn(
+            'GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-${DEFAULT_GRADIENT_ACCUMULATION_STEPS}}"',
+            launcher,
+        )
         self.assertIn('SAVE_EVERY_N_HOURS="${SAVE_EVERY_N_HOURS:-12}"', launcher)
         self.assertIn('MAX_STEPS="${MAX_STEPS:-20000}"', launcher)
         self.assertIn('GPU_COUNT="${GPU_COUNT:-4}"', launcher)
@@ -140,6 +157,37 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn("'version': 6", trainer)
         self.assertIn("truncation=not self.cpt_enabled", trainer)
         self.assertIn('"cpt_eval_queue.jsonl"', trainer)
+
+    def test_v2_data_and_eval_jobs_are_explicit(self):
+        prepare = (REPO_ROOT / "shell" / "prepare_locany_cpt_v2.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("locany_cpt_v4_split_v2_smoke", prepare)
+        self.assertIn("locany_cpt_val_fast.json", prepare)
+        self.assertIn("--minimum-records-per-dataset", prepare)
+        self.assertIn("--allow-manifest-subset", prepare)
+
+        eval_yaml = (REPO_ROOT / "locany_cpt_v4_h20x1_eval_merlin.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("gpu: 1", eval_yaml)
+        self.assertIn("NVIDIA_H20", eval_yaml)
+        self.assertIn("shell/run_locany_cpt_eval_merlin.sh h20", eval_yaml)
+        self.assertIn('EVAL_ATTN_IMPLEMENTATION: "sdpa"', eval_yaml)
+        self.assertIn('EVAL_SAMPLES_PER_TASK: "10"', eval_yaml)
+
+        smoke_eval_yaml = (
+            REPO_ROOT / "locany_cpt_v4_h20x1_smoke_eval_merlin.yaml"
+        ).read_text(encoding="utf-8")
+        self.assertIn('RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-smoke"', smoke_eval_yaml)
+        self.assertIn("locany_cpt_v4_split_v2_smoke", smoke_eval_yaml)
+        self.assertIn('EVAL_MAX_PENDING: "2"', smoke_eval_yaml)
+
+        eval_launcher = (
+            REPO_ROOT / "shell" / "run_locany_cpt_eval_merlin.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("scripts/run_locany_cpt_eval_queue.py", eval_launcher)
+        self.assertIn("--require-zero-inference-errors", eval_launcher)
 
 
 if __name__ == "__main__":

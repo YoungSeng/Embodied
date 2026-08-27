@@ -87,6 +87,7 @@ from eaglevl.train.cpt_sampling import (
     assert_sampling_resume_compatible,
     resolve_cpt_sampling,
 )
+from eaglevl.train.cpt_eval_queue import enqueue_pending_eval
 from PIL import Image, ImageFile, PngImagePlugin
 from torch.utils.data import Dataset, IterableDataset, DataLoader
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
@@ -1648,18 +1649,17 @@ class CheckpointCompletionCallback(TrainerCallback):
                         handle.write("\n")
                         handle.flush()
                         os.fsync(handle.fileno())
+                    # Publish the completion marker before the queue row.  An
+                    # independent evaluator may claim a row immediately, so
+                    # the queue itself must never advertise a partial save.
+                    os.replace(temporary, marker)
                     if _env_flag("LOCANY_CPT_MODE", default=False):
                         diagnostics = osp.join(args.output_dir, "diagnostics")
                         os.makedirs(diagnostics, exist_ok=True)
                         queue_path = osp.join(diagnostics, "cpt_eval_queue.jsonl")
-                        queued_steps = set()
-                        if osp.isfile(queue_path):
-                            with open(queue_path, "r", encoding="utf-8") as queue_handle:
-                                for line in queue_handle:
-                                    if line.strip():
-                                        queued_steps.add(int(json.loads(line)["step"]))
-                        if int(state.global_step) not in queued_steps:
-                            queue_row = {
+                        enqueue_pending_eval(
+                            Path(queue_path),
+                            {
                                 "schema_version": 1,
                                 "step": int(state.global_step),
                                 "checkpoint": checkpoint_dir,
@@ -1667,15 +1667,8 @@ class CheckpointCompletionCallback(TrainerCallback):
                                 "recommended_recipe": "locany_cpt_val_fast.json",
                                 "status": "pending",
                                 "created_at_unix": time.time(),
-                            }
-                            with open(queue_path, "a", encoding="utf-8") as queue_handle:
-                                queue_handle.write(
-                                    json.dumps(queue_row, ensure_ascii=False, sort_keys=True)
-                                    + "\n"
-                                )
-                                queue_handle.flush()
-                                os.fsync(queue_handle.fileno())
-                    os.replace(temporary, marker)
+                            },
+                        )
                     logger.info(
                         "[Checkpoint] COMPLETE step=%s path=%s details=%s warnings=%s",
                         state.global_step,

@@ -145,6 +145,12 @@ def parse_args() -> argparse.Namespace:
         default=32,
         help="0 validates every row",
     )
+    parser.add_argument(
+        "--minimum-records-per-dataset",
+        type=int,
+        default=1,
+        help="fail if any recipe entry has fewer records (default: 1)",
+    )
     parser.add_argument("--skip-image-check", action="store_true")
     parser.add_argument(
         "--split-manifest",
@@ -163,6 +169,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="enforce sample-equal recipe weights (alternative fixed modes may differ)",
     )
+    parser.add_argument(
+        "--allow-manifest-subset",
+        action="store_true",
+        help="allow a held-out recipe such as val_fast to contain a manifest subset",
+    )
     return parser.parse_args()
 
 
@@ -170,6 +181,16 @@ def main() -> int:
     args = parse_args()
     if args.records_per_dataset < 0:
         raise SystemExit("--records-per-dataset cannot be negative")
+    if args.minimum_records_per_dataset < 1:
+        raise SystemExit("--minimum-records-per-dataset must be positive")
+    if (
+        args.records_per_dataset
+        and args.records_per_dataset < args.minimum_records_per_dataset
+    ):
+        raise SystemExit(
+            "--records-per-dataset cannot be smaller than "
+            "--minimum-records-per-dataset"
+        )
     recipe_path = args.recipe.expanduser().resolve()
     recipe = json.loads(recipe_path.read_text(encoding="utf-8"))
     if not isinstance(recipe, dict) or not recipe:
@@ -225,8 +246,11 @@ def main() -> int:
                         ) from exc
                     checked_dataset += 1
                     checked_total += 1
-        if checked_dataset == 0:
-            raise SystemExit(f"{dataset_name}: no records found")
+        if checked_dataset < args.minimum_records_per_dataset:
+            raise SystemExit(
+                f"{dataset_name}: found {checked_dataset} records, expected at least "
+                f"{args.minimum_records_per_dataset}"
+            )
         print(f"{dataset_name:32s} checked={checked_dataset:6,d} weight={weight:g}")
 
     if args.require_equal_weights and max(weights) - min(weights) > 1e-12:
@@ -248,7 +272,11 @@ def main() -> int:
                 manifest_rows = int(
                     manifest_report["task_rows"].get(task, {}).get(manifest_split, 0)
                 )
-                if expected_rows and expected_rows != manifest_rows:
+                subset_is_valid = (
+                    args.allow_manifest_subset
+                    and 0 < expected_rows <= manifest_rows
+                )
+                if expected_rows and expected_rows != manifest_rows and not subset_is_valid:
                     mismatches[task] = {
                         "recipe_rows": expected_rows,
                         "manifest_rows": manifest_rows,

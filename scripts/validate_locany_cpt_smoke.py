@@ -71,6 +71,66 @@ def workbook_sheets(path: Path) -> list[str]:
     return [str(value.attrib["name"]) for value in root.findall("x:sheets/x:sheet", namespace)]
 
 
+def workbook_table_rows(path: Path) -> dict[str, int]:
+    """Return data-row counts without making openpyxl a validator dependency."""
+    output = {}
+    with zipfile.ZipFile(path) as archive:
+        for name in archive.namelist():
+            if not name.startswith("xl/tables/table") or not name.endswith(".xml"):
+                continue
+            root = ElementTree.fromstring(archive.read(name))
+            table_name = str(root.attrib.get("displayName") or root.attrib.get("name"))
+            ref = str(root.attrib.get("ref") or "")
+            end = ref.rsplit(":", 1)[-1]
+            digits = "".join(value for value in end if value.isdigit())
+            output[table_name] = max(int(digits or 1) - 1, 0)
+    return output
+
+
+def _eval_report(diagnostics: Path, step: int, samples_per_task: int) -> dict[str, Any]:
+    path = diagnostics / "cpt_eval_metrics.jsonl"
+    if not path.is_file():
+        raise RuntimeError(f"missing held-out eval metrics: {path}")
+    rows = [
+        row
+        for row in read_jsonl(path)
+        if int(row.get("step") or -1) == step and row.get("split") == "heldout"
+    ]
+    per_task = {str(row.get("task")): row for row in rows if row.get("task") in CPT_TASKS}
+    if set(per_task) != CPT_TASKS or len(per_task) != len(CPT_TASKS):
+        raise RuntimeError(
+            f"step={step} held-out eval task mismatch: tasks={sorted(per_task)}"
+        )
+    for task, row in per_task.items():
+        if row.get("eval_token_ce") is None:
+            raise RuntimeError(f"step={step} task={task} has no eval main-token CE")
+        if int(row.get("samples_per_task") or 0) < samples_per_task:
+            raise RuntimeError(
+                f"step={step} task={task} used fewer than {samples_per_task} samples"
+            )
+        metrics = row.get("metrics") or {}
+        if int(metrics.get("inference_error_count") or 0):
+            raise RuntimeError(
+                f"step={step} task={task} has inference errors: "
+                f"{metrics.get('inference_error_count')}"
+            )
+    macro_rows = [row for row in rows if row.get("task") == "__task_macro__"]
+    if len(macro_rows) != 1:
+        raise RuntimeError(f"step={step} requires exactly one held-out task-macro row")
+    macro = macro_rows[0]
+    if not macro.get("complete_ten_task_heldout"):
+        raise RuntimeError(f"step={step} held-out task macro is incomplete")
+    if macro.get("primary_metric") is None or macro.get("eval_token_ce") is None:
+        raise RuntimeError(f"step={step} held-out task macro lacks primary/CE")
+    return {
+        "step": step,
+        "tasks": sorted(per_task),
+        "samples_per_task": samples_per_task,
+        "task_macro_primary": macro["primary_metric"],
+        "task_macro_eval_main_token_ce": macro["eval_token_ce"],
+    }
+
+
 def _checkpoint_report(run_dir: Path, step: int, world_size: int) -> dict[str, Any]:
     checkpoint = run_dir / f"checkpoint-{step}"
     if not checkpoint.is_dir():
@@ -103,6 +163,8 @@ def validate_run(
     min_step: int = 20,
     resume_step: int = 10,
     require_excel: bool = True,
+    require_eval: bool = False,
+    eval_samples_per_task: int = 10,
 ) -> dict[str, Any]:
     run_dir = run_dir.expanduser().resolve()
     diagnostics = run_dir / "diagnostics"
@@ -182,15 +244,25 @@ def validate_run(
                 raise RuntimeError(f"task={task} final {field} is missing")
 
     queue_path = diagnostics / "cpt_eval_queue.jsonl"
-    queue_steps = {
-        int(row["step"])
-        for row in read_jsonl(queue_path)
-    } if queue_path.is_file() else set()
+    queue_rows = read_jsonl(queue_path) if queue_path.is_file() else []
+    queue_steps = {int(row["step"]) for row in queue_rows}
     required_queue_steps = {resume_step, final_step}
     if not required_queue_steps.issubset(queue_steps):
         raise RuntimeError(
             f"eval queue missing steps={sorted(required_queue_steps - queue_steps)}"
         )
+    eval_report = None
+    if require_eval:
+        completed_final = any(
+            int(row.get("step") or -1) == final_step
+            and row.get("status") == "completed"
+            for row in queue_rows
+        )
+        if not completed_final:
+            raise RuntimeError(
+                f"eval queue has no completed held-out result for checkpoint-{final_step}"
+            )
+        eval_report = _eval_report(diagnostics, final_step, eval_samples_per_task)
 
     checkpoints = {
         str(step): _checkpoint_report(run_dir, step, world_size)
@@ -204,6 +276,13 @@ def validate_run(
         sheets = workbook_sheets(workbook)
         if sheets != ["Overview", "TrainMetrics", "EvalMetrics"]:
             raise RuntimeError(f"unexpected workbook sheets={sheets}")
+        if require_eval:
+            table_rows = workbook_table_rows(workbook)
+            if int(table_rows.get("CPTEvalMetrics") or 0) < len(CPT_TASKS) + 1:
+                raise RuntimeError(
+                    "EvalMetrics workbook table has no complete ten-task held-out result: "
+                    f"{table_rows}"
+                )
     if not (run_dir / "done.txt").is_file():
         raise RuntimeError("final smoke segment did not write done.txt")
 
@@ -216,6 +295,7 @@ def validate_run(
         "final_schema": list(next(iter(final_schemas))),
         "checkpoints": checkpoints,
         "eval_queue_steps": sorted(queue_steps),
+        "heldout_eval": eval_report,
         "workbook_sheets": sheets,
     }
 
@@ -232,6 +312,8 @@ def main() -> int:
     parser.add_argument("--min-step", type=int, default=20)
     parser.add_argument("--resume-step", type=int, default=10)
     parser.add_argument("--no-require-excel", action="store_true")
+    parser.add_argument("--require-eval", action="store_true")
+    parser.add_argument("--eval-samples-per-task", type=int, default=10)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     reports = {}
@@ -244,6 +326,8 @@ def main() -> int:
             min_step=args.min_step,
             resume_step=args.resume_step,
             require_excel=not args.no_require_excel,
+            require_eval=args.require_eval,
+            eval_samples_per_task=args.eval_samples_per_task,
         )
     schemas = {name: report["final_schema"] for name, report in reports.items()}
     if len({tuple(value) for value in schemas.values()}) > 1:

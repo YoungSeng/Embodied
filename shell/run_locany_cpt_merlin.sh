@@ -87,10 +87,10 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 
 if [[ "${CPT_MODE}" == "smoke" ]]; then
-  export RUN_NAME="${RUN_NAME:-locany-3b-ui-cpt-v4-${MACHINE_TYPE}x${GPU_COUNT}-smoke-${JOB_ID}}"
+  export RUN_NAME="${RUN_NAME:-locany-3b-ui-cpt-v4-v2-${MACHINE_TYPE}x${GPU_COUNT}-smoke-${JOB_ID}}"
   export REPORT_TO="${REPORT_TO:-none}"
 else
-  export RUN_NAME="${RUN_NAME:-locany-3b-ui-cpt-v4-${MACHINE_TYPE}x${GPU_COUNT}-formal}"
+  export RUN_NAME="${RUN_NAME:-locany-3b-ui-cpt-v4-v2-${MACHINE_TYPE}x${GPU_COUNT}-formal}"
   export REPORT_TO="${REPORT_TO:-tensorboard}"
 fi
 
@@ -149,7 +149,11 @@ if not torch.cuda.is_available() or torch.cuda.device_count() != expected_gpu_co
         f"Merlin CPT job requires {expected_gpu_count} visible GPUs; "
         f"found {torch.cuda.device_count()}"
     )
-if machine == "h20" and importlib.util.find_spec("magi_attention") is None:
+if (
+    machine == "h20"
+    and os.environ.get("ATTN_IMPLEMENTATION", "sdpa").lower() == "magi"
+    and importlib.util.find_spec("magi_attention") is None
+):
     raise SystemExit("H20 CPT profile requires magi_attention")
 PY
 

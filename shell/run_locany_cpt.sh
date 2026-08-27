@@ -31,15 +31,22 @@ case "${MACHINE_TYPE}" in
     ;;
   h20)
     WORKSPACE="${WORKSPACE:-/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace}"
-    ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-magi}"
-    MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-8192}"
-    MAX_NUM_TOKENS_PER_SAMPLE="${MAX_NUM_TOKENS_PER_SAMPLE:-8192}"
-    MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-25600}"
-    PACKING_BUFFER_SIZE="${PACKING_BUFFER_SIZE:-32}"
+    # H20 Magi profiles at 8192/7280 OOM and 6400 hits a gather-index
+    # failure. Keep the launcher default on the empirically runnable profile.
+    ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
+    MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-7268}"
+    MAX_NUM_TOKENS_PER_SAMPLE="${MAX_NUM_TOKENS_PER_SAMPLE:-7268}"
+    MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-7268}"
+    PACKING_BUFFER_SIZE="${PACKING_BUFFER_SIZE:-16}"
     ;;
 esac
 
 GPU_COUNT="${GPU_COUNT:-4}"
+if [[ "${MACHINE_TYPE}" == "h20" && "${GPU_COUNT}" == "2" ]]; then
+  DEFAULT_GRADIENT_ACCUMULATION_STEPS=4
+else
+  DEFAULT_GRADIENT_ACCUMULATION_STEPS=2
+fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 IFS=',' read -r -a _LOCANY_CPT_GPUS <<< "${CUDA_VISIBLE_DEVICES}"
@@ -49,7 +56,7 @@ if (( ${#_LOCANY_CPT_GPUS[@]} != GPU_COUNT )); then
 fi
 
 if [[ "${CPT_MODE}" == "smoke" ]]; then
-  DATA_DIR="${DATA_DIR:-${WORKSPACE}/data/locany_cpt_v4_smoke}"
+  DATA_DIR="${DATA_DIR:-${WORKSPACE}/data/locany_cpt_v4_split_v2_smoke}"
   RECIPE_NAME="${RECIPE_NAME:-locany_cpt_smoke.json}"
   MAX_STEPS="${MAX_STEPS:-20}"
   SAVE_STEPS="${SAVE_STEPS:-20}"
@@ -59,7 +66,7 @@ if [[ "${CPT_MODE}" == "smoke" ]]; then
   DEFAULT_CPT_METRICS_INTERVAL=5
   DEFAULT_CPT_TABLE_INTERVAL=20
 else
-  DATA_DIR="${DATA_DIR:-${WORKSPACE}/data/locany_cpt_v4}"
+  DATA_DIR="${DATA_DIR:-${WORKSPACE}/data/locany_cpt_v4_split_v2}"
   RECIPE_NAME="${RECIPE_NAME:-locany_cpt_train.json}"
   MAX_STEPS="${MAX_STEPS:-20000}"
   # Time-based callback performs periodic saves; keep the ordinary step trigger out of the way.
@@ -74,7 +81,7 @@ fi
 META_PATH="${META_PATH:-${DATA_DIR}/recipe/${RECIPE_NAME}}"
 MODEL_PATH="${MODEL_PATH:-${WORKSPACE}/hf_home/hub/models--nvidia--LocateAnything-3B/snapshots/c32291ca5e996f5a7a485845b4f57a233936bba0}"
 OUTPUT_BASE="${OUTPUT_BASE:-${WORKSPACE}/gui_models}"
-RUN_NAME="${RUN_NAME:-locany-3b-ui-cpt-v4-${MACHINE_TYPE}x${GPU_COUNT}-${CPT_MODE}}"
+RUN_NAME="${RUN_NAME:-locany-3b-ui-cpt-v4-v2-${MACHINE_TYPE}x${GPU_COUNT}-${CPT_MODE}}"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_BASE}/${RUN_NAME}}"
 ENV_DIR="${ENV_DIR:-${WORKSPACE}/conda_envs/LocateAnything}"
 
@@ -114,7 +121,7 @@ export PROJECT_ROOT WORKSPACE ENV_DIR MODEL_PATH DATA_DIR META_PATH OUTPUT_BASE 
 export ATTN_IMPLEMENTATION MAX_SEQ_LENGTH MAX_NUM_TOKENS_PER_SAMPLE MAX_NUM_TOKENS
 export PACKING_BUFFER_SIZE MAX_STEPS SAVE_STEPS SAVE_EVERY_N_HOURS SAVE_TOTAL_LIMIT
 export GPUS="${GPU_COUNT}" GPU_COUNT
-export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"
+export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-${DEFAULT_GRADIENT_ACCUMULATION_STEPS}}"
 export LEARNING_RATE="${LEARNING_RATE:-5e-6}"
 export WARMUP_STEPS="${WARMUP_STEPS:-${DEFAULT_WARMUP_STEPS}}"
 export WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"

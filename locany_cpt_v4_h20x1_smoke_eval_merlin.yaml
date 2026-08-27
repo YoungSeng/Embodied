@@ -1,7 +1,8 @@
-# Merlin formal training: LocateAnything-3B UI CPT v2, HL H20 x2 safe SDPA profile.
-# Submit: mlx job submitv2 --path locany_cpt_v4_h20x2_formal_merlin.yaml
+# Independent acceptance evaluator for the deterministic H20x2 CPT v2 smoke run.
+# Submit only after checkpoint-20 exists:
+# mlx job submitv2 --path locany_cpt_v4_h20x1_smoke_eval_merlin.yaml
 
-caption: 'LocateAnything UI CPT v2 Formal - H20x2 SDPA'
+caption: 'LocateAnything UI CPT v2 Smoke Held-out Eval - H20x1 SDPA'
 
 jobDefVersion:
   entrypointMode: FULL_SCRIPT
@@ -15,7 +16,7 @@ jobDefVersion:
     imageVid: d8ap37f1enlcr23291ug
 
   lazyDownloadCode: true
-  name: 'locany-cpt-v4-v2-h20x2-formal'
+  name: 'locany-cpt-v4-v2-h20x1-smoke-heldout-eval'
 
   resource:
     arnoldConfig:
@@ -35,11 +36,11 @@ jobDefVersion:
       roles:
         - name: worker
           num: 1
-          cpu: 40
-          gpu: 2
+          cpu: 24
+          gpu: 1
           gpuv: NVIDIA_H20
           queueName: compute-329-hl-cloudnative-ai-iesqa.llm4se-guarantee
-          memory: 460800
+          memory: 230400
           ports: 1
     backend: ARNOLD
 
@@ -51,31 +52,22 @@ jobRunParams:
   entrypointFullScript: |
     set -Eeuo pipefail
     PROJECT_ROOT=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
-    test -f "${PROJECT_ROOT}/shell/run_locany_cpt_merlin.sh"
+    test -f "${PROJECT_ROOT}/shell/run_locany_cpt_eval_merlin.sh"
     cd "${PROJECT_ROOT}"
     export PROJECT_ROOT
     export WORKSPACE=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace
-    export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES:-0,1}"
-    exec bash shell/run_locany_cpt_merlin.sh h20 formal
+    export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES:-0}"
+    exec bash shell/run_locany_cpt_eval_merlin.sh h20
 
   envsList:
-    CUDA_DEVICES: "0,1"
-    GPU_COUNT: "2"
-    DATA_DIR: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4_split_v2"
-    RECIPE_NAME: "locany_cpt_train.json"
-    RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-formal"
-    ATTN_IMPLEMENTATION: "sdpa"
-    MAX_SEQ_LENGTH: "7268"
-    MAX_NUM_TOKENS_PER_SAMPLE: "7268"
-    MAX_NUM_TOKENS: "7268"
-    PACKING_BUFFER_SIZE: "16"
-    GRADIENT_ACCUMULATION_STEPS: "4"
-    MAX_STEPS: "20000"
-    WARMUP_STEPS: "500"
-    LEARNING_RATE: "5e-6"
-    SAVE_STEPS: "1000000000"
-    SAVE_EVERY_N_HOURS: "12"
-    SAVE_TOTAL_LIMIT: "20"
-    REPORT_TO: "tensorboard"
+    CUDA_DEVICES: "0"
+    DATA_DIR: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4_split_v2_smoke"
+    RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-smoke"
+    EVAL_SAMPLES_PER_TASK: "10"
+    EVAL_MAX_PENDING: "2"
+    EVAL_ATTN_IMPLEMENTATION: "sdpa"
+    EVAL_VISION_ATTN_IMPLEMENTATION: "sdpa"
+    EVAL_DTYPE: "bf16"
+    EVAL_MAX_NEW_TOKENS: "1024"
 
 namespace: /user/sicheng.yang

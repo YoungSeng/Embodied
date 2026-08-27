@@ -5,11 +5,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from eaglevl.train.cpt_excel import build_cpt_workbook
 from scripts.validate_locany_cpt_smoke import CPT_TASKS, validate_run
 
 
 class CPTSmokeValidationTest(unittest.TestCase):
-    def _fixture(self, root: Path) -> Path:
+    def _fixture(self, root: Path, *, with_eval: bool = False) -> Path:
         diagnostics = root / "diagnostics"
         diagnostics.mkdir(parents=True)
         (diagnostics / "cpt_run_config.json").write_text(
@@ -54,9 +55,41 @@ class CPTSmokeValidationTest(unittest.TestCase):
             "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
         )
         (diagnostics / "cpt_eval_queue.jsonl").write_text(
-            json.dumps({"step": 10}) + "\n" + json.dumps({"step": 20}) + "\n",
+            json.dumps({"step": 10, "status": "pending"})
+            + "\n"
+            + json.dumps({"step": 20, "status": "completed" if with_eval else "pending"})
+            + "\n",
             encoding="utf-8",
         )
+        if with_eval:
+            eval_rows = []
+            for task in sorted(CPT_TASKS):
+                eval_rows.append(
+                    {
+                        "step": 20,
+                        "split": "heldout",
+                        "task": task,
+                        "samples_per_task": 10,
+                        "eval_token_ce": 1.5,
+                        "primary_metric": 0.8,
+                        "metrics": {"inference_error_count": 0},
+                    }
+                )
+            eval_rows.append(
+                {
+                    "step": 20,
+                    "split": "heldout",
+                    "task": "__task_macro__",
+                    "samples_per_task": 10,
+                    "eval_token_ce": 1.5,
+                    "primary_metric": 0.8,
+                    "complete_ten_task_heldout": True,
+                }
+            )
+            (diagnostics / "cpt_eval_metrics.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in eval_rows),
+                encoding="utf-8",
+            )
         for step in (10, 20):
             checkpoint = root / f"checkpoint-{step}"
             checkpoint.mkdir()
@@ -88,6 +121,17 @@ class CPTSmokeValidationTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(RuntimeError, "sample identity"):
                 validate_run(root, require_excel=False)
+
+    def test_require_eval_checks_real_ten_task_metrics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self._fixture(Path(temporary), with_eval=True)
+            self.assertTrue(build_cpt_workbook(root / "diagnostics"))
+            report = validate_run(
+                root,
+                require_eval=True,
+                eval_samples_per_task=10,
+            )
+            self.assertEqual(report["heldout_eval"]["task_macro_primary"], 0.8)
 
 
 if __name__ == "__main__":

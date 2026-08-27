@@ -1,7 +1,7 @@
 # Merlin formal training: LocateAnything-3B UI CPT, YG four-card SDPA profile.
 # Submit: mlx job submitv2 --path locany_cpt_v4_a100x4_formal_merlin.yaml
 
-caption: 'LocateAnything UI CPT Formal - A100 profile x4'
+caption: 'LocateAnything UI CPT v2 Formal - A100 profile x4'
 
 jobDefVersion:
   entrypointMode: FULL_SCRIPT
@@ -15,7 +15,7 @@ jobDefVersion:
     imageVid: d8ap37f1enlcr23291ug
 
   lazyDownloadCode: true
-  name: 'locany-cpt-v4-a100x4-formal'
+  name: 'locany-cpt-v4-v2-a100x4-formal'
 
   resource:
     arnoldConfig:
@@ -59,9 +59,9 @@ jobRunParams:
 
   envsList:
     CUDA_DEVICES: "0,1,2,3"
-    DATA_DIR: "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4"
+    DATA_DIR: "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4_split_v2"
     RECIPE_NAME: "locany_cpt_train.json"
-    RUN_NAME: "locany-3b-ui-cpt-v4-a100x4-formal"
+    RUN_NAME: "locany-3b-ui-cpt-v4-v2-a100x4-formal"
     ATTN_IMPLEMENTATION: "sdpa"
     MAX_SEQ_LENGTH: "7268"
     MAX_NUM_TOKENS_PER_SAMPLE: "7268"
