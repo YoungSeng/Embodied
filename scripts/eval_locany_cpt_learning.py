@@ -54,7 +54,7 @@ from scripts.inference_ui_defect_locany import LocateAnythingInferencer  # noqa:
 
 
 IMAGE_TOKEN_RE = re.compile(r"<image(?:-\d+)?>")
-EVALUATOR_PROTOCOL_VERSION = 3
+EVALUATOR_PROTOCOL_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -451,6 +451,9 @@ def teacher_forced_main_ce(
         "input_ids": input_ids.to(inferencer.device),
         "labels": labels.to(inferencer.device),
         "return_dict": True,
+        # Teacher-forced CE never consumes KV state.  Disabling it also avoids
+        # allocating a full prompt cache for every validation example.
+        "use_cache": False,
     }
     attention_mask = inputs.get("attention_mask")
     if attention_mask is not None:
@@ -470,7 +473,25 @@ def teacher_forced_main_ce(
         model_inputs["image_flags"] = torch.tensor(
             [len(grid)], dtype=torch.long, device=inferencer.device
         )
-    outputs = inferencer.model(**model_inputs)
+    # The vendored Qwen2 SDPA implementation in the original Base snapshot
+    # chooses its mask builder from ``Qwen2Model.training``.  The eval branch
+    # assumes input_ids is present, but LocateAnything correctly calls the LM
+    # with visually fused inputs_embeds, making input_ids=None.  Select the
+    # training/teacher-forced mask branch only on the decoder container; do not
+    # recurse through children, so attention/MLP/dropout modules remain in eval
+    # mode.  Always restore the flag even when forward raises.
+    language_model = getattr(inferencer.model, "language_model", None)
+    text_decoder = getattr(language_model, "model", None)
+    previous_decoder_training = (
+        bool(text_decoder.training) if text_decoder is not None else None
+    )
+    if text_decoder is not None:
+        text_decoder.training = True
+    try:
+        outputs = inferencer.model(**model_inputs)
+    finally:
+        if text_decoder is not None:
+            text_decoder.training = previous_decoder_training
     loss = getattr(outputs, "lm_loss", None)
     if loss is None:
         loss = getattr(outputs, "loss", None)

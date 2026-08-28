@@ -150,9 +150,16 @@ class NumpyGridProcessor(FakeProcessor):
 class FakeModel:
     def __init__(self):
         self.calls = []
+        self.language_model = SimpleNamespace(
+            model=SimpleNamespace(training=False)
+        )
+        self.decoder_training_during_call = []
 
     def __call__(self, **kwargs):
         self.calls.append(kwargs)
+        self.decoder_training_during_call.append(
+            self.language_model.model.training
+        )
         return SimpleNamespace(lm_loss=FakeTensor(2.5))
 
 
@@ -228,6 +235,9 @@ class CPTEvaluatorEndToEndTest(unittest.TestCase):
         self.assertIn("pixel_values", model.calls[0])
         self.assertIn("image_grid_hws", model.calls[0])
         self.assertIn("image_flags", model.calls[0])
+        self.assertIs(model.calls[0]["use_cache"], False)
+        self.assertEqual(model.decoder_training_during_call, [True])
+        self.assertIs(model.language_model.model.training, False)
 
     def test_teacher_forced_converts_numpy_image_grid_to_torch(self):
         evaluator = load_evaluator_module()

@@ -127,9 +127,14 @@ bash shell/run_locany_cpt_eval_merlin.sh a100
 新日志应出现
 `generation implementation: eaglevl.utils.locany.modeling_locateanything (repository)`；
 Base 和当前 CPT evaluator 还应打印 `generation UI relation : False`；
-评测协议 v3 会自动使用新的 Base cache key，不会复用旧版失败缓存。若仍失败，日志会明确
+评测协议 v4 会自动使用新的 Base cache key，不会复用旧版失败缓存。若仍失败，日志会明确
 打印 `phase=generation|teacher_forced` 以及模型内部完整 traceback，不能再只保留顶层
 `NoneType` 文本。
+
+teacher-forced forward 会关闭 KV cache，并仅将 Qwen decoder 容器临时切到训练时的
+packed/causal mask 构造分支；其 attention、MLP 和 dropout 子层仍保持 eval，forward
+结束后 decoder 状态也会恢复。这个兼容处理用于解决旧 Base remote code 在
+`inputs_embeds` 路径错误下标访问 `input_ids=None` 的问题，不会改变训练代码。
 
 ### 0.4 YG：执行 A800 最终 validator
 
