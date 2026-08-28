@@ -451,6 +451,10 @@ def inference_namespace(args: argparse.Namespace, model_path: str) -> SimpleName
         local_files_only=not args.allow_download,
         use_fast_processor=True,
         enable_ui_relation=False,
+        # CPT held-out evaluation intentionally uses the original generation
+        # path for both Base and checkpoints.  Keep PBD disabled explicitly as
+        # LocateAnythingInferencer's standalone CLI defaults it to enabled.
+        enable_pbd=False,
     )
 
 

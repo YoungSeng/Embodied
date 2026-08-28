@@ -937,6 +937,11 @@ def decode_generation_output(
 
 class LocateAnythingInferencer:
     def __init__(self, args: argparse.Namespace):
+        # Some programmatic callers predate the standalone --enable-pbd flag.
+        # Preserve their original generation behavior instead of failing while
+        # printing the configuration before the model is loaded.
+        if not hasattr(args, "enable_pbd"):
+            args.enable_pbd = False
         validate_device(args.device)
         self.args = args
         self.device = args.device

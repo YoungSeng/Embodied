@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import io
 import sys
@@ -238,6 +239,47 @@ class CPTEvaluatorEndToEndTest(unittest.TestCase):
         self.assertIs(model.calls[0]["use_cache"], False)
         self.assertEqual(model.decoder_training_during_call, [True])
         self.assertIs(model.language_model.model.training, False)
+
+    def test_inference_namespace_disables_relation_and_pbd_for_cpt_eval(self):
+        evaluator = load_evaluator_module()
+        args = SimpleNamespace(
+            processor_path=None,
+            base_model="/models/base",
+            device="cuda:0",
+            dtype="bf16",
+            attn_implementation="sdpa",
+            vision_attn_implementation="flash_attention_2",
+            max_new_tokens=1024,
+            allow_download=False,
+        )
+
+        namespace = evaluator.inference_namespace(args, "/models/checkpoint-0")
+
+        self.assertEqual(namespace.checkpoint, "/models/checkpoint-0")
+        self.assertFalse(namespace.enable_ui_relation)
+        self.assertFalse(namespace.enable_pbd)
+
+        tree = ast.parse(INFERENCER.read_text(encoding="utf-8"))
+        inferencer_class = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "LocateAnythingInferencer"
+        )
+        required_args = set()
+        for node in ast.walk(inferencer_class):
+            if not isinstance(node, ast.Attribute):
+                continue
+            if isinstance(node.value, ast.Name) and node.value.id == "args":
+                required_args.add(node.attr)
+            if (
+                isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "self"
+                and node.value.attr == "args"
+            ):
+                required_args.add(node.attr)
+        self.assertEqual(required_args.difference(vars(namespace)), set())
 
     def test_hash_subset_keeps_all_five_ui_defect_classes_when_available(self):
         evaluator = load_evaluator_module()
