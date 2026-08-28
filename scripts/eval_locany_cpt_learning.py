@@ -35,7 +35,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from eaglevl.train.cpt_eval_metrics import (  # noqa: E402
+    UI_DEFECT_CLASSES,
     aggregate_scores,
+    canonical_defect_label,
     parse_action_type,
     parse_boxes,
     parse_labeled_boxes,
@@ -55,7 +57,7 @@ from scripts.inference_ui_defect_locany import LocateAnythingInferencer  # noqa:
 
 
 IMAGE_TOKEN_RE = re.compile(r"<image(?:-\d+)?>")
-EVALUATOR_PROTOCOL_VERSION = 4
+EVALUATOR_PROTOCOL_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -246,14 +248,53 @@ def _select_examples(
     if strategy == "first":
         return candidates[:count]
     if strategy == "hash":
-        return sorted(
+        ordered = sorted(
             candidates,
             key=lambda value: stable_hash(seed, value.group_id, value.record_id),
-        )[:count]
-    rng = random.Random(stable_hash(seed, task))
-    candidates = list(candidates)
-    rng.shuffle(candidates)
-    return candidates[:count]
+        )
+    else:
+        rng = random.Random(stable_hash(seed, task))
+        ordered = list(candidates)
+        rng.shuffle(ordered)
+    if task != "ui_defect" or count < len(UI_DEFECT_CLASSES):
+        return ordered[:count]
+
+    # A small hash subset can otherwise omit a rare defect family even though
+    # val_fast itself is stratified. Select at least one positive image for
+    # each available canonical class, then fill in deterministic hash order.
+    labels_by_key = {
+        example.key: {
+            canonical_defect_label(item["label"])
+            for item in parse_labeled_boxes(example.target)
+        }
+        for example in ordered
+    }
+    selected: list[Example] = []
+    selected_keys: set[str] = set()
+    covered: set[str] = set()
+    for label in UI_DEFECT_CLASSES:
+        if label in covered:
+            continue
+        candidate = next(
+            (
+                example
+                for example in ordered
+                if example.key not in selected_keys
+                and label in labels_by_key[example.key]
+            ),
+            None,
+        )
+        if candidate is None:
+            continue
+        selected.append(candidate)
+        selected_keys.add(candidate.key)
+        covered.update(labels_by_key[candidate.key])
+    selected.extend(
+        example
+        for example in ordered
+        if example.key not in selected_keys
+    )
+    return selected[:count]
 
 
 def load_examples(
@@ -758,6 +799,44 @@ def summarize(
     }
 
 
+def print_ui_defect_breakdown(model_label: str, summary: dict[str, Any]) -> None:
+    metrics = summary.get("per_task", {}).get("ui_defect")
+    if not isinstance(metrics, dict):
+        return
+
+    def display(value: Any) -> str:
+        return f"{float(value):.4f}" if isinstance(value, (int, float)) else "-"
+
+    print(f"\n[UI_DEFECT METRICS] model={model_label}", flush=True)
+    print(
+        "class                  image_P image_R image_F1 | bbox_P bbox_R bbox_F1",
+        flush=True,
+    )
+    for label in UI_DEFECT_CLASSES:
+        row = metrics.get("per_class", {}).get(label, {})
+        image = row.get("image", {})
+        bbox = row.get("bbox", {})
+        class_name = f"{label}({row.get('display_label', label)})"
+        print(
+            f"{class_name:30s} "
+            f"{display(image.get('precision')):>7s} "
+            f"{display(image.get('recall')):>7s} "
+            f"{display(image.get('f1')):>8s} | "
+            f"{display(bbox.get('precision')):>6s} "
+            f"{display(bbox.get('recall')):>6s} "
+            f"{display(bbox.get('f1')):>7s}",
+            flush=True,
+        )
+    print(
+        "overall "
+        f"image_macro_f1={display(metrics.get('defect_image_macro_f1'))} "
+        f"image_micro_f1={display(metrics.get('defect_image_micro_f1'))} "
+        f"bbox_macro_f1@0.5={display(metrics.get('defect_bbox_macro_f1_50'))} "
+        f"bbox_micro_f1@0.5={display(metrics.get('defect_bbox_micro_f1_50'))}",
+        flush=True,
+    )
+
+
 def parsed_value(task: str, text: str) -> Any:
     if task == "vqa":
         return parse_vqa_label(text)
@@ -1018,6 +1097,7 @@ def build_eval_metric_rows(
     base_per_task = summary["base"].get("per_task", {})
     checkpoint_per_task = summary["checkpoint_metrics"].get("per_task", {})
     evaluation_protocol_id = stable_hash(
+        EVALUATOR_PROTOCOL_VERSION,
         summary["manifest_id"],
         args.eval_split,
         args.subset_strategy,
@@ -1074,6 +1154,7 @@ def build_eval_metric_rows(
             ),
             "eval_loss_tokens": metrics.get("eval_main_loss_tokens"),
             "metrics": metrics,
+            "base_metrics": base_per_task.get(task, {}),
         }
         rows.append(row)
 
@@ -1199,6 +1280,8 @@ def main() -> int:
     checkpoint_results = run_model("checkpoint", args.checkpoint, examples, args)
     base_summary = summarize(examples, base_results, split=args.eval_split)
     checkpoint_summary = summarize(examples, checkpoint_results, split=args.eval_split)
+    print_ui_defect_breakdown("base", base_summary)
+    print_ui_defect_breakdown("checkpoint", checkpoint_summary)
     apply_manual_referring_review(checkpoint_summary, args.manual_review_jsonl)
     summary = {
         "schema_version": 2,

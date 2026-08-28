@@ -126,6 +126,7 @@ echo "run_name         : ${RUN_NAME}"
 echo "visible_gpus     : ${CUDA_VISIBLE_DEVICES}"
 echo "local_cache      : ${CACHE_ROOT}"
 echo "launcher_log     : ${SHARED_RUNTIME_DIR}/launcher.log"
+echo "integrated_eval  : ${CPT_INTEGRATED_EVAL:-0}"
 git rev-parse --short HEAD 2>/dev/null || true
 bash -n "${PROJECT_ROOT}/shell/run_locany_cpt.sh"
 bash -n "${PROJECT_ROOT}/shell/train_locany_ui_defect.sh"
@@ -175,8 +176,82 @@ run_training_phase() {
   return "${phase_exit_code}"
 }
 
+run_integrated_eval_phase() {
+  local phase_name="$1"
+  local formal_output_dir="$2"
+  local eval_exit_code
+  echo "===== Start ${MACHINE_TYPE} ${CPT_MODE} integrated eval phase=${phase_name} ====="
+  set +e
+  CUDA_VISIBLE_DEVICES=0 \
+  RUN_DIR="${formal_output_dir}" \
+  RUN_NAME="${RUN_NAME}" \
+  DATA_DIR="${DATA_DIR}" \
+  EVAL_MAX_PENDING="${EVAL_MAX_PENDING:-20}" \
+  EVAL_SAMPLES_PER_TASK="${EVAL_SAMPLES_PER_TASK:-10}" \
+  EVAL_RETRY_FAILED="${EVAL_RETRY_FAILED:-1}" \
+  bash "${PROJECT_ROOT}/shell/run_locany_cpt_eval_merlin.sh" "${MACHINE_TYPE}" \
+    2>&1 | tee -a "${LAUNCH_LOG}"
+  eval_exit_code="${PIPESTATUS[0]}"
+  set -e
+  echo "EVAL_PHASE=${phase_name} EXIT_CODE=${eval_exit_code}"
+  return "${eval_exit_code}"
+}
+
 SMOKE_RESUME_STEP="${CPT_SMOKE_RESUME_STEP:-0}"
-if [[ "${CPT_MODE}" == "smoke" && "${SMOKE_RESUME_STEP}" -gt 0 ]]; then
+if [[ "${CPT_MODE}" == "formal" && "${CPT_INTEGRATED_EVAL:-0}" == "1" ]]; then
+  export LOCANY_SEGMENT_MODE=1
+  export LOCANY_STOP_AFTER_PERIODIC_SAVE=1
+  export DATA_DIR="${DATA_DIR:-${WORKSPACE}/data/locany_cpt_v4_split_v2}"
+  FORMAL_OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_BASE:-${WORKSPACE}/gui_models}/${RUN_NAME}}"
+  FORMAL_MAX_STEPS="${MAX_STEPS:-20000}"
+  SEGMENT_INDEX=0
+  if [[ -f "${FORMAL_OUTPUT_DIR}/diagnostics/cpt_eval_queue.jsonl" ]]; then
+    # A resubmitted job repairs/evaluates an already completed checkpoint
+    # before spending another six-hour training segment.
+    run_integrated_eval_phase "pre-resume-backlog" "${FORMAL_OUTPUT_DIR}"
+  fi
+  while true; do
+    SEGMENT_INDEX=$((SEGMENT_INDEX + 1))
+    if run_training_phase "formal-segment-${SEGMENT_INDEX}"; then
+      :
+    else
+      TRAIN_EXIT_CODE=$?
+      echo "TRAIN_EXIT_CODE=${TRAIN_EXIT_CODE}"
+      echo "LAUNCH_LOG=${LAUNCH_LOG}"
+      exit "${TRAIN_EXIT_CODE}"
+    fi
+
+    LATEST_STEP="$(
+      "${ENV_DIR}/bin/python" "${PROJECT_ROOT}/scripts/locany_ui5_checkpoint.py" \
+        latest \
+        --output-dir "${FORMAL_OUTPUT_DIR}" \
+        --require-resume \
+        --expected-ranks "${GPU_COUNT}" \
+        --field step
+    )"
+    if [[ ! "${LATEST_STEP}" =~ ^[0-9]+$ || "${LATEST_STEP}" -le 0 ]]; then
+      echo "ERROR: integrated eval found no resumable checkpoint after segment ${SEGMENT_INDEX}: ${LATEST_STEP}" >&2
+      exit 31
+    fi
+    echo "INTEGRATED_EVAL_CHECKPOINT_STEP=${LATEST_STEP}"
+
+    if run_integrated_eval_phase "checkpoint-${LATEST_STEP}" "${FORMAL_OUTPUT_DIR}"; then
+      :
+    else
+      EVAL_EXIT_CODE=$?
+      echo "EVAL_EXIT_CODE=${EVAL_EXIT_CODE}"
+      echo "Training checkpoint is resumable; fix eval and resubmit the same formal job."
+      echo "LAUNCH_LOG=${LAUNCH_LOG}"
+      exit "${EVAL_EXIT_CODE}"
+    fi
+
+    if (( LATEST_STEP >= FORMAL_MAX_STEPS )); then
+      echo "INTEGRATED_FORMAL_COMPLETE_STEP=${LATEST_STEP}"
+      break
+    fi
+    echo "===== Resume training after integrated held-out eval at step ${LATEST_STEP} ====="
+  done
+elif [[ "${CPT_MODE}" == "smoke" && "${SMOKE_RESUME_STEP}" -gt 0 ]]; then
   SMOKE_OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_BASE:-${WORKSPACE}/gui_models}/${RUN_NAME}}"
   SMOKE_RESUME_CHECKPOINT="${SMOKE_OUTPUT_DIR}/checkpoint-${SMOKE_RESUME_STEP}"
   export LOCANY_SEGMENT_MODE=1

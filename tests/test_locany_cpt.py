@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +20,8 @@ from eaglevl.train.cpt_sampling import (
     resolve_cpt_sampling,
 )
 from eaglevl.train.checkpoint_schedule import PeriodicCheckpointSchedule
+import prepare_locany_cpt
+import split_locany_cpt
 from prepare_locany_cpt import extract_image_size, extract_input_size, normalize_box, normalize_record
 from simulate_locany_cpt_sampling import simulate
 
@@ -42,6 +46,24 @@ def _write_jsonl(path: Path, record: dict):
 
 
 class LocateAnythingCPTTest(unittest.TestCase):
+    def test_recipe_fsync_falls_back_only_for_unsupported_filesystems(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "payload.tmp"
+            for module in (prepare_locany_cpt, split_locany_cpt):
+                with self.subTest(module=module.__name__), path.open("w") as handle:
+                    with mock.patch.object(
+                        module.os,
+                        "fsync",
+                        side_effect=OSError(errno.ENOSYS, "Function not implemented"),
+                    ), self.assertWarns(UserWarning):
+                        module.best_effort_fsync(handle, path)
+                    with mock.patch.object(
+                        module.os,
+                        "fsync",
+                        side_effect=OSError(errno.EIO, "I/O error"),
+                    ), self.assertRaises(OSError):
+                        module.best_effort_fsync(handle, path)
+
     def test_sampling_simulation_accounts_for_post_skip_exposure(self):
         recipe = {
             "locany_cpt_small": {

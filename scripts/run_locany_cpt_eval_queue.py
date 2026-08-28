@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from eaglevl.train.cpt_eval_queue import claim_next_eval, finish_eval
+from eaglevl.train.cpt_eval_metrics import UI_DEFECT_CLASSES
 from eaglevl.train.cpt_observability import CPT_TASKS
 
 
@@ -87,6 +88,22 @@ def validate_eval_summary(
                     f"{label} task={task} inference_error_count="
                     f"{metrics.get('inference_error_count')}"
                 )
+        defect = per_task["ui_defect"]
+        defect_classes = defect.get("per_class", {})
+        missing_defect_classes = set(UI_DEFECT_CLASSES).difference(defect_classes)
+        if missing_defect_classes:
+            raise RuntimeError(
+                f"{label} ui_defect is missing five-class metrics: "
+                f"{sorted(missing_defect_classes)}"
+            )
+        for metric in (
+            "defect_image_macro_f1",
+            "defect_image_micro_f1",
+            "defect_bbox_macro_f1_50",
+            "defect_bbox_micro_f1_50",
+        ):
+            if defect.get(metric) is None:
+                raise RuntimeError(f"{label} ui_defect has no {metric}")
 
 
 def evaluator_command(args: argparse.Namespace, row: Mapping[str, Any], output_dir: Path) -> list[str]:

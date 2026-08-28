@@ -10,6 +10,7 @@ captioning, VQA, action prediction, and region description keep natural text.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import re
 import shutil
 import struct
 import tempfile
+import warnings
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from functools import lru_cache
@@ -109,6 +111,28 @@ class KnownDataDrop(NormalizeError):
     def __init__(self, category: str, message: str):
         super().__init__(message)
         self.category = category
+
+
+_UNSUPPORTED_FSYNC_ERRNOS = {
+    errno.ENOSYS,
+    errno.EINVAL,
+    getattr(errno, "ENOTSUP", errno.EINVAL),
+    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+}
+
+
+def best_effort_fsync(handle: Any, path: Path) -> None:
+    """Durably flush when supported, but tolerate ByteNAS ENOSYS/ENOTSUP."""
+
+    try:
+        os.fsync(handle.fileno())
+    except OSError as exc:
+        if exc.errno not in _UNSUPPORTED_FSYNC_ERRNOS:
+            raise
+        warnings.warn(
+            f"filesystem does not support fsync for {path} ({exc}); "
+            "continuing with close + atomic replace"
+        )
 
 
 def classify_source(relative_path: Path) -> str:
@@ -730,6 +754,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-image-check", action="store_true")
     parser.add_argument("--max-error-rate", type=float, default=0.001)
     parser.add_argument("--progress-every", type=int, default=10000)
+    parser.add_argument(
+        "--split-progress-every",
+        type=int,
+        default=1000,
+        help="row interval for the three full split/hash passes",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--no-split",
@@ -861,18 +891,27 @@ def main() -> int:
                             )
                 if stop_task:
                     break
+            print(
+                f"[{task}] DONE read={stats[task].source_records:,} "
+                f"written={stats[task].written_records:,} "
+                f"known_dropped={stats[task].known_dropped_records:,} "
+                f"rejected={stats[task].rejected_records:,}",
+                flush=True,
+            )
 
+        print("[prepare] phase=finalize_normalized_annotations state=START", flush=True)
         for handle, _ in temp_outputs.values():
             handle.flush()
-            os.fsync(handle.fileno())
+            best_effort_fsync(handle, Path(handle.name))
             handle.close()
         rejected_handle.flush()
-        os.fsync(rejected_handle.fileno())
+        best_effort_fsync(rejected_handle, Path(rejected_handle.name))
         rejected_handle.close()
 
         for task, destination in destinations.items():
             os.replace(temp_outputs[task][1], destination)
         os.replace(rejected_tmp, rejected_path)
+        print("[prepare] phase=finalize_normalized_annotations state=DONE", flush=True)
     except Exception:
         for handle, temporary in [*temp_outputs.values(), (rejected_handle, rejected_tmp)]:
             try:
@@ -921,6 +960,11 @@ def main() -> int:
     if not args.no_split:
         from split_locany_cpt import split_recipe
 
+        print(
+            "[prepare] phase=group_level_split state=START "
+            f"mode={args.group_id_mode}",
+            flush=True,
+        )
         split_summary = split_recipe(
             recipe_path,
             output_dir,
@@ -929,7 +973,9 @@ def main() -> int:
             val_fast_per_task=args.val_fast_per_task,
             group_id_mode=args.group_id_mode,
             train_recipe_name=args.recipe_name,
+            progress_every=args.split_progress_every,
         )
+        print("[prepare] phase=group_level_split state=DONE", flush=True)
         recipe_path = recipe_dir / args.recipe_name
 
     manifest = {

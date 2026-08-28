@@ -64,6 +64,46 @@ class CPTSmokeValidationTest(unittest.TestCase):
         if with_eval:
             eval_rows = []
             for task in sorted(CPT_TASKS):
+                task_metrics = {"inference_error_count": 0}
+                base_metrics = {"inference_error_count": 0}
+                if task == "ui_defect":
+                    per_class = {
+                        defect: {
+                            "display_label": defect,
+                            "image": {
+                                "tp": 1,
+                                "fp": 0,
+                                "fn": 0,
+                                "tn": 9,
+                                "precision": 1.0,
+                                "recall": 1.0,
+                                "f1": 1.0,
+                            },
+                            "bbox": {
+                                "tp": 1,
+                                "fp": 0,
+                                "fn": 0,
+                                "precision": 1.0,
+                                "recall": 1.0,
+                                "f1": 1.0,
+                            },
+                        }
+                        for defect in (
+                            "text_overflow",
+                            "text_ellipsis",
+                            "occlusion",
+                            "cropping",
+                            "content_missing",
+                        )
+                    }
+                    task_metrics.update(
+                        per_class=per_class,
+                        image_macro={"precision": 1.0, "recall": 1.0, "f1": 1.0},
+                        bbox_macro={"precision": 1.0, "recall": 1.0, "f1": 1.0},
+                        image_micro={"tp": 5, "fp": 0, "fn": 0, "f1": 1.0},
+                        bbox_micro={"tp": 5, "fp": 0, "fn": 0, "f1": 1.0},
+                    )
+                    base_metrics = dict(task_metrics)
                 eval_rows.append(
                     {
                         "step": 20,
@@ -72,7 +112,8 @@ class CPTSmokeValidationTest(unittest.TestCase):
                         "samples_per_task": 10,
                         "eval_token_ce": 1.5,
                         "primary_metric": 0.8,
-                        "metrics": {"inference_error_count": 0},
+                        "metrics": task_metrics,
+                        "base_metrics": base_metrics,
                     }
                 )
             eval_rows.append(

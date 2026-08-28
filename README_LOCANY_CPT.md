@@ -18,12 +18,12 @@ YG smoke recipe
 → YG A800 validator passed
 → YG 全量 recipe 检查
 → HL 全量 recipe
-→ H20×2 formal
-→ formal checkpoint 产生后再跑独立 held-out eval
+→ H20×4 formal
+→ 每训练约 6 小时自动 checkpoint → 同 job 单卡 held-out generation/CE → 自动 resume
 ```
 
 H20 排队通常需要一到两天，因此不再把 H20 smoke/eval 作为 formal 启动前门禁。H20
-仍使用固定的 SDPA + 7268/7268/7268 + packing buffer 16 + 梯度累积 4。仓库命令中的
+四卡使用固定的 SDPA + 7268/7268/7268 + packing buffer 16 + 梯度累积 2。仓库命令中的
 `a100` 是历史 profile 标识；对应 Merlin YAML 实际申请 `A800_SXM_40GB`，不是 A100。
 
 下面各命令按顺序逐条执行。不要把 YG 生成的 recipe 复制到 HL；两边 JSONL 的绝对图片
@@ -221,22 +221,47 @@ bash shell/prepare_locany_cpt_v2.sh h20 formal
 
 必须看到 `CPT_V2_DATA_READY=...` 后再提交训练。
 
-### 0.7 HL：直接提交 H20×2 formal
+全量准备在最后一个任务（通常日志停在 `vqa read=...`）之后还没有结束。随后会执行：归一化
+文件 flush/原子发布、第一遍逐图片内容 SHA-256 与跨任务连通分组、第二遍聚合 group/标签
+分层、第三遍写 train/val/manifest，最后生成 val_fast。第一次读取 NAS 图片内容可能明显比
+JSONL 转换更久，这是正常阶段，不要看到最后一条 VQA 日志就 Ctrl-C。新日志会持续打印：
+
+```text
+[prepare] phase=group_level_split state=START mode=sha256
+[split] phase=hash_images_and_connect_groups state=PROGRESS rows=...
+[split] phase=aggregate_groups_and_strata state=PROGRESS rows=...
+[split] phase=write_train_val_and_manifest state=PROGRESS rows=...
+```
+
+第一遍被 Ctrl-C 时会尽量保存 `diagnostics/image_hash_cache.json`；确认没有另一个 prepare
+进程后使用同一命令加 `OVERWRITE=1` 重跑，可复用已完成的图片哈希。只有最终出现
+`CPT_V2_DATA_READY=...` 才算 recipe 完成。
+
+### 0.7 HL：直接提交 H20×4 formal（含每 6 小时集成评测）
 
 ```bash
 cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
 ```
 
 ```bash
-mlx job submitv2 --path locany_cpt_v4_h20x2_formal_merlin.yaml
+mlx job submitv2 --path locany_cpt_v4_h20x4_formal_merlin.yaml
 ```
 
 这个主流程不再先提交 H20 smoke。formal 使用新的
-`RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x2-formal`，不会续训 checkpoint-1549/1860。
+`RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x4-formal`，不会续训 checkpoint-1549/1860。
 
-### 0.8 HL：formal 产生 checkpoint 后提交 held-out eval
+该 YAML 固定 `CPT_INTEGRATED_EVAL=1`、`SAVE_EVERY_N_HOURS=6`。一个 segment 约训练
+6 小时后，四卡 torchrun 先保存完整可续训 checkpoint 并正常退出以释放显存；同一个
+Merlin job 随后只暴露 GPU 0，真实运行固定 held-out val_fast 的 generation 和
+teacher-forced CE。评测成功后自动从刚才的 checkpoint 恢复四卡训练。评测时间不计入下一个
+6 小时训练 interval，因此相邻评测结果的实际墙钟间隔是“约 6 小时 + 上一次评测耗时”。
 
-评测不阻塞 formal 训练。每次希望消费一个 pending milestone checkpoint 时提交：
+评测失败时 formal job 非零退出，不会绕过测试继续训练；checkpoint 仍可完整 resume。修复
+代码后重新提交同一 YAML，会先重试 queue 中 failed/pending 的评测，再开始下一段训练。
+
+### 0.8 HL：人工补跑 held-out eval（仅用于故障恢复）
+
+主流程不需要提交独立 eval job。只有集成评测曾失败、或需要人工重算历史 checkpoint 时才提交：
 
 ```bash
 cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
@@ -246,8 +271,8 @@ cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Em
 mlx job submitv2 --path locany_cpt_v4_h20x1_eval_merlin.yaml
 ```
 
-该 eval job 默认每次消费一个 pending checkpoint；有多个 checkpoint 时可重复提交。Base
-结果按同一 manifest/protocol 缓存，不会为每个 checkpoint 重复推理。
+该 eval job 一次最多消费当前积压的 20 个 checkpoint。Base 结果按同一 manifest/protocol
+缓存，不会为每个 checkpoint 重复推理。
 
 ## 1. 数据准备与无泄漏切分
 
@@ -378,8 +403,10 @@ python scripts/simulate_locany_cpt_sampling.py \
 
 ```bash
 CPT_SAMPLING_MODE=sample_equal \
-RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x2-formal \
-bash shell/run_locany_cpt.sh h20 formal
+RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x4-formal \
+CPT_INTEGRATED_EVAL=1 \
+SAVE_EVERY_N_HOURS=6 \
+bash shell/run_locany_cpt_merlin.sh h20 formal
 ```
 
 Merlin 入口：
@@ -389,7 +416,7 @@ Merlin 入口：
   scripts/submit_locany_cpt.py --mode smoke --cluster yg
 /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python \
   scripts/submit_locany_cpt.py --mode formal --cluster yg
-mlx job submitv2 --path locany_cpt_v4_h20x2_formal_merlin.yaml
+mlx job submitv2 --path locany_cpt_v4_h20x4_formal_merlin.yaml
 ```
 
 上述两条 A800 命令都可将 `--cluster yg` 改为 `--cluster aiai_locate`。该参数只控制
@@ -397,15 +424,15 @@ mlx job submitv2 --path locany_cpt_v4_h20x2_formal_merlin.yaml
 这里给出了 A800 formal 命令就同时启动另一场正式实验。
 
 当前 formal 启动前只要求 A800 smoke：它先在 step 10 强制保存并退出 segment，再从同一
-checkpoint 自动 resume 到 step 20，因此一个 job 同时覆盖多卡训练与断点续训。H20×2
+checkpoint 自动 resume 到 step 20，因此一个 job 同时覆盖多卡训练与断点续训。H20×4
 formal 默认每 rank packed-token 上限 7268、单样本与序列上限也为 7268、SDPA、
-packing buffer 16、梯度累积 4；A800×4 默认 SDPA + 7268/7268/12800、梯度累积 2。
+packing buffer 16、梯度累积 2；A800×4 默认 SDPA + 7268/7268/12800、梯度累积 2。
 `shell/run_locany_cpt.sh`
 会先验证 train split，再将 split/length stats 复制到 run 的 `diagnostics/`。
 
 这里三个数依次是 `MAX_SEQ_LENGTH`、`MAX_NUM_TOKENS_PER_SAMPLE`、
 `MAX_NUM_TOKENS`。因此 A800 的单样本上限仍是 7268，12800 是每 rank 一个 packed batch
-可容纳的总 token；当前 H20×2 三项均为 7268，不使用旧配置中的 25600。独立 evaluator
+可容纳的总 token；当前 H20×4 三项均为 7268，不使用旧配置中的 25600。集成 evaluator
 一次只处理一个样本，不受训练 packing 的 12800 控制；高分辨率 UI 图像必须让 MoonViT
 使用 `flash_attention_2`，文本侧仍使用 SDPA。
 
@@ -476,14 +503,15 @@ Trainer checkpoint 保存 optimizer、scheduler、random state，以及每 rank 
 行号并以非零状态退出。
 
 每个通过完整性校验的 checkpoint 还会由 rank 0 去重追加
-`diagnostics/cpt_eval_queue.jsonl`，标记待独立 job 执行的 held-out val_fast 评测。完成标记
+`diagnostics/cpt_eval_queue.jsonl`，标记待同 job 集成阶段执行的 held-out val_fast 评测。完成标记
 会先原子落盘、随后才发布 queue row，避免评测器抢到尚未完成的 checkpoint。queue row
 具有 pending/running/completed/failed 状态；失败项只能显式设置 `EVAL_RETRY_FAILED=1` 重试。
 
 ## 6. Held-out 评测
 
 训练池只能显式标记为 `train_pool/domain_absorption`；best checkpoint 只看 held-out。
-推荐用独立 Merlin job 跑 generation，避免阻塞 formal training。
+H20×4 formal 默认每约 6 小时分段，在同一个 Merlin job 内释放训练进程后用 GPU 0 跑
+generation + teacher-forced CE；评测完成才 resume。下面的直接命令只用于离线调试或重算：
 
 ```bash
 python scripts/eval_locany_cpt_learning.py \
@@ -505,8 +533,8 @@ python scripts/eval_locany_cpt_learning.py \
   --teacher-forced
 ```
 
-独立 queue consumer 已接入。formal 启动前由 A800 smoke 完成 checkpoint-10→20 后的
-held-out 门禁；在 A800 节点上只暴露 GPU 0：
+queue consumer 同时供集成评测和人工恢复使用。formal 启动前由 A800 smoke 完成
+checkpoint-10→20 后的 held-out 门禁；在 A800 节点上只暴露 GPU 0：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -517,8 +545,8 @@ EVAL_SAMPLES_PER_TASK=10 \
 bash shell/run_locany_cpt_eval_merlin.sh a100
 ```
 
-formal 训练期间按 checkpoint 提交下面的单卡 job；Base 结果按 manifest/protocol 缓存，
-同一验证集不会重复推理：
+formal 主流程不需要再提交单卡 job。Base 结果按 manifest/protocol 缓存，同一验证集不会
+为每个 checkpoint 重复跑 Base。下面命令仅作为集成评测失败后的人工恢复入口：
 
 ```bash
 mlx job submitv2 --path locany_cpt_v4_h20x1_eval_merlin.yaml
@@ -547,6 +575,13 @@ grounding Recall@0.5、OCR one-to-one label-aware F1@0.5、referring/referring_k
 ROUGE-L、VQA 正确/错误 accuracy；Char-F1 均作为附属指标。Point 支持两种语法且坐标必须位于 `[0,1000]`；box
 采用一对一最大总 IoU 匹配，UI defect 只允许同类匹配。综合分数仅为十任务 primary 的
 等权 `heldout_task_macro_primary`。
+
+UI defect 的 hash 子集会在数据可用时强制覆盖文字溢出、文本省略、元素遮挡/重叠、元素
+裁切、内容缺失五类。每次 Base/checkpoint 真实推理结束都会在日志打印五类的 image-level
+P/R/F1 与 class-aware bbox P/R/F1@0.5，以及总的 image macro/micro F1 和 bbox
+macro/micro F1@0.5。相同内容同时保存在 `summary.json`、`cpt_eval_metrics.jsonl` 和 Excel，
+不是仅打印后丢失；bbox macro F1@0.5 仍是 ui_defect 的 primary metric，image F1 是额外
+诊断指标。
 
 best checkpoint 依次按 held-out task-macro primary 最大、task-macro main CE 最小排序；
 关键弱任务相对历史 best 下降超过 3 个百分点时不自动标 best。少于完整十任务的 held-out
@@ -580,8 +615,14 @@ python scripts/build_locany_cpt_excel.py \
   --output "$RUN_DIR/diagnostics/cpt_training_evaluation.xlsx"
 ```
 
-工作簿严格只有 `Overview`、`TrainMetrics`、`EvalMetrics` 三个 sheet，冻结表头并启用筛选。
-缺失值保持空白，不写成 0。`openpyxl` 缺失或保存失败只产生 warning，不会终止训练。
+工作簿严格只有三个 sheet，冻结表头并启用筛选：
+
+- `TrainMetrics`：训练集的 step × task sample/token/skip/coverage/CE 记录；
+- `EvalMetrics`：held-out 测试集的 checkpoint × task CE、primary、Base delta 和 best 记录；
+- `UIDefectMetrics`：Base/checkpoint × 五类 × image/bbox 的 P/R/F1，以及 macro/micro 总指标。
+
+缺失值保持空白，不写成 0。`openpyxl` 缺失或保存失败只产生 warning，不会终止训练；
+JSON/JSONL 仍是 source of truth，Excel 可随时重建。
 
 ## 8. 验收
 
@@ -619,7 +660,8 @@ python scripts/validate_locany_cpt_smoke.py \
 
 `--require-eval` 还会确认最终 checkpoint 的 queue 状态为 completed、十任务
 `eval_token_ce` 非空、推理错误为 0、task-macro 完整；启用 Excel 校验时还要求
-`CPTEvalMetrics` 表至少包含十任务加一行 macro，而不只是存在空的 sheet。
+`CPTEvalMetrics` 表至少包含十任务加一行 macro，`CPTUIDefectMetrics` 至少包含 Base 和
+checkpoint 的五类 image/bbox 行，而不只是存在空的 sheet。
 
 常见失败含义：
 

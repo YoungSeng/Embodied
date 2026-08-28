@@ -159,6 +159,24 @@ class CPTEvalQueueTest(unittest.TestCase):
             }
             for task in CPT_TASKS
         }
+        per_task["ui_defect"].update(
+            {
+                "per_class": {
+                    task: {"image": {"f1": 0.5}, "bbox": {"f1": 0.5}}
+                    for task in (
+                        "text_overflow",
+                        "text_ellipsis",
+                        "occlusion",
+                        "cropping",
+                        "content_missing",
+                    )
+                },
+                "defect_image_macro_f1": 0.5,
+                "defect_image_micro_f1": 0.5,
+                "defect_bbox_macro_f1_50": 0.5,
+                "defect_bbox_micro_f1_50": 0.5,
+            }
+        )
         summary = {
             "split": "heldout",
             "teacher_forced": True,

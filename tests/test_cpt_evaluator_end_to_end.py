@@ -239,6 +239,38 @@ class CPTEvaluatorEndToEndTest(unittest.TestCase):
         self.assertEqual(model.decoder_training_during_call, [True])
         self.assertIs(model.language_model.model.training, False)
 
+    def test_hash_subset_keeps_all_five_ui_defect_classes_when_available(self):
+        evaluator = load_evaluator_module()
+        labels = ["文字溢出", "文本省略", "元素遮挡", "元素裁切", "内容缺失"]
+        candidates = [
+            evaluator.Example(
+                key=f"ui_defect:record-{index}",
+                task="ui_defect",
+                record_id=f"record-{index}",
+                group_id=f"group-{index}",
+                split="heldout",
+                image="screen.png",
+                prompt="find defects",
+                target=(
+                    f"<ref>{label}</ref>"
+                    f"<box><{index}><{index}><{index + 10}><{index + 10}></box>"
+                ),
+                source="fixture.jsonl",
+                line=index,
+            )
+            for index, label in enumerate(labels, start=1)
+        ]
+
+        selected = evaluator._select_examples(
+            [*reversed(candidates)], 5, "hash", 20260826, "ui_defect"
+        )
+        selected_labels = {
+            evaluator.canonical_defect_label(item["label"])
+            for example in selected
+            for item in evaluator.parse_labeled_boxes(example.target)
+        }
+        self.assertEqual(selected_labels, set(evaluator.UI_DEFECT_CLASSES))
+
     def test_teacher_forced_converts_numpy_image_grid_to_torch(self):
         evaluator = load_evaluator_module()
         model = FakeModel()

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from eaglevl.train.cpt_eval_metrics import (
     aggregate_scores,
+    canonical_defect_label,
     defect_metrics,
     micro_primary,
     one_to_one_boxes,
@@ -27,6 +28,13 @@ def pair(label: str, box: tuple[int, int, int, int]) -> str:
 
 
 class CPTEvalMetricsTest(unittest.TestCase):
+    def test_ui_defect_legacy_labels_map_to_fixed_five_classes(self):
+        self.assertEqual(canonical_defect_label("文字溢出容器"), "text_overflow")
+        self.assertEqual(canonical_defect_label("文字省略异常"), "text_ellipsis")
+        self.assertEqual(canonical_defect_label("UI element overlap"), "occlusion")
+        self.assertEqual(canonical_defect_label("元素被裁切"), "cropping")
+        self.assertEqual(canonical_defect_label("内容未展示"), "content_missing")
+
     def test_vqa_correct_and_incorrect_are_not_char_f1_accuracy(self):
         score = score_task(
             "vqa",
@@ -74,8 +82,42 @@ class CPTEvalMetricsTest(unittest.TestCase):
             pair("元素被裁切", (100, 100, 300, 300)),
         )
         self.assertEqual(metrics["defect_macro_f1_50"], 0.0)
-        self.assertEqual(metrics["defect_per_class"]["元素被裁切"]["tp"], 0)
-        self.assertEqual(metrics["defect_confusion"]["元素被裁切->元素重叠"], 1)
+        self.assertEqual(metrics["defect_per_class"]["cropping"]["tp"], 0)
+        self.assertEqual(metrics["defect_confusion"]["cropping->occlusion"], 1)
+
+    def test_ui_defect_aggregates_five_class_image_and_bbox_granularity(self):
+        scores = [
+            score_task(
+                "ui_defect",
+                pair("元素裁切", (100, 100, 300, 300)),
+                pair("元素被裁切", (100, 100, 300, 300)),
+            ),
+            score_task(
+                "ui_defect",
+                "<box>none</box>",
+                pair("文字溢出", (400, 400, 600, 600)),
+            ),
+        ]
+        metrics = aggregate_scores("ui_defect", scores)
+
+        self.assertEqual(
+            list(metrics["per_class"])[:5],
+            [
+                "text_overflow",
+                "text_ellipsis",
+                "occlusion",
+                "cropping",
+                "content_missing",
+            ],
+        )
+        self.assertEqual(metrics["per_class"]["cropping"]["image"]["tp"], 1)
+        self.assertEqual(metrics["per_class"]["cropping"]["bbox"]["tp"], 1)
+        self.assertEqual(metrics["per_class"]["text_overflow"]["image"]["fn"], 1)
+        self.assertEqual(metrics["per_class"]["text_overflow"]["bbox"]["fn"], 1)
+        self.assertIsNone(metrics["per_class"]["text_ellipsis"]["image"]["f1"])
+        self.assertAlmostEqual(metrics["defect_image_macro_f1"], 0.5)
+        self.assertAlmostEqual(metrics["defect_bbox_macro_f1_50"], 0.5)
+        self.assertAlmostEqual(metrics["primary_metric"], 0.5)
 
     def test_ocr_reports_location_and_label_aware_results(self):
         target = pair("设置", (10, 10, 100, 100))

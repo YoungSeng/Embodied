@@ -10,10 +10,13 @@ coverage reporting, and held-out evaluation.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
 import tempfile
+import time
+import warnings
 from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +26,27 @@ from typing import Any, Iterable, Iterator, Mapping
 DEFAULT_SEED = 20260826
 DEFAULT_VAL_FRACTION = 0.02
 DEFAULT_VAL_FAST_PER_TASK = 200
+
+_UNSUPPORTED_FSYNC_ERRNOS = {
+    errno.ENOSYS,
+    errno.EINVAL,
+    getattr(errno, "ENOTSUP", errno.EINVAL),
+    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+}
+
+
+def best_effort_fsync(handle: Any, path: Path) -> None:
+    """Durably flush when supported, but tolerate ByteNAS ENOSYS/ENOTSUP."""
+
+    try:
+        os.fsync(handle.fileno())
+    except OSError as exc:
+        if exc.errno not in _UNSUPPORTED_FSYNC_ERRNOS:
+            raise
+        warnings.warn(
+            f"filesystem does not support fsync for {path} ({exc}); "
+            "continuing with close + atomic replace"
+        )
 
 
 def stable_hash(*values: object) -> str:
@@ -335,7 +359,7 @@ def atomic_write_json(path: Path, value: Any, *, sort_keys: bool = False) -> Non
         json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=sort_keys)
         handle.write("\n")
         handle.flush()
-        os.fsync(handle.fileno())
+        best_effort_fsync(handle, temporary)
     os.replace(temporary, path)
 
 
@@ -445,6 +469,7 @@ def split_recipe(
     val_fast_per_task: int = DEFAULT_VAL_FAST_PER_TASK,
     group_id_mode: str = "sha256",
     train_recipe_name: str = "locany_cpt_train.json",
+    progress_every: int = 1000,
 ) -> dict[str, Any]:
     if not 0.0 < val_fraction < 1.0:
         raise ValueError("val_fraction must be between 0 and 1")
@@ -457,34 +482,73 @@ def split_recipe(
     cache = ImageHashCache(diagnostics_dir / "image_hash_cache.json")
     original_recipe, sources = load_recipe_sources(recipe_path)
 
+    split_started = time.time()
+
+    def report_progress(
+        phase: str,
+        rows: int,
+        phase_started: float,
+        *,
+        done: bool = False,
+    ) -> None:
+        elapsed = max(time.time() - phase_started, 1.0e-9)
+        state = "DONE" if done else "PROGRESS"
+        print(
+            f"[split] phase={phase} state={state} rows={rows:,} "
+            f"rows_per_second={rows / elapsed:.1f} "
+            f"phase_seconds={elapsed:.1f} total_seconds={time.time() - split_started:.1f}",
+            flush=True,
+        )
+
     identity_union = ImageIdentityUnion()
     record_ids: set[str] = set()
     path_duplicate_candidates: dict[tuple[str, int], set[str]] = defaultdict(set)
-    for source in sources:
-        for line_number, record in iter_source_records(source):
-            paths = resolve_record_images(record, source.root)
-            if group_id_mode == "path":
-                for path in paths:
-                    stat = path.stat()
-                    path_duplicate_candidates[
-                        (path.name.casefold(), int(stat.st_size))
-                    ].add(path.as_posix())
-            _, _, content_digests = image_group_id(paths, cache, group_id_mode)
-            identity_union.connect(content_digests)
-            record_id = stable_record_id(source, line_number, record)
-            if record_id in record_ids:
-                raise ValueError(
-                    f"duplicate record_id={record_id!r}; source row IDs must be unique "
-                    "within each CPT task"
-                )
-            record_ids.add(record_id)
-    cache.save()
+    phase = "hash_images_and_connect_groups"
+    phase_started = time.time()
+    phase_rows = 0
+    print(
+        f"[split] phase={phase} state=START mode={group_id_mode} "
+        f"cached_images={len(cache.values):,}",
+        flush=True,
+    )
+    try:
+        for source in sources:
+            for line_number, record in iter_source_records(source):
+                paths = resolve_record_images(record, source.root)
+                if group_id_mode == "path":
+                    for path in paths:
+                        stat = path.stat()
+                        path_duplicate_candidates[
+                            (path.name.casefold(), int(stat.st_size))
+                        ].add(path.as_posix())
+                _, _, content_digests = image_group_id(paths, cache, group_id_mode)
+                identity_union.connect(content_digests)
+                record_id = stable_record_id(source, line_number, record)
+                if record_id in record_ids:
+                    raise ValueError(
+                        f"duplicate record_id={record_id!r}; source row IDs must be unique "
+                        "within each CPT task"
+                    )
+                record_ids.add(record_id)
+                phase_rows += 1
+                if progress_every and phase_rows % progress_every == 0:
+                    report_progress(phase, phase_rows, phase_started)
+    finally:
+        # Preserve expensive content hashes even when a user interrupts the
+        # first full NAS scan. OVERWRITE=1 can then rebuild annotations while
+        # reusing the cache instead of re-reading every image byte.
+        cache.save()
+    report_progress(phase, phase_rows, phase_started, done=True)
     identity_to_group = identity_union.group_ids()
 
     # Aggregate tasks and label strata only after shared-image connected
     # components are complete. This prevents a multi-image record [A, B] from
     # being split away from single-image records A or B.
     groups: dict[str, GroupInfo] = {}
+    phase = "aggregate_groups_and_strata"
+    phase_started = time.time()
+    phase_rows = 0
+    print(f"[split] phase={phase} state=START", flush=True)
     for source in sources:
         for line_number, record in iter_source_records(source):
             paths = resolve_record_images(record, source.root)
@@ -497,6 +561,10 @@ def split_recipe(
             info.rows += 1
             info.normalized_paths.update(normalized_paths)
             info.content_digests.update(content_digests)
+            phase_rows += 1
+            if progress_every and phase_rows % progress_every == 0:
+                report_progress(phase, phase_rows, phase_started)
+    report_progress(phase, phase_rows, phase_started, done=True)
     path_duplicate_suspects = [
         {
             "basename": basename,
@@ -532,6 +600,10 @@ def split_recipe(
             "val_labels": Counter(),
         }
     )
+    phase = "write_train_val_and_manifest"
+    phase_started = time.time()
+    phase_rows = 0
+    print(f"[split] phase={phase} state=START", flush=True)
     try:
         for source in sources:
             for line_number, record in iter_source_records(source):
@@ -583,10 +655,14 @@ def split_recipe(
                     "strata": strata,
                 }
                 manifest_handle.write(json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n")
+                phase_rows += 1
+                if progress_every and phase_rows % progress_every == 0:
+                    report_progress(phase, phase_rows, phase_started)
     finally:
         for handle in handles.values():
             handle.close()
         manifest_handle.close()
+    report_progress(phase, phase_rows, phase_started, done=True)
     cache.save()
 
     # Ensure empty task files exist so recipes are schema-stable and validation
@@ -601,6 +677,7 @@ def split_recipe(
     val_fast_dir = output_dir / "val_fast"
     val_fast_counts = {}
     val_fast_groups = {}
+    print("[split] phase=build_val_fast state=START", flush=True)
     for task in tasks:
         records = _fast_subset(
             output_dir / "val" / f"{task}.jsonl",
@@ -616,6 +693,10 @@ def split_recipe(
         val_fast_counts[task] = len(records)
         val_fast_groups[task] = len(
             {str(record.get("cpt_group_id")) for record in records}
+        )
+        print(
+            f"[split] phase=build_val_fast task={task} rows={len(records):,}",
+            flush=True,
         )
 
     recipe_task_stats = {
@@ -684,6 +765,11 @@ def split_recipe(
         "tasks": summary_tasks,
     }
     atomic_write_json(diagnostics_dir / "split_summary.json", summary)
+    print(
+        f"[split] phase=complete state=DONE total_rows={phase_rows:,} "
+        f"groups={len(groups):,} total_seconds={time.time() - split_started:.1f}",
+        flush=True,
+    )
     return summary
 
 
@@ -696,6 +782,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-fast-per-task", type=int, default=DEFAULT_VAL_FAST_PER_TASK)
     parser.add_argument("--group-id-mode", choices=("sha256", "path"), default="sha256")
     parser.add_argument("--train-recipe-name", default="locany_cpt_train.json")
+    parser.add_argument("--progress-every", type=int, default=1000)
     return parser.parse_args()
 
 
@@ -709,6 +796,7 @@ def main() -> int:
         val_fast_per_task=args.val_fast_per_task,
         group_id_mode=args.group_id_mode,
         train_recipe_name=args.train_recipe_name,
+        progress_every=args.progress_every,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0

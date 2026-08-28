@@ -65,6 +65,7 @@ PREPARE_ARGS=(
   --val-fraction "${CPT_VAL_FRACTION:-0.02}"
   --val-fast-per-task "${VAL_FAST_PER_TASK}"
   --group-id-mode "${CPT_GROUP_ID_MODE:-sha256}"
+  --split-progress-every "${CPT_SPLIT_PROGRESS_EVERY:-1000}"
 )
 if [[ "${OVERWRITE:-0}" == "1" ]]; then
   PREPARE_ARGS+=(--overwrite)

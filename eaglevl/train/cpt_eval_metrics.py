@@ -44,6 +44,63 @@ PRIMARY_METRIC_BY_TASK = {
     "vqa": "vqa_accuracy",
 }
 
+UI_DEFECT_CLASSES = (
+    "text_overflow",
+    "text_ellipsis",
+    "occlusion",
+    "cropping",
+    "content_missing",
+)
+UI_DEFECT_CLASS_DISPLAY = {
+    "text_overflow": "文字溢出",
+    "text_ellipsis": "文本省略",
+    "occlusion": "元素遮挡/重叠",
+    "cropping": "元素裁切",
+    "content_missing": "内容缺失",
+}
+_UI_DEFECT_LABEL_ALIASES = {
+    "text_overflow": {
+        "text overflow",
+        "文字溢出",
+        "文本溢出",
+        "文字溢出容器",
+    },
+    "text_ellipsis": {
+        "text ellipsis",
+        "text truncation error",
+        "文本省略",
+        "文字省略",
+        "文字省略异常",
+    },
+    "occlusion": {
+        "occlusion",
+        "element overlap",
+        "element occlusion",
+        "ui element overlap",
+        "元素遮挡",
+        "元素重叠",
+        "遮挡",
+        "重叠",
+    },
+    "cropping": {
+        "cropping",
+        "cropped element",
+        "element cropping",
+        "ui element cropping",
+        "元素裁切",
+        "元素被裁切",
+        "元素截断",
+        "裁切",
+    },
+    "content_missing": {
+        "content missing",
+        "missing content",
+        "content not displayed",
+        "内容缺失",
+        "内容未展示",
+    },
+}
+
 
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", SPECIAL_END_RE.sub("", value.strip())).strip()
@@ -52,6 +109,19 @@ def normalize_text(value: str) -> str:
 def normalize_label(value: str) -> str:
     value = normalize_text(value).casefold()
     return re.sub(r"\s*\|\s*type\s*=.*$", "", value).strip()
+
+
+def canonical_defect_label(value: str) -> str:
+    """Map dataset/prompt aliases onto the fixed five UI-defect classes."""
+
+    normalized = normalize_label(value)
+    lookup = re.sub(r"[\s_-]+", " ", normalized).strip().casefold()
+    for canonical, aliases in _UI_DEFECT_LABEL_ALIASES.items():
+        if lookup == canonical.replace("_", " ") or lookup in {
+            alias.casefold() for alias in aliases
+        }:
+            return canonical
+    return normalized
 
 
 def parse_label_type(value: str) -> tuple[str, str | None]:
@@ -365,8 +435,13 @@ def point_metrics(prediction: str, target: str) -> dict[str, Any]:
 
 def defect_metrics(prediction: str, target: str) -> dict[str, Any]:
     predicted, gold = parse_labeled_boxes(prediction), parse_labeled_boxes(target)
-    classes = sorted({item["label"] for item in [*predicted, *gold]})
+    for item in [*predicted, *gold]:
+        item["label"] = canonical_defect_label(item["label"])
+    observed_classes = {item["label"] for item in [*predicted, *gold] if item["label"]}
+    classes = [label for label in UI_DEFECT_CLASSES if label in observed_classes]
+    classes.extend(sorted(observed_classes.difference(UI_DEFECT_CLASSES)))
     per_class = {}
+    image_per_class = {}
     confusion: Counter[str] = Counter()
     for label in classes:
         pred_text = "\n".join(
@@ -380,6 +455,20 @@ def defect_metrics(prediction: str, target: str) -> dict[str, Any]:
             if item["label"] == label
         )
         per_class[label] = one_to_one_boxes(pred_text, gold_text, label_aware=True)
+
+    image_classes = [*UI_DEFECT_CLASSES]
+    image_classes.extend(sorted(observed_classes.difference(UI_DEFECT_CLASSES)))
+    for label in image_classes:
+        gold_positive = any(item["label"] == label for item in gold)
+        pred_positive = any(item["label"] == label for item in predicted)
+        image_per_class[label] = {
+            "tp": int(gold_positive and pred_positive),
+            "fp": int(not gold_positive and pred_positive),
+            "fn": int(gold_positive and not pred_positive),
+            "tn": int(not gold_positive and not pred_positive),
+            "gold_positive": int(gold_positive),
+            "predicted_positive": int(pred_positive),
+        }
 
     # Location matching without class compatibility exposes class confusion.
     weights = [
@@ -398,6 +487,7 @@ def defect_metrics(prediction: str, target: str) -> dict[str, Any]:
     return {
         "defect_macro_f1_50": sum(macro_values) / len(macro_values) if macro_values else 1.0,
         "defect_per_class": per_class,
+        "defect_image_per_class": image_per_class,
         "defect_confusion": dict(sorted(confusion.items())),
         "defect_gold_count": len(gold),
         "defect_pred_count": len(predicted),
@@ -617,26 +707,99 @@ def aggregate_scores(task: str, scores: Sequence[dict[str, Any]]) -> dict[str, A
     if task == "vqa":
         output["confusion"] = dict(sorted(Counter(score.get("vqa_confusion") for score in scores).items()))
     if task == "ui_defect":
-        per_class_counts: dict[str, Counter[str]] = defaultdict(Counter)
+        per_class_box_counts: dict[str, Counter[str]] = defaultdict(Counter)
+        per_class_image_counts: dict[str, Counter[str]] = defaultdict(Counter)
         confusion: Counter[str] = Counter()
         for score in scores:
             for label, metrics in score.get("defect_per_class", {}).items():
                 for key in ("tp", "fp", "fn"):
-                    per_class_counts[label][key] += int(metrics[key])
+                    per_class_box_counts[label][key] += int(metrics[key])
+            for label, metrics in score.get("defect_image_per_class", {}).items():
+                for key in ("tp", "fp", "fn", "tn"):
+                    per_class_image_counts[label][key] += int(metrics[key])
             confusion.update(score.get("defect_confusion", {}))
-        per_class = {}
-        for label, counts in per_class_counts.items():
-            precision = counts["tp"] / (counts["tp"] + counts["fp"]) if counts["tp"] + counts["fp"] else 0.0
-            recall = counts["tp"] / (counts["tp"] + counts["fn"]) if counts["tp"] + counts["fn"] else 0.0
-            per_class[label] = {
-                **counts,
+
+        def prf(counts: Counter[str], *, include_tn: bool = False) -> dict[str, Any]:
+            tp, fp, fn = counts["tp"], counts["fp"], counts["fn"]
+            tn = counts["tn"] if include_tn else 0
+            active = tp + fp + fn
+            if active:
+                precision = tp / (tp + fp) if tp + fp else 0.0
+                recall = tp / (tp + fn) if tp + fn else 0.0
+                f1 = (
+                    2 * precision * recall / (precision + recall)
+                    if precision + recall
+                    else 0.0
+                )
+            else:
+                precision = recall = f1 = None
+            result = {
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
                 "precision": precision,
                 "recall": recall,
-                "f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0,
+                "f1": f1,
             }
+            if include_tn:
+                total = tp + fp + fn + tn
+                result.update(
+                    tn=tn,
+                    accuracy=(tp + tn) / total if total else None,
+                    images=total,
+                )
+            return result
+
+        observed = set(per_class_box_counts) | set(per_class_image_counts)
+        classes = [*UI_DEFECT_CLASSES]
+        classes.extend(sorted(observed.difference(UI_DEFECT_CLASSES)))
+        per_class = {}
+        for label in classes:
+            bbox = prf(per_class_box_counts[label])
+            image = prf(per_class_image_counts[label], include_tn=True)
+            per_class[label] = {
+                **bbox,
+                "display_label": UI_DEFECT_CLASS_DISPLAY.get(label, label),
+                "bbox": bbox,
+                "image": image,
+            }
+
+        def macro(granularity: str) -> dict[str, float | None]:
+            values = [
+                per_class[label][granularity]
+                for label in UI_DEFECT_CLASSES
+                if per_class[label][granularity]["f1"] is not None
+            ]
+            return {
+                metric: _mean(item[metric] for item in values)
+                for metric in ("precision", "recall", "f1")
+            }
+
+        def micro(granularity: str) -> dict[str, Any]:
+            counts: Counter[str] = Counter()
+            for value in per_class.values():
+                for key in ("tp", "fp", "fn", "tn"):
+                    counts[key] += int(value[granularity].get(key) or 0)
+            return prf(counts, include_tn=granularity == "image")
+
+        bbox_macro = macro("bbox")
+        image_macro = macro("image")
+        bbox_micro = micro("bbox")
+        image_micro = micro("image")
         output["per_class"] = per_class
+        output["bbox_macro"] = bbox_macro
+        output["image_macro"] = image_macro
+        output["bbox_micro"] = bbox_micro
+        output["image_micro"] = image_micro
+        output["defect_bbox_macro_f1_50"] = bbox_macro["f1"]
+        output["defect_image_macro_f1"] = image_macro["f1"]
+        output["defect_bbox_micro_f1_50"] = bbox_micro["f1"]
+        output["defect_image_micro_f1"] = image_micro["f1"]
+        # Preserve the original primary metric name while making its bbox
+        # granularity explicit in the additional fields above.
+        output["defect_macro_f1_50"] = bbox_macro["f1"]
         output["confusion"] = dict(sorted(confusion.items()))
-        output["primary_metric"] = _mean(value["f1"] for value in per_class.values())
+        output["primary_metric"] = bbox_macro["f1"]
     if task in {"all_ui_elements", "ocr"}:
         box_units = sum(
             int(score.get("location_metrics", {}).get("gold_count", 0))

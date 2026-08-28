@@ -4087,7 +4087,12 @@ def main():
     my_callbacks = []
     if model_args.save_every_n_hours > 0:
         my_callbacks.append(
-            SaveCheckpointCallback(interval_hours=model_args.save_every_n_hours)
+            SaveCheckpointCallback(
+                interval_hours=model_args.save_every_n_hours,
+                stop_after_save=_env_flag(
+                    "LOCANY_STOP_AFTER_PERIODIC_SAVE", default=False
+                ),
+            )
         )
     my_callbacks.append(MemoryLoggerCallback())
     my_callbacks.append(DataloaderStateCallback(train_dataset))

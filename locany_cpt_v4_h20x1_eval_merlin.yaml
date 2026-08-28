@@ -1,4 +1,4 @@
-# Independent held-out evaluator for checkpoints queued by the H20x2 CPT v2 run.
+# Independent held-out evaluator for checkpoints queued by the H20x4 CPT v2 run.
 # Submit after the smoke/formal training job has produced a complete checkpoint:
 # mlx job submitv2 --path locany_cpt_v4_h20x1_eval_merlin.yaml
 
@@ -63,9 +63,11 @@ jobRunParams:
     CUDA_DEVICES: "0"
     INSTALL_SYSTEM_RUNTIME_DEPS: "1"
     DATA_DIR: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4_split_v2"
-    RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-formal"
+    RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x4-formal"
     EVAL_SAMPLES_PER_TASK: "10"
-    EVAL_MAX_PENDING: "1"
+    # One scarce H20 allocation drains all checkpoints currently waiting in
+    # the queue instead of requiring one Merlin submission per checkpoint.
+    EVAL_MAX_PENDING: "20"
     EVAL_ATTN_IMPLEMENTATION: "sdpa"
     EVAL_VISION_ATTN_IMPLEMENTATION: "flash_attention_2"
     EVAL_DTYPE: "bf16"

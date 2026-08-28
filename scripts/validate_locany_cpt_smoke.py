@@ -274,13 +274,18 @@ def validate_run(
         if not workbook.is_file():
             raise RuntimeError(f"missing smoke workbook: {workbook}")
         sheets = workbook_sheets(workbook)
-        if sheets != ["Overview", "TrainMetrics", "EvalMetrics"]:
+        if sheets != ["TrainMetrics", "EvalMetrics", "UIDefectMetrics"]:
             raise RuntimeError(f"unexpected workbook sheets={sheets}")
         if require_eval:
             table_rows = workbook_table_rows(workbook)
             if int(table_rows.get("CPTEvalMetrics") or 0) < len(CPT_TASKS) + 1:
                 raise RuntimeError(
                     "EvalMetrics workbook table has no complete ten-task held-out result: "
+                    f"{table_rows}"
+                )
+            if int(table_rows.get("CPTUIDefectMetrics") or 0) < 20:
+                raise RuntimeError(
+                    "UIDefectMetrics workbook table has no five-class image/bbox result: "
                     f"{table_rows}"
                 )
     if not (run_dir / "done.txt").is_file():

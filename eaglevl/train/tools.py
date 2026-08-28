@@ -92,6 +92,7 @@ class SaveCheckpointCallback(TrainerCallback):
         save_interval_minutes=None,
         *,
         interval_hours=None,
+        stop_after_save: bool = False,
     ):
         super().__init__()
         del save_interval_minutes
@@ -99,14 +100,22 @@ class SaveCheckpointCallback(TrainerCallback):
         if hours is None:
             raise ValueError("interval_hours is required")
         self.schedule = PeriodicCheckpointSchedule(float(hours))
+        self.stop_after_save = bool(stop_after_save)
 
     def on_train_begin(self, args, state, control, **kwargs):
         self.schedule.start(time.time())
         return control
 
     def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step > 0 and self.schedule.is_due(time.time()):
+        periodic_due = state.global_step > 0 and self.schedule.is_due(time.time())
+        final_step = state.global_step >= int(args.max_steps)
+        if periodic_due or (self.stop_after_save and final_step):
             control.should_save = True
+        if periodic_due and self.stop_after_save:
+            # Trainer saves after on_step_end and only then exits its loop. The
+            # parent Merlin process can release torchrun, run single-GPU held-
+            # out generation, and resume this exact checkpoint.
+            control.should_training_stop = True
         return control
 
     def on_save(self, args, state, control, **kwargs):

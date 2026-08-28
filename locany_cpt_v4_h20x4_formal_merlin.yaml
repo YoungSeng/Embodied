@@ -74,8 +74,17 @@ jobRunParams:
     WARMUP_STEPS: "500"
     LEARNING_RATE: "5e-6"
     SAVE_STEPS: "1000000000"
-    SAVE_EVERY_N_HOURS: "12"
+    # Every completed wall-clock interval produces a resumable checkpoint;
+    # this same x4 job then releases torchrun and evaluates it on GPU 0.
+    SAVE_EVERY_N_HOURS: "6"
     SAVE_TOTAL_LIMIT: "20"
+    CPT_INTEGRATED_EVAL: "1"
+    EVAL_SAMPLES_PER_TASK: "10"
+    EVAL_MAX_PENDING: "20"
+    EVAL_ATTN_IMPLEMENTATION: "sdpa"
+    EVAL_VISION_ATTN_IMPLEMENTATION: "flash_attention_2"
+    EVAL_DTYPE: "bf16"
+    EVAL_MAX_NEW_TOKENS: "1024"
     REPORT_TO: "tensorboard"
 
 namespace: /user/sicheng.yang

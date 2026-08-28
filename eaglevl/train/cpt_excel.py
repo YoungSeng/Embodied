@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
-SHEETS = ("Overview", "TrainMetrics", "EvalMetrics")
+SHEETS = ("TrainMetrics", "EvalMetrics", "UIDefectMetrics")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -58,6 +58,97 @@ def _ordered_columns(rows: Iterable[Mapping[str, Any]], preferred: list[str]) ->
     for row in rows:
         keys.update(row)
     return [key for key in preferred if key in keys] + sorted(keys.difference(preferred))
+
+
+def _ui_defect_metric_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project nested five-class image/bbox metrics into an analysis table."""
+
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("task") != "ui_defect":
+            continue
+        common = {
+            key: row.get(key)
+            for key in (
+                "checkpoint",
+                "step",
+                "split",
+                "manifest_id",
+                "evaluation_protocol_id",
+                "samples_per_task",
+            )
+        }
+        for model, metrics in (
+            ("checkpoint", row.get("metrics")),
+            ("base", row.get("base_metrics")),
+        ):
+            if not isinstance(metrics, Mapping):
+                continue
+            for class_name, class_metrics in metrics.get("per_class", {}).items():
+                if not isinstance(class_metrics, Mapping):
+                    continue
+                for granularity in ("image", "bbox"):
+                    values = class_metrics.get(granularity, {})
+                    if not isinstance(values, Mapping):
+                        continue
+                    output.append(
+                        {
+                            **common,
+                            "model": model,
+                            "aggregate": "class",
+                            "class": class_name,
+                            "class_label": class_metrics.get(
+                                "display_label", class_name
+                            ),
+                            "granularity": granularity,
+                            "iou_threshold": 0.5 if granularity == "bbox" else None,
+                            **{
+                                key: values.get(key)
+                                for key in (
+                                    "tp",
+                                    "fp",
+                                    "fn",
+                                    "tn",
+                                    "precision",
+                                    "recall",
+                                    "f1",
+                                    "accuracy",
+                                    "images",
+                                )
+                            },
+                        }
+                    )
+            for aggregate in ("macro", "micro"):
+                for granularity in ("image", "bbox"):
+                    values = metrics.get(f"{granularity}_{aggregate}", {})
+                    if not isinstance(values, Mapping):
+                        continue
+                    output.append(
+                        {
+                            **common,
+                            "model": model,
+                            "aggregate": aggregate,
+                            "class": f"__{aggregate}__",
+                            "class_label": f"five-class {aggregate}",
+                            "granularity": granularity,
+                            "iou_threshold": 0.5 if granularity == "bbox" else None,
+                            **{
+                                key: values.get(key)
+                                for key in (
+                                    "tp",
+                                    "fp",
+                                    "fn",
+                                    "tn",
+                                    "precision",
+                                    "recall",
+                                    "f1",
+                                    "accuracy",
+                                    "images",
+                                )
+                            },
+                        }
+                    )
+    return output
 
 
 def _latest_by_task(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -255,19 +346,18 @@ def build_cpt_workbook(
     output = Path(output_path) if output_path else diagnostics / "cpt_training_evaluation.xlsx"
     try:
         from openpyxl import Workbook
-        run_config = _read_json(diagnostics / "cpt_run_config.json")
-        split_summary = _read_json(diagnostics / "split_summary.json")
-        data_stats = _read_json(diagnostics / "cpt_data_stats.json")
-        train_rows = [_flatten(row) for row in _read_jsonl(diagnostics / "cpt_train_metrics.jsonl")]
-        eval_rows = [_flatten(row) for row in _read_jsonl(diagnostics / "cpt_eval_metrics.jsonl")]
-        overview = _overview_rows(run_config, split_summary, data_stats, train_rows, eval_rows)
+        raw_train_rows = _read_jsonl(diagnostics / "cpt_train_metrics.jsonl")
+        raw_eval_rows = _read_jsonl(diagnostics / "cpt_eval_metrics.jsonl")
+        train_rows = [_flatten(row) for row in raw_train_rows]
+        eval_rows = [_flatten(row) for row in raw_eval_rows]
+        ui_defect_rows = _ui_defect_metric_rows(raw_eval_rows)
 
         workbook = Workbook()
         workbook.remove(workbook.active)
         specs = (
-            ("Overview", overview, ["run_name", "seed", "world_size", "sampling_mode", "task", "train_rows", "val_rows", "val_fast_rows", "train_groups", "val_groups", "group_leakage", "pre_mtp_p50", "pre_mtp_p95", "pre_mtp_p99", "post_mtp_p50", "post_mtp_p95", "post_mtp_p99", "post_mtp_max", "static_oversize_rate", "sampling_probability", "sample_share", "total_token_share", "oversize_skip_rate", "row_coverage", "group_coverage", "effective_epoch", "repeat_factor", "train_total_token_ce", "best_step", "best_primary", "base_primary", "primary_metric", "delta_vs_base"], "CPTOverview"),
             ("TrainMetrics", train_rows, ["step", "epoch", "scope", "task", "learning_rate", "global_loss", "train_main_token_ce", "train_mtp_token_ce", "train_total_token_ce", "main_loss_tokens", "mtp_loss_tokens", "attempted_samples", "accepted_samples", "trained_samples", "oversize_skipped_samples", "oversize_skip_rate", "sample_share", "main_supervised_tokens", "mtp_supervised_tokens", "total_supervised_tokens", "total_token_share", "avg_post_mtp_length", "p95_post_mtp_length", "packing_efficiency", "row_coverage", "group_coverage", "effective_epoch", "repeat_factor"], "CPTTrainMetrics"),
             ("EvalMetrics", eval_rows, ["checkpoint", "step", "split", "task", "manifest_id", "evaluation_protocol_id", "subset_strategy", "samples_per_task", "ce_kind", "train_main_token_ce", "eval_token_ce", "train_val_main_ce_gap", "train_val_ce_gap", "eval_loss_tokens", "primary_name", "primary_metric", "base_primary", "delta_vs_base", "is_best_overall", "complete_ten_task_heldout", "eval_wall_time_seconds"], "CPTEvalMetrics"),
+            ("UIDefectMetrics", ui_defect_rows, ["checkpoint", "step", "split", "model", "aggregate", "class", "class_label", "granularity", "iou_threshold", "tp", "fp", "fn", "tn", "precision", "recall", "f1", "accuracy", "images", "manifest_id", "evaluation_protocol_id", "samples_per_task"], "CPTUIDefectMetrics"),
         )
         for name, rows, preferred, table_name in specs:
             sheet = workbook.create_sheet(name)

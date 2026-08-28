@@ -76,8 +76,11 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
             self.assertIn('GRADIENT_ACCUMULATION_STEPS: "2"', text)
             self.assertIn('MAX_STEPS: "20000"', text)
             self.assertIn('LEARNING_RATE: "5e-6"', text)
-            self.assertIn('SAVE_EVERY_N_HOURS: "12"', text)
             self.assertIn('SAVE_STEPS: "1000000000"', text)
+        self.assertIn('SAVE_EVERY_N_HOURS: "12"', a100)
+        self.assertIn('SAVE_EVERY_N_HOURS: "6"', h20)
+        self.assertIn('CPT_INTEGRATED_EVAL: "1"', h20)
+        self.assertIn('EVAL_SAMPLES_PER_TASK: "10"', h20)
         self.assertIn('MAX_NUM_TOKENS: "12800"', a100)
         self.assertIn('ATTN_IMPLEMENTATION: "sdpa"', a100)
         self.assertIn('MAX_SEQ_LENGTH: "7268"', h20)
@@ -133,6 +136,9 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn('x${GPU_COUNT}-formal', merlin)
         self.assertIn('run_training_phase "pre-resume-${SMOKE_RESUME_STEP}"', merlin)
         self.assertIn('export LOCANY_SEGMENT_MODE=1', merlin)
+        self.assertIn('export LOCANY_STOP_AFTER_PERIODIC_SAVE=1', merlin)
+        self.assertIn('run_integrated_eval_phase', merlin)
+        self.assertIn('CPT_INTEGRATED_EVAL', merlin)
         self.assertIn(
             "SMOKE_PRE_RESUME=SKIPPED_EXISTING_RESUMABLE_CHECKPOINT", merlin
         )
@@ -145,6 +151,9 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         trainer = (
             REPO_ROOT / "eaglevl" / "train" / "locany_finetune_magi_stream.py"
         ).read_text(encoding="utf-8")
+        tools = (REPO_ROOT / "eaglevl" / "train" / "tools.py").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("export ENABLE_UI_RELATION=False", launcher)
         self.assertIn(
@@ -165,6 +174,9 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn("'version': 6", trainer)
         self.assertIn("truncation=not self.cpt_enabled", trainer)
         self.assertIn('"cpt_eval_queue.jsonl"', trainer)
+        self.assertIn('"LOCANY_STOP_AFTER_PERIODIC_SAVE"', trainer)
+        self.assertIn("if periodic_due and self.stop_after_save:", tools)
+        self.assertIn("control.should_training_stop = True", tools)
 
     def test_v2_data_and_eval_jobs_are_explicit(self):
         prepare = (REPO_ROOT / "shell" / "prepare_locany_cpt_v2.sh").read_text(
@@ -186,6 +198,8 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
             'EVAL_VISION_ATTN_IMPLEMENTATION: "flash_attention_2"', eval_yaml
         )
         self.assertIn('EVAL_SAMPLES_PER_TASK: "10"', eval_yaml)
+        self.assertIn('RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x4-formal"', eval_yaml)
+        self.assertIn('EVAL_MAX_PENDING: "20"', eval_yaml)
 
         smoke_eval_yaml = (
             REPO_ROOT / "locany_cpt_v4_h20x1_smoke_eval_merlin.yaml"
