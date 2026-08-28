@@ -90,7 +90,7 @@ raw 结果始终位于 `detections/{text,icon,merged}/`，不同几何版本写�
 watch -n 5 'cat work_dirs/ui5_eval_detector_preview_v5/run_status.json'
 ```
 
-确认 preview 后，必须在训练前完成全量 17,281 张内容唯一图片的离线 cache。训练中的
+确认 preview 后，必须在训练前完成全量 1,555 张内容唯一图片的离线 cache。训练中的
 step-0/1000/2000 评测不会现场启动 PaddleOCR 或 icon worker：
 
 ```bash
@@ -117,6 +117,7 @@ EVAL_CACHE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_L
   --seam-candidates safe-raw-detector-edges-only \
   --strict-vertical-partition \
   --cache-scope full_test \
+  --expected-full-test-unique-images 1555 \
   --visualization-samples 60 \
   --resume
 
@@ -124,7 +125,7 @@ EVAL_CACHE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_L
   --cache-dir "${EVAL_CACHE}" \
   --scan-name horizontal_scan_v5_raw_detector_edge_aligned \
   --cache-scope full_test \
-  --expected-unique-images 17281 \
+  --expected-unique-images 1555 \
   --require-strict-nonoverlap \
   --require-raw-detector-edge-alignment \
   --require-detector-unique-containment \
@@ -141,7 +142,9 @@ boundary cut、balanced fallback、full-in-multi、duplicate 和 nested 均为 0
 schema-v4 marker 会被拒绝；preview marker 也不能用于正式训练评测。
 
 marker 中的 `cache_scope` 明确区分 `preview` 与 `full_test`。preview 必须记录正数
-`max_images_per_task`；full-test 必须为 0，并绑定显式的 17,281 张预期内容唯一图片。训练/周期
+`max_images_per_task`；full-test 必须为 0，并绑定显式的 1,555 张预期内容唯一图片。五个任务
+各有 1,555 条记录并共享同一内容池，因此 task manifest 共 7,775 条、content-unique union 为
+1,555；不要把训练池的 17,281 张误用作测试集门禁。训练/周期
 评测默认要求 `full_test`，所以 20/200 张预览即使几何全部通过也会在 LocateAnything worker
 启动前 fail closed。
 
@@ -158,6 +161,7 @@ marker 中的 `cache_scope` 明确区分 `preview` 与 `full_test`。preview 必
   --eval-detector-cache "${EVAL_CACHE}" \
   --eval-detector-cache-mode readonly \
   --eval-scan-name horizontal_scan_v5_raw_detector_edge_aligned \
+  --eval-expected-unique-images 1555 \
   --require-cache-scope full_test \
   --require-strict-nonoverlap \
   --require-raw-detector-edge-alignment \
@@ -261,6 +265,7 @@ python scripts/submit_locany_ui5.py \
   --eval-detector-cache "${EVAL_CACHE}" \
   --eval-detector-cache-mode readonly \
   --eval-scan-name horizontal_scan_v5_raw_detector_edge_aligned \
+  --eval-expected-unique-images 1555 \
   --require-cache-scope full_test \
   --require-strict-nonoverlap \
   --require-raw-detector-edge-alignment \

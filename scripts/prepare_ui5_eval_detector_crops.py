@@ -26,7 +26,11 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from locany_ui5_common import TASK_JSONL, TASKS
+from locany_ui5_common import (
+    DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
+    TASK_JSONL,
+    TASKS,
+)
 from run_ui5_crop_audit import (
     AuditPaths,
     ProgressReporter,
@@ -93,7 +97,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cache-scope", choices=("auto", "preview", "full_test"), default="auto"
     )
-    parser.add_argument("--expected-full-test-unique-images", type=int, default=17281)
+    parser.add_argument(
+        "--expected-full-test-unique-images",
+        type=int,
+        default=DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
+    )
     parser.add_argument("--scan-max-crops", type=int, default=10)
     parser.add_argument("--scan-target-height", type=int, default=960)
     parser.add_argument("--scan-overlap-ratio", type=float, default=0.12)
@@ -849,7 +857,13 @@ def _resolve_cache_scope(
     expected = (
         unique_count
         if cache_scope == "preview"
-        else int(getattr(args, "expected_full_test_unique_images", 17281))
+        else int(
+            getattr(
+                args,
+                "expected_full_test_unique_images",
+                DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
+            )
+        )
     )
     if unique_count != expected:
         raise RuntimeError(

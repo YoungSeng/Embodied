@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from locany_ui5_common import (
+    DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
     DEFAULT_CONFIG_PATH,
     PROJECT_ROOT,
     assert_gpu_mode_consistency,
@@ -86,7 +87,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument("--eval-expected-unique-images", type=int, default=17281)
+    parser.add_argument(
+        "--eval-expected-unique-images",
+        type=int,
+        default=DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
+    )
     parser.add_argument("--eval-text-python", default=None)
     parser.add_argument("--eval-icon-python", default=None)
     parser.add_argument("--eval-text-model-dir", default=None)
@@ -264,7 +269,11 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
             else "0"
         ),
         "EVAL_EXPECTED_UNIQUE_IMAGES": str(
-            getattr(args, "eval_expected_unique_images", 17281)
+            getattr(
+                args,
+                "eval_expected_unique_images",
+                DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
+            )
         ),
         "EVAL_TILE_MAX_COUNT": str(getattr(args, "eval_tile_max_count", 10)),
         "EVAL_TILE_TARGET_LONG_SIDE": str(

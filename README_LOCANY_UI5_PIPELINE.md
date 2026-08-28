@@ -285,7 +285,7 @@ guarded/protected band、空隙中点或理想等分点生成 seam。安全 raw 
 `eval_detector_cache_ready.json` 在输入、detector shard、merged、几何 manifest、summary、CSV 和
 gallery 全部写入并通过门禁后最后原子生成。readonly 会重新校验 dataset/detector/geometry
 digest；缓存缺失、不完整或 digest 不一致时 fail closed，不回退现场 detector 或 full image。
-正式评测还要求 `cache_scope=full_test`、`max_images_per_task=0`、17,281 张内容唯一图片，并拒绝
+正式评测还要求 `cache_scope=full_test`、`max_images_per_task=0`、1,555 张内容唯一图片，并拒绝
 schema-v4 或 preview marker。更改几何时使用新的 `EVAL_SCAN_NAME`，只重跑 CPU crop；raw
 detector shard 保持不变。
 

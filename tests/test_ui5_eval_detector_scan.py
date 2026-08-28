@@ -502,7 +502,7 @@ class DetectorScanPipelineTest(unittest.TestCase):
                 output_dir=root,
                 scan_name="horizontal_scan_v5_raw_detector_edge_aligned",
                 cache_scope="preview",
-                expected_full_test_unique_images=17281,
+                expected_full_test_unique_images=1555,
                 scan_max_crops=10,
                 scan_target_height=960,
                 scan_overlap_ratio=0.12,
@@ -629,9 +629,23 @@ class DetectorScanPipelineTest(unittest.TestCase):
         self.assertEqual(config["EVAL_REQUIRE_STRICT_NONOVERLAP"], 1)
         self.assertEqual(config["EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT"], 1)
         self.assertEqual(config["EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT"], 1)
+        self.assertEqual(config["EVAL_EXPECTED_UNIQUE_IMAGES"], 1555)
         self.assertEqual(config["EVAL_SCAN_TARGET_GUARD_RATIO"], 0.0)
         self.assertEqual(config["EVAL_SCAN_TARGET_GUARD_MIN_PIXELS"], 0)
         self.assertEqual(config["EVAL_SCAN_TARGET_GUARD_MAX_PIXELS"], 0)
+
+    def test_prepare_full_test_default_matches_verified_eval_manifest(self) -> None:
+        args = preparer.parse_args(
+            [
+                "--stage",
+                "crop",
+                "--output-dir",
+                "cache",
+                "--parser-root",
+                ".",
+            ]
+        )
+        self.assertEqual(args.expected_full_test_unique_images, 1555)
 
     def test_runtime_preflight_rejects_nonzero_guard_in_raw_edge_mode(self) -> None:
         with self.assertRaisesRegex(ValueError, "target guard 0/0/0"):

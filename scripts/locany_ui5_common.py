@@ -34,6 +34,11 @@ TASK_ISSUE_NAMES = {
     "content_missing": "内容未展示",
 }
 
+# The five production evaluation JSONL files share one pool of 1,555
+# content-unique images.  Keep this separate from the 17,281-image training
+# pool used by crop_audit_v4_gt_repair.
+DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES = 1555
+
 
 def parse_bool(value: Any, *, name: str = "value") -> bool:
     if isinstance(value, bool):
@@ -389,7 +394,11 @@ def resolve_runtime_config(
             )
         ),
         "EVAL_EXPECTED_UNIQUE_IMAGES": int(
-            _env_value(env, "EVAL_EXPECTED_UNIQUE_IMAGES", 17281)
+            _env_value(
+                env,
+                "EVAL_EXPECTED_UNIQUE_IMAGES",
+                DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
+            )
         ),
         "EVAL_TEXT_PYTHON": str(_env_value(env, "EVAL_TEXT_PYTHON", "")),
         "EVAL_ICON_PYTHON": str(_env_value(env, "EVAL_ICON_PYTHON", "")),

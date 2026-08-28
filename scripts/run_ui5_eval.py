@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from locany_ui5_common import PROJECT_ROOT
+from locany_ui5_common import DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES, PROJECT_ROOT
 from ui5_eval_detector_cache import validate_eval_detector_cache
 
 
@@ -74,7 +74,11 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument("--eval-expected-unique-images", type=int, default=17281)
+    parser.add_argument(
+        "--eval-expected-unique-images",
+        type=int,
+        default=DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
+    )
     parser.add_argument("--eval-text-python", default=None)
     parser.add_argument("--eval-icon-python", default=None)
     parser.add_argument("--eval-text-model-dir", type=Path, default=None)
