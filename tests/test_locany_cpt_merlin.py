@@ -133,6 +133,10 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn('x${GPU_COUNT}-formal', merlin)
         self.assertIn('run_training_phase "pre-resume-${SMOKE_RESUME_STEP}"', merlin)
         self.assertIn('export LOCANY_SEGMENT_MODE=1', merlin)
+        self.assertIn(
+            "SMOKE_PRE_RESUME=SKIPPED_EXISTING_RESUMABLE_CHECKPOINT", merlin
+        )
+        self.assertIn("scripts/locany_ui5_checkpoint.py", merlin)
 
     def test_disabled_ui_relation_skips_ui5_only_trainer_audits(self):
         launcher = (REPO_ROOT / "shell" / "run_locany_cpt.sh").read_text(
@@ -154,6 +158,9 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn("self._write_cpt_metrics(step, logs)", trainer)
         self.assertIn("if self._ui5_enabled and step in {1, 20, 100}:", trainer)
         self.assertIn("@record\ndef main():", trainer)
+        self.assertIn("publish_cpt_checkpoint_completion", trainer)
+        self.assertIn("reconcile_cpt_checkpoint_completion", trainer)
+        self.assertIn("dist.destroy_process_group()", trainer)
         self.assertIn("CPT resume dataloader state is missing", trainer)
         self.assertIn("'version': 6", trainer)
         self.assertIn("truncation=not self.cpt_enabled", trainer)

@@ -177,15 +177,26 @@ run_training_phase() {
 
 SMOKE_RESUME_STEP="${CPT_SMOKE_RESUME_STEP:-0}"
 if [[ "${CPT_MODE}" == "smoke" && "${SMOKE_RESUME_STEP}" -gt 0 ]]; then
+  SMOKE_OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_BASE:-${WORKSPACE}/gui_models}/${RUN_NAME}}"
+  SMOKE_RESUME_CHECKPOINT="${SMOKE_OUTPUT_DIR}/checkpoint-${SMOKE_RESUME_STEP}"
   export LOCANY_SEGMENT_MODE=1
-  export LOCANY_STOP_AFTER_STEP="${SMOKE_RESUME_STEP}"
-  if run_training_phase "pre-resume-${SMOKE_RESUME_STEP}"; then
-    :
+  if "${ENV_DIR}/bin/python" "${PROJECT_ROOT}/scripts/locany_ui5_checkpoint.py" \
+    validate \
+    --checkpoint "${SMOKE_RESUME_CHECKPOINT}" \
+    --mode resume \
+    --expected-ranks "${GPU_COUNT}" >/dev/null 2>&1; then
+    echo "SMOKE_PRE_RESUME=SKIPPED_EXISTING_RESUMABLE_CHECKPOINT"
+    echo "SMOKE_RESUME_CHECKPOINT=${SMOKE_RESUME_CHECKPOINT}"
   else
-    TRAIN_EXIT_CODE=$?
-    echo "TRAIN_EXIT_CODE=${TRAIN_EXIT_CODE}"
-    echo "LAUNCH_LOG=${LAUNCH_LOG}"
-    exit "${TRAIN_EXIT_CODE}"
+    export LOCANY_STOP_AFTER_STEP="${SMOKE_RESUME_STEP}"
+    if run_training_phase "pre-resume-${SMOKE_RESUME_STEP}"; then
+      :
+    else
+      TRAIN_EXIT_CODE=$?
+      echo "TRAIN_EXIT_CODE=${TRAIN_EXIT_CODE}"
+      echo "LAUNCH_LOG=${LAUNCH_LOG}"
+      exit "${TRAIN_EXIT_CODE}"
+    fi
   fi
   unset LOCANY_STOP_AFTER_STEP
   if run_training_phase "post-resume"; then

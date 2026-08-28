@@ -77,6 +77,11 @@ scripts/submit_locany_cpt.py --mode smoke --cluster aiai_locate
 该 job 实际申请 `A800_SXM_40GB × 4`，先保存 checkpoint-10，再从 checkpoint-10
 自动 resume 到 checkpoint-20。必须等 job 正常完成后再执行下一步。
 
+如果旧 job 已在 checkpoint-10 完整写盘后因 completion marker/eval queue 的
+`Errno 38: Function not implemented` 退出，直接用相同命令重新提交，不要删除
+checkpoint-10。launcher 会先做 resume 完整性验证；验证通过时跳过前十步，训练入口自动
+补齐 marker/queue，并从 checkpoint-10 继续到 checkpoint-20。
+
 ### 0.3 YG：在 A800 上跑 held-out eval
 
 在可使用 A800 的节点执行。评测只使用 GPU 0，因此显式限制可见卡数为 1：
@@ -549,6 +554,11 @@ python scripts/validate_locany_cpt_smoke.py \
 
 常见失败含义：
 
+- `Checkpoint completion ... OSError: [Errno 38] Function not implemented`：部分 ByteNAS
+  挂载不实现 `fcntl.flock` 或 `fsync`。CPT eval queue 现在优先使用 `flock`，收到明确的
+  `ENOSYS/ENOTSUP` 后退化到带超时和 stale recovery 的原子目录锁；marker/queue 的
+  `fsync` 不支持时使用 close + 同目录原子替换。已经通过 resume 校验的 checkpoint 会在
+  重启时补齐 completion marker 和 queue row，不会重训或静默删除。
 - `ImportError: libGL.so.1`：OpenCV wheel 缺少任务容器的系统动态库，不是 CUDA/NCCL
   错误。所有 CPT train/eval YAML 默认设置 `INSTALL_SYSTEM_RUNTIME_DEPS=1`；launcher 会在
   `torchrun` 前预检，仅在确实缺失时通过 `sudo apt-get` 安装 `libgl1 libglib2.0-0`，随后

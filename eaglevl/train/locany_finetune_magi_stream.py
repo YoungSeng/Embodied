@@ -12,6 +12,7 @@ Key Features:
 
 import os
 import os.path as osp
+import errno
 import copy
 import logging
 import random
@@ -1610,6 +1611,145 @@ class DataloaderStateCallback(TrainerCallback):
         return control
 
 
+_UNSUPPORTED_FSYNC_ERRNOS = {
+    errno.ENOSYS,
+    errno.EINVAL,
+    getattr(errno, "ENOTSUP", errno.EINVAL),
+    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+}
+
+
+def _checkpoint_fsync(handle, *, path: Path) -> None:
+    """Best-effort durability on filesystems that implement regular-file fsync."""
+
+    try:
+        os.fsync(handle.fileno())
+    except OSError as exc:
+        if exc.errno not in _UNSUPPORTED_FSYNC_ERRNOS:
+            raise
+        logger.warning(
+            "[Checkpoint] filesystem does not support fsync for %s (%s); "
+            "continuing with close + atomic replace",
+            path,
+            exc,
+        )
+
+
+def publish_cpt_checkpoint_completion(
+    checkpoint_dir: Path,
+    *,
+    global_step: int,
+    world_size: int,
+    output_dir: Path,
+    recovered: bool = False,
+) -> dict[str, Any]:
+    """Validate, mark, and enqueue one checkpoint in crash-safe order."""
+
+    checkpoint_dir = checkpoint_dir.expanduser().resolve()
+    output_dir = output_dir.expanduser().resolve()
+    report = validate_checkpoint(
+        checkpoint_dir,
+        mode="resume",
+        expected_ranks=world_size,
+    )
+    if not report["valid"]:
+        raise RuntimeError(
+            "checkpoint resume validation failed before marker publish: "
+            + "; ".join(report["errors"])
+        )
+
+    marker = checkpoint_dir / "checkpoint_complete.json"
+    temporary = marker.with_name(f"{marker.name}.tmp-{os.getpid()}")
+    payload = {
+        "schema_version": 1,
+        "global_step": int(global_step),
+        "completed_at_unix": time.time(),
+        "hostname": socket.gethostname(),
+        "world_size": int(world_size),
+        "recovered_after_interrupted_publish": bool(recovered),
+        "validation": report,
+    }
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            _checkpoint_fsync(handle, path=temporary)
+        # The marker is published before the queue row. An evaluator can never
+        # observe an advertised checkpoint whose resume files were incomplete.
+        os.replace(temporary, marker)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            logger.exception(
+                "[Checkpoint] could not remove marker temporary file %s",
+                temporary,
+            )
+
+    if _env_flag("LOCANY_CPT_MODE", default=False):
+        queue_path = output_dir / "diagnostics" / "cpt_eval_queue.jsonl"
+        try:
+            enqueue_pending_eval(
+                queue_path,
+                {
+                    "schema_version": 1,
+                    "step": int(global_step),
+                    "checkpoint": str(checkpoint_dir),
+                    "split": "heldout",
+                    "recommended_recipe": "locany_cpt_val_fast.json",
+                    "status": "pending",
+                    "created_at_unix": time.time(),
+                },
+            )
+        except BaseException as exc:
+            raise RuntimeError(
+                "checkpoint marker was published, but eval queue publish failed: "
+                f"queue={queue_path}; {type(exc).__name__}: {exc}"
+            ) from exc
+    return report
+
+
+def reconcile_cpt_checkpoint_completion(
+    checkpoint_dir: Path,
+    *,
+    global_step: int,
+    world_size: int,
+    output_dir: Path,
+) -> None:
+    """Repair marker/queue publication after a previously interrupted save."""
+
+    error = None
+    if get_rank() == 0:
+        try:
+            report = publish_cpt_checkpoint_completion(
+                checkpoint_dir,
+                global_step=global_step,
+                world_size=world_size,
+                output_dir=output_dir,
+                recovered=True,
+            )
+            logger.info(
+                "[Checkpoint] reconciled resumable checkpoint before restart: "
+                "step=%s path=%s warnings=%s",
+                global_step,
+                checkpoint_dir,
+                report["warnings"],
+            )
+        except BaseException as exc:
+            error = (
+                "CPT checkpoint completion recovery failed: "
+                f"checkpoint={checkpoint_dir}; {type(exc).__name__}: {exc}"
+            )
+            logger.exception("[Checkpoint] restart reconciliation FAILED")
+    if dist.is_available() and dist.is_initialized():
+        message = [error]
+        dist.broadcast_object_list(message, src=0)
+        error = message[0]
+    if error is not None:
+        raise RuntimeError(error)
+
+
 class CheckpointCompletionCallback(TrainerCallback):
     """Validate every rank's resume state before declaring a save complete."""
 
@@ -1621,77 +1761,25 @@ class CheckpointCompletionCallback(TrainerCallback):
         validation_error = None
         if rank == 0:
             try:
-                report = validate_checkpoint(
+                report = publish_cpt_checkpoint_completion(
                     Path(checkpoint_dir),
-                    mode="resume",
-                    expected_ranks=(dist.get_world_size() if dist.is_initialized() else 1),
+                    global_step=int(state.global_step),
+                    world_size=(dist.get_world_size() if dist.is_initialized() else 1),
+                    output_dir=Path(args.output_dir),
                 )
-                if not report["valid"]:
-                    validation_error = (
-                        "Checkpoint save returned but resume validation failed: "
-                        f"checkpoint={checkpoint_dir}; errors={'; '.join(report['errors'])}"
-                    )
-                else:
-                    marker = osp.join(checkpoint_dir, "checkpoint_complete.json")
-                    temporary = f"{marker}.tmp-{os.getpid()}"
-                    payload = {
-                        "schema_version": 1,
-                        "global_step": int(state.global_step),
-                        "completed_at_unix": time.time(),
-                        "hostname": socket.gethostname(),
-                        "world_size": (
-                            dist.get_world_size() if dist.is_initialized() else 1
-                        ),
-                        "validation": report,
-                    }
-                    with open(temporary, "w", encoding="utf-8") as handle:
-                        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-                        handle.write("\n")
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    # Publish the completion marker before the queue row.  An
-                    # independent evaluator may claim a row immediately, so
-                    # the queue itself must never advertise a partial save.
-                    os.replace(temporary, marker)
-                    if _env_flag("LOCANY_CPT_MODE", default=False):
-                        diagnostics = osp.join(args.output_dir, "diagnostics")
-                        os.makedirs(diagnostics, exist_ok=True)
-                        queue_path = osp.join(diagnostics, "cpt_eval_queue.jsonl")
-                        enqueue_pending_eval(
-                            Path(queue_path),
-                            {
-                                "schema_version": 1,
-                                "step": int(state.global_step),
-                                "checkpoint": checkpoint_dir,
-                                "split": "heldout",
-                                "recommended_recipe": "locany_cpt_val_fast.json",
-                                "status": "pending",
-                                "created_at_unix": time.time(),
-                            },
-                        )
-                    logger.info(
-                        "[Checkpoint] COMPLETE step=%s path=%s details=%s warnings=%s",
-                        state.global_step,
-                        checkpoint_dir,
-                        report["details"],
-                        report["warnings"],
-                    )
+                logger.info(
+                    "[Checkpoint] COMPLETE step=%s path=%s details=%s warnings=%s",
+                    state.global_step,
+                    checkpoint_dir,
+                    report["details"],
+                    report["warnings"],
+                )
             except BaseException as exc:
                 validation_error = (
                     "Checkpoint completion validation/marker failed: "
                     f"checkpoint={checkpoint_dir}; {type(exc).__name__}: {exc}"
                 )
                 logger.exception("[Checkpoint] completion FAILED")
-            finally:
-                temporary_path = locals().get("temporary")
-                if temporary_path and osp.exists(temporary_path):
-                    try:
-                        os.remove(temporary_path)
-                    except OSError:
-                        logger.exception(
-                            "[Checkpoint] could not remove marker temporary file %s",
-                            temporary_path,
-                        )
         if dist.is_available() and dist.is_initialized():
             message = [validation_error]
             dist.broadcast_object_list(message, src=0)
@@ -3704,6 +3792,15 @@ def main():
         last_checkpoint = get_last_checkpoint_guard(training_args.output_dir)
         if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
             logger.info(f'Checkpoint detected at {last_checkpoint}, resuming training.')
+        if last_checkpoint is not None and _env_flag("LOCANY_CPT_MODE", default=False):
+            checkpoint_name = osp.basename(osp.normpath(last_checkpoint))
+            checkpoint_step = int(checkpoint_name.rsplit("checkpoint-", 1)[1])
+            reconcile_cpt_checkpoint_completion(
+                Path(last_checkpoint),
+                global_step=checkpoint_step,
+                world_size=(dist.get_world_size() if dist.is_initialized() else 1),
+                output_dir=Path(training_args.output_dir),
+            )
             
     set_seed(training_args.seed)
     
@@ -4145,4 +4242,11 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except BaseException:
+                logger.exception("Failed to destroy distributed process group during shutdown")

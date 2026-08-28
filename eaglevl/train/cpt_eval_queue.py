@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import logging
 import os
 import socket
 import tempfile
@@ -11,6 +13,15 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
+
+
+logger = logging.getLogger(__name__)
+_UNSUPPORTED_FLOCK_ERRNOS = {
+    errno.ENOSYS,
+    errno.EINVAL,
+    getattr(errno, "ENOTSUP", errno.EINVAL),
+    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+}
 
 
 def _queue_id(row: Mapping[str, Any]) -> str:
@@ -38,6 +49,20 @@ def read_eval_queue(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _fsync_if_supported(handle: Any, *, path: Path) -> None:
+    try:
+        os.fsync(handle.fileno())
+    except OSError as exc:
+        if exc.errno not in _UNSUPPORTED_FLOCK_ERRNOS:
+            raise
+        logger.warning(
+            "eval queue filesystem does not support fsync for %s (%s); "
+            "continuing with close + atomic replace",
+            path,
+            exc,
+        )
+
+
 def _atomic_write(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
@@ -47,8 +72,77 @@ def _atomic_write(path: Path, rows: list[dict[str, Any]]) -> None:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
         handle.flush()
-        os.fsync(handle.fileno())
+        _fsync_if_supported(handle, path=temporary)
     os.replace(temporary, path)
+
+
+def _acquire_flock(handle: Any) -> Any | None:
+    """Return the fcntl module when flock works, otherwise request fallback."""
+
+    try:
+        import fcntl
+    except ImportError:  # Windows unit-test fallback.
+        return None
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except OSError as exc:
+        if exc.errno not in _UNSUPPORTED_FLOCK_ERRNOS:
+            raise
+        logger.warning(
+            "eval queue filesystem does not support flock (%s); "
+            "using atomic directory lock",
+            exc,
+        )
+        return None
+    return fcntl
+
+
+@contextmanager
+def _directory_queue_lock(lock_path: Path) -> Iterator[None]:
+    """Portable NAS fallback based on atomic mkdir/rmdir."""
+
+    directory = Path(str(lock_path) + ".mkdir")
+    timeout_seconds = float(os.environ.get("CPT_EVAL_QUEUE_LOCK_TIMEOUT_SECONDS", "120"))
+    stale_seconds = float(os.environ.get("CPT_EVAL_QUEUE_LOCK_STALE_SECONDS", "600"))
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            directory.mkdir()
+            break
+        except FileExistsError:
+            try:
+                age_seconds = time.time() - directory.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            if age_seconds > stale_seconds:
+                removed_stale_lock = False
+                try:
+                    directory.rmdir()
+                    removed_stale_lock = True
+                    logger.warning(
+                        "removed stale eval queue directory lock: path=%s age=%.1fs",
+                        directory,
+                        age_seconds,
+                    )
+                except FileNotFoundError:
+                    removed_stale_lock = True
+                except OSError:
+                    removed_stale_lock = False
+                if removed_stale_lock:
+                    continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"timed out waiting for eval queue lock {directory} after "
+                    f"{timeout_seconds:.1f}s"
+                )
+            time.sleep(0.1)
+    try:
+        yield
+    finally:
+        try:
+            directory.rmdir()
+        except FileNotFoundError:
+            pass
 
 
 @contextmanager
@@ -56,17 +150,15 @@ def eval_queue_lock(path: Path) -> Iterator[None]:
     lock_path = path.with_suffix(path.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as handle:
-        try:
-            import fcntl
-        except ImportError:  # Windows unit-test fallback.
-            fcntl = None
-        if fcntl is not None:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        fcntl_module = _acquire_flock(handle)
+        if fcntl_module is None:
+            with _directory_queue_lock(lock_path):
+                yield
+            return
         try:
             yield
         finally:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            fcntl_module.flock(handle.fileno(), fcntl_module.LOCK_UN)
 
 
 def enqueue_pending_eval(path: Path, row: Mapping[str, Any]) -> bool:

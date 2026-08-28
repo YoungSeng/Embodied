@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import errno
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from eaglevl.train import cpt_eval_queue
 from eaglevl.train.cpt_eval_queue import (
     claim_next_eval,
     enqueue_pending_eval,
@@ -15,6 +18,34 @@ from scripts.run_locany_cpt_eval_queue import validate_eval_summary
 
 
 class CPTEvalQueueTest(unittest.TestCase):
+    def test_flock_unsupported_falls_back_to_atomic_directory_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            queue = Path(temporary) / "diagnostics" / "cpt_eval_queue.jsonl"
+            with mock.patch.object(cpt_eval_queue, "_acquire_flock", return_value=None):
+                self.assertTrue(
+                    enqueue_pending_eval(
+                        queue,
+                        {"step": 10, "checkpoint": "/run/checkpoint-10"},
+                    )
+                )
+            self.assertEqual(read_eval_queue(queue)[0]["step"], 10)
+            self.assertFalse(
+                Path(str(queue.with_suffix(queue.suffix + ".lock")) + ".mkdir").exists()
+            )
+
+    def test_fsync_unsupported_keeps_atomic_queue_publish(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            queue = Path(temporary) / "diagnostics" / "cpt_eval_queue.jsonl"
+            unsupported = OSError(errno.ENOSYS, "Function not implemented")
+            with mock.patch.object(cpt_eval_queue.os, "fsync", side_effect=unsupported):
+                self.assertTrue(
+                    enqueue_pending_eval(
+                        queue,
+                        {"step": 10, "checkpoint": "/run/checkpoint-10"},
+                    )
+                )
+            self.assertEqual(read_eval_queue(queue)[0]["step"], 10)
+
     def test_queue_deduplicates_claims_and_records_terminal_state(self):
         with tempfile.TemporaryDirectory() as temporary:
             queue = Path(temporary) / "diagnostics/cpt_eval_queue.jsonl"
