@@ -660,6 +660,22 @@ class CheckpointTests(unittest.TestCase):
 
 
 class HistoryTests(unittest.TestCase):
+    def test_collect_metrics_direct_script_uses_checkout_eaglevl(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "collect_ui5_metrics.py"),
+                    "--help",
+                ],
+                cwd=temporary,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("{record,has-success,convert-report}", completed.stdout)
+
     def test_tiled_gate_aggregation_keeps_image_probability(self) -> None:
         diagnostics = locany_ui5_common.aggregate_tiled_gate_diagnostics(
             [

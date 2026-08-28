@@ -8,8 +8,16 @@ import csv
 import importlib.util
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
+
+# Direct invocations use ``scripts/`` as sys.path[0].  Put this checkout first
+# so the history repair command cannot accidentally import an older installed
+# ``eaglevl`` package that lacks the UI5 Excel logger.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from locany_ui5_common import TASK_ISSUE_NAMES, TASKS, image_gate_probability
 from eaglevl.train.ui5_excel_logger import (
