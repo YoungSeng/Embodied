@@ -95,6 +95,48 @@ def discover_checkpoints(run_dir: Path, requested_steps: Sequence[int] | None) -
     return [(step, found[step]) for step in steps]
 
 
+def has_all_ui5_test_files(path: Path) -> bool:
+    return path.is_dir() and all((path / filename).is_file() for filename in TASK_JSONL.values())
+
+
+def resolve_ui5_input_dir(raw_value: str | None, run_dir: Path) -> tuple[Path, str]:
+    """Resolve an explicit path or infer WORKSPACE/data from the CPT run path.
+
+    ``--input-dir "$UI5_TEST_DIR"`` becomes an empty string when the shell
+    variable was not set.  Treating that as ``Path('.')`` hid the real problem
+    and produced a misleading error under the repository root.
+    """
+
+    raw = str(raw_value or "").strip()
+    if raw:
+        requested = Path(raw).expanduser().resolve()
+        if has_all_ui5_test_files(requested):
+            return requested, "explicit"
+        expected = ", ".join(TASK_JSONL.values())
+        raise FileNotFoundError(
+            f"explicit --input-dir does not contain all five UI5 JSONL files: {requested}; "
+            f"expected: {expected}"
+        )
+
+    candidates: list[tuple[str, Path]] = []
+    for env_name in ("UI5_TEST_DIR", "EVAL_INPUT_DIR"):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            candidates.append((f"environment:{env_name}", Path(value).expanduser().resolve()))
+    # Expected layout: WORKSPACE/gui_models/RUN_NAME -> WORKSPACE/data.
+    candidates.append(("inferred-from-run-dir", run_dir.parent.parent / "data"))
+    for source, candidate in candidates:
+        candidate = candidate.resolve()
+        if has_all_ui5_test_files(candidate):
+            print(f"[AUTO] UI5 test directory ({source}): {candidate}", flush=True)
+            return candidate, source
+    rendered = ", ".join(f"{source}={path}" for source, path in candidates)
+    raise FileNotFoundError(
+        "--input-dir was empty and no complete UI5 test directory could be inferred; "
+        f"checked: {rendered}"
+    )
+
+
 def parse_external_metrics(values: Sequence[str]) -> list[tuple[str, Path]]:
     result: list[tuple[str, Path]] = []
     labels: set[str] = set()
@@ -548,9 +590,16 @@ def parse_args() -> argparse.Namespace:
         description="Run legacy CPT checkpoint sweep on five UI defect test sets",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--run-dir", type=Path, required=True, help="directory containing checkpoint-N")
-    parser.add_argument("--processor-path", type=Path, required=True, help="base LocateAnything processor/model directory")
-    parser.add_argument("--input-dir", type=Path, required=True, help="directory containing five test_ui_* JSONL files")
+    parser.add_argument("--run-dir", required=True, help="directory containing checkpoint-N")
+    parser.add_argument("--processor-path", required=True, help="base LocateAnything processor/model directory")
+    parser.add_argument(
+        "--input-dir",
+        default=None,
+        help=(
+            "directory containing five test_ui_* JSONL files; an empty/omitted value "
+            "uses UI5_TEST_DIR, EVAL_INPUT_DIR, then WORKSPACE/data inferred from --run-dir"
+        ),
+    )
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--steps", nargs="*", type=int, default=None, help="checkpoint steps; omit to discover all")
     parser.add_argument("--gpu-devices", default="0,1", help="physical GPU IDs; one checkpoint per GPU")
@@ -594,9 +643,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    args.run_dir = args.run_dir.expanduser().resolve()
-    args.processor_path = args.processor_path.expanduser().resolve()
-    args.input_dir = args.input_dir.expanduser().resolve()
+    raw_run_dir = str(args.run_dir or "").strip()
+    raw_processor_path = str(args.processor_path or "").strip()
+    if not raw_run_dir:
+        raise ValueError(
+            "--run-dir expanded to an empty string; define RUN_DIR or pass the absolute path"
+        )
+    if not raw_processor_path:
+        raise ValueError(
+            "--processor-path expanded to an empty string; define BASE_MODEL or pass the absolute path"
+        )
+    args.run_dir = Path(raw_run_dir).expanduser().resolve()
+    args.processor_path = Path(raw_processor_path).expanduser().resolve()
+    args.input_dir, input_dir_source = resolve_ui5_input_dir(args.input_dir, args.run_dir)
     args.output_root = (
         args.output_root.expanduser().resolve()
         if args.output_root is not None
@@ -632,6 +691,7 @@ def main() -> int:
         "run_dir": str(args.run_dir),
         "output_root": str(args.output_root),
         "input_dir": str(args.input_dir),
+        "input_dir_source": input_dir_source,
         "processor_path": str(args.processor_path),
         "steps": [step for step, _ in checkpoints],
         "gpu_devices": gpus,

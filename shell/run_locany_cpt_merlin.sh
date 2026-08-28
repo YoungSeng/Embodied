@@ -127,6 +127,7 @@ echo "visible_gpus     : ${CUDA_VISIBLE_DEVICES}"
 echo "local_cache      : ${CACHE_ROOT}"
 echo "launcher_log     : ${SHARED_RUNTIME_DIR}/launcher.log"
 echo "integrated_eval  : ${CPT_INTEGRATED_EVAL:-0}"
+echo "eval_at_start    : ${CPT_EVAL_AT_START:-1}"
 git rev-parse --short HEAD 2>/dev/null || true
 bash -n "${PROJECT_ROOT}/shell/run_locany_cpt.sh"
 bash -n "${PROJECT_ROOT}/shell/train_locany_ui_defect.sh"
@@ -197,6 +198,37 @@ run_integrated_eval_phase() {
   return "${eval_exit_code}"
 }
 
+run_initial_eval_phase() {
+  local formal_output_dir="$1"
+  local base_model="${MODEL_PATH:-${WORKSPACE}/hf_home/hub/models--nvidia--LocateAnything-3B/snapshots/c32291ca5e996f5a7a485845b4f57a233936bba0}"
+  local eval_exit_code
+  echo "===== Start ${MACHINE_TYPE} ${CPT_MODE} integrated step-0 held-out + external UI5 eval ====="
+  set +e
+  CUDA_VISIBLE_DEVICES=0 \
+  "${ENV_DIR}/bin/python" "${PROJECT_ROOT}/scripts/run_locany_cpt_initial_eval.py" \
+    --run-dir "${formal_output_dir}" \
+    --data-dir "${DATA_DIR}" \
+    --eval-recipe-name "${EVAL_RECIPE_NAME:-locany_cpt_val_fast.json}" \
+    --base-model "${base_model}" \
+    --python "${ENV_DIR}/bin/python" \
+    --samples-per-task "${EVAL_SAMPLES_PER_TASK:-10}" \
+    --device cuda:0 \
+    --dtype "${EVAL_DTYPE:-bf16}" \
+    --attn-implementation "${EVAL_ATTN_IMPLEMENTATION:-sdpa}" \
+    --vision-attn-implementation "${EVAL_VISION_ATTN_IMPLEMENTATION:-flash_attention_2}" \
+    --max-new-tokens "${EVAL_MAX_NEW_TOKENS:-1024}" \
+    --external-ui5-data-dir "${CPT_EXTERNAL_UI5_DATA_DIR:-${WORKSPACE}/data}" \
+    --external-max-new-tokens "${EVAL_EXTERNAL_MAX_NEW_TOKENS:-4096}" \
+    --external-max-images-per-task "${EVAL_EXTERNAL_MAX_IMAGES_PER_TASK:-0}" \
+    --external-iou-thresholds 0.1 \
+    --seed "${CPT_EVAL_SEED:-20260826}" \
+    2>&1 | tee -a "${LAUNCH_LOG}"
+  eval_exit_code="${PIPESTATUS[0]}"
+  set -e
+  echo "INITIAL_EVAL_PHASE=step-0 EXIT_CODE=${eval_exit_code}"
+  return "${eval_exit_code}"
+}
+
 SMOKE_RESUME_STEP="${CPT_SMOKE_RESUME_STEP:-0}"
 if [[ "${CPT_MODE}" == "formal" && "${CPT_INTEGRATED_EVAL:-0}" == "1" ]]; then
   export LOCANY_SEGMENT_MODE=1
@@ -205,6 +237,19 @@ if [[ "${CPT_MODE}" == "formal" && "${CPT_INTEGRATED_EVAL:-0}" == "1" ]]; then
   FORMAL_OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_BASE:-${WORKSPACE}/gui_models}/${RUN_NAME}}"
   FORMAL_MAX_STEPS="${MAX_STEPS:-20000}"
   SEGMENT_INDEX=0
+  if [[ "${CPT_EVAL_AT_START:-1}" == "1" ]]; then
+    if run_initial_eval_phase "${FORMAL_OUTPUT_DIR}"; then
+      :
+    else
+      EVAL_EXIT_CODE=$?
+      echo "INITIAL_EVAL_EXIT_CODE=${EVAL_EXIT_CODE}"
+      echo "Initial held-out evaluation failed; formal training has not started."
+      echo "The same step-0 gate also requires the external UI5 evaluation to pass."
+      echo "Fix evaluation and resubmit the same formal job."
+      echo "LAUNCH_LOG=${LAUNCH_LOG}"
+      exit "${EVAL_EXIT_CODE}"
+    fi
+  fi
   if [[ -f "${FORMAL_OUTPUT_DIR}/diagnostics/cpt_eval_queue.jsonl" ]]; then
     # A resubmitted job repairs/evaluates an already completed checkpoint
     # before spending another six-hour training segment.
@@ -249,7 +294,7 @@ if [[ "${CPT_MODE}" == "formal" && "${CPT_INTEGRATED_EVAL:-0}" == "1" ]]; then
       echo "INTEGRATED_FORMAL_COMPLETE_STEP=${LATEST_STEP}"
       break
     fi
-    echo "===== Resume training after integrated held-out eval at step ${LATEST_STEP} ====="
+    echo "===== Resume training after integrated held-out + external UI5 eval at step ${LATEST_STEP} ====="
   done
 elif [[ "${CPT_MODE}" == "smoke" && "${SMOKE_RESUME_STEP}" -gt 0 ]]; then
   SMOKE_OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_BASE:-${WORKSPACE}/gui_models}/${RUN_NAME}}"

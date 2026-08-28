@@ -15,7 +15,7 @@ jobDefVersion:
     imageVid: d8ap37f1enlcr23291ug
 
   lazyDownloadCode: true
-  name: 'locany-cpt-v4-v2-h20x2-formal'
+  name: 'locany-cpt-v4-v2-h20x2-formal-eval0'
 
   resource:
     arnoldConfig:
@@ -64,7 +64,8 @@ jobRunParams:
     GPU_COUNT: "2"
     DATA_DIR: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4_split_v2"
     RECIPE_NAME: "locany_cpt_train.json"
-    RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-formal"
+    # New directory: never resume the formal run that started before step-0 eval.
+    RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-formal-eval0"
     ATTN_IMPLEMENTATION: "sdpa"
     MAX_SEQ_LENGTH: "7268"
     MAX_NUM_TOKENS_PER_SAMPLE: "7268"
@@ -76,16 +77,27 @@ jobRunParams:
     LEARNING_RATE: "5e-6"
     SAVE_STEPS: "1000000000"
     # Every six training hours, this same x2 job saves a resumable checkpoint,
-    # releases torchrun, evaluates held-out data on GPU 0, then resumes x2.
+    # releases torchrun, evaluates both held-out and external UI5 on GPU 0,
+    # then resumes x2.
     SAVE_EVERY_N_HOURS: "6"
     SAVE_TOTAL_LIMIT: "20"
     CPT_INTEGRATED_EVAL: "1"
+    # Before optimizer step 1, run Base on held-out val_fast and the external
+    # five UI5 JSONLs under WORKSPACE/data.
+    CPT_EVAL_AT_START: "1"
+    CPT_EXTERNAL_UI5_EVAL: "1"
+    CPT_EXTERNAL_UI5_DATA_DIR: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data"
+    # Fixed hash subset sampled only from the image-group held-out pool.
+    EVAL_RECIPE_NAME: "locany_cpt_val_fast.json"
     EVAL_SAMPLES_PER_TASK: "10"
     EVAL_MAX_PENDING: "20"
     EVAL_ATTN_IMPLEMENTATION: "sdpa"
     EVAL_VISION_ATTN_IMPLEMENTATION: "flash_attention_2"
     EVAL_DTYPE: "bf16"
     EVAL_MAX_NEW_TOKENS: "1024"
+    EVAL_EXTERNAL_MAX_NEW_TOKENS: "4096"
+    # 0 means the complete external test sets, not a smoke subset.
+    EVAL_EXTERNAL_MAX_IMAGES_PER_TASK: "0"
     REPORT_TO: "tensorboard"
 
 namespace: /user/sicheng.yang

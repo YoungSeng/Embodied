@@ -79,6 +79,15 @@ def parse_args() -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--checkpoint-step",
+        type=int,
+        default=None,
+        help=(
+            "explicit metric step override; used by the integrated step-0 Base "
+            "evaluation when --checkpoint points at the original model directory"
+        ),
+    )
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--recipe", type=Path, required=True)
     parser.add_argument("--processor-path", default=None)
@@ -162,6 +171,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--progress-heartbeat-seconds cannot be negative")
     if args.qualitative_per_task < 0:
         parser.error("--qualitative-per-task cannot be negative")
+    if args.checkpoint_step is not None and args.checkpoint_step < 0:
+        parser.error("--checkpoint-step cannot be negative")
     return args
 
 
@@ -1092,7 +1103,11 @@ def build_eval_metric_rows(
     summary: dict[str, Any],
     history: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    step = checkpoint_step(args.checkpoint)
+    step = (
+        int(args.checkpoint_step)
+        if args.checkpoint_step is not None
+        else checkpoint_step(args.checkpoint)
+    )
     train_rows = _read_jsonl_rows(args.train_metrics_jsonl)
     base_per_task = summary["base"].get("per_task", {})
     checkpoint_per_task = summary["checkpoint_metrics"].get("per_task", {})
@@ -1277,7 +1292,15 @@ def main() -> int:
     counts = Counter(example.task for example in examples)
     print(f"Selected {len(examples)} examples by {args.subset_strategy}: {dict(counts)}")
     base_results, base_cache, base_cache_hit = load_or_run_base(args, examples, manifest_id)
-    checkpoint_results = run_model("checkpoint", args.checkpoint, examples, args)
+    if Path(args.checkpoint).expanduser().resolve() == Path(args.base_model).expanduser().resolve():
+        print(
+            "[EVAL] checkpoint equals Base model; reusing the validated Base predictions "
+            "for the step-0 baseline instead of loading/inferencing the same model twice",
+            flush=True,
+        )
+        checkpoint_results = base_results
+    else:
+        checkpoint_results = run_model("checkpoint", args.checkpoint, examples, args)
     base_summary = summarize(examples, base_results, split=args.eval_split)
     checkpoint_summary = summarize(examples, checkpoint_results, split=args.eval_split)
     print_ui_defect_breakdown("base", base_summary)
@@ -1300,6 +1323,11 @@ def main() -> int:
         "task_counts": dict(counts),
         "base_model": args.base_model,
         "checkpoint": args.checkpoint,
+        "step": (
+            int(args.checkpoint_step)
+            if args.checkpoint_step is not None
+            else checkpoint_step(args.checkpoint)
+        ),
         "base_cache": str(base_cache),
         "base_cache_hit": base_cache_hit,
         "teacher_forced": args.teacher_forced,

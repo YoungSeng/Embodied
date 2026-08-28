@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claim pending CPT checkpoints and run held-out evaluation in a subprocess."""
+"""Claim CPT checkpoints and run held-out plus optional external evaluation."""
 
 from __future__ import annotations
 
@@ -26,11 +26,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--queue", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument("--eval-recipe-name", default="locany_cpt_val_fast.json")
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--processor-path", default=None)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument(
         "--evaluator", type=Path, default=PROJECT_ROOT / "scripts/eval_locany_cpt_learning.py"
+    )
+    parser.add_argument(
+        "--external-evaluator",
+        type=Path,
+        default=PROJECT_ROOT / "scripts/run_locany_cpt_external_ui5_eval.py",
+    )
+    parser.add_argument("--external-ui5-data-dir", type=Path, default=None)
+    parser.add_argument(
+        "--external-ui5-eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--external-max-new-tokens", type=int, default=4096)
+    parser.add_argument("--external-max-images-per-task", type=int, default=0)
+    parser.add_argument(
+        "--external-iou-thresholds", nargs="+", type=float, default=(0.1,)
     )
     parser.add_argument("--samples-per-task", type=int, default=10)
     parser.add_argument("--max-pending", type=int, default=1)
@@ -49,6 +66,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.samples_per_task <= 0 or args.max_pending <= 0:
         parser.error("--samples-per-task and --max-pending must be positive")
+    if args.external_max_new_tokens <= 0 or args.external_max_images_per_task < 0:
+        parser.error("invalid external UI5 token/image limit")
     return args
 
 
@@ -115,7 +134,7 @@ def evaluator_command(args: argparse.Namespace, row: Mapping[str, Any], output_d
         "--checkpoint", str(Path(str(row["checkpoint"])).expanduser().resolve()),
         "--base-model", str(Path(args.base_model).expanduser().resolve()),
         "--processor-path", str(Path(args.processor_path or args.base_model).expanduser().resolve()),
-        "--recipe", str(data_dir / "recipe/locany_cpt_val_fast.json"),
+        "--recipe", str(data_dir / "recipe" / args.eval_recipe_name),
         "--manifest", str(data_dir / "diagnostics/split_manifest.jsonl"),
         "--eval-split", "heldout",
         "--subset-strategy", "hash",
@@ -143,17 +162,80 @@ def run_claim(args: argparse.Namespace, row: Mapping[str, Any]) -> dict[str, Any
     step = int(row["step"])
     output_dir = args.run_dir.expanduser().resolve() / "eval" / f"checkpoint-{step}"
     output_dir.mkdir(parents=True, exist_ok=True)
-    command = evaluator_command(args, row, output_dir)
-    subprocess.run(command, cwd=PROJECT_ROOT, check=True)
     summary_path = output_dir / "summary.json"
-    if not summary_path.is_file():
-        raise RuntimeError(f"evaluator produced no summary: {summary_path}")
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    validate_eval_summary(
-        summary,
-        samples_per_task=args.samples_per_task,
-        require_zero_errors=args.require_zero_inference_errors,
-    )
+    heldout_cache_hit = False
+    if summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            validate_eval_summary(
+                summary,
+                samples_per_task=args.samples_per_task,
+                require_zero_errors=args.require_zero_inference_errors,
+            )
+            if int(summary.get("step") or -1) != step:
+                raise RuntimeError(
+                    f"held-out cache step mismatch: {summary.get('step')!r} != {step}"
+                )
+            if Path(str(summary.get("checkpoint"))).expanduser().resolve() != checkpoint:
+                raise RuntimeError(
+                    "held-out cache checkpoint mismatch: "
+                    f"{summary.get('checkpoint')!r} != {checkpoint}"
+                )
+            heldout_cache_hit = True
+            print(f"HELDOUT_EVAL_CACHE=HIT step={step} summary={summary_path}")
+        except (OSError, ValueError, json.JSONDecodeError, RuntimeError):
+            heldout_cache_hit = False
+    if not heldout_cache_hit:
+        command = evaluator_command(args, row, output_dir)
+        subprocess.run(command, cwd=PROJECT_ROOT, check=True)
+        if not summary_path.is_file():
+            raise RuntimeError(f"evaluator produced no summary: {summary_path}")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        validate_eval_summary(
+            summary,
+            samples_per_task=args.samples_per_task,
+            require_zero_errors=args.require_zero_inference_errors,
+        )
+    external_summary_path = None
+    if args.external_ui5_eval:
+        if args.external_ui5_data_dir is None:
+            raise RuntimeError(
+                "external UI5 evaluation is enabled but --external-ui5-data-dir is missing"
+            )
+        external_command = [
+            str(args.python),
+            str(args.external_evaluator.expanduser().resolve()),
+            "--checkpoint", str(checkpoint),
+            "--checkpoint-step", str(step),
+            "--base-model", str(Path(args.base_model).expanduser().resolve()),
+            "--processor-path", str(
+                Path(args.processor_path or args.base_model).expanduser().resolve()
+            ),
+            "--run-dir", str(args.run_dir.expanduser().resolve()),
+            "--input-dir", str(args.external_ui5_data_dir.expanduser().resolve()),
+            "--python", str(args.python),
+            "--device", args.device,
+            "--dtype", args.dtype,
+            "--attn-implementation", args.attn_implementation,
+            "--vision-attn-implementation", args.vision_attn_implementation,
+            "--max-new-tokens", str(args.external_max_new_tokens),
+            "--seed", str(args.seed),
+            "--max-images-per-task", str(args.external_max_images_per_task),
+            "--iou-thresholds",
+            *(str(value) for value in args.external_iou_thresholds),
+            "--no-build-excel",
+        ]
+        subprocess.run(external_command, cwd=PROJECT_ROOT, check=True)
+        external_summary_path = (
+            args.run_dir.expanduser().resolve()
+            / "eval_external_ui5"
+            / f"checkpoint-{step}"
+            / "summary.json"
+        )
+        if not external_summary_path.is_file():
+            raise RuntimeError(
+                f"external UI5 evaluator produced no summary: {external_summary_path}"
+            )
     # Workbook projection is optional and must not invalidate good JSON/JSONL.
     workbook_command = [
         str(args.python),
@@ -164,7 +246,11 @@ def run_claim(args: argparse.Namespace, row: Mapping[str, Any]) -> dict[str, Any
     return {
         "step": step,
         "summary": str(summary_path),
+        "external_ui5_summary": (
+            str(external_summary_path) if external_summary_path is not None else None
+        ),
         "output_dir": str(output_dir),
+        "heldout_cache_hit": heldout_cache_hit,
         "workbook_exit_code": int(workbook.returncode),
     }
 

@@ -80,7 +80,12 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn('SAVE_EVERY_N_HOURS: "12"', a100)
         self.assertIn('SAVE_EVERY_N_HOURS: "6"', h20)
         self.assertIn('CPT_INTEGRATED_EVAL: "1"', h20)
+        self.assertIn('CPT_EVAL_AT_START: "1"', h20)
+        self.assertIn('CPT_EXTERNAL_UI5_EVAL: "1"', h20)
+        self.assertIn('EVAL_RECIPE_NAME: "locany_cpt_val_fast.json"', h20)
         self.assertIn('EVAL_SAMPLES_PER_TASK: "10"', h20)
+        self.assertIn('GPU_COUNT: "4"', h20)
+        self.assertIn('RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x4-formal-eval0"', h20)
         self.assertIn('MAX_NUM_TOKENS: "12800"', a100)
         self.assertIn('ATTN_IMPLEMENTATION: "sdpa"', a100)
         self.assertIn('MAX_SEQ_LENGTH: "7268"', h20)
@@ -93,7 +98,7 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("caption: 'LocateAnything UI CPT v2 Formal - H20x2 SDPA'", h20x2)
-        self.assertIn("name: 'locany-cpt-v4-v2-h20x2-formal'", h20x2)
+        self.assertIn("name: 'locany-cpt-v4-v2-h20x2-formal-eval0'", h20x2)
         self.assertIn("cpu: 40", h20x2)
         self.assertIn("memory: 460800", h20x2)
         self.assertIn('GPU_COUNT: "2"', h20x2)
@@ -105,6 +110,12 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn('PACKING_BUFFER_SIZE: "16"', h20x2)
         self.assertIn('SAVE_EVERY_N_HOURS: "6"', h20x2)
         self.assertIn('CPT_INTEGRATED_EVAL: "1"', h20x2)
+        self.assertIn('CPT_EVAL_AT_START: "1"', h20x2)
+        self.assertIn("CPT_EXTERNAL_UI5_DATA_DIR", h20x2)
+        self.assertIn('CPT_EXTERNAL_UI5_EVAL: "1"', h20x2)
+        self.assertIn('EVAL_EXTERNAL_MAX_NEW_TOKENS: "4096"', h20x2)
+        self.assertIn('EVAL_EXTERNAL_MAX_IMAGES_PER_TASK: "0"', h20x2)
+        self.assertIn('EVAL_RECIPE_NAME: "locany_cpt_val_fast.json"', h20x2)
         self.assertIn('EVAL_SAMPLES_PER_TASK: "10"', h20x2)
 
         h20x2_smoke = (
@@ -141,6 +152,10 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn('export LOCANY_SEGMENT_MODE=1', merlin)
         self.assertIn('export LOCANY_STOP_AFTER_PERIODIC_SAVE=1', merlin)
         self.assertIn('run_integrated_eval_phase', merlin)
+        self.assertIn('run_initial_eval_phase', merlin)
+        self.assertIn('--external-ui5-data-dir', merlin)
+        self.assertIn('scripts/run_locany_cpt_initial_eval.py', merlin)
+        self.assertIn('Initial held-out evaluation failed; formal training has not started.', merlin)
         self.assertIn('CPT_INTEGRATED_EVAL', merlin)
         self.assertIn(
             "SMOKE_PRE_RESUME=SKIPPED_EXISTING_RESUMABLE_CHECKPOINT", merlin
@@ -204,7 +219,7 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
             'EVAL_VISION_ATTN_IMPLEMENTATION: "flash_attention_2"', eval_yaml
         )
         self.assertIn('EVAL_SAMPLES_PER_TASK: "10"', eval_yaml)
-        self.assertIn('RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-formal"', eval_yaml)
+        self.assertIn('RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-formal-eval0"', eval_yaml)
         self.assertIn('EVAL_MAX_PENDING: "20"', eval_yaml)
 
         smoke_eval_yaml = (
@@ -222,6 +237,9 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
             REPO_ROOT / "shell" / "run_locany_cpt_eval_merlin.sh"
         ).read_text(encoding="utf-8")
         self.assertIn("scripts/run_locany_cpt_eval_queue.py", eval_launcher)
+        self.assertIn("--external-ui5-data-dir", eval_launcher)
+        self.assertIn("--external-iou-thresholds 0.1", eval_launcher)
+        self.assertNotIn("--external-iou-thresholds 0.1 0.5", eval_launcher)
         self.assertIn("--require-zero-inference-errors", eval_launcher)
         self.assertIn("shell/ensure_locany_cpt_runtime.sh", eval_launcher)
         self.assertIn("EVAL_VISION_ATTN_IMPLEMENTATION:-flash_attention_2", eval_launcher)

@@ -54,6 +54,21 @@ def canonical_metrics(f1: float = 0.5) -> dict:
 
 
 class CPTUI5CheckpointSweepTests(unittest.TestCase):
+    def test_empty_input_dir_infers_workspace_data_from_run_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            run_dir = workspace / "gui_models" / "legacy-cpt"
+            test_dir = workspace / "data"
+            run_dir.mkdir(parents=True)
+            test_dir.mkdir()
+            for filename in locany_ui5_common.TASK_JSONL.values():
+                (test_dir / filename).write_text("{}\n", encoding="utf-8")
+
+            resolved, source = sweep.resolve_ui5_input_dir("", run_dir)
+
+            self.assertEqual(resolved, test_dir.resolve())
+            self.assertEqual(source, "inferred-from-run-dir")
+
     def test_two_gpu_checkpoint_sweep_scores_and_aggregates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

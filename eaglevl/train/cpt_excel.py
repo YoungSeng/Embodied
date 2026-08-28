@@ -65,7 +65,7 @@ def _ui_defect_metric_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     output: list[dict[str, Any]] = []
     for row in rows:
-        if row.get("task") != "ui_defect":
+        if row.get("task") not in {"ui_defect", "ui_defect_external"}:
             continue
         common = {
             key: row.get(key)
@@ -73,6 +73,8 @@ def _ui_defect_metric_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "checkpoint",
                 "step",
                 "split",
+                "task",
+                "evaluation_kind",
                 "manifest_id",
                 "evaluation_protocol_id",
                 "samples_per_task",
@@ -84,6 +86,9 @@ def _ui_defect_metric_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ):
             if not isinstance(metrics, Mapping):
                 continue
+            bbox_iou_threshold = metrics.get(
+                "iou_threshold", row.get("iou_threshold", 0.5)
+            )
             for class_name, class_metrics in metrics.get("per_class", {}).items():
                 if not isinstance(class_metrics, Mapping):
                     continue
@@ -101,7 +106,9 @@ def _ui_defect_metric_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                                 "display_label", class_name
                             ),
                             "granularity": granularity,
-                            "iou_threshold": 0.5 if granularity == "bbox" else None,
+                            "iou_threshold": (
+                                bbox_iou_threshold if granularity == "bbox" else None
+                            ),
                             **{
                                 key: values.get(key)
                                 for key in (
@@ -131,7 +138,9 @@ def _ui_defect_metric_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                             "class": f"__{aggregate}__",
                             "class_label": f"five-class {aggregate}",
                             "granularity": granularity,
-                            "iou_threshold": 0.5 if granularity == "bbox" else None,
+                            "iou_threshold": (
+                                bbox_iou_threshold if granularity == "bbox" else None
+                            ),
                             **{
                                 key: values.get(key)
                                 for key in (
@@ -357,7 +366,7 @@ def build_cpt_workbook(
         specs = (
             ("TrainMetrics", train_rows, ["step", "epoch", "scope", "task", "learning_rate", "global_loss", "train_main_token_ce", "train_mtp_token_ce", "train_total_token_ce", "main_loss_tokens", "mtp_loss_tokens", "attempted_samples", "accepted_samples", "trained_samples", "oversize_skipped_samples", "oversize_skip_rate", "sample_share", "main_supervised_tokens", "mtp_supervised_tokens", "total_supervised_tokens", "total_token_share", "avg_post_mtp_length", "p95_post_mtp_length", "packing_efficiency", "row_coverage", "group_coverage", "effective_epoch", "repeat_factor"], "CPTTrainMetrics"),
             ("EvalMetrics", eval_rows, ["checkpoint", "step", "split", "task", "manifest_id", "evaluation_protocol_id", "subset_strategy", "samples_per_task", "ce_kind", "train_main_token_ce", "eval_token_ce", "train_val_main_ce_gap", "train_val_ce_gap", "eval_loss_tokens", "primary_name", "primary_metric", "base_primary", "delta_vs_base", "is_best_overall", "complete_ten_task_heldout", "eval_wall_time_seconds"], "CPTEvalMetrics"),
-            ("UIDefectMetrics", ui_defect_rows, ["checkpoint", "step", "split", "model", "aggregate", "class", "class_label", "granularity", "iou_threshold", "tp", "fp", "fn", "tn", "precision", "recall", "f1", "accuracy", "images", "manifest_id", "evaluation_protocol_id", "samples_per_task"], "CPTUIDefectMetrics"),
+            ("UIDefectMetrics", ui_defect_rows, ["checkpoint", "step", "split", "task", "evaluation_kind", "model", "aggregate", "class", "class_label", "granularity", "iou_threshold", "tp", "fp", "fn", "tn", "precision", "recall", "f1", "accuracy", "images", "manifest_id", "evaluation_protocol_id", "samples_per_task"], "CPTUIDefectMetrics"),
         )
         for name, rows, preferred, table_name in specs:
             sheet = workbook.create_sheet(name)

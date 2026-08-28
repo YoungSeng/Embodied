@@ -17,11 +17,13 @@ case "${MACHINE_TYPE}" in
     WORKSPACE="${WORKSPACE:-/mnt/bn/intelligent-service-yg/logging/sicheng_workspace}"
     FILESYSTEM_ROOT=/mnt/bn/intelligent-service-yg
     DEFAULT_RUN_NAME=locany-3b-ui-cpt-v4-v2-a100x4-formal
+    DEFAULT_EXTERNAL_UI5_EVAL=0
     ;;
   h20)
     WORKSPACE="${WORKSPACE:-/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace}"
     FILESYSTEM_ROOT=/mnt/bn/intelligent-service-arnold-hl
-    DEFAULT_RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x2-formal
+    DEFAULT_RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x2-formal-eval0
+    DEFAULT_EXTERNAL_UI5_EVAL=1
     ;;
 esac
 
@@ -32,13 +34,19 @@ RUN_DIR="${RUN_DIR:-${WORKSPACE}/gui_models/${RUN_NAME}}"
 QUEUE_PATH="${QUEUE_PATH:-${RUN_DIR}/diagnostics/cpt_eval_queue.jsonl}"
 BASE_MODEL="${BASE_MODEL:-${WORKSPACE}/hf_home/hub/models--nvidia--LocateAnything-3B/snapshots/c32291ca5e996f5a7a485845b4f57a233936bba0}"
 EVAL_SAMPLES_PER_TASK="${EVAL_SAMPLES_PER_TASK:-10}"
+EVAL_RECIPE_NAME="${EVAL_RECIPE_NAME:-locany_cpt_val_fast.json}"
 EVAL_MAX_PENDING="${EVAL_MAX_PENDING:-1}"
+EXTERNAL_UI5_DATA_DIR="${CPT_EXTERNAL_UI5_DATA_DIR:-${WORKSPACE}/data}"
+EXTERNAL_UI5_EVAL="${CPT_EXTERNAL_UI5_EVAL:-${DEFAULT_EXTERNAL_UI5_EVAL}}"
 
 test -d "${PROJECT_ROOT}" || { echo "ERROR: missing project: ${PROJECT_ROOT}" >&2; exit 20; }
 test -x "${ENV_DIR}/bin/python" || { echo "ERROR: missing environment: ${ENV_DIR}" >&2; exit 21; }
 test -d "${FILESYSTEM_ROOT}" || { echo "ERROR: missing filesystem: ${FILESYSTEM_ROOT}" >&2; exit 22; }
 test -d "${BASE_MODEL}" || { echo "ERROR: missing base model: ${BASE_MODEL}" >&2; exit 23; }
 test -f "${QUEUE_PATH}" || { echo "ERROR: missing eval queue: ${QUEUE_PATH}" >&2; exit 24; }
+if [[ "${EXTERNAL_UI5_EVAL}" == "1" ]]; then
+  test -d "${EXTERNAL_UI5_DATA_DIR}" || { echo "ERROR: missing external UI5 data: ${EXTERNAL_UI5_DATA_DIR}" >&2; exit 25; }
+fi
 
 RAW_JOB_ID="${ARNOLD_TRIAL_ID:-${ARNOLD_JOB_ID:-manual-$$}}"
 JOB_ID="${RAW_JOB_ID//[^a-zA-Z0-9._-]/_}"
@@ -63,6 +71,9 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export PROJECT_ROOT ENV_DIR
 
 cd "${PROJECT_ROOT}"
+echo "heldout_eval         : enabled"
+echo "external_ui5_eval    : ${EXTERNAL_UI5_EVAL}"
+echo "external_ui5_data    : ${EXTERNAL_UI5_DATA_DIR}"
 bash -n shell/run_locany_cpt_eval_merlin.sh
 bash shell/ensure_locany_cpt_runtime.sh
 "${ENV_DIR}/bin/python" - <<'PY'
@@ -73,7 +84,7 @@ print("eval gpu:", torch.cuda.get_device_name(0))
 PY
 
 "${ENV_DIR}/bin/python" scripts/validate_locany_cpt.py \
-  --recipe "${DATA_DIR}/recipe/locany_cpt_val_fast.json" \
+  --recipe "${DATA_DIR}/recipe/${EVAL_RECIPE_NAME}" \
   --records-per-dataset 0 \
   --minimum-records-per-dataset "${EVAL_SAMPLES_PER_TASK}" \
   --split-manifest "${DATA_DIR}/diagnostics/split_manifest.jsonl" \
@@ -84,6 +95,7 @@ EVAL_ARGS=(
   --queue "${QUEUE_PATH}"
   --run-dir "${RUN_DIR}"
   --data-dir "${DATA_DIR}"
+  --eval-recipe-name "${EVAL_RECIPE_NAME}"
   --base-model "${BASE_MODEL}"
   --python "${ENV_DIR}/bin/python"
   --samples-per-task "${EVAL_SAMPLES_PER_TASK}"
@@ -95,7 +107,15 @@ EVAL_ARGS=(
   --max-new-tokens "${EVAL_MAX_NEW_TOKENS:-1024}"
   --seed "${CPT_EVAL_SEED:-20260826}"
   --require-zero-inference-errors
+  --external-max-new-tokens "${EVAL_EXTERNAL_MAX_NEW_TOKENS:-4096}"
+  --external-max-images-per-task "${EVAL_EXTERNAL_MAX_IMAGES_PER_TASK:-0}"
+  --external-iou-thresholds 0.1
 )
+if [[ "${EXTERNAL_UI5_EVAL}" == "1" ]]; then
+  EVAL_ARGS+=(--external-ui5-eval --external-ui5-data-dir "${EXTERNAL_UI5_DATA_DIR}")
+else
+  EVAL_ARGS+=(--no-external-ui5-eval)
+fi
 if [[ "${EVAL_RETRY_FAILED:-0}" == "1" ]]; then
   EVAL_ARGS+=(--retry-failed)
 fi

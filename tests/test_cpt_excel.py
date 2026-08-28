@@ -87,6 +87,17 @@ class CPTExcelTest(unittest.TestCase):
                         {
                             "checkpoint": "checkpoint-200",
                             "step": 200,
+                            "split": "external_ui5",
+                            "task": "ui_defect_external",
+                            "evaluation_kind": "external_ui5_generalization",
+                            "iou_threshold": 0.1,
+                            "primary_metric": 2 / 3,
+                            "metrics": {**defect_metrics, "iou_threshold": 0.1},
+                            "base_metrics": {**defect_metrics, "iou_threshold": 0.1},
+                        },
+                        {
+                            "checkpoint": "checkpoint-200",
+                            "step": 200,
                             "split": "heldout",
                             "task": "__task_macro__",
                             "primary_metric": 0.8,
@@ -124,6 +135,16 @@ class CPTExcelTest(unittest.TestCase):
             )
             self.assertAlmostEqual(cropping_bbox["f1"], 2 / 3)
             self.assertIsNone(cropping_bbox["tn"])
+            external_bbox = next(
+                row
+                for row in rows
+                if row["split"] == "external_ui5"
+                and row["model"] == "checkpoint"
+                and row["class"] == "cropping"
+                and row["granularity"] == "bbox"
+            )
+            self.assertEqual(external_bbox["task"], "ui_defect_external")
+            self.assertAlmostEqual(external_bbox["iou_threshold"], 0.1)
             for sheet in workbook.worksheets:
                 self.assertEqual(sheet.freeze_panes, "A2")
                 self.assertIsNotNone(sheet.auto_filter.ref)
