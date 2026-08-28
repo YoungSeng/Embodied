@@ -51,6 +51,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(env["MAX_STEPS"], "20")
         self.assertEqual(env["SAVE_STEPS"], "20")
         self.assertEqual(env["RUN_NAME"], "local-smoke")
+        self.assertEqual(env["TC_MSED_STAGE"], "v4")
         self.assertEqual(
             Path(command[-1]), PROJECT_ROOT / "shell" / "run_locany_ui5_pipeline.sh"
         )
@@ -62,6 +63,18 @@ class RuntimeConfigTests(unittest.TestCase):
         env = run_locany_ui5_local_debug.build_environment(args, base_env={})
         self.assertEqual(env["MAX_NUM_TOKENS"], "25600")
         self.assertEqual(env["GRADIENT_ACCUMULATION_STEPS"], "1")
+
+    def test_local_debug_uses_same_tcmsed_stage_switch_as_formal_job(self) -> None:
+        args = run_locany_ui5_local_debug.parse_args(
+            [
+                "--gpus", "4", "--tc-msed-stage", "m3",
+                "--project-root", str(PROJECT_ROOT),
+            ]
+        )
+        env = run_locany_ui5_local_debug.build_environment(args, base_env={})
+        self.assertEqual(env["TC_MSED_STAGE"], "m3")
+        self.assertEqual(env["GRADIENT_ACCUMULATION_STEPS"], "2")
+        self.assertEqual(env["MAX_NUM_TOKENS"], "12800")
 
     def test_a800_defaults_are_gpu_count_specific(self) -> None:
         common = {"MACHINE_TYPE": "a800", "VERSION": "v4"}
@@ -190,6 +203,22 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertIn("name: 'locany-ui5-v4-a800x4-aiai-locate'", rendered)
         self.assertEqual(runtime["RESOURCE_GROUP"], "aiai_locate")
         self.assertEqual(runtime["RESOURCE_GROUP_ID"], 2146)
+
+    def test_formal_eval_pbd_ablation_is_explicitly_rendered(self) -> None:
+        args = submit_locany_ui5.parse_args(
+            [
+                "--machine",
+                "a800",
+                "--gpus",
+                "4",
+                "--eval-disable-pbd",
+                "--render-only",
+            ]
+        )
+        rendered, runtime = submit_locany_ui5.render_job(args)
+        self.assertEqual(runtime["EVAL_ENABLE_PBD"], 0)
+        self.assertEqual(rendered.count("EVAL_ENABLE_PBD:"), 1)
+        self.assertIn('EVAL_ENABLE_PBD: "0"', rendered)
 
     def test_unknown_resource_group_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unknown resource group"):
@@ -504,6 +533,34 @@ class CheckpointTests(unittest.TestCase):
         self.assertIn(
             "relation_pyramid.gate_heads.", report["missing_groups"]
         )
+
+    def test_tcmsed_checkpoint_validation_requires_every_enabled_stage_group(self) -> None:
+        base_keys = {
+            f"model.{group}weight"
+            for group in patch_locany_checkpoint.REQUIRED_RELATION_WEIGHT_GROUPS
+        }
+        m3_groups = (
+            "relation_pyramid.task_scale_embedding.",
+            "relation_pyramid.task_scale_projection.",
+            "relation_pyramid.image_scale_projection.",
+            "relation_pyramid.coarse_box_head.",
+            "relation_pbd.router_query.",
+            "relation_pbd.router_key.",
+            "relation_pbd.router_value.",
+            "relation_pbd.coverage_gamma",
+            "relation_pbd.coord_prior_lambda",
+        )
+        keys = base_keys | {f"model.{group}weight" for group in m3_groups}
+        report = patch_locany_checkpoint.validate_relation_weight_keys(
+            keys, {"tc_msed_stage": "m3"}
+        )
+        self.assertTrue(report["valid"], report)
+        keys = {key for key in keys if "coord_prior_lambda" not in key}
+        report = patch_locany_checkpoint.validate_relation_weight_keys(
+            keys, {"tc_msed_stage": "m3"}
+        )
+        self.assertFalse(report["valid"])
+        self.assertIn("relation_pbd.coord_prior_lambda", report["missing_groups"])
 
     def test_pbd_checkpoint_config_validation_requires_saved_selector_ids(self) -> None:
         report = patch_locany_checkpoint.validate_pbd_config(

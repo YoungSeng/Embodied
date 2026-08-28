@@ -467,6 +467,10 @@ class RelationConditionedDetailPyramid(nn.Module):
         context = torch.zeros_like(evidence)
         active_slots = torch.zeros(self.num_slots, device=device)
 
+        # This helper is the legacy ordered-slot target builder used by v4/M1.
+        # It cannot represent more targets than slots, so cap explicitly here;
+        # the set-localizer path below keeps the complete GT set and applies its
+        # own order-invariant capacity rule before Hungarian matching.
         valid_indices = box_mask.nonzero(as_tuple=False).flatten()[: self.num_slots]
         for slot, box_index in enumerate(valid_indices.tolist()):
             box = boxes[box_index].float().to(device=device) / 1000.0
@@ -505,7 +509,10 @@ class RelationConditionedDetailPyramid(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return one spatial target per GT box, independent of slot order."""
 
-        valid_indices = box_mask.nonzero(as_tuple=False).flatten()[: self.num_slots]
+        # Preserve the complete unordered target set here.  The caller owns the
+        # deterministic K-slot capacity policy and must retain the selected GT
+        # ordinals so teacher-forced box spans stay aligned with matched slots.
+        valid_indices = box_mask.nonzero(as_tuple=False).flatten()
         if valid_indices.numel() == 0:
             empty = torch.zeros(0, height * width, device=device)
             return empty, empty, boxes.new_zeros((0, 4), device=device).float()
@@ -625,6 +632,11 @@ class RelationConditionedDetailPyramid(nn.Module):
 
         image_index = 0
         parameter_zero = self.evidence_queries.sum() * 0.0
+        target_capacity = (
+            int(target_boxes.shape[1])
+            if target_boxes is not None and target_boxes.ndim >= 3
+            else self.num_slots
+        )
         for sample_index in range(num_samples):
             raw_family = int(relation_family[sample_index].item())
             family = int(relation_family[sample_index].clamp(0, self.num_families - 1).item())
@@ -648,7 +660,12 @@ class RelationConditionedDetailPyramid(nn.Module):
                 scale_weights_list.append(scale_weights_all[family])
                 gate_targets_list.append(torch.zeros(self.num_slots, device=empty_tokens.device, dtype=empty_tokens.dtype))
                 matched_indices_list.append(
-                    torch.full((self.num_slots,), -1, device=empty_tokens.device, dtype=torch.long)
+                    torch.full(
+                        (target_capacity,),
+                        -1,
+                        device=empty_tokens.device,
+                        dtype=torch.long,
+                    )
                 )
                 matched_counts.append(parameter_zero.detach().float())
                 unmatched_counts.append(parameter_zero.detach().float() + self.num_slots)
@@ -761,7 +778,7 @@ class RelationConditionedDetailPyramid(nn.Module):
 
             gate_targets = torch.zeros(self.num_slots, device=fused.device, dtype=fused.dtype)
             matched_for_sample = torch.full(
-                (self.num_slots,), -1, device=fused.device, dtype=torch.long
+                (target_capacity,), -1, device=fused.device, dtype=torch.long
             )
             if target_boxes is not None and target_box_mask is not None and self.set_localizer:
                 box_evidence, box_context, valid_boxes = self._box_attention_targets(
@@ -771,6 +788,23 @@ class RelationConditionedDetailPyramid(nn.Module):
                     width,
                     fused.device,
                 )
+                # K is intentionally fixed at eight for the first ablation.
+                # A pathological screenshot with more GT boxes must not crash
+                # a long run; keep the K largest boxes using an order-invariant
+                # geometric criterion until a larger-K experiment is explicit.
+                valid_target_ordinals = torch.arange(
+                    valid_boxes.shape[0], device=fused.device, dtype=torch.long
+                )
+                if valid_boxes.shape[0] > self.num_slots:
+                    areas = (
+                        (valid_boxes[:, 2] - valid_boxes[:, 0]).clamp_min(0.0)
+                        * (valid_boxes[:, 3] - valid_boxes[:, 1]).clamp_min(0.0)
+                    )
+                    keep = torch.argsort(areas, descending=True)[: self.num_slots]
+                    valid_boxes = valid_boxes[keep]
+                    box_evidence = box_evidence[keep]
+                    box_context = box_context[keep]
+                    valid_target_ordinals = valid_target_ordinals[keep]
                 if valid_boxes.shape[0] > 0:
                     positive_focal_cost = (
                         (1.0 - torch.sigmoid(gate_logits.float())).pow(self.focal_gamma)
@@ -797,7 +831,9 @@ class RelationConditionedDetailPyramid(nn.Module):
                         + attention_kl_cost
                     )
                     matched_slots, matched_targets = hungarian_assignment(cost)
-                    matched_for_sample[matched_targets] = matched_slots
+                    matched_for_sample[
+                        valid_target_ordinals[matched_targets]
+                    ] = matched_slots
                     gate_targets[matched_slots] = 1.0
                     predicted = sample_coarse_boxes[matched_slots].float()
                     expected = valid_boxes[matched_targets].float()
@@ -858,7 +894,10 @@ class RelationConditionedDetailPyramid(nn.Module):
                     sample_attention_loss = (evidence_ce + context_ce).mean()
                     evidence_losses.append(sample_attention_loss)
                     attention_losses_by_task[task].append(sample_attention_loss)
-                matched_count = int(gate_targets.sum().item())
+                valid_target_ordinals = target_box_mask[sample_index].bool().nonzero(
+                    as_tuple=False
+                ).flatten()[: self.num_slots]
+                matched_count = int(valid_target_ordinals.numel())
                 matched_for_sample[:matched_count] = torch.arange(
                     matched_count, device=fused.device, dtype=torch.long
                 )
@@ -1181,6 +1220,119 @@ def pbd_prediction_groups(
     return positions, samples, anchor_ordinals, offsets
 
 
+def coordinate_bridge_prediction_groups(
+    input_ids: torch.Tensor,
+    sub_sample_lengths: torch.Tensor,
+    active_positions: torch.Tensor,
+    active_samples: torch.Tensor,
+    active_anchor_ordinals: torch.Tensor,
+    active_offsets: torch.Tensor,
+    selected_coarse_boxes: torch.Tensor,
+    coord_start_token_id: int,
+    coord_end_token_id: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select all four coordinate-prediction states for AR and MTP.
+
+    PBD itself deliberately remains anchor-only in ordinary AR.  The geometry
+    bridge has a different contract: the hidden state at ``<box>`` predicts x1
+    and the next three coordinate-token states predict y1/x2/y2.  MTP already
+    exposes those states as offsets 0..3, while a teacher-forced AR sequence
+    needs them expanded from the anchor.  Expansion is bounded by the current
+    packed sub-sample and only follows observed coordinate tokens.
+    """
+
+    if not (
+        active_positions.numel()
+        == active_samples.numel()
+        == active_anchor_ordinals.numel()
+        == active_offsets.numel()
+        == selected_coarse_boxes.shape[0]
+    ):
+        raise ValueError("coordinate bridge PBD metadata lengths disagree")
+    if active_positions.numel() == 0:
+        empty = active_positions.reshape(-1).long()
+        return empty, empty.clone(), empty.clone(), selected_coarse_boxes[:0]
+
+    flat_ids = input_ids.reshape(-1)
+    lengths = sub_sample_lengths.reshape(-1).long()
+    if int(lengths.sum().item()) != flat_ids.numel():
+        raise ValueError(
+            "coordinate bridge packed lengths disagree with input_ids: "
+            f"sum={int(lengths.sum().item())}, tokens={flat_ids.numel()}"
+        )
+    starts = torch.cat(
+        (
+            lengths.new_zeros(1),
+            lengths.cumsum(dim=0)[:-1],
+        )
+    )
+    ends = starts + lengths
+
+    output_positions: List[int] = []
+    output_samples: List[int] = []
+    output_offsets: List[int] = []
+    output_boxes: List[torch.Tensor] = []
+    groups: Dict[Tuple[int, int], List[int]] = {}
+    for index in range(active_positions.numel()):
+        group = (
+            int(active_samples[index].item()),
+            int(active_anchor_ordinals[index].item()),
+        )
+        groups.setdefault(group, []).append(index)
+
+    for (sample, _), indices in groups.items():
+        ordered = sorted(indices, key=lambda index: int(active_offsets[index].item()))
+        by_offset = {int(active_offsets[index].item()): index for index in ordered}
+        anchor_index = by_offset.get(0)
+        if anchor_index is None:
+            continue
+        anchor_position = int(active_positions[anchor_index].item())
+        anchor_box = selected_coarse_boxes[anchor_index]
+
+        # MTP exposes the entire block through the shared PBD selector.
+        if any(offset > 0 for offset in by_offset):
+            for offset in range(4):
+                index = by_offset.get(offset)
+                if index is None:
+                    break
+                output_positions.append(int(active_positions[index].item()))
+                output_samples.append(sample)
+                output_offsets.append(offset)
+                output_boxes.append(selected_coarse_boxes[index])
+            continue
+
+        # AR: <box> hidden predicts x1; hidden states on coord1/2/3 predict the
+        # remaining three coordinates.  Never inspect or cross another packed
+        # sample, and stop as soon as the teacher-forced coordinate chain ends.
+        output_positions.append(anchor_position)
+        output_samples.append(sample)
+        output_offsets.append(0)
+        output_boxes.append(anchor_box)
+        sample_end = int(ends[sample].item())
+        for offset in range(1, 4):
+            position = anchor_position + offset
+            if position >= sample_end:
+                break
+            token = int(flat_ids[position].item())
+            if token < int(coord_start_token_id) or token > int(coord_end_token_id):
+                break
+            output_positions.append(position)
+            output_samples.append(sample)
+            output_offsets.append(offset)
+            output_boxes.append(anchor_box)
+
+    device = active_positions.device
+    if not output_positions:
+        empty = active_positions[:0]
+        return empty, empty.clone(), empty.clone(), selected_coarse_boxes[:0]
+    return (
+        torch.tensor(output_positions, device=device, dtype=torch.long),
+        torch.tensor(output_samples, device=device, dtype=torch.long),
+        torch.tensor(output_offsets, device=device, dtype=torch.long),
+        torch.stack(output_boxes, dim=0),
+    )
+
+
 def apply_coordinate_logit_prior(
     logits: torch.Tensor,
     active_positions: torch.Tensor,
@@ -1222,6 +1374,48 @@ def apply_coordinate_logit_prior(
             dtype=flat.dtype
         )
     return output
+
+
+def coordinate_gaussian_prior(
+    active_offsets: torch.Tensor,
+    active_samples: torch.Tensor,
+    selected_coarse_boxes: torch.Tensor,
+    defect_type: torch.Tensor,
+    task_lambdas: torch.Tensor,
+    coordinate_count: int,
+    sigma: float = 0.05,
+) -> torch.Tensor:
+    """Vectorized coordinate-vocabulary prior shared by train and inference."""
+
+    count = int(coordinate_count)
+    if count <= 0 or float(sigma) <= 0.0:
+        raise ValueError("coordinate_count and sigma must be positive")
+    values = torch.linspace(
+        0.0,
+        1000.0,
+        count,
+        device=selected_coarse_boxes.device,
+        dtype=torch.float32,
+    )
+    result = selected_coarse_boxes.new_zeros(
+        (active_offsets.numel(), count), dtype=torch.float32
+    )
+    valid = (active_offsets >= 0) & (active_offsets < 4)
+    if not bool(valid.any()):
+        return result
+    indices = valid.nonzero(as_tuple=False).flatten()
+    dimensions = active_offsets[indices].long()
+    samples = active_samples[indices].long()
+    tasks = defect_type[samples].long().clamp(0, task_lambdas.numel() - 1)
+    strengths = task_lambdas[tasks].float()
+    centers = selected_coarse_boxes[indices, dimensions].float()
+    width = 1000.0 * float(sigma)
+    result[indices] = (
+        -strengths[:, None]
+        * (values[None, :] - centers[:, None]).square()
+        / (2.0 * width * width)
+    )
+    return result
 
 
 def apply_soft_gate_logit_prior(
@@ -1445,12 +1639,13 @@ class RelationToPBD(nn.Module):
                     (active_positions.numel(), num_slots), dtype=torch.float32
                 )
                 soft_anchor_weights: List[torch.Tensor] = []
-                seen_groups: Dict[Tuple[int, int], torch.Tensor] = {}
+                seen_route_weights: Dict[Tuple[int, int], torch.Tensor] = {}
+                seen_selected_slots: Dict[Tuple[int, int], int] = {}
                 for active_index in range(active_positions.numel()):
                     sample = int(active_samples[active_index].item())
                     ordinal = int(active_anchor_ordinals[active_index].item())
                     group = (sample, ordinal)
-                    if group not in seen_groups:
+                    if group not in seen_route_weights:
                         query = self.router_query(flat_hidden[active_positions[active_index]]).float()
                         keys = self.router_key(relation_tokens[sample]).float()
                         route_logits = (
@@ -1471,14 +1666,26 @@ class RelationToPBD(nn.Module):
                         selected = F.one_hot(
                             torch.tensor(chosen, device=route_logits.device), num_slots
                         ).float()
-                        seen_groups[group] = selected
+                        # The first TC-MSED experiment keeps the differentiable
+                        # soft mixture.  The discrete (teacher/argmax) slot is
+                        # used only for coverage state, coarse geometry and
+                        # diagnostics.  This lets LM loss train q/k/v routing;
+                        # straight-through top-1 remains a separate ablation.
+                        seen_route_weights[group] = soft_weights
+                        seen_selected_slots[group] = chosen
                         soft_anchor_weights.append(soft_weights)
                         final_slot_usage[sample] += selected
-                    selected = seen_groups[group]
-                    all_weights[active_index] = selected
-                    selected_index = int(selected.argmax().item())
+                    route_weights = seen_route_weights[group]
+                    all_weights[active_index] = route_weights
+                    selected_index = seen_selected_slots[group]
                     selected_slot_indices[active_index] = selected_index
-                    token = self.router_value(relation_tokens[sample, selected_index])
+                    # K=1 is a strict degeneration to the legacy selected token;
+                    # do not add an otherwise unidentifiable value projection.
+                    if num_slots == 1:
+                        token = relation_tokens[sample, 0]
+                    else:
+                        projected_tokens = self.router_value(relation_tokens[sample])
+                        token = route_weights.to(dtype=projected_tokens.dtype) @ projected_tokens
                     if self.overlap_adapter and defect_type is not None and int(defect_type[sample].item()) == 2:
                         token = token + self.overlap_adapter_up(
                             self.overlap_adapter_down(token)
@@ -1488,7 +1695,9 @@ class RelationToPBD(nn.Module):
                         selected_coarse_boxes[active_index] = coarse_boxes[sample, selected_index]
                 if len(soft_anchor_weights) > 1:
                     by_sample: Dict[int, List[torch.Tensor]] = {}
-                    for (sample, _), weights in zip(seen_groups.keys(), soft_anchor_weights):
+                    for (sample, _), weights in zip(
+                        seen_route_weights.keys(), soft_anchor_weights
+                    ):
                         by_sample.setdefault(sample, []).append(weights)
                     overlap_terms = []
                     for values in by_sample.values():
@@ -1500,8 +1709,8 @@ class RelationToPBD(nn.Module):
                 routing_weights = all_weights
                 safe_best_tokens = routed_tokens
                 anchor_selected = []
-                for group, selected in seen_groups.items():
-                    anchor_selected.append((group[0], int(selected.argmax().item())))
+                for group, selected_index in seen_selected_slots.items():
+                    anchor_selected.append((group[0], int(selected_index)))
                 if anchor_selected:
                     total = len(anchor_selected)
                     unique_per_sample = []

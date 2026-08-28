@@ -77,6 +77,17 @@ class LocateAnythingConfig(PretrainedConfig):
             relation_gate_threshold=0.5,
             relation_gate_mode="observe",
             relation_gate_thresholds=None,
+            tc_msed_stage="v4",
+            relation_task_scale_router=False,
+            relation_set_localizer=False,
+            relation_dynamic_slot_pbd=False,
+            relation_coordinate_bridge=False,
+            relation_soft_gate=False,
+            relation_overlap_adapter=False,
+            relation_box_l1_loss_weight=0.0,
+            relation_box_giou_loss_weight=0.0,
+            relation_coverage_loss_weight=0.0,
+            relation_coord_prior_sigma=0.05,
             ui_relation_initialization_seed=20260823,
             ui_relation_initialization_reason=None,
             **kwargs):
@@ -138,9 +149,24 @@ class LocateAnythingConfig(PretrainedConfig):
         self.relation_focal_beta = relation_focal_beta
         self.relation_gate_threshold = relation_gate_threshold
         self.relation_gate_mode = str(relation_gate_mode).lower()
-        if self.relation_gate_mode not in {"observe", "hard"}:
-            raise ValueError("relation_gate_mode must be 'observe' or 'hard'")
+        if self.relation_gate_mode not in {"observe", "hard", "soft"}:
+            raise ValueError("relation_gate_mode must be 'observe', 'hard', or 'soft'")
         self.relation_gate_thresholds = dict(relation_gate_thresholds or {})
+        self.tc_msed_stage = str(tc_msed_stage).lower()
+        if self.tc_msed_stage not in {"v4", "m1", "m2", "m3", "m4", "m5"}:
+            raise ValueError("tc_msed_stage must be one of v4/m1/m2/m3/m4/m5")
+        self.relation_task_scale_router = bool(relation_task_scale_router)
+        self.relation_set_localizer = bool(relation_set_localizer)
+        self.relation_dynamic_slot_pbd = bool(relation_dynamic_slot_pbd)
+        self.relation_coordinate_bridge = bool(relation_coordinate_bridge)
+        self.relation_soft_gate = bool(relation_soft_gate)
+        self.relation_overlap_adapter = bool(relation_overlap_adapter)
+        self.relation_box_l1_loss_weight = float(relation_box_l1_loss_weight)
+        self.relation_box_giou_loss_weight = float(relation_box_giou_loss_weight)
+        self.relation_coverage_loss_weight = float(relation_coverage_loss_weight)
+        self.relation_coord_prior_sigma = float(relation_coord_prior_sigma)
+        if self.relation_coord_prior_sigma <= 0.0:
+            raise ValueError("relation_coord_prior_sigma must be positive")
         self.ui_relation_initialization_seed = int(ui_relation_initialization_seed)
         self.ui_relation_initialization_reason = ui_relation_initialization_reason
         if not 0.0 <= float(self.relation_gate_threshold) <= 1.0:
@@ -182,6 +208,17 @@ class LocateAnythingConfig(PretrainedConfig):
         output['relation_gate_threshold'] = self.relation_gate_threshold
         output['relation_gate_mode'] = self.relation_gate_mode
         output['relation_gate_thresholds'] = self.relation_gate_thresholds
+        output['tc_msed_stage'] = self.tc_msed_stage
+        output['relation_task_scale_router'] = self.relation_task_scale_router
+        output['relation_set_localizer'] = self.relation_set_localizer
+        output['relation_dynamic_slot_pbd'] = self.relation_dynamic_slot_pbd
+        output['relation_coordinate_bridge'] = self.relation_coordinate_bridge
+        output['relation_soft_gate'] = self.relation_soft_gate
+        output['relation_overlap_adapter'] = self.relation_overlap_adapter
+        output['relation_box_l1_loss_weight'] = self.relation_box_l1_loss_weight
+        output['relation_box_giou_loss_weight'] = self.relation_box_giou_loss_weight
+        output['relation_coverage_loss_weight'] = self.relation_coverage_loss_weight
+        output['relation_coord_prior_sigma'] = self.relation_coord_prior_sigma
         output['ui_relation_initialization_seed'] = self.ui_relation_initialization_seed
         output['ui_relation_initialization_reason'] = self.ui_relation_initialization_reason
         output['_attn_implementation'] = self._attn_implementation

@@ -129,10 +129,45 @@ def checkpoint_weight_keys(checkpoint: Path) -> set[str]:
     return set()
 
 
-def validate_relation_weight_keys(keys: set[str]) -> dict[str, Any]:
+def validate_relation_weight_keys(
+    keys: set[str], config: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    stage = str((config or {}).get("tc_msed_stage", "v4")).lower()
+    stage_groups: dict[str, tuple[str, ...]] = {
+        "v4": (),
+        "m1": (
+            "relation_pyramid.task_scale_embedding.",
+            "relation_pyramid.task_scale_projection.",
+            "relation_pyramid.image_scale_projection.",
+        ),
+        "m2": ("relation_pyramid.coarse_box_head.",),
+        "m3": (
+            "relation_pbd.router_query.",
+            "relation_pbd.router_key.",
+            "relation_pbd.router_value.",
+            "relation_pbd.coverage_gamma",
+            "relation_pbd.coord_prior_lambda",
+        ),
+        "m4": ("relation_pyramid.soft_gate_beta",),
+        "m5": (
+            "relation_pbd.overlap_adapter_down.",
+            "relation_pbd.overlap_adapter_up.",
+        ),
+    }
+    stage_order = ("v4", "m1", "m2", "m3", "m4", "m5")
+    required = list(REQUIRED_RELATION_WEIGHT_GROUPS)
+    if stage not in stage_order:
+        return {
+            "valid": False,
+            "missing_groups": [],
+            "error": f"unsupported tc_msed_stage={stage!r}",
+            "relation_key_count": 0,
+        }
+    for enabled_stage in stage_order[1 : stage_order.index(stage) + 1]:
+        required.extend(stage_groups[enabled_stage])
     missing = [
         group
-        for group in REQUIRED_RELATION_WEIGHT_GROUPS
+        for group in required
         if not any(group in key for key in keys)
     ]
     return {
@@ -203,10 +238,13 @@ def patch_checkpoint(
     if not checkpoint_has_weights(checkpoint):
         raise FileNotFoundError(f"Checkpoint is missing model weights: {checkpoint}")
 
+    config_path = checkpoint / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    original_config = dict(config)
     relation_weight_report = None
     if validate_relation_weights:
         relation_weight_report = validate_relation_weight_keys(
-            checkpoint_weight_keys(checkpoint)
+            checkpoint_weight_keys(checkpoint), config
         )
         legacy_only = relation_weight_report["missing_groups"] == [
             "relation_pyramid.image_gate_heads."
@@ -251,9 +289,6 @@ def patch_checkpoint(
         shutil.copy2(source.resolve(), destination)
         copied.append(name)
 
-    config_path = checkpoint / "config.json"
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    original_config = dict(config)
     if allow_legacy_slot_gate and relation_weight_report is not None:
         config["ui_relation_legacy_slot_gate_as_image_gate"] = bool(
             relation_weight_report["missing_groups"]

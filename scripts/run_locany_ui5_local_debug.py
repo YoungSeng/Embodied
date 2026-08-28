@@ -34,6 +34,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--learning-rate", default="2e-5")
     parser.add_argument("--run-name", default=None)
+    parser.add_argument(
+        "--tc-msed-stage",
+        choices=("v4", "m1", "m2", "m3", "m4", "m5"),
+        default="v4",
+        help="TC-MSED ablation stage; uses the same stage switch as formal jobs",
+    )
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     parser.add_argument("--env-dir", type=Path, default=None)
     parser.add_argument("--base-model", type=Path, default=None)
@@ -102,6 +108,7 @@ def build_environment(
             "PIPELINE_MODE": "train",
             "RUN_NAME": run_name,
             "OUTPUT_BASE": str(output_base),
+            "TC_MSED_STAGE": args.tc_msed_stage,
         }
     )
     optional_paths = {
@@ -142,6 +149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "CUDA_DEVICES",
         "MAX_NUM_TOKENS",
         "GRADIENT_ACCUMULATION_STEPS",
+        "TC_MSED_STAGE",
         "MAX_STEPS",
         "SAVE_STEPS",
         "ENABLE_EVAL",

@@ -37,9 +37,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tasks", nargs="+", choices=TASKS, default=list(TASKS))
     parser.add_argument("--max-images-per-task", type=int, default=0)
     parser.add_argument(
-        "--relation-gate-mode", choices=("observe", "hard"), default="observe"
+        "--relation-gate-mode", choices=("observe", "hard", "soft"), default="observe"
     )
     parser.add_argument("--relation-gate-threshold", type=float, default=None)
+    parser.add_argument(
+        "--enable-pbd",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="独立控制 PBD/coordinate bridge，供同 checkpoint 消融使用",
+    )
     parser.add_argument(
         "--model-load-preflight",
         action=argparse.BooleanOptionalAction,
@@ -130,6 +136,7 @@ def build_command(
         "--relation-gate-mode",
         args.relation_gate_mode,
     ]
+    command.append("--enable-pbd" if args.enable_pbd else "--no-enable-pbd")
     if args.relation_gate_threshold is not None:
         command.extend(
             ["--relation-gate-threshold", str(args.relation_gate_threshold)]

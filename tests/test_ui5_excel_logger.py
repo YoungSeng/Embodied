@@ -26,11 +26,27 @@ def training_metrics(step: int) -> dict:
         "loss_total": 1.0,
         "pbd_delta_norm": 0.25,
         "pbd_active_positions": 6,
+        "box_anchor_count": 1,
+        "loss_box_l1": 0.4,
+        "loss_box_giou": 0.3,
+        "loss_attn_kl": 0.2,
+        "loss_coverage": 0.1,
+        "coarse_iou_mean": 0.5,
+        "coarse_recall_03": 0.7,
+        "coarse_recall_05": 0.6,
+        "matched_slots": 2,
+        "unmatched_slots": 6,
+        "unique_slot_count": 2,
+        "duplicate_slot_rate": 0.0,
         "tasks": {
             task: {
                 "detail_weight_l5": 0.2,
                 "detail_weight_l15": 0.3,
                 "detail_weight_l26": 0.5,
+                "scale_entropy": 1.03,
+                "scale_batch_std_l5": 0.01,
+                "scale_batch_std_l15": 0.02,
+                "scale_batch_std_l26": 0.03,
             }
             for task in TRAIN_TASKS
         },
@@ -192,7 +208,10 @@ class UI5ExcelLoggerTest(unittest.TestCase):
                     ]
                     self.assertAlmostEqual(sum(weights), 1.0, places=7)
                 self.assertEqual(row["pbd_active_positions"], 6)
+                self.assertEqual(row["box_anchor_count"], 1)
                 self.assertAlmostEqual(row["pbd_delta_norm"], 0.25)
+                self.assertAlmostEqual(row["loss_box_l1"], 0.4)
+                self.assertAlmostEqual(row["coarse_recall_05"], 0.6)
             finally:
                 workbook.close()
 
@@ -237,6 +256,49 @@ class UI5ExcelLoggerTest(unittest.TestCase):
                 )
             finally:
                 workbook.close()
+
+    def test_soft_eval_keeps_separate_observe_raw_metrics(self):
+        gate_metrics = {
+            task: {
+                "relation_gate_mode": "soft",
+                "selected_gate_threshold": 0.3,
+                "gated_precision": 0.7,
+                "gated_recall": 0.6,
+                "gated_f1": 0.646,
+                "gated_predicted_positive": 3,
+                "gate_filter_rate": 0.2,
+            }
+            for task in (
+                "text_overflow",
+                "text_ellipsis",
+                "occlusion",
+                "cropping",
+                "content_missing",
+            )
+        }
+        rows = build_eval_rows(
+            step=1000,
+            checkpoint="checkpoint-1000",
+            metrics=scorer_metrics(0.6),
+            raw_metrics=scorer_metrics(0.4),
+            gate_metrics=gate_metrics,
+        )
+        image = next(
+            row
+            for row in rows
+            if row["task"] == "text_overflow" and row["granularity"] == "image"
+        )
+        bbox = next(
+            row
+            for row in rows
+            if row["task"] == "text_overflow" and row["granularity"] == "bbox"
+        )
+        self.assertEqual(image["raw_f1"], 0.4)
+        self.assertEqual(image["soft_f1"], 0.6)
+        self.assertEqual(bbox["raw_f1"], 0.4)
+        self.assertEqual(bbox["soft_f1"], 0.6)
+        self.assertIsNone(bbox["gated_f1"])
+        self.assertIsNone(bbox["diagnostic_upper_bound_f1"])
 
     def test_failed_atomic_replace_leaves_original_workbook_readable(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -165,7 +165,10 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn('if self._ui5_enabled and "grad_norm" in logs:', trainer)
         self.assertIn("and step % self._cpt_metrics_interval == 0", trainer)
         self.assertIn("self._write_cpt_metrics(step, logs)", trainer)
-        self.assertIn("if self._ui5_enabled and step in {1, 20, 100}:", trainer)
+        self.assertIn(
+            "if self._ui5_enabled and (\n            step in {1, 20}",
+            trainer,
+        )
         self.assertIn("@record\ndef main():", trainer)
         self.assertIn("publish_cpt_checkpoint_completion", trainer)
         self.assertIn("reconcile_cpt_checkpoint_completion", trainer)

@@ -313,6 +313,10 @@ echo "GRADIENT_ACCUMULATION_STEPS   : ${GRADIENT_ACCUMULATION_STEPS}"
 echo "RELATION_GATE_LOSS_WEIGHT     : ${RELATION_GATE_LOSS_WEIGHT:-1.0}"
 echo "RELATION_SLOT_GATE_LOSS_WEIGHT: ${RELATION_SLOT_GATE_LOSS_WEIGHT:-0.1}"
 echo "RELATION_ATTENTION_LOSS_WEIGHT: ${RELATION_ATTENTION_LOSS_WEIGHT:-0.1}"
+echo "TC_MSED_STAGE                  : ${TC_MSED_STAGE:-v4}"
+echo "RELATION_BOX_L1_LOSS_WEIGHT   : ${RELATION_BOX_L1_LOSS_WEIGHT:-0.0}"
+echo "RELATION_BOX_GIOU_LOSS_WEIGHT : ${RELATION_BOX_GIOU_LOSS_WEIGHT:-0.0}"
+echo "RELATION_COVERAGE_LOSS_WEIGHT : ${RELATION_COVERAGE_LOSS_WEIGHT:-0.0}"
 echo "LEARNING_RATE                 : ${LEARNING_RATE}"
 echo "MAX_STEPS                     : ${MAX_STEPS}"
 echo "SAVE_EVERY_N_HOURS            : ${SAVE_EVERY_N_HOURS:-0}"
@@ -373,6 +377,11 @@ if torchrun \
   --relation_gate_threshold "${RELATION_GATE_THRESHOLD:-0.5}" \
   --relation_focal_beta "${RELATION_FOCAL_BETA:-0.999}" \
   --relation_focal_gamma "${RELATION_FOCAL_GAMMA:-2.0}" \
+  --tc_msed_stage "${TC_MSED_STAGE:-v4}" \
+  --relation_box_l1_loss_weight "${RELATION_BOX_L1_LOSS_WEIGHT:-0.0}" \
+  --relation_box_giou_loss_weight "${RELATION_BOX_GIOU_LOSS_WEIGHT:-0.0}" \
+  --relation_coverage_loss_weight "${RELATION_COVERAGE_LOSS_WEIGHT:-0.0}" \
+  --relation_coord_prior_sigma "${RELATION_COORD_PRIOR_SIGMA:-0.05}" \
   --balance_ui_defects "${BALANCE_UI_DEFECTS:-True}" \
   --ui_records_per_class "${UI_RECORDS_PER_CLASS:-17604}" \
   --ui_negative_to_positive_ratio "${UI_NEGATIVE_TO_POSITIVE_RATIO:-2.0}" \

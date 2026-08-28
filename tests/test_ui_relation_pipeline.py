@@ -192,11 +192,11 @@ class UIRelationPipelineTest(unittest.TestCase):
         self.assertIsNotNone(training_output.image_gate_loss)
         self.assertIsNotNone(training_output.slot_gate_loss)
 
-    def test_detail_scale_weights_start_as_exact_thirds(self):
+    def test_detail_scale_weights_preserve_family_prior(self):
         module, _, output = self.make_pyramid()
         torch.testing.assert_close(
-            module.scale_logits,
-            torch.zeros_like(module.scale_logits),
+            module.scale_logits.float().softmax(dim=-1),
+            module.family_scale_prior,
         )
         torch.testing.assert_close(
             output.scale_weights.sum(dim=-1),
@@ -204,7 +204,7 @@ class UIRelationPipelineTest(unittest.TestCase):
         )
         torch.testing.assert_close(
             output.scale_weights,
-            torch.full_like(output.scale_weights, 1.0 / 3.0),
+            module.family_scale_prior[0].unsqueeze(0),
         )
         for head in (*module.gate_heads, *module.image_gate_heads):
             torch.testing.assert_close(

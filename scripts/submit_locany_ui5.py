@@ -58,6 +58,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--version", default="v4")
     parser.add_argument("--data-version", default="v3")
     parser.add_argument("--run-name", default=None)
+    parser.add_argument(
+        "--tc-msed-stage",
+        choices=("v4", "m1", "m2", "m3", "m4", "m5"),
+        default="v4",
+        help="Architecture ablation stage; v4 is the exact fallback baseline",
+    )
     parser.add_argument("--scorer-root", default=None)
     parser.add_argument(
         "--training-data-source-dir",
@@ -90,9 +96,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--eval-fail-policy", choices=("stop", "warn"), default="stop")
     parser.add_argument(
-        "--relation-gate-mode", choices=("observe", "hard"), default="observe"
+        "--relation-gate-mode", choices=("observe", "hard", "soft"), default=None
     )
     parser.add_argument("--relation-gate-threshold", type=float, default=None)
+    pbd_group = parser.add_mutually_exclusive_group()
+    pbd_group.add_argument(
+        "--eval-enable-pbd", dest="eval_enable_pbd", action="store_true"
+    )
+    pbd_group.add_argument(
+        "--eval-disable-pbd", dest="eval_enable_pbd", action="store_false"
+    )
+    parser.set_defaults(eval_enable_pbd=True)
     runtime_deps_group = parser.add_mutually_exclusive_group()
     runtime_deps_group.add_argument(
         "--install-system-runtime-deps",
@@ -141,6 +155,7 @@ def render_template(template: str, replacements: dict[str, str]) -> str:
 def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
     env = dict(os.environ)
     resource_group = str(getattr(args, "resource_group", "default"))
+    tc_msed_stage = str(getattr(args, "tc_msed_stage", "v4"))
     cuda_devices = args.cuda_devices or ",".join(
         str(index) for index in range(args.gpus)
     )
@@ -163,7 +178,15 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "ENABLE_EVAL": "1" if args.enable_eval else "0",
         "EVAL_AT_START": "1" if args.eval_at_start else "0",
         "EVAL_FAIL_POLICY": args.eval_fail_policy,
-        "RELATION_GATE_MODE": getattr(args, "relation_gate_mode", "observe"),
+        # Some internal callers construct an argparse.Namespace directly.  Keep
+        # the new switch backward-compatible with those callers and default to
+        # the production-safe behaviour (PBD enabled).
+        "EVAL_ENABLE_PBD": "1" if getattr(args, "eval_enable_pbd", True) else "0",
+        "TC_MSED_STAGE": tc_msed_stage,
+        "RELATION_GATE_MODE": (
+            getattr(args, "relation_gate_mode", None)
+            or ("soft" if tc_msed_stage in {"m4", "m5"} else "observe")
+        ),
         "INSTALL_SYSTEM_RUNTIME_DEPS": (
             "1" if getattr(args, "install_system_runtime_deps", True) else "0"
         ),
@@ -253,6 +276,7 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "GPU_COUNT",
         "CUDA_DEVICES",
         "EVAL_GPU_DEVICES",
+        "EVAL_ENABLE_PBD",
         "DATA_VERSION",
         "VERSION",
         "MAX_STEPS",
@@ -267,6 +291,11 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "RELATION_FOCAL_BETA",
         "RELATION_FOCAL_GAMMA",
         "RELATION_NUM_SLOTS",
+        "TC_MSED_STAGE",
+        "RELATION_BOX_L1_LOSS_WEIGHT",
+        "RELATION_BOX_GIOU_LOSS_WEIGHT",
+        "RELATION_COVERAGE_LOSS_WEIGHT",
+        "RELATION_COORD_PRIOR_SIGMA",
         "MAX_SEQ_LENGTH",
         "MAX_NUM_TOKENS_PER_SAMPLE",
         "MAX_NUM_TOKENS",
@@ -358,8 +387,15 @@ def main() -> int:
         "MAX_NUM_TOKENS",
         "MAX_NUM_TOKENS_SCOPE",
         "GRADIENT_ACCUMULATION_STEPS",
+        "TC_MSED_STAGE",
         "RELATION_GATE_LOSS_WEIGHT",
+        "RELATION_SLOT_GATE_LOSS_WEIGHT",
         "RELATION_ATTENTION_LOSS_WEIGHT",
+        "RELATION_BOX_L1_LOSS_WEIGHT",
+        "RELATION_BOX_GIOU_LOSS_WEIGHT",
+        "RELATION_COVERAGE_LOSS_WEIGHT",
+        "RELATION_COORD_PRIOR_SIGMA",
+        "RELATION_GATE_MODE",
         "RELATION_GATE_THRESHOLD",
         "RELATION_FOCAL_BETA",
         "RELATION_FOCAL_GAMMA",
@@ -367,6 +403,7 @@ def main() -> int:
         "MAX_STEPS",
         "SAVE_STEPS",
         "ENABLE_EVAL",
+        "EVAL_ENABLE_PBD",
         "EVAL_AT_START",
         "EVAL_INTERVAL_STEPS",
         "EVAL_MAX_IMAGES_PER_TASK",

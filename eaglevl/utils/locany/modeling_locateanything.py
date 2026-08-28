@@ -38,6 +38,7 @@ from .relation_modules import (
     RelationToPBD,
     apply_coordinate_logit_prior,
     apply_soft_gate_logit_prior,
+    coordinate_bridge_prediction_groups,
     match_ui_relation_prompt,
     pbd_active_delta_norm,
     replace_pbd_active_logits,
@@ -505,9 +506,9 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             if relation_gate_mode is not None
             else getattr(self.config, "relation_gate_mode", "observe")
         ).lower()
-        if gate_mode not in {"observe", "hard"}:
+        if gate_mode not in {"observe", "hard", "soft"}:
             raise ValueError(
-                f"relation_gate_mode must be observe or hard, got {gate_mode!r}"
+                f"relation_gate_mode must be observe, hard, or soft, got {gate_mode!r}"
             )
         task_thresholds = dict(
             getattr(self.config, "relation_gate_thresholds", {}) or {}
@@ -606,6 +607,11 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         coordinate_logits = None
         pbd_delta_sum = 0.0
         pbd_active_positions = 0
+        runtime_enable_pbd = bool(getattr(self, "_runtime_enable_pbd", True))
+        slot_usage_state = None
+        selected_slot_history = []
+        pending_ar_coordinate_box = None
+        pending_ar_coordinate_offset = 0
 
         text_config = self.config.text_config
         pbd_block_size = int(text_config.block_size)
@@ -744,6 +750,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
 
             # Step 2: Model forward & update KV cache
             with torch.no_grad():
+                pbd_applied_this_round = False
                 if relation_output is not None:
                     prepare_inputs['output_hidden_states'] = True
                 outputs = self.language_model(**prepare_inputs)
@@ -751,7 +758,11 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 # Training and generation use the same packed-boundary-aware
                 # position selector and the same best relation token.  This is
                 # anchor-only for AR and the full configured block for MTP.
-                if relation_output is not None and outputs.hidden_states is not None:
+                if (
+                    relation_output is not None
+                    and runtime_enable_pbd
+                    and outputs.hidden_states is not None
+                ):
                     pbd_input_ids = prepare_inputs.get("input_ids")
                     if pbd_input_ids is None:
                         raise RuntimeError(
@@ -771,8 +782,27 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                         box_start_token_id=int(self.config.box_start_token_id),
                         text_mask_token_id=text_mask_token_id,
                         block_size=pbd_block_size,
+                        relation_tokens=relation_output.relation_tokens,
+                        slot_gate_logits=relation_output.slot_gate_logits,
+                        coarse_boxes=relation_output.coarse_boxes,
+                        defect_type=defect_type,
+                        initial_slot_usage=slot_usage_state,
                     )
+                    if pbd_output.final_slot_usage is not None:
+                        slot_usage_state = pbd_output.final_slot_usage.detach()
+                    if (
+                        pbd_output.selected_slot_indices is not None
+                        and pbd_output.active_offsets is not None
+                    ):
+                        anchor_selection = pbd_output.selected_slot_indices[
+                            pbd_output.active_offsets == 0
+                        ]
+                        selected_slot_history.extend(
+                            int(value) for value in anchor_selection.detach().cpu().tolist()
+                            if int(value) >= 0
+                        )
                     if pbd_output.active_positions.numel() > 0:
+                        pbd_applied_this_round = True
                         active_count = int(pbd_output.active_positions.numel())
                         batch_delta_norm = pbd_active_delta_norm(
                             last_hidden,
@@ -790,6 +820,50 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                             replacement_logits,
                             pbd_output.active_positions,
                         )
+                        if (
+                            self.relation_pbd.coordinate_bridge
+                            and pbd_output.selected_coarse_boxes is not None
+                        ):
+                            (
+                                coord_bridge_positions,
+                                coord_bridge_samples,
+                                coord_bridge_offsets,
+                                coord_bridge_boxes,
+                            ) = coordinate_bridge_prediction_groups(
+                                pbd_input_ids,
+                                torch.tensor(
+                                    [pbd_input_ids.numel()],
+                                    device=pbd_input_ids.device,
+                                    dtype=torch.long,
+                                ),
+                                pbd_output.active_positions,
+                                pbd_output.active_samples,
+                                pbd_output.active_anchor_ordinals,
+                                pbd_output.active_offsets,
+                                pbd_output.selected_coarse_boxes,
+                                int(self.config.coord_start_token_id),
+                                int(self.config.coord_end_token_id),
+                            )
+                            outputs.logits = apply_coordinate_logit_prior(
+                                outputs.logits,
+                                coord_bridge_positions,
+                                coord_bridge_offsets,
+                                coord_bridge_samples,
+                                coord_bridge_boxes,
+                                defect_type,
+                                self.relation_pbd.coord_prior_lambda,
+                                int(self.config.coord_start_token_id),
+                                int(self.config.coord_end_token_id),
+                                sigma=float(getattr(self.config, "relation_coord_prior_sigma", 0.05)),
+                            )
+                            if not use_mtp:
+                                anchor_mask = coord_bridge_offsets == 0
+                                if bool(anchor_mask.any()):
+                                    pending_ar_coordinate_box = (
+                                        coord_bridge_boxes[anchor_mask][-1:]
+                                        .detach()
+                                    )
+                                    pending_ar_coordinate_offset = 1
                         box_anchor_hidden = pbd_output.box_anchor_hidden
                         coord_start = int(self.config.coord_start_token_id)
                         coord_end = int(self.config.coord_end_token_id) + 1
@@ -797,6 +871,61 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                             box_anchor_hidden,
                             self.language_model.lm_head.weight[coord_start:coord_end],
                         )
+
+                # In pure/fallback AR, only the <box> anchor is a PBD position.
+                # Carry its selected coarse geometry over the next three token
+                # decisions so x1/y1/x2/y2 all receive the same slot prior.
+                if (
+                    relation_output is not None
+                    and runtime_enable_pbd
+                    and not use_mtp
+                    and self.relation_pbd.coordinate_bridge
+                    and pending_ar_coordinate_box is not None
+                    and not pbd_applied_this_round
+                    and pending_ar_coordinate_offset < 4
+                ):
+                    flat_logit_count = outputs.logits.reshape(
+                        -1, outputs.logits.shape[-1]
+                    ).shape[0]
+                    outputs.logits = apply_coordinate_logit_prior(
+                        outputs.logits,
+                        torch.tensor(
+                            [flat_logit_count - 1],
+                            device=outputs.logits.device,
+                            dtype=torch.long,
+                        ),
+                        torch.tensor(
+                            [pending_ar_coordinate_offset],
+                            device=outputs.logits.device,
+                            dtype=torch.long,
+                        ),
+                        torch.zeros(1, device=outputs.logits.device, dtype=torch.long),
+                        pending_ar_coordinate_box,
+                        defect_type,
+                        self.relation_pbd.coord_prior_lambda,
+                        int(self.config.coord_start_token_id),
+                        int(self.config.coord_end_token_id),
+                        sigma=float(
+                            getattr(self.config, "relation_coord_prior_sigma", 0.05)
+                        ),
+                    )
+                    pending_ar_coordinate_offset += 1
+                    if pending_ar_coordinate_offset >= 4:
+                        pending_ar_coordinate_box = None
+
+            if (
+                relation_output is not None
+                and gate_mode == "soft"
+                and self.relation_pyramid.soft_gate
+            ):
+                outputs.logits = apply_soft_gate_logit_prior(
+                    outputs.logits,
+                    relation_output.p_defect,
+                    defect_type,
+                    self.relation_pyramid.soft_gate_beta,
+                    int(self.config.box_start_token_id),
+                    int(self.config.none_token_id),
+                )
 
             if outputs.past_key_values is None:
                 raise RuntimeError(
@@ -839,6 +968,8 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                     switch_to_ar_count += 1
                 elif out_type == 'box_end_ar':
                     use_mtp = True
+                    pending_ar_coordinate_box = None
+                    pending_ar_coordinate_offset = 0
             # fast mode: use_mtp stays True always
             # slow mode: use_mtp stays False always
 
@@ -870,6 +1001,14 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                     and "<box>" in compact_response
                 ),
                 "coarse_boxes": relation_output.coarse_boxes,
+                "slot_gate_probabilities": torch.sigmoid(relation_output.slot_gate_logits),
+                "selected_slot_indices": selected_slot_history,
+                "pbd_enabled": runtime_enable_pbd,
+                "unique_slot_count": len(set(selected_slot_history)),
+                "duplicate_slot_rate": (
+                    (len(selected_slot_history) - len(set(selected_slot_history)))
+                    / max(len(selected_slot_history), 1)
+                ),
                 "query_attention": relation_output.query_attention,
                 "box_anchor_hidden": box_anchor_hidden,
                 "coordinate_logits": coordinate_logits,

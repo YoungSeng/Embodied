@@ -36,6 +36,8 @@ from .relation_modules import (
     RelationToPBD,
     apply_coordinate_logit_prior,
     apply_soft_gate_logit_prior,
+    coordinate_bridge_prediction_groups,
+    coordinate_gaussian_prior,
     pbd_active_delta_norm,
 )
 from .ui_relation_setup import ui_relation_collective_device
@@ -131,6 +133,8 @@ class UIDefectModelOutput(CausalLMOutputWithPast):
     relation_gate_prob_mean: Optional[torch.Tensor] = None
     pbd_delta_norm: Optional[torch.Tensor] = None
     pbd_active_positions: Optional[torch.Tensor] = None
+    box_anchor_count: Optional[torch.Tensor] = None
+    pbd_to_hidden_ratio: Optional[torch.Tensor] = None
     loss_lm_contribution: Optional[torch.Tensor] = None
     loss_image_gate_contribution: Optional[torch.Tensor] = None
     loss_slot_gate_contribution: Optional[torch.Tensor] = None
@@ -138,6 +142,25 @@ class UIDefectModelOutput(CausalLMOutputWithPast):
     loss_reconstructed: Optional[torch.Tensor] = None
     loss_reconstruction_error: Optional[torch.Tensor] = None
     attention_active: Optional[torch.Tensor] = None
+    attention_kl_loss: Optional[torch.Tensor] = None
+    attention_ce_diagnostic: Optional[torch.Tensor] = None
+    box_l1_loss: Optional[torch.Tensor] = None
+    box_giou_loss: Optional[torch.Tensor] = None
+    coverage_loss: Optional[torch.Tensor] = None
+    coordinate_bridge_loss: Optional[torch.Tensor] = None
+    matched_slot_indices: Optional[torch.Tensor] = None
+    scale_entropy: Optional[torch.Tensor] = None
+    scale_batch_std: Optional[torch.Tensor] = None
+    coarse_iou_mean: Optional[torch.Tensor] = None
+    coarse_recall_03: Optional[torch.Tensor] = None
+    coarse_recall_05: Optional[torch.Tensor] = None
+    matched_slots: Optional[torch.Tensor] = None
+    unmatched_slots: Optional[torch.Tensor] = None
+    slot_usage_entropy: Optional[torch.Tensor] = None
+    unique_slot_count: Optional[torch.Tensor] = None
+    duplicate_slot_rate: Optional[torch.Tensor] = None
+    coord_prior_lambdas: Optional[torch.Tensor] = None
+    soft_gate_betas: Optional[torch.Tensor] = None
     cpt_token_losses: Optional[torch.Tensor] = None
     global_visual_cache: Optional[Any] = None
 
@@ -558,6 +581,12 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         coordinate_logits = None
         pbd_delta_norm = None
         pbd_active_positions = None
+        box_anchor_count = None
+        pbd_to_hidden_ratio = None
+        coverage_loss = None
+        coordinate_bridge_loss = None
+        soft_gate_bridge_loss = None
+        pbd_output = None
 
         if relation_output is not None:
             if isinstance(ssl, torch.Tensor):
@@ -588,6 +617,11 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 box_start_token_id=int(self.config.box_start_token_id),
                 text_mask_token_id=int(text_config.text_mask_token_id),
                 block_size=int(text_config.block_size),
+                relation_tokens=relation_output.relation_tokens,
+                slot_gate_logits=relation_output.slot_gate_logits,
+                coarse_boxes=relation_output.coarse_boxes,
+                matched_slot_indices=relation_output.matched_slot_indices,
+                defect_type=defect_type,
             )
             hidden_states = pbd_output.hidden_states
             box_anchor_hidden = pbd_output.box_anchor_hidden
@@ -597,17 +631,107 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 hidden_states.detach(),
                 pbd_output.active_positions,
             )
+            if pbd_output.active_positions.numel() > 0:
+                active_hidden_norm = decoder_hidden_states.reshape(
+                    -1, decoder_hidden_states.shape[-1]
+                )[pbd_output.active_positions].detach().float().norm(dim=-1).mean()
+                pbd_to_hidden_ratio = pbd_delta_norm / active_hidden_norm.clamp_min(1.0e-12)
             pbd_active_positions = torch.tensor(
                 pbd_output.active_positions.numel(),
                 device=hidden_states.device,
                 dtype=torch.long,
             )
+            box_anchor_count = torch.tensor(
+                int((pbd_output.active_offsets == 0).sum().item())
+                if pbd_output.active_offsets is not None
+                else 0,
+                device=hidden_states.device,
+                dtype=torch.long,
+            )
+            coverage_loss = pbd_output.coverage_loss
             coord_start = int(self.config.coord_start_token_id)
             coord_end = int(self.config.coord_end_token_id) + 1
-            coordinate_logits = F.linear(
-                box_anchor_hidden,
-                lm_head_weight[coord_start:coord_end],
-            )
+            if (
+                self.relation_pbd.coordinate_bridge
+                and pbd_output.active_positions.numel() > 0
+            ):
+                (
+                    coord_bridge_positions,
+                    coord_bridge_samples,
+                    coord_bridge_offsets,
+                    coord_bridge_boxes,
+                ) = coordinate_bridge_prediction_groups(
+                    model_input_ids,
+                    ssl_for_fusion,
+                    pbd_output.active_positions,
+                    pbd_output.active_samples,
+                    pbd_output.active_anchor_ordinals,
+                    pbd_output.active_offsets,
+                    pbd_output.selected_coarse_boxes,
+                    coord_start,
+                    coord_end - 1,
+                )
+                active_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])[
+                    coord_bridge_positions
+                ]
+                base_coordinate_logits = F.linear(
+                    active_hidden, lm_head_weight[coord_start:coord_end]
+                )
+                coordinate_prior = coordinate_gaussian_prior(
+                    coord_bridge_offsets,
+                    coord_bridge_samples,
+                    coord_bridge_boxes,
+                    defect_type,
+                    self.relation_pbd.coord_prior_lambda,
+                    coord_end - coord_start,
+                    sigma=float(getattr(self.config, "relation_coord_prior_sigma", 0.05)),
+                ).to(dtype=base_coordinate_logits.dtype)
+                coordinate_logits = base_coordinate_logits + coordinate_prior
+                if labels is not None:
+                    flat_labels = labels.reshape(-1)
+                    next_positions = coord_bridge_positions + 1
+                    valid_coordinate = (
+                        (coord_bridge_offsets < 4)
+                        & (next_positions < flat_labels.numel())
+                    )
+                    safe_next = next_positions.clamp_max(max(flat_labels.numel() - 1, 0))
+                    coordinate_targets = flat_labels[safe_next] - coord_start
+                    valid_coordinate = valid_coordinate & (
+                        (coordinate_targets >= 0)
+                        & (coordinate_targets < coord_end - coord_start)
+                    )
+                    if bool(valid_coordinate.any()):
+                        # Replace exactly the affected full-vocabulary LM CE
+                        # terms.  A CE over only the coordinate sub-vocabulary
+                        # has a different normalizer and would over-weight the
+                        # bridge relative to the packed-token LM mean.
+                        full_targets = flat_labels[safe_next][valid_coordinate].long()
+                        base_full_logits = F.linear(
+                            active_hidden[valid_coordinate], lm_head_weight
+                        ).float()
+                        enhanced_full_logits = base_full_logits.clone()
+                        enhanced_full_logits[:, coord_start:coord_end] += (
+                            coordinate_prior[valid_coordinate].float()
+                        )
+                        supervised_tokens = labels[..., 1:].ne(IGNORE_INDEX).sum().clamp_min(1)
+                        base_ce = F.cross_entropy(
+                            base_full_logits,
+                            full_targets,
+                            reduction="sum",
+                        )
+                        enhanced_ce = F.cross_entropy(
+                            enhanced_full_logits,
+                            full_targets,
+                            reduction="sum",
+                        )
+                        coordinate_bridge_loss = (
+                            enhanced_ce - base_ce
+                        ) / supervised_tokens.float()
+            else:
+                coordinate_logits = F.linear(
+                    box_anchor_hidden,
+                    lm_head_weight[coord_start:coord_end],
+                )
         
         hidden_dim = hidden_states.shape[-1]
 
@@ -616,6 +740,11 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         image_gate_contribution = None
         slot_gate_contribution = None
         attention_contribution = None
+        box_l1_contribution = None
+        box_giou_contribution = None
+        coverage_contribution = None
+        coordinate_bridge_contribution = None
+        soft_gate_contribution = None
         loss_reconstructed = None
         loss_reconstruction_error = None
         cpt_token_losses = None
@@ -667,15 +796,95 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                         * relation_output.attention_loss
                     )
                     loss = loss + attention_contribution
+                if relation_output.box_l1_loss is not None:
+                    box_l1_contribution = (
+                        float(getattr(self.config, "relation_box_l1_loss_weight", 0.0))
+                        * relation_output.box_l1_loss
+                    )
+                    loss = loss + box_l1_contribution
+                if relation_output.box_giou_loss is not None:
+                    box_giou_contribution = (
+                        float(getattr(self.config, "relation_box_giou_loss_weight", 0.0))
+                        * relation_output.box_giou_loss
+                    )
+                    loss = loss + box_giou_contribution
+                if coverage_loss is not None:
+                    coverage_contribution = (
+                        float(getattr(self.config, "relation_coverage_loss_weight", 0.0))
+                        * coverage_loss
+                    )
+                    loss = loss + coverage_contribution
+                if coordinate_bridge_loss is not None:
+                    coordinate_bridge_contribution = coordinate_bridge_loss
+                    loss = loss + coordinate_bridge_contribution
+                if (
+                    self.relation_pyramid.soft_gate
+                    and relation_output.p_defect is not None
+                ):
+                    flat_hidden_for_gate = hidden_states[..., :-1, :].contiguous().view(
+                        -1, hidden_dim
+                    )
+                    flat_gate_labels = labels[..., 1:].contiguous().view(-1)
+                    box_id = int(self.config.box_start_token_id)
+                    none_id = int(self.config.none_token_id)
+                    gate_positions = (flat_gate_labels == box_id) | (flat_gate_labels == none_id)
+                    if bool(gate_positions.any()):
+                        base_gate_logits = F.linear(
+                            flat_hidden_for_gate[gate_positions], lm_head_weight
+                        ).float()
+                        lengths = ssl_for_fusion.reshape(-1).long()
+                        sample_ids = torch.repeat_interleave(
+                            torch.arange(lengths.numel(), device=lengths.device), lengths
+                        )
+                        shifted_sample_ids = sample_ids[1:]
+                        if shifted_sample_ids.numel() > flat_gate_labels.numel():
+                            shifted_sample_ids = shifted_sample_ids[: flat_gate_labels.numel()]
+                        elif shifted_sample_ids.numel() < flat_gate_labels.numel():
+                            shifted_sample_ids = F.pad(
+                                shifted_sample_ids,
+                                (0, flat_gate_labels.numel() - shifted_sample_ids.numel()),
+                                value=int(lengths.numel() - 1),
+                            )
+                        selected_samples = shifted_sample_ids[gate_positions]
+                        selected_tasks = defect_type[selected_samples].long().clamp(
+                            0, self.relation_pyramid.soft_gate_beta.numel() - 1
+                        )
+                        betas = self.relation_pyramid.soft_gate_beta[selected_tasks].float()
+                        probabilities = relation_output.p_defect[selected_samples].float()
+                        enhanced_gate_logits = base_gate_logits.clone()
+                        enhanced_gate_logits[:, box_id] += betas * probabilities
+                        enhanced_gate_logits[:, none_id] += betas * (1.0 - probabilities)
+                        gate_targets = flat_gate_labels[gate_positions].long()
+                        base_gate_ce = F.cross_entropy(
+                            base_gate_logits, gate_targets, reduction="sum"
+                        )
+                        enhanced_gate_ce = F.cross_entropy(
+                            enhanced_gate_logits, gate_targets, reduction="sum"
+                        )
+                        soft_gate_bridge_loss = (
+                            enhanced_gate_ce - base_gate_ce
+                        ) / float(valid_shift_labels)
+                        soft_gate_contribution = soft_gate_bridge_loss
+                        loss = loss + soft_gate_contribution
             zero = lm_loss.new_zeros(())
             image_gate_contribution = image_gate_contribution if image_gate_contribution is not None else zero
             slot_gate_contribution = slot_gate_contribution if slot_gate_contribution is not None else zero
             attention_contribution = attention_contribution if attention_contribution is not None else zero
+            box_l1_contribution = box_l1_contribution if box_l1_contribution is not None else zero
+            box_giou_contribution = box_giou_contribution if box_giou_contribution is not None else zero
+            coverage_contribution = coverage_contribution if coverage_contribution is not None else zero
+            coordinate_bridge_contribution = coordinate_bridge_contribution if coordinate_bridge_contribution is not None else zero
+            soft_gate_contribution = soft_gate_contribution if soft_gate_contribution is not None else zero
             loss_reconstructed = (
                 lm_loss
                 + image_gate_contribution
                 + slot_gate_contribution
                 + attention_contribution
+                + box_l1_contribution
+                + box_giou_contribution
+                + coverage_contribution
+                + coordinate_bridge_contribution
+                + soft_gate_contribution
             )
             loss_reconstruction_error = (loss - loss_reconstructed).abs()
             if float(loss_reconstruction_error.detach().float().item()) >= 1.0e-4:
@@ -744,6 +953,25 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             image_gate_loss=relation_output.image_gate_loss if relation_output is not None else None,
             slot_gate_loss=relation_output.slot_gate_loss if relation_output is not None else None,
             attention_loss=relation_output.attention_loss if relation_output is not None else None,
+            attention_kl_loss=relation_output.attention_kl_loss if relation_output is not None else None,
+            attention_ce_diagnostic=relation_output.attention_ce_diagnostic if relation_output is not None else None,
+            box_l1_loss=relation_output.box_l1_loss if relation_output is not None else None,
+            box_giou_loss=relation_output.box_giou_loss if relation_output is not None else None,
+            coverage_loss=coverage_loss,
+            coordinate_bridge_loss=coordinate_bridge_loss,
+            matched_slot_indices=relation_output.matched_slot_indices if relation_output is not None else None,
+            scale_entropy=relation_output.scale_entropy if relation_output is not None else None,
+            scale_batch_std=relation_output.scale_batch_std if relation_output is not None else None,
+            coarse_iou_mean=relation_output.coarse_iou_mean if relation_output is not None else None,
+            coarse_recall_03=relation_output.coarse_recall_03 if relation_output is not None else None,
+            coarse_recall_05=relation_output.coarse_recall_05 if relation_output is not None else None,
+            matched_slots=relation_output.matched_slots if relation_output is not None else None,
+            unmatched_slots=relation_output.unmatched_slots if relation_output is not None else None,
+            slot_usage_entropy=relation_output.slot_usage_entropy if relation_output is not None else None,
+            unique_slot_count=pbd_output.unique_slot_count if pbd_output is not None else None,
+            duplicate_slot_rate=pbd_output.duplicate_slot_rate if pbd_output is not None else None,
+            coord_prior_lambdas=(self.relation_pbd.coord_prior_lambda if self.enable_ui_relation and self.relation_pbd.coordinate_bridge else None),
+            soft_gate_betas=(self.relation_pyramid.soft_gate_beta if self.enable_ui_relation and self.relation_pyramid.soft_gate else None),
             per_task_gate_loss=(
                 relation_output.per_task_gate_loss if relation_output is not None else None
             ),
@@ -796,6 +1024,8 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             ),
             pbd_delta_norm=pbd_delta_norm,
             pbd_active_positions=pbd_active_positions,
+            box_anchor_count=box_anchor_count,
+            pbd_to_hidden_ratio=pbd_to_hidden_ratio,
             loss_lm_contribution=lm_loss,
             loss_image_gate_contribution=image_gate_contribution,
             loss_slot_gate_contribution=slot_gate_contribution,

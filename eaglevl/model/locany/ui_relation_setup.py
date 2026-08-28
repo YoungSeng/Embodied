@@ -65,6 +65,11 @@ def configure_ui5_model_config(
     relation_gate_threshold: float,
     relation_focal_beta: float,
     relation_focal_gamma: float,
+    tc_msed_stage: str = "v4",
+    relation_box_l1_loss_weight: float = 0.0,
+    relation_box_giou_loss_weight: float = 0.0,
+    relation_coverage_loss_weight: float = 0.0,
+    relation_coord_prior_sigma: float = 0.05,
 ):
     """Apply the one authoritative UI5 configuration to a model config."""
 
@@ -101,7 +106,23 @@ def configure_ui5_model_config(
     config.relation_slot_gate_loss_weight = float(relation_slot_gate_loss_weight)
     config.relation_attention_loss_weight = float(relation_attention_loss_weight)
     config.relation_gate_threshold = float(relation_gate_threshold)
-    config.relation_gate_mode = "observe"
+    stage = str(tc_msed_stage).lower()
+    stages = ("v4", "m1", "m2", "m3", "m4", "m5")
+    if stage not in stages:
+        raise ValueError(f"unknown TC-MSED stage: {stage!r}")
+    stage_index = stages.index(stage)
+    config.tc_msed_stage = stage
+    config.relation_task_scale_router = stage_index >= 1
+    config.relation_set_localizer = stage_index >= 2
+    config.relation_dynamic_slot_pbd = stage_index >= 3
+    config.relation_coordinate_bridge = stage_index >= 3
+    config.relation_soft_gate = stage_index >= 4
+    config.relation_overlap_adapter = stage_index >= 5
+    config.relation_box_l1_loss_weight = float(relation_box_l1_loss_weight)
+    config.relation_box_giou_loss_weight = float(relation_box_giou_loss_weight)
+    config.relation_coverage_loss_weight = float(relation_coverage_loss_weight)
+    config.relation_coord_prior_sigma = float(relation_coord_prior_sigma)
+    config.relation_gate_mode = "soft" if config.relation_soft_gate else "observe"
     if not hasattr(config, "relation_gate_thresholds"):
         config.relation_gate_thresholds = {}
     config.relation_focal_beta = float(relation_focal_beta)

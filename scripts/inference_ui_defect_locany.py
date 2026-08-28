@@ -396,10 +396,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--enable-pbd",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "独立开启/关闭 Relation-to-PBD 与 coordinate bridge；用于同一 checkpoint "
+            "的 PBD on/off 诊断，不会关闭 Detail Pyramid、slots 或 image Gate"
+        ),
+    )
+    parser.add_argument(
         "--relation-gate-mode",
-        choices=("observe", "hard"),
+        choices=("observe", "hard", "soft"),
         default="observe",
-        help="observe 始终生成并记录 Gate；hard 才允许阈值提前返回 none",
+        help="observe 仅观测；hard 可提前返回 none；soft 使用模型内部可学习先验",
     )
     parser.add_argument(
         "--relation-gate-threshold",
@@ -948,6 +957,7 @@ class LocateAnythingInferencer:
         print(f"generation mode         : {args.generation_mode}")
         print(f"relation gate mode      : {args.relation_gate_mode}")
         print(f"relation gate override  : {args.relation_gate_threshold}")
+        print(f"PBD enabled             : {args.enable_pbd}")
 
         if self.device.startswith("cuda"):
             logical_index = int(self.device.split(":", 1)[1]) if ":" in self.device else 0
@@ -1082,6 +1092,7 @@ class LocateAnythingInferencer:
         self.model.enable_ui_relation = bool(
             getattr(self.model.config, "enable_ui_relation", False)
         )
+        self.model._runtime_enable_pbd = bool(args.enable_pbd)
         self.model._last_ui_defect_interface = None
         self.model.generate = MethodType(
             RepositoryInferenceModel.generate,
@@ -1169,6 +1180,14 @@ class LocateAnythingInferencer:
             "pbd_active_positions": self._scalar(
                 interface.get("pbd_active_positions")
             ),
+            "coarse_boxes": self._scalar(interface.get("coarse_boxes")),
+            "slot_gate_probabilities": self._scalar(
+                interface.get("slot_gate_probabilities")
+            ),
+            "selected_slot_indices": interface.get("selected_slot_indices", []),
+            "pbd_enabled": bool(interface.get("pbd_enabled", self.args.enable_pbd)),
+            "unique_slot_count": interface.get("unique_slot_count"),
+            "duplicate_slot_rate": interface.get("duplicate_slot_rate"),
         }
 
     @torch.inference_mode()
@@ -1480,6 +1499,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "dtype": args.dtype,
             "attn_implementation": args.attn_implementation,
             "enable_ui_relation": args.enable_ui_relation,
+            "pbd_enabled": bool(args.enable_pbd),
             "relation_gate_mode": args.relation_gate_mode,
             "relation_gate_threshold": args.relation_gate_threshold,
         },
@@ -1761,6 +1781,22 @@ def run_one_task(
             gate_diagnostics.setdefault("would_pass", None)
             gate_diagnostics.setdefault("gate_filtered", False)
             gate_diagnostics["final_has_bbox"] = bool(detections)
+            gate_diagnostics["image_size"] = {"width": width, "height": height}
+            gate_diagnostics["final_boxes_normalized_1000"] = parsed.normalized_boxes
+            gate_diagnostics["final_boxes_pixel_xyxy"] = pixel_boxes
+            selected_slots = list(gate_diagnostics.get("selected_slot_indices") or [])
+            gate_diagnostics["box_slot_bindings"] = [
+                {
+                    "box_index": box_index,
+                    "slot_index": (
+                        int(selected_slots[box_index])
+                        if box_index < len(selected_slots)
+                        else None
+                    ),
+                    "box_normalized_1000": box,
+                }
+                for box_index, box in enumerate(parsed.normalized_boxes)
+            ]
             atomic_write_json(
                 gate_path,
                 {

@@ -117,6 +117,17 @@ def ui_model_signature(checkpoint: Path) -> str:
         "relation_slot_gate_loss_weight": config.get(
             "relation_slot_gate_loss_weight"
         ),
+        "tc_msed_stage": config.get("tc_msed_stage", "v4"),
+        "relation_task_scale_router": config.get("relation_task_scale_router", False),
+        "relation_set_localizer": config.get("relation_set_localizer", False),
+        "relation_dynamic_slot_pbd": config.get("relation_dynamic_slot_pbd", False),
+        "relation_coordinate_bridge": config.get("relation_coordinate_bridge", False),
+        "relation_soft_gate": config.get("relation_soft_gate", False),
+        "relation_overlap_adapter": config.get("relation_overlap_adapter", False),
+        "relation_box_l1_loss_weight": config.get("relation_box_l1_loss_weight", 0.0),
+        "relation_box_giou_loss_weight": config.get("relation_box_giou_loss_weight", 0.0),
+        "relation_coverage_loss_weight": config.get("relation_coverage_loss_weight", 0.0),
+        "relation_coord_prior_sigma": config.get("relation_coord_prior_sigma", 0.05),
         "box_start_token_id": config.get("box_start_token_id"),
         "text_mask_token_id": (config.get("text_config") or {}).get(
             "text_mask_token_id"
@@ -152,6 +163,7 @@ def collect_gate_metrics(
     if prediction_dir is None or not prediction_dir.is_dir():
         return {}
     ground_truth: dict[str, dict[str, bool]] = {}
+    ground_truth_boxes: dict[str, dict[str, list[Any]]] = {}
     if gt_dir is not None and gt_dir.is_dir():
         scorer_file = (
             scorer_root / "qwen3vl_merge_and_score_fixed_5tasks.py"
@@ -178,6 +190,7 @@ def collect_gate_metrics(
             for task in TASKS:
                 source = gt_dir / TASK_JSONL[task]
                 labels: dict[str, bool] = {}
+                boxes_by_path: dict[str, list[Any]] = {}
                 if source.is_file():
                     with source.open("r", encoding="utf-8") as handle:
                         for line in handle:
@@ -187,14 +200,19 @@ def collect_gate_metrics(
                             image_path = _sample_image_path(sample, source.parent)
                             if image_path is None:
                                 continue
-                            positive = bool(
+                            parsed_boxes = list(
                                 extract_bboxes_for_issue(
                                     get_gt_payload(sample), TASK_ISSUE_NAMES[task]
                                 )
+                                or []
                             )
+                            positive = bool(parsed_boxes)
                             labels[image_path] = positive
                             labels[Path(image_path).name] = positive
+                            boxes_by_path[image_path] = parsed_boxes
+                            boxes_by_path[Path(image_path).name] = parsed_boxes
                 ground_truth[task] = labels
+                ground_truth_boxes[task] = boxes_by_path
 
     result: dict[str, dict[str, Any]] = {}
     for task in TASKS:
@@ -212,7 +230,32 @@ def collect_gate_metrics(
         negatives: list[float] = []
         sweep_samples: list[dict[str, Any]] = []
         gate_tp = gate_fp = gate_fn = 0
+        gt_box_sum = pred_box_sum = 0
+        count_absolute_error = 0.0
+        coarse_iou_values: list[float] = []
+        duplicate_slot_values: list[float] = []
         labels = ground_truth.get(task, {})
+        task_boxes = ground_truth_boxes.get(task, {})
+
+        def xyxy(value: Any) -> list[float] | None:
+            if isinstance(value, dict):
+                value = value.get("bbox", value.get("box", value.get("xyxy")))
+            if not isinstance(value, (list, tuple)) or len(value) < 4:
+                return None
+            try:
+                return [float(item) for item in value[:4]]
+            except (TypeError, ValueError):
+                return None
+
+        def iou(left: list[float], right: list[float]) -> float:
+            lx1, ly1, lx2, ly2 = left
+            rx1, ry1, rx2, ry2 = right
+            intersection = max(0.0, min(lx2, rx2) - max(lx1, rx1)) * max(
+                0.0, min(ly2, ry2) - max(ly1, ry1)
+            )
+            left_area = max(0.0, lx2 - lx1) * max(0.0, ly2 - ly1)
+            right_area = max(0.0, rx2 - rx1) * max(0.0, ry2 - ry1)
+            return intersection / max(left_area + right_area - intersection, 1.0e-9)
         for record in records:
             p_defect = record.get("p_defect")
             image_path = str(record.get("image_path", ""))
@@ -230,6 +273,23 @@ def collect_gate_metrics(
                         "p_defect": float(p_defect),
                     }
                 )
+            gt_boxes = [
+                parsed for value in task_boxes.get(image_path, task_boxes.get(Path(image_path).name, []))
+                if (parsed := xyxy(value)) is not None
+            ]
+            predicted_count = int(record.get("prediction_boxes", 0) or 0)
+            gt_box_sum += len(gt_boxes)
+            pred_box_sum += predicted_count
+            count_absolute_error += abs(predicted_count - len(gt_boxes))
+            raw_coarse = record.get("coarse_boxes") or []
+            if raw_coarse and isinstance(raw_coarse[0], list) and raw_coarse[0] and isinstance(raw_coarse[0][0], list):
+                raw_coarse = raw_coarse[0]
+            coarse = [parsed for value in raw_coarse if (parsed := xyxy(value)) is not None]
+            for target in gt_boxes:
+                coarse_iou_values.append(max((iou(target, candidate) for candidate in coarse), default=0.0))
+            duplicate = record.get("duplicate_slot_rate")
+            if isinstance(duplicate, (int, float)):
+                duplicate_slot_values.append(float(duplicate))
         gate_precision = gate_tp / (gate_tp + gate_fp) if gate_tp + gate_fp else 0.0
         gate_recall = gate_tp / (gate_tp + gate_fn) if gate_tp + gate_fn else 0.0
         gate_f1 = (
@@ -267,6 +327,21 @@ def collect_gate_metrics(
             "gate_recall": gate_recall,
             "gate_f1": gate_f1,
             "_sweep_samples": sweep_samples,
+            "gt_average_box_count": gt_box_sum / len(records) if records else None,
+            "pred_average_box_count": pred_box_sum / len(records) if records else None,
+            "count_mae": count_absolute_error / len(records) if records else None,
+            "coarse_recall_03": (
+                sum(value >= 0.3 for value in coarse_iou_values) / len(coarse_iou_values)
+                if coarse_iou_values else None
+            ),
+            "coarse_recall_05": (
+                sum(value >= 0.5 for value in coarse_iou_values) / len(coarse_iou_values)
+                if coarse_iou_values else None
+            ),
+            "duplicate_slot_rate": (
+                sum(duplicate_slot_values) / len(duplicate_slot_values)
+                if duplicate_slot_values else None
+            ),
         }
     return result
 
@@ -459,8 +534,18 @@ def append_excel_evaluation(
         / "diagnostics"
         / "ui5_training_evaluation.xlsx"
     )
+    raw_metrics = (
+        load_metrics(args.raw_metrics_json)
+        if getattr(args, "raw_metrics_json", None) is not None
+        else (metrics if args.relation_gate_mode != "soft" else {})
+    )
+    gate_prediction_dir = (
+        args.raw_prediction_dir
+        if getattr(args, "raw_prediction_dir", None) is not None
+        else args.prediction_dir
+    )
     gate_metrics = collect_gate_metrics(
-        args.prediction_dir, args.gt_dir, args.scorer_root
+        gate_prediction_dir, args.gt_dir, args.scorer_root
     )
     sweep = build_gate_threshold_sweep(gate_metrics)
     if args.prediction_dir is not None:
@@ -492,6 +577,7 @@ def append_excel_evaluation(
             }
         )
         gate_metrics[task].pop("_sweep_samples", None)
+        gate_metrics[task]["relation_gate_mode"] = args.relation_gate_mode
         sample_count = int(gate_metrics[task].get("samples", 0))
         if sample_count >= 100 and int(
             gate_metrics[task].get("raw_predicted_positive") or 0
@@ -524,6 +610,7 @@ def append_excel_evaluation(
         checkpoint=str(args.checkpoint),
         metrics=metrics,
         gate_metrics=gate_metrics,
+        raw_metrics=raw_metrics,
     )
     UI5ExcelLogger(diagnostics_path).append_eval(args.step, rows)
     return diagnostics_path
@@ -570,14 +657,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-num-tokens-scope", default="per_rank_packed_batch"
     )
     record.add_argument(
-        "--relation-gate-mode", choices=("observe", "hard"), default="observe"
+        "--relation-gate-mode", choices=("observe", "hard", "soft"), default="observe"
     )
     record.add_argument("--checkpoint", type=Path, required=True)
     record.add_argument("--metrics-json", type=Path, default=None)
+    record.add_argument("--raw-metrics-json", type=Path, default=None)
     record.add_argument("--start-time", required=True)
     record.add_argument("--end-time", required=True)
     record.add_argument("--status", choices=("success", "failed"), required=True)
     record.add_argument("--prediction-dir", type=Path, default=None)
+    record.add_argument("--raw-prediction-dir", type=Path, default=None)
     record.add_argument("--gt-dir", type=Path, default=None)
     record.add_argument("--scorer-root", type=Path, default=None)
     record.add_argument("--diagnostics-xlsx", type=Path, default=None)
@@ -588,7 +677,7 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--history-dir", type=Path, required=True)
     check.add_argument("--step", type=int, required=True)
     check.add_argument(
-        "--relation-gate-mode", choices=("observe", "hard"), default="observe"
+        "--relation-gate-mode", choices=("observe", "hard", "soft"), default="observe"
     )
 
     convert = subparsers.add_parser("convert-report")
@@ -618,7 +707,7 @@ def main() -> int:
                 or (
                     Path(str(row.get("checkpoint", ""))).name == "checkpoint-0"
                     and '"has_image_gate":true' in str(row.get("ui_model_signature", ""))
-                    and row.get("relation_gate_mode") == "observe"
+                    and row.get("relation_gate_mode") in {"observe", "soft"}
                 )
             )
             for row in rows

@@ -206,12 +206,19 @@ def resolve_runtime_config(
         )
     )
 
+    tc_msed_stage = str(_env_value(env, "TC_MSED_STAGE", "v4")).lower()
+    if tc_msed_stage not in {"v4", "m1", "m2", "m3", "m4", "m5"}:
+        raise ValueError("TC_MSED_STAGE must be v4/m1/m2/m3/m4/m5")
+    tc_enabled = tc_msed_stage != "v4"
+    set_enabled = tc_msed_stage in {"m2", "m3", "m4", "m5"}
+    dynamic_enabled = tc_msed_stage in {"m3", "m4", "m5"}
     resolved: dict[str, Any] = {
         "MACHINE_TYPE": machine_type,
         "RESOURCE_GROUP": str(_env_value(env, "RESOURCE_GROUP", "default")),
         "GPU_COUNT": gpu_count,
         "CUDA_DEVICES": cuda_devices,
         "EVAL_GPU_DEVICES": eval_gpu_devices,
+        "EVAL_ENABLE_PBD": int(_env_value(env, "EVAL_ENABLE_PBD", 1)),
         "WORKSPACE": workspace,
         "PROJECT_ROOT": project_root,
         "ENV_DIR": str(
@@ -268,19 +275,19 @@ def resolve_runtime_config(
             )
         ),
         "RELATION_GATE_LOSS_WEIGHT": float(
-            _env_value(env, "RELATION_GATE_LOSS_WEIGHT", 1.0)
+            _env_value(env, "RELATION_GATE_LOSS_WEIGHT", 0.2 if tc_enabled else 1.0)
         ),
         "RELATION_SLOT_GATE_LOSS_WEIGHT": float(
-            _env_value(env, "RELATION_SLOT_GATE_LOSS_WEIGHT", 0.1)
+            _env_value(env, "RELATION_SLOT_GATE_LOSS_WEIGHT", 0.5 if tc_enabled else 0.1)
         ),
         "RELATION_ATTENTION_LOSS_WEIGHT": float(
-            _env_value(env, "RELATION_ATTENTION_LOSS_WEIGHT", 0.1)
+            _env_value(env, "RELATION_ATTENTION_LOSS_WEIGHT", 1.0 if tc_enabled else 0.1)
         ),
         "RELATION_GATE_THRESHOLD": float(
             _env_value(env, "RELATION_GATE_THRESHOLD", 0.5)
         ),
         "RELATION_GATE_MODE": str(
-            _env_value(env, "RELATION_GATE_MODE", "observe")
+            _env_value(env, "RELATION_GATE_MODE", "soft" if tc_msed_stage in {"m4", "m5"} else "observe")
         ).lower(),
         "RELATION_FOCAL_BETA": float(
             _env_value(env, "RELATION_FOCAL_BETA", 0.999)
@@ -290,6 +297,19 @@ def resolve_runtime_config(
         ),
         "RELATION_NUM_SLOTS": int(
             _env_value(env, "RELATION_NUM_SLOTS", 8)
+        ),
+        "TC_MSED_STAGE": tc_msed_stage,
+        "RELATION_BOX_L1_LOSS_WEIGHT": float(
+            _env_value(env, "RELATION_BOX_L1_LOSS_WEIGHT", 5.0 if set_enabled else 0.0)
+        ),
+        "RELATION_BOX_GIOU_LOSS_WEIGHT": float(
+            _env_value(env, "RELATION_BOX_GIOU_LOSS_WEIGHT", 2.0 if set_enabled else 0.0)
+        ),
+        "RELATION_COVERAGE_LOSS_WEIGHT": float(
+            _env_value(env, "RELATION_COVERAGE_LOSS_WEIGHT", 0.1 if dynamic_enabled else 0.0)
+        ),
+        "RELATION_COORD_PRIOR_SIGMA": float(
+            _env_value(env, "RELATION_COORD_PRIOR_SIGMA", 0.05)
         ),
         "SAVE_STEPS": save_steps,
         "ENABLE_EVAL": int(enable_eval),
@@ -316,10 +336,12 @@ def resolve_runtime_config(
         )
     if resolved["GRADIENT_ACCUMULATION_STEPS"] < 1:
         raise ValueError("GRADIENT_ACCUMULATION_STEPS must be positive")
+    if resolved["EVAL_ENABLE_PBD"] not in {0, 1}:
+        raise ValueError("EVAL_ENABLE_PBD must be 0 or 1")
     if not 0.0 <= resolved["RELATION_GATE_THRESHOLD"] <= 1.0:
         raise ValueError("RELATION_GATE_THRESHOLD must be in [0, 1]")
-    if resolved["RELATION_GATE_MODE"] not in {"observe", "hard"}:
-        raise ValueError("RELATION_GATE_MODE must be observe or hard")
+    if resolved["RELATION_GATE_MODE"] not in {"observe", "hard", "soft"}:
+        raise ValueError("RELATION_GATE_MODE must be observe, hard, or soft")
     if not 0.0 <= resolved["RELATION_FOCAL_BETA"] < 1.0:
         raise ValueError("RELATION_FOCAL_BETA must be in [0, 1)")
     if resolved["RELATION_FOCAL_GAMMA"] < 0.0:

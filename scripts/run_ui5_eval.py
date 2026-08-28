@@ -33,9 +33,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     parser.add_argument("--max-images-per-task", type=int, default=0)
     parser.add_argument(
-        "--relation-gate-mode", choices=("observe", "hard"), default="observe"
+        "--relation-gate-mode", choices=("observe", "hard", "soft"), default="observe"
     )
     parser.add_argument("--relation-gate-threshold", type=float, default=None)
+    parser.add_argument(
+        "--enable-pbd",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="独立控制 PBD/coordinate bridge，便于同 checkpoint PBD on/off 复评",
+    )
+    parser.add_argument(
+        "--raw-soft-ablation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "soft 模式先用同一 checkpoint 跑一次 observe，给 Excel 提供真正的 raw 对照"
+        ),
+    )
     parser.add_argument("--skip-patch", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -67,6 +81,86 @@ def run_checked(command: list[str], *, cwd: Path | None, stage: str) -> None:
         raise error
 
 
+def build_inference_command(
+    args: argparse.Namespace,
+    *,
+    prediction_dir: Path,
+    runtime_profile: Path,
+    gate_mode: str,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(args.project_root / "scripts" / "run_ui5_parallel_inference.py"),
+        "--checkpoint",
+        str(args.checkpoint),
+        "--processor-path",
+        str(args.base_model),
+        "--input-dir",
+        str(args.input_dir),
+        "--output-dir",
+        str(prediction_dir),
+        "--gpu-devices",
+        args.eval_gpu_devices,
+        "--attn-implementation",
+        args.attn_implementation,
+        "--inference-script",
+        str(args.project_root / "scripts" / "inference_ui_defect_locany.py"),
+        "--runtime-profile",
+        str(runtime_profile),
+        "--relation-gate-mode",
+        gate_mode,
+        "--enable-pbd" if args.enable_pbd else "--no-enable-pbd",
+    ]
+    existing_manifest = prediction_dir / "_run_manifest.json"
+    if existing_manifest.is_file():
+        overwrite = False
+        try:
+            previous = json.loads(existing_manifest.read_text(encoding="utf-8"))
+            generation = previous.get("generation", {})
+            overwrite = (
+                generation.get("relation_gate_mode") != gate_mode
+                or bool(generation.get("pbd_enabled", True)) != bool(args.enable_pbd)
+            )
+        except (OSError, json.JSONDecodeError):
+            overwrite = True
+        if overwrite:
+            command.append("--overwrite")
+    if args.relation_gate_threshold is not None:
+        command.extend(["--relation-gate-threshold", str(args.relation_gate_threshold)])
+    if args.max_images_per_task:
+        command.extend(["--max-images-per-task", str(args.max_images_per_task)])
+    return command
+
+
+def build_score_command(
+    args: argparse.Namespace,
+    *,
+    prediction_dir: Path,
+    raw_evaluation_root: Path,
+    run_name: str,
+) -> list[str]:
+    scorer_script = args.scorer_root / "qwen3vl_merge_and_score_fixed_5tasks.py"
+    if not scorer_script.is_file():
+        raise FileNotFoundError(f"Scorer script does not exist: {scorer_script}")
+    return [
+        sys.executable,
+        str(scorer_script),
+        "--all_tasks",
+        "--input_mode",
+        "yolo_dir",
+        "--gt_dir",
+        str(args.input_dir),
+        "--pred_root",
+        str(prediction_dir),
+        "--output_root",
+        str(raw_evaluation_root),
+        "--run_name",
+        run_name,
+        "--yolo_bbox_format",
+        "xyxy",
+    ]
+
+
 def record_history(
     *,
     args: argparse.Namespace,
@@ -77,6 +171,8 @@ def record_history(
     status: str,
     prediction_dir: Path,
     evaluation_run_dir: Path | None,
+    raw_metrics_json: Path | None,
+    raw_prediction_dir: Path | None,
     error: str,
 ) -> None:
     command = [
@@ -116,6 +212,10 @@ def record_history(
     ]
     if metrics_json is not None and metrics_json.is_file():
         command.extend(["--metrics-json", str(metrics_json)])
+    if raw_metrics_json is not None and raw_metrics_json.is_file():
+        command.extend(["--raw-metrics-json", str(raw_metrics_json)])
+    if raw_prediction_dir is not None and raw_prediction_dir.is_dir():
+        command.extend(["--raw-prediction-dir", str(raw_prediction_dir)])
     if evaluation_run_dir is not None:
         command.extend(["--evaluation-run-dir", str(evaluation_run_dir)])
     run_checked(command, cwd=args.project_root, stage="history")
@@ -145,6 +245,8 @@ def main() -> int:
     current_stage = "preflight"
     current_command: list[str] = []
     metrics_json: Path | None = None
+    raw_metrics_json: Path | None = None
+    raw_prediction_dir: Path | None = None
 
     metadata: dict[str, Any] = {
         "schema_version": 1,
@@ -154,6 +256,8 @@ def main() -> int:
         "max_num_tokens": args.max_num_tokens,
         "max_num_tokens_scope": "per_rank_packed_batch",
         "relation_gate_mode": args.relation_gate_mode,
+        "raw_soft_ablation": bool(args.raw_soft_ablation),
+        "pbd_enabled": bool(args.enable_pbd),
         "checkpoint": str(args.checkpoint),
         "prediction_dir": str(prediction_dir),
         "evaluation_run_dir": str(evaluation_run_dir),
@@ -193,76 +297,61 @@ def main() -> int:
             else:
                 print(f"[DRY RUN:{current_stage}] {shlex.join(current_command)}")
 
+        if args.relation_gate_mode == "soft" and args.raw_soft_ablation:
+            raw_prediction_dir = (
+                args.output_dir
+                / f"inference-checkpoint-{args.step}-raw-observe"
+            )
+            raw_run_name = f"checkpoint-{args.step}-raw-observe-{attempt_stamp}"
+            raw_evaluation_run_dir = raw_evaluation_root / raw_run_name
+            current_stage = "raw_observe_parallel_inference"
+            current_command = build_inference_command(
+                args,
+                prediction_dir=raw_prediction_dir,
+                runtime_profile=runtime_profile,
+                gate_mode="observe",
+            )
+            if args.dry_run:
+                print(f"[DRY RUN:{current_stage}] {shlex.join(current_command)}")
+            else:
+                run_checked(current_command, cwd=args.project_root, stage=current_stage)
+            current_stage = "raw_observe_score"
+            current_command = build_score_command(
+                args,
+                prediction_dir=raw_prediction_dir,
+                raw_evaluation_root=raw_evaluation_root,
+                run_name=raw_run_name,
+            )
+            if args.dry_run:
+                print(f"[DRY RUN:{current_stage}] {shlex.join(current_command)}")
+            else:
+                run_checked(current_command, cwd=args.scorer_root, stage=current_stage)
+                raw_metrics_json = raw_evaluation_run_dir / "all_tasks_evaluation.json"
+                if not raw_metrics_json.is_file():
+                    raise FileNotFoundError(
+                        "Raw observe scorer succeeded but metric JSON was not generated: "
+                        f"{raw_metrics_json}"
+                    )
+
         current_stage = "parallel_inference"
-        current_command = [
-            sys.executable,
-            str(args.project_root / "scripts" / "run_ui5_parallel_inference.py"),
-            "--checkpoint",
-            str(args.checkpoint),
-            "--processor-path",
-            str(args.base_model),
-            "--input-dir",
-            str(args.input_dir),
-            "--output-dir",
-            str(prediction_dir),
-            "--gpu-devices",
-            args.eval_gpu_devices,
-            "--attn-implementation",
-            args.attn_implementation,
-            "--inference-script",
-            str(args.project_root / "scripts" / "inference_ui_defect_locany.py"),
-            "--runtime-profile",
-            str(runtime_profile),
-            "--relation-gate-mode",
-            args.relation_gate_mode,
-        ]
-        existing_manifest = prediction_dir / "_run_manifest.json"
-        overwrite_for_gate_mode_change = False
-        if existing_manifest.is_file():
-            try:
-                previous_manifest = json.loads(existing_manifest.read_text(encoding="utf-8"))
-                previous_mode = previous_manifest.get("generation", {}).get(
-                    "relation_gate_mode"
-                )
-                overwrite_for_gate_mode_change = previous_mode != args.relation_gate_mode
-            except (OSError, json.JSONDecodeError):
-                overwrite_for_gate_mode_change = True
-        if overwrite_for_gate_mode_change:
-            current_command.append("--overwrite")
-        if args.relation_gate_threshold is not None:
-            current_command.extend(
-                ["--relation-gate-threshold", str(args.relation_gate_threshold)]
-            )
-        if args.max_images_per_task:
-            current_command.extend(
-                ["--max-images-per-task", str(args.max_images_per_task)]
-            )
+        current_command = build_inference_command(
+            args,
+            prediction_dir=prediction_dir,
+            runtime_profile=runtime_profile,
+            gate_mode=args.relation_gate_mode,
+        )
         if args.dry_run:
             print(f"[DRY RUN:{current_stage}] {shlex.join(current_command)}")
         else:
             run_checked(current_command, cwd=args.project_root, stage=current_stage)
 
-        scorer_script = args.scorer_root / "qwen3vl_merge_and_score_fixed_5tasks.py"
-        if not scorer_script.is_file():
-            raise FileNotFoundError(f"Scorer script does not exist: {scorer_script}")
         current_stage = "score"
-        current_command = [
-            sys.executable,
-            str(scorer_script),
-            "--all_tasks",
-            "--input_mode",
-            "yolo_dir",
-            "--gt_dir",
-            str(args.input_dir),
-            "--pred_root",
-            str(prediction_dir),
-            "--output_root",
-            str(raw_evaluation_root),
-            "--run_name",
-            run_name,
-            "--yolo_bbox_format",
-            "xyxy",
-        ]
+        current_command = build_score_command(
+            args,
+            prediction_dir=prediction_dir,
+            raw_evaluation_root=raw_evaluation_root,
+            run_name=run_name,
+        )
         if args.dry_run:
             print(f"[DRY RUN:{current_stage}] {shlex.join(current_command)}")
             metadata.update(
@@ -302,6 +391,8 @@ def main() -> int:
             status="success",
             prediction_dir=prediction_dir,
             evaluation_run_dir=evaluation_run_dir,
+            raw_metrics_json=raw_metrics_json,
+            raw_prediction_dir=raw_prediction_dir,
             error="",
         )
         metadata.update(
@@ -309,6 +400,12 @@ def main() -> int:
                 "status": "success",
                 "evaluation_end_time": end_time,
                 "metrics_json": str(metrics_json),
+                "raw_metrics_json": (
+                    str(raw_metrics_json) if raw_metrics_json is not None else None
+                ),
+                "raw_prediction_dir": (
+                    str(raw_prediction_dir) if raw_prediction_dir is not None else None
+                ),
             }
         )
         atomic_write_json(metadata_path, metadata)
@@ -338,6 +435,8 @@ def main() -> int:
                 status="failed",
                 prediction_dir=prediction_dir,
                 evaluation_run_dir=evaluation_run_dir,
+                raw_metrics_json=raw_metrics_json,
+                raw_prediction_dir=raw_prediction_dir,
                 error=f"stage={current_stage}; exit_code={exit_code}; {error_text}",
             )
         except Exception as history_exc:

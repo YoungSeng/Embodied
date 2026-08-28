@@ -149,6 +149,22 @@ class ModelArguments:
         default=0.1,
         metadata={'help': 'Weight of evidence/context weak-supervision loss.'},
     )
+    tc_msed_stage: str = field(
+        default="v4",
+        metadata={'help': 'TC-MSED ablation stage: v4, m1, m2, m3, m4, or m5.'},
+    )
+    relation_box_l1_loss_weight: float = field(
+        default=0.0, metadata={'help': 'Hungarian matched coarse-box L1 weight.'}
+    )
+    relation_box_giou_loss_weight: float = field(
+        default=0.0, metadata={'help': 'Hungarian matched coarse-box GIoU weight.'}
+    )
+    relation_coverage_loss_weight: float = field(
+        default=0.0, metadata={'help': 'Dynamic slot routing coverage weight.'}
+    )
+    relation_coord_prior_sigma: float = field(
+        default=0.05, metadata={'help': 'Coordinate prior sigma as coordinate-range fraction.'}
+    )
     relation_gate_threshold: float = field(
         default=0.5,
         metadata={'help': 'Inference defectness threshold stored in the checkpoint config.'},

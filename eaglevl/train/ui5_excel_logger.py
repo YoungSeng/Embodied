@@ -19,6 +19,8 @@ TRAIN_TASKS = (
 
 TRAIN_BASE_COLUMNS = (
     "step",
+    "task_id",
+    "tc_msed_stage",
     "epoch",
     "gpu_num",
     "max_num_tokens",
@@ -48,6 +50,10 @@ TRAIN_BASE_COLUMNS = (
     "loss_reconstructed",
     "loss_reconstruction_error",
     "attention_active_batch_rate",
+    "loss_box_l1",
+    "loss_box_giou",
+    "loss_attn_kl",
+    "loss_coverage",
     "grad_norm",
     "grad_norm_max",
     "samples",
@@ -73,6 +79,15 @@ TRAIN_TASK_SUFFIXES = (
     "detail_weight_l5",
     "detail_weight_l15",
     "detail_weight_l26",
+    "scale_w_l5",
+    "scale_w_l15",
+    "scale_w_l26",
+    "scale_entropy",
+    "scale_batch_std_l5",
+    "scale_batch_std_l15",
+    "scale_batch_std_l26",
+    "coord_prior_lambda",
+    "soft_gate_beta",
 )
 TRAIN_MODULE_COLUMNS = (
     "detail_layer5_norm",
@@ -90,6 +105,17 @@ TRAIN_MODULE_COLUMNS = (
     "relation_gate_prob_mean",
     "pbd_delta_norm",
     "pbd_active_positions",
+    "coarse_iou_mean",
+    "coarse_recall_03",
+    "coarse_recall_05",
+    "matched_slots",
+    "unmatched_slots",
+    "slot_usage_entropy",
+    "box_anchor_count",
+    "unique_slot_count",
+    "duplicate_slot_rate",
+    "pbd_to_hidden_ratio",
+    "pbd_delta_norm_active",
     "relation_grad_norm",
     # Kept as the backwards-compatible aggregate of image/slot Gate gradients.
     # Older workbooks contain this column, while newer runs also expose the two
@@ -115,6 +141,21 @@ TRAIN_MODULE_COLUMNS = (
     "pbd_absolute_update_norm",
     "pbd_relative_update_norm",
     "pbd_changed_element_count",
+    "coarse_box_grad_norm",
+    "coord_bridge_grad_norm",
+    "coarse_box_grad_seen_steps",
+    "coord_bridge_grad_seen_steps",
+    "coarse_box_relative_update_norm",
+    "coord_bridge_relative_update_norm",
+    # Task-book spellings kept as explicit aliases so downstream analysis does
+    # not need to know the legacy diagnostic column names above.
+    "grad_relation",
+    "grad_coarse_box",
+    "grad_pbd",
+    "grad_coord_bridge",
+    "update_ratio_relation",
+    "update_ratio_pbd",
+    "update_ratio_coord_bridge",
 )
 TRAIN_COLUMNS = (
     *TRAIN_BASE_COLUMNS,
@@ -158,6 +199,18 @@ EVAL_COLUMNS = (
     "gated_f1",
     "gated_predicted_positive",
     "gate_filter_rate",
+    "soft_precision",
+    "soft_recall",
+    "soft_f1",
+    "diagnostic_upper_bound_f1",
+    "gt_average_box_count",
+    "pred_average_box_count",
+    "count_mae",
+    "coarse_recall_03",
+    "coarse_recall_05",
+    "duplicate_slot_rate",
+    "raw_best_f1_so_far",
+    "raw_best_step_so_far",
 )
 
 SHEET_TRAIN = "train_100steps"
@@ -384,6 +437,12 @@ class UI5ExcelLogger:
             best = max(valid, key=lambda item: float(item["f1"]), default=None)
             row["best_f1_so_far"] = best.get("f1") if best else None
             row["best_step_so_far"] = best.get("step") if best else None
+            raw_history = [item for item in history if item.get("raw_f1") is not None]
+            raw_candidates = [*raw_history, row]
+            raw_valid = [item for item in raw_candidates if item.get("raw_f1") is not None]
+            raw_best = max(raw_valid, key=lambda item: float(item["raw_f1"]), default=None)
+            row["raw_best_f1_so_far"] = raw_best.get("raw_f1") if raw_best else None
+            row["raw_best_step_so_far"] = raw_best.get("step") if raw_best else None
 
     def append_eval(self, step: int, task_metrics: Sequence[Mapping[str, Any]]) -> bool:
         step = int(step)
@@ -430,6 +489,7 @@ def build_eval_rows(
     checkpoint: str,
     metrics: Mapping[str, Any],
     gate_metrics: Mapping[str, Mapping[str, Any]] | None = None,
+    raw_metrics: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Convert scorer JSON plus gate summaries into the 12 requested rows."""
 
@@ -441,12 +501,19 @@ def build_eval_rows(
         "content_missing": "content_missing",
     }
     gate_metrics = gate_metrics or {}
+    if raw_metrics is None:
+        raw_metrics = metrics
     rows: list[dict[str, Any]] = []
     for scorer_task, diagnostic_task in scorer_to_diagnostic.items():
         task_values = metrics.get("tasks", {}).get(scorer_task, {})
         gate = gate_metrics.get(scorer_task, {})
         for granularity in ("image", "bbox"):
             values = task_values.get(granularity, {})
+            raw_values = (
+                raw_metrics.get("tasks", {})
+                .get(scorer_task, {})
+                .get(granularity, {})
+            )
             tp = values.get("tp")
             fp = values.get("fp")
             rows.append(
@@ -475,16 +542,56 @@ def build_eval_rows(
                     "p_defect_pos": gate.get("p_defect_pos"),
                     "p_defect_neg": gate.get("p_defect_neg"),
                     "parse_error": gate.get("parse_error"),
-                    "raw_precision": gate.get("raw_precision"),
-                    "raw_recall": gate.get("raw_recall"),
-                    "raw_f1": gate.get("raw_f1"),
-                    "raw_predicted_positive": gate.get("raw_predicted_positive"),
-                    "selected_gate_threshold": gate.get("selected_gate_threshold"),
-                    "gated_precision": gate.get("gated_precision"),
-                    "gated_recall": gate.get("gated_recall"),
-                    "gated_f1": gate.get("gated_f1"),
-                    "gated_predicted_positive": gate.get("gated_predicted_positive"),
-                    "gate_filter_rate": gate.get("gate_filter_rate"),
+                    "raw_precision": raw_values.get("precision"),
+                    "raw_recall": raw_values.get("recall"),
+                    "raw_f1": raw_values.get("f1"),
+                    "raw_predicted_positive": (
+                        int(raw_values.get("tp")) + int(raw_values.get("fp"))
+                        if raw_values.get("tp") is not None
+                        and raw_values.get("fp") is not None
+                        else None
+                    ),
+                    # The offline threshold sweep filters whole-image raw
+                    # predictions.  It is not a bbox matcher and must never be
+                    # copied into bbox rows as if it were a localization score.
+                    "selected_gate_threshold": (
+                        gate.get("selected_gate_threshold")
+                        if granularity == "image" else None
+                    ),
+                    "gated_precision": (
+                        gate.get("gated_precision") if granularity == "image" else None
+                    ),
+                    "gated_recall": (
+                        gate.get("gated_recall") if granularity == "image" else None
+                    ),
+                    "gated_f1": (
+                        gate.get("gated_f1") if granularity == "image" else None
+                    ),
+                    "gated_predicted_positive": (
+                        gate.get("gated_predicted_positive")
+                        if granularity == "image" else None
+                    ),
+                    "gate_filter_rate": (
+                        gate.get("gate_filter_rate") if granularity == "image" else None
+                    ),
+                    "soft_precision": (
+                        values.get("precision") if gate.get("relation_gate_mode") == "soft" else None
+                    ),
+                    "soft_recall": (
+                        values.get("recall") if gate.get("relation_gate_mode") == "soft" else None
+                    ),
+                    "soft_f1": (
+                        values.get("f1") if gate.get("relation_gate_mode") == "soft" else None
+                    ),
+                    "diagnostic_upper_bound_f1": (
+                        gate.get("gated_f1") if granularity == "image" else None
+                    ),
+                    "gt_average_box_count": gate.get("gt_average_box_count"),
+                    "pred_average_box_count": gate.get("pred_average_box_count"),
+                    "count_mae": gate.get("count_mae"),
+                    "coarse_recall_03": gate.get("coarse_recall_03"),
+                    "coarse_recall_05": gate.get("coarse_recall_05"),
+                    "duplicate_slot_rate": gate.get("duplicate_slot_rate"),
                 }
             )
 
@@ -578,24 +685,86 @@ def build_eval_rows(
                 "selected_gate_threshold": (
                     sum(float(row.get("selected_gate_threshold") or 0.0) for row in source_rows)
                     / len(source_rows)
+                    if any(row.get("selected_gate_threshold") is not None for row in source_rows)
+                    else None
                 ),
                 "gated_precision": (
                     sum(float(row.get("gated_precision") or 0.0) for row in source_rows)
                     / len(source_rows)
+                    if any(row.get("gated_precision") is not None for row in source_rows)
+                    else None
                 ),
                 "gated_recall": (
                     sum(float(row.get("gated_recall") or 0.0) for row in source_rows)
                     / len(source_rows)
+                    if any(row.get("gated_recall") is not None for row in source_rows)
+                    else None
                 ),
                 "gated_f1": (
                     sum(float(row.get("gated_f1") or 0.0) for row in source_rows)
                     / len(source_rows)
+                    if any(row.get("gated_f1") is not None for row in source_rows)
+                    else None
                 ),
-                "gated_predicted_positive": summed("gated_predicted_positive"),
+                "gated_predicted_positive": (
+                    summed("gated_predicted_positive")
+                    if any(row.get("gated_predicted_positive") is not None for row in source_rows)
+                    else None
+                ),
                 "gate_filter_rate": (
                     1.0
                     - summed("gated_predicted_positive")
                     / max(1, summed("raw_predicted_positive"))
+                    if any(row.get("gate_filter_rate") is not None for row in source_rows)
+                    else None
+                ),
+                "soft_precision": (
+                    sum(float(row.get("soft_precision") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                    if any(row.get("soft_precision") is not None for row in source_rows)
+                    else None
+                ),
+                "soft_recall": (
+                    sum(float(row.get("soft_recall") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                    if any(row.get("soft_recall") is not None for row in source_rows)
+                    else None
+                ),
+                "soft_f1": (
+                    sum(float(row.get("soft_f1") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                    if any(row.get("soft_f1") is not None for row in source_rows)
+                    else None
+                ),
+                "diagnostic_upper_bound_f1": (
+                    sum(float(row.get("diagnostic_upper_bound_f1") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                    if any(row.get("diagnostic_upper_bound_f1") is not None for row in source_rows)
+                    else None
+                ),
+                "gt_average_box_count": (
+                    sum(float(row.get("gt_average_box_count") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "pred_average_box_count": (
+                    sum(float(row.get("pred_average_box_count") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "count_mae": (
+                    sum(float(row.get("count_mae") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "coarse_recall_03": (
+                    sum(float(row.get("coarse_recall_03") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "coarse_recall_05": (
+                    sum(float(row.get("coarse_recall_05") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "duplicate_slot_rate": (
+                    sum(float(row.get("duplicate_slot_rate") or 0.0) for row in source_rows)
+                    / len(source_rows)
                 ),
             }
         )
