@@ -18,12 +18,13 @@ YG smoke recipe
 → YG A800 validator passed
 → YG 全量 recipe 检查
 → HL 全量 recipe
-→ H20×4 formal
+→ H20×2 formal（当前有二卡时使用；x4 YAML 保留）
 → 每训练约 6 小时自动 checkpoint → 同 job 单卡 held-out generation/CE → 自动 resume
 ```
 
 H20 排队通常需要一到两天，因此不再把 H20 smoke/eval 作为 formal 启动前门禁。H20
-四卡使用固定的 SDPA + 7268/7268/7268 + packing buffer 16 + 梯度累积 2。仓库命令中的
+二卡使用固定的 SDPA + 7268/7268/7268 + packing buffer 16 + 梯度累积 4；四卡版本梯度
+累积为 2。仓库命令中的
 `a100` 是历史 profile 标识；对应 Merlin YAML 实际申请 `A800_SXM_40GB`，不是 A100。
 
 下面各命令按顺序逐条执行。不要把 YG 生成的 recipe 复制到 HL；两边 JSONL 的绝对图片
@@ -253,18 +254,18 @@ bash shell/prepare_locany_cpt_v2.sh a100 formal
 `cpt_source_record_id`/manifest `source_record_id`。所有重复项写入
 `diagnostics/duplicate_record_ids.json`，若来源定位符仍冲突则继续非零退出，绝不静默覆盖。
 
-### 0.7 HL：直接提交 H20×4 formal（含每 6 小时集成评测）
+### 0.7 HL：直接提交 H20×2 formal（含每 6 小时集成评测）
 
 ```bash
 cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
 ```
 
 ```bash
-mlx job submitv2 --path locany_cpt_v4_h20x4_formal_merlin.yaml
+mlx job submitv2 --path locany_cpt_v4_h20x2_formal_merlin.yaml
 ```
 
 这个主流程不再先提交 H20 smoke。formal 使用新的
-`RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x4-formal`，不会续训 checkpoint-1549/1860。
+`RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x2-formal`，不会续训 checkpoint-1549/1860。
 
 该 YAML 固定 `CPT_INTEGRATED_EVAL=1`、`SAVE_EVERY_N_HOURS=6`。一个 segment 约训练
 6 小时后，四卡 torchrun 先保存完整可续训 checkpoint 并正常退出以释放显存；同一个
@@ -419,7 +420,10 @@ python scripts/simulate_locany_cpt_sampling.py \
 
 ```bash
 CPT_SAMPLING_MODE=sample_equal \
-RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x4-formal \
+RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x2-formal \
+GPU_COUNT=2 \
+CUDA_VISIBLE_DEVICES=0,1 \
+GRADIENT_ACCUMULATION_STEPS=4 \
 CPT_INTEGRATED_EVAL=1 \
 SAVE_EVERY_N_HOURS=6 \
 bash shell/run_locany_cpt_merlin.sh h20 formal
@@ -432,7 +436,7 @@ Merlin 入口：
   scripts/submit_locany_cpt.py --mode smoke --cluster yg
 /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python \
   scripts/submit_locany_cpt.py --mode formal --cluster yg
-mlx job submitv2 --path locany_cpt_v4_h20x4_formal_merlin.yaml
+mlx job submitv2 --path locany_cpt_v4_h20x2_formal_merlin.yaml
 ```
 
 上述两条 A800 命令都可将 `--cluster yg` 改为 `--cluster aiai_locate`。该参数只控制
@@ -440,15 +444,16 @@ mlx job submitv2 --path locany_cpt_v4_h20x4_formal_merlin.yaml
 这里给出了 A800 formal 命令就同时启动另一场正式实验。
 
 当前 formal 启动前只要求 A800 smoke：它先在 step 10 强制保存并退出 segment，再从同一
-checkpoint 自动 resume 到 step 20，因此一个 job 同时覆盖多卡训练与断点续训。H20×4
+checkpoint 自动 resume 到 step 20，因此一个 job 同时覆盖多卡训练与断点续训。当前 H20×2
 formal 默认每 rank packed-token 上限 7268、单样本与序列上限也为 7268、SDPA、
-packing buffer 16、梯度累积 2；A800×4 默认 SDPA + 7268/7268/12800、梯度累积 2。
+packing buffer 16、梯度累积 4；H20×4/A800×4 的梯度累积均为 2，A800×4 默认
+SDPA + 7268/7268/12800。
 `shell/run_locany_cpt.sh`
 会先验证 train split，再将 split/length stats 复制到 run 的 `diagnostics/`。
 
 这里三个数依次是 `MAX_SEQ_LENGTH`、`MAX_NUM_TOKENS_PER_SAMPLE`、
 `MAX_NUM_TOKENS`。因此 A800 的单样本上限仍是 7268，12800 是每 rank 一个 packed batch
-可容纳的总 token；当前 H20×4 三项均为 7268，不使用旧配置中的 25600。集成 evaluator
+可容纳的总 token；当前 H20×2 三项均为 7268，不使用旧配置中的 25600。集成 evaluator
 一次只处理一个样本，不受训练 packing 的 12800 控制；高分辨率 UI 图像必须让 MoonViT
 使用 `flash_attention_2`，文本侧仍使用 SDPA。
 
@@ -526,7 +531,7 @@ Trainer checkpoint 保存 optimizer、scheduler、random state，以及每 rank 
 ## 6. Held-out 评测
 
 训练池只能显式标记为 `train_pool/domain_absorption`；best checkpoint 只看 held-out。
-H20×4 formal 默认每约 6 小时分段，在同一个 Merlin job 内释放训练进程后用 GPU 0 跑
+H20×2 formal 默认每约 6 小时分段，在同一个 Merlin job 内释放训练进程后用 GPU 0 跑
 generation + teacher-forced CE；评测完成才 resume。下面的直接命令只用于离线调试或重算：
 
 ```bash

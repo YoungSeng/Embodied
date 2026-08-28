@@ -103,6 +103,9 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn('MAX_NUM_TOKENS_PER_SAMPLE: "7268"', h20x2)
         self.assertIn('MAX_NUM_TOKENS: "7268"', h20x2)
         self.assertIn('PACKING_BUFFER_SIZE: "16"', h20x2)
+        self.assertIn('SAVE_EVERY_N_HOURS: "6"', h20x2)
+        self.assertIn('CPT_INTEGRATED_EVAL: "1"', h20x2)
+        self.assertIn('EVAL_SAMPLES_PER_TASK: "10"', h20x2)
 
         h20x2_smoke = (
             REPO_ROOT / "locany_cpt_v4_h20x2_smoke_merlin.yaml"
@@ -201,7 +204,7 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
             'EVAL_VISION_ATTN_IMPLEMENTATION: "flash_attention_2"', eval_yaml
         )
         self.assertIn('EVAL_SAMPLES_PER_TASK: "10"', eval_yaml)
-        self.assertIn('RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x4-formal"', eval_yaml)
+        self.assertIn('RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-formal"', eval_yaml)
         self.assertIn('EVAL_MAX_PENDING: "20"', eval_yaml)
 
         smoke_eval_yaml = (
