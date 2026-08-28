@@ -1073,6 +1073,16 @@ class LocateAnythingInferencer:
             LocateAnythingForConditionalGeneration as RepositoryInferenceModel,
         )
 
+        # The original NVIDIA Base snapshot predates the UI-relation modules,
+        # so its Python class has no instance attribute even when the composed
+        # config now contains ``enable_ui_relation``.  The CPT evaluator sets
+        # that config flag to false; mirror it onto the legacy instance before
+        # binding the newer method.  Do this unconditionally so Base and the
+        # checkpoint obey the same explicit runtime override.
+        self.model.enable_ui_relation = bool(
+            getattr(self.model.config, "enable_ui_relation", False)
+        )
+        self.model._last_ui_defect_interface = None
         self.model.generate = MethodType(
             RepositoryInferenceModel.generate,
             self.model,
@@ -1089,6 +1099,7 @@ class LocateAnythingInferencer:
             "generation implementation: "
             "eaglevl.utils.locany.modeling_locateanything (repository)"
         )
+        print(f"generation UI relation : {self.model.enable_ui_relation}")
         requested_backend = args.attn_implementation
         if (
             requested_backend != "auto"

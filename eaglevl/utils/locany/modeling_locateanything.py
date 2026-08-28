@@ -459,7 +459,8 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         relation_output = None
         global_visual_cache = None
         relation_device = pixel_values.device if pixel_values is not None else input_ids.device
-        if relation_family is None and self.enable_ui_relation:
+        enable_ui_relation = bool(getattr(self, "enable_ui_relation", False))
+        if relation_family is None and enable_ui_relation:
             relation_family, inferred_defect_type = self._infer_ui_relation(
                 input_ids, tokenizer, relation_device
             )
@@ -472,7 +473,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
 
         if visual_features is not None:
             vit_embeds = visual_features
-        elif self.enable_ui_relation and relation_family is not None and defect_type is not None:
+        elif enable_ui_relation and relation_family is not None and defect_type is not None:
             vit_embeds, relation_output, global_visual_cache = self.extract_ui_features(
                 pixel_values,
                 image_grid_hws,

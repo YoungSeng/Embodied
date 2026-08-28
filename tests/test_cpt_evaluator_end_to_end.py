@@ -14,6 +14,8 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EVALUATOR = REPO_ROOT / "scripts" / "eval_locany_cpt_learning.py"
+INFERENCER = REPO_ROOT / "scripts" / "inference_ui_defect_locany.py"
+REPOSITORY_MODEL = REPO_ROOT / "eaglevl" / "utils" / "locany" / "modeling_locateanything.py"
 
 
 class FakeTensor:
@@ -248,6 +250,18 @@ class CPTEvaluatorEndToEndTest(unittest.TestCase):
         self.assertIn("exclusive_file_lock", source)
         self.assertIn("fsync_if_supported", source)
         self.assertNotIn("fcntl.flock", source)
+
+    def test_repository_generation_supports_legacy_base_without_relation_attribute(self):
+        inferencer_source = INFERENCER.read_text(encoding="utf-8")
+        model_source = REPOSITORY_MODEL.read_text(encoding="utf-8")
+        self.assertIn(
+            "self.model.enable_ui_relation = bool(",
+            inferencer_source,
+        )
+        self.assertIn(
+            'getattr(self, "enable_ui_relation", False)',
+            model_source,
+        )
 
     def test_run_model_keeps_teacher_forced_result_in_prediction_row(self):
         evaluator = load_evaluator_module()

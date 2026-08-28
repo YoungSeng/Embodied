@@ -126,6 +126,7 @@ bash shell/run_locany_cpt_eval_merlin.sh a100
 
 新日志应出现
 `generation implementation: eaglevl.utils.locany.modeling_locateanything (repository)`；
+Base 和当前 CPT evaluator 还应打印 `generation UI relation : False`；
 评测协议 v3 会自动使用新的 Base cache key，不会复用旧版失败缓存。若仍失败，日志会明确
 打印 `phase=generation|teacher_forced` 以及模型内部完整 traceback，不能再只保留顶层
 `NoneType` 文本。
