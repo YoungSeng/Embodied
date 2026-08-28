@@ -604,6 +604,109 @@ macro/micro F1@0.5。相同内容同时保存在 `summary.json`、`cpt_eval_metr
 不是仅打印后丢失；bbox macro F1@0.5 仍是 ui_defect 的 primary metric，image F1 是额外
 诊断指标。
 
+### 6.1 上一版 CPT 的八个 checkpoint 在双 H20 上跑五类测试集
+
+这项对比使用独立的五类 UI defect 测试集，不是 CPT 2% held-out。调度单位是 checkpoint：
+每张 H20 只加载一份模型并顺序跑完五类，两张卡同时处理两个 checkpoint。默认对旧 CPT
+显式关闭后来新增的 UI relation 和 relation-to-PBD 覆盖，保留旧 checkpoint 自身的生成
+行为；不要为旧模型加 `--enable-ui-relation` 或 `--enable-pbd`。
+
+在已经分配到两张本地 H20 的 worker 上进入仓库，然后逐条执行：
+
+```bash
+cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
+
+RUN_DIR=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_models/locany-3b-ui-cpt-v4-h20x2-formal
+
+BASE_MODEL=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/hf_home/hub/models--nvidia--LocateAnything-3B/snapshots/c32291ca5e996f5a7a485845b4f57a233936bba0
+
+UI5_TEST_DIR=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data
+
+SWEEP_DIR="$RUN_DIR/ui5_checkpoint_sweep"
+```
+
+先只检查路径、八个 checkpoint 和两卡调度命令，不加载模型：
+
+```bash
+python scripts/run_locany_cpt_ui5_checkpoint_sweep.py \
+  --run-dir "$RUN_DIR" \
+  --processor-path "$BASE_MODEL" \
+  --input-dir "$UI5_TEST_DIR" \
+  --output-root "$SWEEP_DIR" \
+  --steps 516 1033 1549 2066 2584 3101 3617 4135 \
+  --gpu-devices 0,1 \
+  --attn-implementation sdpa \
+  --vision-attn-implementation flash_attention_2 \
+  --generation-mode hybrid \
+  --max-new-tokens 4096 \
+  --iou-threshold 0.1 \
+  --dry-run
+```
+
+检查通过后执行完整推理和统一评分：
+
+```bash
+python scripts/run_locany_cpt_ui5_checkpoint_sweep.py \
+  --run-dir "$RUN_DIR" \
+  --processor-path "$BASE_MODEL" \
+  --input-dir "$UI5_TEST_DIR" \
+  --output-root "$SWEEP_DIR" \
+  --steps 516 1033 1549 2066 2584 3101 3617 4135 \
+  --gpu-devices 0,1 \
+  --attn-implementation sdpa \
+  --vision-attn-implementation flash_attention_2 \
+  --generation-mode hybrid \
+  --max-new-tokens 4096 \
+  --iou-threshold 0.1
+```
+
+`0.1` 与仓库现有 `qwen3vl_merge_and_score_fixed_5tasks.py` 的历史默认口径一致，和既有
+Qwen/同事模型报告比较时不要擅自改阈值。若还要严格的 bbox F1@0.5，不需要重新推理，
+只需复用预测做一次 `score-only`：
+
+```bash
+python scripts/run_locany_cpt_ui5_checkpoint_sweep.py \
+  --run-dir "$RUN_DIR" \
+  --processor-path "$BASE_MODEL" \
+  --input-dir "$UI5_TEST_DIR" \
+  --output-root "$SWEEP_DIR" \
+  --steps 516 1033 1549 2066 2584 3101 3617 4135 \
+  --gpu-devices 0,1 \
+  --stage score-only \
+  --iou-threshold 0.5
+```
+
+推理逐图片断点续跑；Ctrl-C 后重新执行同一条完整命令即可，已有图片不会重推。每个
+checkpoint 的预测保存在 `predictions/checkpoint-STEP/`，原始文本在各任务的 `raw/`。
+比较结果保存在：
+
+- `comparison/checkpoint_comparison_iou-0p1.json`：完整机器可读结果；
+- `comparison/checkpoint_comparison_iou-0p1_overview.csv`：每个模型一行的 macro/micro 总表；
+- `comparison/checkpoint_comparison_iou-0p1_image.csv`：五类 image 粒度明细；
+- `comparison/checkpoint_comparison_iou-0p1_bbox.csv`：五类 bbox 粒度明细；
+- `comparison/checkpoint_comparison_iou-0p1.xlsx`：仅含 `Overview`、`ImageMetrics`、
+  `BBoxMetrics` 三个 sheet。Excel 写入失败只 warning，不影响 JSON/CSV 和推理结果。
+
+其他模型只要也经过同一个五类评分器、已有 `all_tasks_evaluation.json`，即可离线加入同一
+份表，不重新推 CPT：
+
+```bash
+python scripts/run_locany_cpt_ui5_checkpoint_sweep.py \
+  --run-dir "$RUN_DIR" \
+  --processor-path "$BASE_MODEL" \
+  --input-dir "$UI5_TEST_DIR" \
+  --output-root "$SWEEP_DIR" \
+  --steps 516 1033 1549 2066 2584 3101 3617 4135 \
+  --stage aggregate-only \
+  --iou-threshold 0.1 \
+  --external-metrics "Qwen3VL=/path/to/qwen/all_tasks_evaluation.json" \
+  --external-metrics "OtherModel=/path/to/other/all_tasks_evaluation.json"
+```
+
+`--overwrite` 会清理所选 checkpoint 已有的单图预测后重跑，正常续跑不要使用。若只想先
+做真实 GPU smoke，可另设一个输出目录并加 `--steps 516 --max-images-per-task 1`，不要把
+1 张/类的结果写入正式 `SWEEP_DIR`。
+
 best checkpoint 依次按 held-out task-macro primary 最大、task-macro main CE 最小排序；
 关键弱任务相对历史 best 下降超过 3 个百分点时不自动标 best。少于完整十任务的 held-out
 结果、train-pool 指标均不能成为 best。
