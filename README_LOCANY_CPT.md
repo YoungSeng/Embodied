@@ -103,6 +103,31 @@ bash shell/run_locany_cpt_eval_merlin.sh a100
 十任务 Base/checkpoint teacher-forced CE 均非空、inference error 为 0，并生成真实
 `cpt_eval_metrics.jsonl` 和三 sheet Excel。
 
+这里的 `EVAL_SAMPLES_PER_TASK=10` 是每个模型 100 条，不是整个命令只跑 100 条：首次
+执行需要完成 Base 100 条、checkpoint-10 100 条、checkpoint-20 100 条，共约 300 次
+generation + teacher-forced forward。Base 的 100 条全部完成后才原子写入 cache；在此之前
+按 Ctrl-C 会丢失本轮尚未落盘的 Base 结果，下次需要从 Base 第 1 条重跑。单卡 `slow`
+generation 且每条最多生成 1024 token，耗时可能从几十分钟到数小时，不能用模型加载后的
+短暂无输出来判断卡死。
+
+新 evaluator 默认每条打印 `[EVAL] ... START/DONE`；单条超过 60 秒时还会打印
+`[EVAL HEARTBEAT]`，其中包含当前 Base/checkpoint、样本序号、task、phase 和耗时。可用
+`--progress-every N` 降低 START/DONE 频率，用 `--progress-heartbeat-seconds N` 修改
+heartbeat 间隔（设为 0 才会关闭）。运行期间可在另一终端检查 GPU 和进程：
+
+```bash
+watch -n 5 'nvidia-smi --query-gpu=utilization.gpu,memory.used,power.draw --format=csv,noheader'
+```
+
+```bash
+PID=$(pgrep -n -f 'scripts/eval_locany_cpt_learning.py')
+ps -p "$PID" -o pid,etime,%cpu,%mem,stat,cmd
+```
+
+GPU 利用率/功耗周期性变化，或进程仍有 CPU 活动时继续等待。不要并行启动第二个 consumer，
+否则它会等待同一个 Base cache 锁。只有 heartbeat 长时间停在同一 phase，且 GPU、CPU 都
+持续无活动时，才按异常排查。
+
 如果 eval 因基础设施或依赖问题退出，对应 queue row 会变为 `failed`。修复代码后在同一
 命令中增加 `EVAL_RETRY_FAILED=1`；runner 会显式重试 failed row，Base cache 和指标写入
 均使用与 eval queue 相同的 ByteNAS 兼容锁。

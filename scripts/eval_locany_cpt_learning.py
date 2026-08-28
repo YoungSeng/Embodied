@@ -17,6 +17,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from collections import Counter, OrderedDict
@@ -129,6 +130,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=1,
+        help="print START/DONE progress every N evaluation examples",
+    )
+    parser.add_argument(
+        "--progress-heartbeat-seconds",
+        type=float,
+        default=60.0,
+        help="print the active example and phase at this interval; 0 disables heartbeat",
+    )
+    parser.add_argument(
         "--fail-fast-inference-errors",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -141,6 +154,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--samples-per-task must be positive")
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be positive")
+    if args.progress_every <= 0:
+        parser.error("--progress-every must be positive")
+    if args.progress_heartbeat_seconds < 0:
+        parser.error("--progress-heartbeat-seconds cannot be negative")
     if args.qualitative_per_task < 0:
         parser.error("--qualitative-per-task cannot be negative")
     return args
@@ -526,32 +543,104 @@ def run_model(
     # needs only the scalar fused CE and must not allocate the token-loss buffer.
     inferencer.model._cpt_observability_enabled = False
     results: dict[str, dict[str, Any]] = {}
+    total_examples = len(examples)
+    progress_every = max(1, int(getattr(args, "progress_every", 1)))
+    heartbeat_seconds = max(
+        0.0, float(getattr(args, "progress_heartbeat_seconds", 60.0))
+    )
+    progress_lock = threading.Lock()
+    progress_state: dict[str, Any] = {
+        "number": 0,
+        "key": None,
+        "task": None,
+        "phase": None,
+        "sample_started": None,
+    }
+    heartbeat_stop = threading.Event()
+
+    def update_progress(
+        number: int, example: Example, phase: str, sample_started: float
+    ) -> None:
+        with progress_lock:
+            progress_state.update(
+                number=number,
+                key=example.key,
+                task=example.task,
+                phase=phase,
+                sample_started=sample_started,
+            )
+
+    def heartbeat() -> None:
+        while not heartbeat_stop.wait(heartbeat_seconds):
+            with progress_lock:
+                snapshot = dict(progress_state)
+            if snapshot["key"] is None:
+                continue
+            now = time.time()
+            print(
+                "[EVAL HEARTBEAT] "
+                f"model={label} sample={snapshot['number']}/{total_examples} "
+                f"task={snapshot['task']} phase={snapshot['phase']} "
+                f"sample_elapsed_seconds={now - snapshot['sample_started']:.1f} "
+                f"model_elapsed_seconds={now - started:.1f}",
+                flush=True,
+            )
+
+    heartbeat_thread = None
+    if heartbeat_seconds > 0:
+        heartbeat_thread = threading.Thread(
+            target=heartbeat,
+            name=f"{label}-eval-heartbeat",
+            daemon=True,
+        )
+        heartbeat_thread.start()
     try:
         for index, example in enumerate(examples):
+            sample_number = index + 1
+            sample_started = time.time()
+            status = "running"
+            should_print_progress = (
+                sample_number == 1
+                or sample_number == total_examples
+                or sample_number % progress_every == 0
+            )
             torch.manual_seed(args.seed + index)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(args.seed + index)
             phase = "image_load"
+            update_progress(sample_number, example, phase, sample_started)
+            if should_print_progress:
+                print(
+                    f"[EVAL] model={label} sample={sample_number}/{total_examples} "
+                    f"task={example.task} record={example.record_id} START "
+                    f"phase={phase}",
+                    flush=True,
+                )
             try:
                 with Image.open(example.image) as opened:
                     image = opened.convert("RGB")
                 with torch.inference_mode():
                     phase = "generation"
+                    update_progress(sample_number, example, phase, sample_started)
                     prediction = inferencer.predict(image=image, question=example.prompt)
                     phase = "teacher_forced"
+                    update_progress(sample_number, example, phase, sample_started)
                     teacher_forced = (
                         teacher_forced_main_ce(inferencer, image, example)
                         if args.teacher_forced
                         else {}
                     )
                 phase = "scoring"
+                update_progress(sample_number, example, phase, sample_started)
                 results[example.key] = {
                     "prediction": prediction,
                     "error": None,
                     "metrics": score_result(example, prediction, None),
                     **teacher_forced,
                 }
+                status = "ok"
             except Exception as exc:
+                status = "error"
                 original_traceback = traceback.format_exc()
                 error = f"phase={phase}; {type(exc).__name__}: {exc}"
                 results[example.key] = {
@@ -585,7 +674,29 @@ def run_model(
                         "original traceback:\n"
                         f"{original_traceback.rstrip()}"
                     ) from None
+            finally:
+                sample_elapsed = time.time() - sample_started
+                if should_print_progress or status == "error":
+                    print(
+                        f"[EVAL] model={label} sample={sample_number}/{total_examples} "
+                        f"task={example.task} record={example.record_id} DONE "
+                        f"status={status} phase={phase} "
+                        f"sample_seconds={sample_elapsed:.3f} "
+                        f"model_seconds={time.time() - started:.3f}",
+                        flush=True,
+                    )
+                with progress_lock:
+                    if progress_state["number"] == sample_number:
+                        progress_state.update(
+                            key=None,
+                            task=None,
+                            phase=None,
+                            sample_started=None,
+                        )
     finally:
+        heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=2.0)
         del inferencer
         gc.collect()
         if torch.cuda.is_available():

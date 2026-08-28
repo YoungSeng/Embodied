@@ -288,11 +288,12 @@ class CPTEvaluatorEndToEndTest(unittest.TestCase):
             seed=20260826,
         )
         FakeInferencer.instances.clear()
+        stdout = io.StringIO()
         with mock.patch.object(
             evaluator, "LocateAnythingInferencer", FakeInferencer
         ), mock.patch.object(
             evaluator.Image, "open", return_value=FakeOpenedImage()
-        ):
+        ), mock.patch.object(evaluator.sys, "stdout", stdout):
             results = evaluator.run_model(
                 "checkpoint", "/models/checkpoint-20", [self.example(evaluator)], args
             )
@@ -303,6 +304,12 @@ class CPTEvaluatorEndToEndTest(unittest.TestCase):
         self.assertAlmostEqual(result["teacher_forced_main_token_ce"], 2.5)
         self.assertEqual(result["metrics"]["vqa_accuracy"], 1.0)
         self.assertEqual(len(FakeInferencer.instances[0].model.calls), 1)
+        progress = stdout.getvalue()
+        self.assertIn(
+            "model=checkpoint sample=1/1 task=vqa record=record-1 START",
+            progress,
+        )
+        self.assertIn("record=record-1 DONE status=ok", progress)
 
     def test_run_model_fail_fast_preserves_phase_and_original_traceback(self):
         evaluator = load_evaluator_module()
