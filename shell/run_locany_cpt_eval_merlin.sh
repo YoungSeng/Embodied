@@ -59,6 +59,7 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 export INSTALL_SYSTEM_RUNTIME_DEPS="${INSTALL_SYSTEM_RUNTIME_DEPS:-1}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PROJECT_ROOT ENV_DIR
 
 cd "${PROJECT_ROOT}"
@@ -90,7 +91,7 @@ EVAL_ARGS=(
   --device cuda:0
   --dtype "${EVAL_DTYPE:-bf16}"
   --attn-implementation "${EVAL_ATTN_IMPLEMENTATION:-sdpa}"
-  --vision-attn-implementation "${EVAL_VISION_ATTN_IMPLEMENTATION:-sdpa}"
+  --vision-attn-implementation "${EVAL_VISION_ATTN_IMPLEMENTATION:-flash_attention_2}"
   --max-new-tokens "${EVAL_MAX_NEW_TOKENS:-1024}"
   --seed "${CPT_EVAL_SEED:-20260826}"
   --require-zero-inference-errors

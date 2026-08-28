@@ -344,6 +344,12 @@ packing buffer 16、梯度累积 4；A800×4 默认 SDPA + 7268/7268/12800、梯
 `shell/run_locany_cpt.sh`
 会先验证 train split，再将 split/length stats 复制到 run 的 `diagnostics/`。
 
+这里三个数依次是 `MAX_SEQ_LENGTH`、`MAX_NUM_TOKENS_PER_SAMPLE`、
+`MAX_NUM_TOKENS`。因此 A800 的单样本上限仍是 7268，12800 是每 rank 一个 packed batch
+可容纳的总 token；当前 H20×2 三项均为 7268，不使用旧配置中的 25600。独立 evaluator
+一次只处理一个样本，不受训练 packing 的 12800 控制；高分辨率 UI 图像必须让 MoonViT
+使用 `flash_attention_2`，文本侧仍使用 SDPA。
+
 H20 的 Magi 8192/7280 已实测 OOM，Magi 6400 已出现 gather index 越界，因此 v2 H20
 smoke/formal 均不再把 Magi 或 25600 作为默认值。所有 v2 YAML 使用全新的
 `DATA_DIR=.../locany_cpt_v4_split_v2[_smoke]` 与带 `v2` 的 `RUN_NAME`；新实验从原始

@@ -61,6 +61,7 @@ def fake_torch_module() -> types.ModuleType:
     module.full_like = lambda tensor, value: FakeTensor(
         np.full_like(tensor.value, value)
     )
+    module.as_tensor = lambda value, **_kwargs: FakeTensor(value)
     module.where = lambda tensor: tuple(FakeTensor(axis) for axis in np.where(tensor.value))
     module.tensor = lambda value, **_kwargs: FakeTensor(value)
     module.is_tensor = lambda value: isinstance(value, FakeTensor)
@@ -134,6 +135,13 @@ class FakeProcessor:
             "pixel_values": FakeTensor([[0.25]]),
             "image_grid_hws": FakeTensor([[2, 2]]),
         }
+
+
+class NumpyGridProcessor(FakeProcessor):
+    def __call__(self, **kwargs):
+        result = super().__call__(**kwargs)
+        result["image_grid_hws"] = np.asarray([[2, 2]], dtype=np.int64)
+        return result
 
 
 class FakeModel:
@@ -211,6 +219,21 @@ class CPTEvaluatorEndToEndTest(unittest.TestCase):
         self.assertIn("pixel_values", model.calls[0])
         self.assertIn("image_grid_hws", model.calls[0])
         self.assertIn("image_flags", model.calls[0])
+
+    def test_teacher_forced_converts_numpy_image_grid_to_torch(self):
+        evaluator = load_evaluator_module()
+        model = FakeModel()
+        inferencer = SimpleNamespace(
+            processor=NumpyGridProcessor(),
+            model=model,
+            device="cuda:0",
+            dtype="bfloat16",
+        )
+        metrics = evaluator.teacher_forced_main_ce(
+            inferencer, object(), self.example(evaluator)
+        )
+        self.assertEqual(metrics["teacher_forced_main_tokens"], 2)
+        self.assertIsInstance(model.calls[0]["image_grid_hws"], FakeTensor)
 
     def test_evaluator_uses_shared_nas_compatible_lock(self):
         source = EVALUATOR.read_text(encoding="utf-8")

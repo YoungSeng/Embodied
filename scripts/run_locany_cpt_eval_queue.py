@@ -114,6 +114,7 @@ def evaluator_command(args: argparse.Namespace, row: Mapping[str, Any], output_d
         "--max-new-tokens", str(args.max_new_tokens),
         "--seed", str(args.seed),
         "--teacher-forced",
+        "--fail-fast-inference-errors",
     ]
 
 

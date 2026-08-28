@@ -1173,8 +1173,10 @@ class LocateAnythingInferencer:
             raise KeyError("processor 输出中缺少 pixel_values")
         pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
         image_grid_hws = processor_inputs.get("image_grid_hws")
-        if torch.is_tensor(image_grid_hws):
-            image_grid_hws = image_grid_hws.to(self.device)
+        if image_grid_hws is not None:
+            if not torch.is_tensor(image_grid_hws):
+                image_grid_hws = torch.as_tensor(image_grid_hws, dtype=torch.long)
+            image_grid_hws = image_grid_hws.to(device=self.device, dtype=torch.long)
 
         generate_kwargs: dict[str, Any] = {
             "pixel_values": pixel_values,

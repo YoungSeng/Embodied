@@ -53,6 +53,7 @@ from scripts.inference_ui_defect_locany import LocateAnythingInferencer  # noqa:
 
 
 IMAGE_TOKEN_RE = re.compile(r"<image(?:-\d+)?>")
+EVALUATOR_PROTOCOL_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,12 @@ def parse_args() -> argparse.Namespace:
         default="flash_attention_2",
     )
     parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--fail-fast-inference-errors",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="stop on the first processor/model/OOM error instead of caching partial results",
+    )
     parser.add_argument("--seed", type=int, default=20260826)
     parser.add_argument("--allow-download", action="store_true")
     args = parser.parse_args()
@@ -455,9 +462,10 @@ def teacher_forced_main_ce(
     )
     grid = inputs.get("image_grid_hws")
     if grid is not None:
-        model_inputs["image_grid_hws"] = (
-            grid.to(inferencer.device) if torch.is_tensor(grid) else grid
-        )
+        if not torch.is_tensor(grid):
+            grid = torch.as_tensor(grid, dtype=torch.long)
+        grid = grid.to(device=inferencer.device, dtype=torch.long)
+        model_inputs["image_grid_hws"] = grid
         model_inputs["image_flags"] = torch.tensor(
             [len(grid)], dtype=torch.long, device=inferencer.device
         )
@@ -528,6 +536,21 @@ def run_model(
                     "teacher_forced_main_token_ce": None,
                 }
                 print(f"[ERROR] {example.key}: {exc}", file=sys.stderr, flush=True)
+                # CUDA OOM exceptions retain traceback frames containing large
+                # tensors. Drop the traceback before emptying the allocator so
+                # a single bad sample cannot poison every following example.
+                try:
+                    exc.__traceback__ = None
+                except Exception:
+                    pass
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if getattr(args, "fail_fast_inference_errors", False):
+                    raise RuntimeError(
+                        "evaluation stopped on the first inference error: "
+                        f"example={example.key}; {error}"
+                    ) from None
     finally:
         del inferencer
         gc.collect()
@@ -604,6 +627,7 @@ def parsed_value(task: str, text: str) -> Any:
 
 def cache_key(args: argparse.Namespace, examples: list[Example], manifest_id: str) -> str:
     return stable_hash(
+        EVALUATOR_PROTOCOL_VERSION,
         Path(args.base_model).expanduser().resolve(),
         Path(args.processor_path or args.base_model).expanduser().resolve(),
         manifest_id,
@@ -628,7 +652,12 @@ def load_or_run_base(
     with exclusive_file_lock(path.with_suffix(path.suffix + ".lock")):
         if path.is_file():
             payload = json.loads(path.read_text(encoding="utf-8"))
-            if payload.get("example_keys") == [example.key for example in examples]:
+            if (
+                payload.get("evaluator_protocol_version")
+                == EVALUATOR_PROTOCOL_VERSION
+                and payload.get("example_keys")
+                == [example.key for example in examples]
+            ):
                 results = payload["results"]
                 for example in examples:
                     result = results[example.key]
@@ -643,7 +672,8 @@ def load_or_run_base(
         temporary.write_text(
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
+                    "evaluator_protocol_version": EVALUATOR_PROTOCOL_VERSION,
                     "base_model": str(Path(args.base_model).expanduser().resolve()),
                     "manifest_id": manifest_id,
                     "example_keys": [example.key for example in examples],

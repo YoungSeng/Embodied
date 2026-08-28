@@ -182,6 +182,9 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn("NVIDIA_H20", eval_yaml)
         self.assertIn("shell/run_locany_cpt_eval_merlin.sh h20", eval_yaml)
         self.assertIn('EVAL_ATTN_IMPLEMENTATION: "sdpa"', eval_yaml)
+        self.assertIn(
+            'EVAL_VISION_ATTN_IMPLEMENTATION: "flash_attention_2"', eval_yaml
+        )
         self.assertIn('EVAL_SAMPLES_PER_TASK: "10"', eval_yaml)
 
         smoke_eval_yaml = (
@@ -190,6 +193,10 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn('RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-smoke"', smoke_eval_yaml)
         self.assertIn("locany_cpt_v4_split_v2_smoke", smoke_eval_yaml)
         self.assertIn('EVAL_MAX_PENDING: "2"', smoke_eval_yaml)
+        self.assertIn(
+            'EVAL_VISION_ATTN_IMPLEMENTATION: "flash_attention_2"',
+            smoke_eval_yaml,
+        )
 
         eval_launcher = (
             REPO_ROOT / "shell" / "run_locany_cpt_eval_merlin.sh"
@@ -197,6 +204,13 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         self.assertIn("scripts/run_locany_cpt_eval_queue.py", eval_launcher)
         self.assertIn("--require-zero-inference-errors", eval_launcher)
         self.assertIn("shell/ensure_locany_cpt_runtime.sh", eval_launcher)
+        self.assertIn("EVAL_VISION_ATTN_IMPLEMENTATION:-flash_attention_2", eval_launcher)
+        self.assertIn("expandable_segments:True", eval_launcher)
+
+        queue_runner = (
+            REPO_ROOT / "scripts" / "run_locany_cpt_eval_queue.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"--fail-fast-inference-errors"', queue_runner)
 
     def test_cpt_runtime_preflight_installs_libgl_before_worker_imports(self):
         helper = (
