@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
         default="readonly",
     )
     parser.add_argument(
-        "--eval-scan-name", default="horizontal_scan_v3_no_overlap"
+        "--eval-scan-name", default="horizontal_scan_v4_detector_edge_aligned"
     )
     parser.add_argument(
         "--require-cache-scope",
@@ -64,6 +64,16 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--require-detector-edge-alignment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--require-guarded-bbox-unique-containment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--eval-expected-unique-images", type=int, default=17281)
     parser.add_argument("--eval-text-python", default=None)
     parser.add_argument("--eval-icon-python", default=None)
@@ -71,6 +81,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-icon-model", type=Path, default=None)
     parser.add_argument("--eval-detector-workers-per-gpu", type=int, choices=(1, 2), default=1)
     parser.add_argument("--scan-target-height", type=int, default=960)
+    parser.add_argument("--scan-target-guard-ratio", type=float, default=0.015)
+    parser.add_argument("--scan-target-guard-min-pixels", type=int, default=16)
+    parser.add_argument("--scan-target-guard-max-pixels", type=int, default=64)
     parser.add_argument("--scan-vertical-link-ratio", type=float, default=0.025)
     parser.add_argument("--scan-context-ratio", type=float, default=0.20)
     parser.add_argument("--scan-min-context-image-ratio", type=float, default=0.015)
@@ -175,6 +188,10 @@ def main() -> int:
         raise ValueError("--tile-overlap-ratio must be in (0, 1)")
     if args.scan_target_height <= 0:
         raise ValueError("--scan-target-height must be positive")
+    if not 0 <= args.scan_target_guard_ratio <= 0.10:
+        raise ValueError("--scan-target-guard-ratio must be in [0, 0.10]")
+    if not 0 <= args.scan_target_guard_min_pixels <= args.scan_target_guard_max_pixels:
+        raise ValueError("scan target guard pixel bounds are invalid")
     if min(
         args.scan_vertical_link_ratio,
         args.scan_context_ratio,
@@ -244,6 +261,10 @@ def main() -> int:
         "eval_scan_name": args.eval_scan_name,
         "required_cache_scope": args.require_cache_scope,
         "require_strict_nonoverlap": args.require_strict_nonoverlap,
+        "require_detector_edge_alignment": args.require_detector_edge_alignment,
+        "require_guarded_bbox_unique_containment": (
+            args.require_guarded_bbox_unique_containment
+        ),
         "checkpoint": str(args.checkpoint),
         "prediction_dir": str(prediction_dir),
         "evaluation_run_dir": str(evaluation_run_dir),
@@ -293,6 +314,10 @@ def main() -> int:
                     "--scan-max-crops", str(args.tile_max_count),
                     "--scan-target-height", str(args.scan_target_height),
                     "--scan-context-pixels", "0",
+                    "--target-guard-ratio", str(args.scan_target_guard_ratio),
+                    "--target-guard-min-pixels", str(args.scan_target_guard_min_pixels),
+                    "--target-guard-max-pixels", str(args.scan_target_guard_max_pixels),
+                    "--seam-candidates", "detector-edges-only",
                     "--strict-vertical-partition",
                     "--cache-scope", args.require_cache_scope,
                     "--expected-full-test-unique-images",
@@ -325,6 +350,12 @@ def main() -> int:
                     input_dir=args.input_dir,
                     required_cache_scope=args.require_cache_scope,
                     require_strict_nonoverlap=args.require_strict_nonoverlap,
+                    require_detector_edge_alignment=(
+                        args.require_detector_edge_alignment
+                    ),
+                    require_guarded_bbox_unique_containment=(
+                        args.require_guarded_bbox_unique_containment
+                    ),
                 )
                 detector_crop_manifest_digest = hashlib.sha256(
                     detector_crop_manifest.read_bytes()
@@ -333,6 +364,7 @@ def main() -> int:
                     "detector cache: readonly validated | "
                     f"scan={args.eval_scan_name} | scope={marker['cache_scope']} | "
                     f"strict_nonoverlap={marker['strict_vertical_partition']} | "
+                    f"edge_aligned={marker['detector_edge_aligned']} | "
                     f"images={marker['dataset']['content_unique_images']} | "
                     f"manifest={detector_crop_manifest}",
                     flush=True,

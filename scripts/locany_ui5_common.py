@@ -359,7 +359,9 @@ def resolve_runtime_config(
             _env_value(env, "EVAL_DETECTOR_CACHE_MODE", "readonly")
         ).lower(),
         "EVAL_SCAN_NAME": str(
-            _env_value(env, "EVAL_SCAN_NAME", "horizontal_scan_v3_no_overlap")
+            _env_value(
+                env, "EVAL_SCAN_NAME", "horizontal_scan_v4_detector_edge_aligned"
+            )
         ),
         "EVAL_REQUIRE_CACHE_SCOPE": str(
             _env_value(env, "EVAL_REQUIRE_CACHE_SCOPE", "full_test")
@@ -368,6 +370,20 @@ def resolve_runtime_config(
             parse_bool(
                 _env_value(env, "EVAL_REQUIRE_STRICT_NONOVERLAP", "1"),
                 name="EVAL_REQUIRE_STRICT_NONOVERLAP",
+            )
+        ),
+        "EVAL_REQUIRE_DETECTOR_EDGE_ALIGNMENT": int(
+            parse_bool(
+                _env_value(env, "EVAL_REQUIRE_DETECTOR_EDGE_ALIGNMENT", "1"),
+                name="EVAL_REQUIRE_DETECTOR_EDGE_ALIGNMENT",
+            )
+        ),
+        "EVAL_REQUIRE_GUARDED_BBOX_UNIQUE_CONTAINMENT": int(
+            parse_bool(
+                _env_value(
+                    env, "EVAL_REQUIRE_GUARDED_BBOX_UNIQUE_CONTAINMENT", "1"
+                ),
+                name="EVAL_REQUIRE_GUARDED_BBOX_UNIQUE_CONTAINMENT",
             )
         ),
         "EVAL_EXPECTED_UNIQUE_IMAGES": int(
@@ -401,6 +417,15 @@ def resolve_runtime_config(
         "EVAL_TILE_NMS_IOU": float(_env_value(env, "EVAL_TILE_NMS_IOU", 0.50)),
         "EVAL_SCAN_TARGET_HEIGHT": int(
             _env_value(env, "EVAL_SCAN_TARGET_HEIGHT", 960)
+        ),
+        "EVAL_SCAN_TARGET_GUARD_RATIO": float(
+            _env_value(env, "EVAL_SCAN_TARGET_GUARD_RATIO", 0.015)
+        ),
+        "EVAL_SCAN_TARGET_GUARD_MIN_PIXELS": int(
+            _env_value(env, "EVAL_SCAN_TARGET_GUARD_MIN_PIXELS", 16)
+        ),
+        "EVAL_SCAN_TARGET_GUARD_MAX_PIXELS": int(
+            _env_value(env, "EVAL_SCAN_TARGET_GUARD_MAX_PIXELS", 64)
         ),
         "EVAL_SCAN_VERTICAL_LINK_RATIO": float(
             _env_value(env, "EVAL_SCAN_VERTICAL_LINK_RATIO", 0.025)
@@ -459,6 +484,14 @@ def resolve_runtime_config(
         raise ValueError("EVAL_EXPECTED_UNIQUE_IMAGES cannot be negative")
     if resolved["EVAL_SCAN_TARGET_HEIGHT"] <= 0:
         raise ValueError("EVAL_SCAN_TARGET_HEIGHT must be positive")
+    if not 0 <= resolved["EVAL_SCAN_TARGET_GUARD_RATIO"] <= 0.10:
+        raise ValueError("EVAL_SCAN_TARGET_GUARD_RATIO must be in [0, 0.10]")
+    if not (
+        0
+        <= resolved["EVAL_SCAN_TARGET_GUARD_MIN_PIXELS"]
+        <= resolved["EVAL_SCAN_TARGET_GUARD_MAX_PIXELS"]
+    ):
+        raise ValueError("EVAL scan target guard pixel bounds are invalid")
     for name in (
         "EVAL_SCAN_VERTICAL_LINK_RATIO",
         "EVAL_SCAN_CONTEXT_RATIO",

@@ -54,7 +54,7 @@ from ui5_eval_detector_cache import (
 # Detector selection/shard identity remains v2 so a geometry-only schema bump
 # never invalidates or rewrites the expensive raw text/icon cache.
 DETECTOR_MANIFEST_FORMAT_VERSION = 2
-SCAN_FORMAT_VERSION = 3
+SCAN_FORMAT_VERSION = 4
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -87,7 +87,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--enable-mkldnn", action="store_true")
     parser.add_argument("--icon-long-side", type=int, default=1920)
     parser.add_argument("--icon-confidence", type=float, default=0.05)
-    parser.add_argument("--scan-name", default="horizontal_scan_v3_no_overlap")
+    parser.add_argument(
+        "--scan-name", default="horizontal_scan_v4_detector_edge_aligned"
+    )
     parser.add_argument(
         "--cache-scope", choices=("auto", "preview", "full_test"), default="auto"
     )
@@ -102,6 +104,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--scan-detector-margin-ratio", type=float, default=0.003)
     parser.add_argument("--scan-seam-search-ratio", type=float, default=0.25)
     parser.add_argument("--scan-context-pixels", type=int, default=0)
+    parser.add_argument("--target-guard-ratio", type=float, default=0.015)
+    parser.add_argument("--target-guard-min-pixels", type=int, default=16)
+    parser.add_argument("--target-guard-max-pixels", type=int, default=64)
+    parser.add_argument(
+        "--seam-candidates",
+        choices=("detector-edges-only",),
+        default="detector-edges-only",
+    )
     parser.add_argument(
         "--strict-vertical-partition",
         action=argparse.BooleanOptionalAction,
@@ -337,6 +347,15 @@ def _metric_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     detector_unique_contained = sum(
         int(row.get("detector_bbox_unique_containment_count", 0)) for row in rows
     )
+    guarded_total = sum(int(row.get("guarded_bbox_count", 0)) for row in rows)
+    guarded_unique_contained = sum(
+        int(row.get("guarded_bbox_unique_containment_count", 0)) for row in rows
+    )
+    nearest_edge_distances = [
+        int(distance)
+        for row in rows
+        for distance in row.get("seam_nearest_guarded_edge_distance_pixels", [])
+    ]
     seam_sources = Counter(
         source for row in rows for source in row.get("seam_source", [])
     )
@@ -363,6 +382,9 @@ def _metric_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "detector_bbox_containment_rate": (
             detector_contained / detector_total if detector_total else 1.0
         ),
+        "detector_bbox_unique_containment_rate": (
+            detector_unique_contained / detector_total if detector_total else 1.0
+        ),
         "detector_bbox_containment_rate_min": min(contain_rates, default=1.0),
         "uncontained_detector_bbox_count": sum(
             int(row.get("uncontained_detector_bbox_count", 0)) for row in rows
@@ -374,6 +396,40 @@ def _metric_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             int(row.get("horizontal_seam_count", 0)) for row in rows
         ),
         "seam_source_counts": dict(sorted(seam_sources.items())),
+        "detector_edge_candidate_count": sum(
+            int(row.get("detector_edge_candidate_count", 0)) for row in rows
+        ),
+        "non_edge_seam_count": sum(
+            int(row.get("non_edge_seam_count", 0)) for row in rows
+        ),
+        "gap_interior_seam_count": sum(
+            int(row.get("gap_interior_seam_count", 0)) for row in rows
+        ),
+        "every_seam_is_guarded_detector_edge_failure_count": sum(
+            row.get("every_seam_is_guarded_detector_edge") is not True for row in rows
+        ),
+        "seam_nearest_guarded_edge_distance_pixels_max": max(
+            nearest_edge_distances, default=0
+        ),
+        "seam_nearest_guarded_edge_distance_pixels_mean": (
+            mean(nearest_edge_distances) if nearest_edge_distances else 0.0
+        ),
+        "guarded_bbox_count": guarded_total,
+        "guarded_bbox_unique_containment_count": guarded_unique_contained,
+        "guarded_bbox_unique_containment_rate": (
+            guarded_unique_contained / guarded_total if guarded_total else 1.0
+        ),
+        "guarded_bbox_crossed_by_seam_count": sum(
+            int(row.get("guarded_bbox_crossed_by_seam_count", 0)) for row in rows
+        ),
+        "target_guard_pixels_effective_min": min(
+            (int(row.get("target_guard_pixels_effective", 0)) for row in rows),
+            default=0,
+        ),
+        "target_guard_pixels_effective_max": max(
+            (int(row.get("target_guard_pixels_effective", 0)) for row in rows),
+            default=0,
+        ),
         "safe_seam_count": sum(int(row.get("safe_seam_count", 0)) for row in rows),
         "balanced_fallback_seam_count": sum(
             int(row.get("balanced_fallback_seam_count", 0)) for row in rows
@@ -439,22 +495,56 @@ def _draw_preview(
     scale = min(1.0, max_panel_width / image.width, 4200 / image.height)
     original_display = image.resize((round(image.width * scale), round(image.height * scale))) if scale < 1 else image.copy()
     display = original_display.copy()
-    draw = ImageDraw.Draw(display)
     font = ImageFont.load_default()
     def box(raw: Sequence[int]) -> tuple[int, int, int, int]:
         return tuple(round(int(value) * scale) for value in raw)  # type: ignore[return-value]
+    overlay = Image.new("RGBA", display.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    for band in record.get("guarded_protected_vertical_bands", []):
+        y1 = round(int(band["y1"]) * scale)
+        y2 = round(int(band["y2"]) * scale)
+        overlay_draw.rectangle(
+            (0, y1, display.width - 1, y2),
+            fill=(145, 70, 210, 48),
+            outline=(130, 55, 190, 145),
+            width=max(1, round(2 * scale)),
+        )
+    display = Image.alpha_composite(display.convert("RGBA"), overlay).convert("RGB")
+    overlay.close()
+    draw = ImageDraw.Draw(display)
     for item in record["text_detections"]:
         draw.rectangle(box(item["bbox"]), outline=(0, 210, 80), width=max(2, round(3 * scale)))
     for item in record["icon_detections"]:
         draw.rectangle(box(item["bbox"]), outline=(255, 145, 0), width=max(2, round(3 * scale)))
-    for seam in record.get("horizontal_seams", []):
-        y = round(int(seam) * scale)
+    selected_seams = set(int(value) for value in record.get("horizontal_seams", []))
+    for candidate in record.get("detector_edge_candidates", []):
+        if int(candidate) in selected_seams:
+            continue
+        y = round(int(candidate) * scale)
         dash = max(5, round(14 * scale))
         for x in range(0, display.width, dash * 2):
-            draw.line((x, y, min(display.width, x + dash), y), fill=(235, 35, 35), width=max(2, round(3 * scale)))
+            draw.line(
+                (x, y, min(display.width, x + dash), y),
+                fill=(115, 115, 115),
+                width=max(1, round(2 * scale)),
+            )
     for index, tile in enumerate(record["tiles"]):
         draw.rectangle(box(tile), outline=(30, 110, 255), width=max(2, round(4 * scale)))
         draw.text((6, box(tile)[1] + 4), f"crop {index}", fill=(30, 110, 255), font=font)
+    for provenance in record.get("seam_edge_provenance", []):
+        seam = int(provenance["seam"])
+        y = round(seam * scale)
+        draw.line(
+            (0, y, display.width, y),
+            fill=(235, 35, 35),
+            width=max(2, round(3 * scale)),
+        )
+        label = (
+            f"{provenance['source']} {provenance['edge']} "
+            f"guard={provenance['guard_px']} ideal_dist="
+            f"{provenance['distance_to_ideal_partition']}"
+        )
+        draw.text((8, max(0, y - 13)), label, fill=(205, 10, 10), font=font)
 
     crops: list[Image.Image] = []
     for index, tile in enumerate(record["tiles"]):
@@ -481,7 +571,7 @@ def _draw_preview(
     y = banner_height
     canvas_draw.text((8, y + 4), "Original", fill="black", font=font)
     canvas.paste(original_display, (0, y + 20))
-    canvas_draw.text((original_display.width + panel_gap + 8, y + 4), "Text/Icon + seams + crops", fill="black", font=font)
+    canvas_draw.text((original_display.width + panel_gap + 8, y + 4), "Text/Icon + guarded bands + edge candidates + seams", fill="black", font=font)
     canvas.paste(display, (original_display.width + panel_gap, y + 20))
     y += display.height + 20
     for index, thumb in enumerate(crops):
@@ -533,15 +623,17 @@ def _select_visualizations(rows: Sequence[Mapping[str, Any]], count: int) -> lis
     return selected
 
 
-def _write_v2_v3_coordinate_comparison(
+def _write_v3_v4_coordinate_comparison(
     output_dir: Path,
     crop_root: Path,
     rows: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Compare a preserved v2 scan with v3 without mutating either manifest."""
+    """Compare preserved v3 seams with guarded-edge-only v4 coordinates."""
 
-    old_manifest = output_dir / "horizontal_scan_v2" / "detector_scan_crops.jsonl"
-    comparison_path = crop_root / "v2_v3_coordinate_compare.csv"
+    old_manifest = (
+        output_dir / "horizontal_scan_v3_no_overlap" / "detector_scan_crops.jsonl"
+    )
+    comparison_path = crop_root / "v3_v4_coordinate_compare.csv"
     if not old_manifest.is_file():
         comparison_path.unlink(missing_ok=True)
         return {"available": False, "compared_images": 0, "path": None}
@@ -549,24 +641,24 @@ def _write_v2_v3_coordinate_comparison(
     new_by_id = {str(row["image_id"]): row for row in rows}
     if set(old_by_id) != set(new_by_id):
         raise RuntimeError(
-            "horizontal_scan_v2/v3 image_id sets differ; refusing a partial coordinate comparison"
+            "horizontal_scan_v3/v4 image_id sets differ; refusing a partial coordinate comparison"
         )
     fields = (
         "image_id",
         "width",
         "height",
-        "v2_tile_count",
         "v3_tile_count",
-        "v2_tiles",
+        "v4_tile_count",
         "v3_tiles",
-        "v2_adjacent_overlap_pixels_total",
-        "v3_adjacent_overlap_pixels_total",
-        "v2_processed_pixel_ratio",
+        "v4_tiles",
+        "v3_horizontal_seams",
+        "v4_horizontal_seams",
+        "v3_seam_nearest_v4_guarded_edge_distance_pixels",
+        "v4_seam_nearest_guarded_edge_distance_pixels",
+        "v3_non_edge_seam_count_under_v4_guard",
+        "v4_non_edge_seam_count",
         "v3_processed_pixel_ratio",
-        "v2_seam_crossed_detector_bbox_count",
-        "v3_seam_crossed_detector_bbox_count",
-        "v2_detector_boundary_cut_count",
-        "v3_detector_boundary_cut_count",
+        "v4_processed_pixel_ratio",
     )
     temporary = comparison_path.with_name(f".{comparison_path.name}.tmp-{os.getpid()}")
     with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
@@ -581,35 +673,39 @@ def _write_v2_v3_coordinate_comparison(
             new_metrics = strict_vertical_partition_metrics(
                 int(new["width"]), int(new["height"]), new["tiles"]
             )
+            edges = [int(value) for value in new["detector_edge_candidates"]]
+            old_distances = [
+                min((abs(int(seam) - edge) for edge in edges), default=int(new["height"]))
+                for seam in old.get("horizontal_seams", [])
+            ]
             writer.writerow(
                 {
                     "image_id": image_id,
                     "width": new["width"],
                     "height": new["height"],
-                    "v2_tile_count": len(old["tiles"]),
-                    "v3_tile_count": len(new["tiles"]),
-                    "v2_tiles": json.dumps(old["tiles"], separators=(",", ":")),
-                    "v3_tiles": json.dumps(new["tiles"], separators=(",", ":")),
-                    "v2_adjacent_overlap_pixels_total": old_metrics[
-                        "adjacent_overlap_pixels_total"
-                    ],
-                    "v3_adjacent_overlap_pixels_total": new_metrics[
-                        "adjacent_overlap_pixels_total"
-                    ],
-                    "v2_processed_pixel_ratio": old_metrics["processed_pixel_ratio"],
-                    "v3_processed_pixel_ratio": new_metrics["processed_pixel_ratio"],
-                    "v2_seam_crossed_detector_bbox_count": old.get(
-                        "seam_crossed_detector_bbox_count", ""
+                    "v3_processed_pixel_ratio": old_metrics["processed_pixel_ratio"],
+                    "v4_processed_pixel_ratio": new_metrics["processed_pixel_ratio"],
+                    "v3_tile_count": len(old["tiles"]),
+                    "v4_tile_count": len(new["tiles"]),
+                    "v3_tiles": json.dumps(old["tiles"], separators=(",", ":")),
+                    "v4_tiles": json.dumps(new["tiles"], separators=(",", ":")),
+                    "v3_horizontal_seams": json.dumps(
+                        old.get("horizontal_seams", []), separators=(",", ":")
                     ),
-                    "v3_seam_crossed_detector_bbox_count": new.get(
-                        "seam_crossed_detector_bbox_count", ""
+                    "v4_horizontal_seams": json.dumps(
+                        new.get("horizontal_seams", []), separators=(",", ":")
                     ),
-                    "v2_detector_boundary_cut_count": old.get(
-                        "detector_boundary_cut_count", ""
+                    "v3_seam_nearest_v4_guarded_edge_distance_pixels": json.dumps(
+                        old_distances, separators=(",", ":")
                     ),
-                    "v3_detector_boundary_cut_count": new.get(
-                        "detector_boundary_cut_count", ""
+                    "v4_seam_nearest_guarded_edge_distance_pixels": json.dumps(
+                        new.get("seam_nearest_guarded_edge_distance_pixels", []),
+                        separators=(",", ":"),
                     ),
+                    "v3_non_edge_seam_count_under_v4_guard": sum(
+                        distance != 0 for distance in old_distances
+                    ),
+                    "v4_non_edge_seam_count": new.get("non_edge_seam_count", ""),
                 }
             )
     os.replace(temporary, comparison_path)
@@ -634,7 +730,28 @@ def _cache_file_record(cache_dir: Path, path: Path, *, jsonl_rows: int | None = 
 
 def _geometry_gate(summary: Mapping[str, Any]) -> dict[str, Any]:
     overall = summary["overall"]
+    config = summary["geometry_config"]
     conditions = {
+        "schema_version_equals_4": int(config.get("schema_version", -1)) == 4,
+        "scan_name_is_v4_detector_edge_aligned": (
+            summary.get("scan_name") == "horizontal_scan_v4_detector_edge_aligned"
+        ),
+        "seam_selection_is_guarded_detector_edge_dp": (
+            config.get("seam_selection")
+            == "guarded_detector_edge_dynamic_programming"
+        ),
+        "target_guard_ratio_equals_0_015": float(
+            config.get("target_guard_ratio", -1)
+        )
+        == 0.015,
+        "target_guard_min_pixels_equals_16": int(
+            config.get("target_guard_pixels_min", -1)
+        )
+        == 16,
+        "target_guard_max_pixels_equals_64": int(
+            config.get("target_guard_pixels_max", -1)
+        )
+        == 64,
         "strict_vertical_partition_true": int(overall["strict_vertical_partition_failure_count"]) == 0,
         "adjacent_overlap_pixels_total_zero": int(overall["adjacent_overlap_pixels_total"]) == 0,
         "adjacent_gap_pixels_total_zero": int(overall["adjacent_gap_pixels_total"]) == 0,
@@ -650,7 +767,26 @@ def _geometry_gate(summary: Mapping[str, Any]) -> dict[str, Any]:
         "every_detector_bbox_belongs_to_exactly_one_crop": (
             int(overall["detector_bbox_unique_containment_count"])
             == int(overall["detector_bbox_count"])
+            and float(overall["detector_bbox_unique_containment_rate"]) == 1.0
         ),
+        "every_seam_is_guarded_detector_edge": (
+            int(overall["every_seam_is_guarded_detector_edge_failure_count"]) == 0
+        ),
+        "non_edge_seam_count_zero": int(overall["non_edge_seam_count"]) == 0,
+        "gap_interior_seam_count_zero": int(overall["gap_interior_seam_count"]) == 0,
+        "seam_guarded_edge_distance_max_zero": int(
+            overall["seam_nearest_guarded_edge_distance_pixels_max"]
+        )
+        == 0,
+        "guarded_bbox_unique_containment_equals_1": (
+            float(overall["guarded_bbox_unique_containment_rate"]) == 1.0
+            and int(overall["guarded_bbox_unique_containment_count"])
+            == int(overall["guarded_bbox_count"])
+        ),
+        "guarded_bbox_crossed_by_seam_count_zero": int(
+            overall["guarded_bbox_crossed_by_seam_count"]
+        )
+        == 0,
         "full_tile_in_multi_plan_count_zero": int(overall["full_tile_in_multi_plan_count"]) == 0,
         "duplicate_tile_count_zero": int(overall["duplicate_tile_count"]) == 0,
         "nested_tile_count_zero": int(overall["nested_tile_count"]) == 0,
@@ -764,6 +900,33 @@ def _write_cache_ready_marker(
             "summary cache_scope changed before ready marker publication: "
             f"summary={summary.get('cache_scope')}, resolved={cache_scope}"
         )
+    guarded_band_digest = cache_json_digest(
+        [
+            {
+                "image_id": row["image_id"],
+                "bands": row["guarded_protected_vertical_bands"],
+            }
+            for row in rows
+        ]
+    )
+    if summary.get("guarded_band_digest") != guarded_band_digest:
+        raise RuntimeError("summary guarded-band digest does not match scan rows")
+    geometry_state_digest = cache_json_digest(
+        {
+            "config": geometry_config,
+            "merged_detection_sha256": sha256_file(paths.merged),
+            "guarded_band_digest": guarded_band_digest,
+        }
+    )
+    if summary.get("geometry_state_digest") != geometry_state_digest:
+        raise RuntimeError("summary geometry-state digest does not match current inputs")
+    gallery_files = [
+        _cache_file_record(args.output_dir, path)
+        for path in sorted((crop_root / "gallery").rglob("*"))
+        if path.is_file()
+    ]
+    if not gallery_files:
+        raise RuntimeError("cannot publish readonly cache without a completed gallery")
     marker = {
         "schema_version": CACHE_MARKER_SCHEMA_VERSION,
         "ready": True,
@@ -772,6 +935,8 @@ def _write_cache_ready_marker(
         "max_images_per_task": max_images_per_task,
         "expected_unique_images": expected_unique_images,
         "strict_vertical_partition": True,
+        "detector_edge_aligned": True,
+        "guarded_bbox_unique_containment": True,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "created_after_all_checks": True,
         "gt_used": False,
@@ -796,6 +961,10 @@ def _write_cache_ready_marker(
             "config_digest": cache_json_digest(geometry_config),
             "gate_passes": True,
             "strict_vertical_partition": True,
+            "detector_edge_aligned": True,
+            "guarded_bbox_unique_containment": True,
+            "guarded_band_digest": guarded_band_digest,
+            "geometry_state_digest": geometry_state_digest,
             "scan_manifest": _cache_file_record(
                 args.output_dir,
                 crop_root / "detector_scan_crops.jsonl",
@@ -804,11 +973,13 @@ def _write_cache_ready_marker(
             "summary": _cache_file_record(args.output_dir, crop_root / "summary.json"),
             "statistics": _cache_file_record(args.output_dir, crop_root / "statistics.csv"),
             "gallery": _cache_file_record(args.output_dir, crop_root / "gallery" / "index.html"),
+            "gallery_files": gallery_files,
+            "gallery_digest": cache_json_digest(gallery_files),
         },
     }
-    comparison_path = crop_root / "v2_v3_coordinate_compare.csv"
+    comparison_path = crop_root / "v3_v4_coordinate_compare.csv"
     if comparison_path.is_file():
-        marker["geometry"]["v2_v3_coordinate_comparison"] = _cache_file_record(
+        marker["geometry"]["v3_v4_coordinate_comparison"] = _cache_file_record(
             args.output_dir, comparison_path
         )
     atomic_write_json(cache_marker_path(args.output_dir, args.scan_name), marker)
@@ -828,11 +999,13 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
             "dense_band_ratio": args.scan_dense_band_ratio,
             "seam_search_ratio": args.scan_seam_search_ratio,
         },
-        "detector_margin_ratio": args.scan_detector_margin_ratio,
-        "detector_margin_pixels": [2, 12],
         "context_pixels": args.scan_context_pixels,
+        "target_guard_ratio": args.target_guard_ratio,
+        "target_guard_pixels_min": args.target_guard_min_pixels,
+        "target_guard_pixels_max": args.target_guard_max_pixels,
         "strict_vertical_partition": args.strict_vertical_partition,
-        "seam_selection": "global_detector_free_gap_dynamic_programming",
+        "seam_candidates": args.seam_candidates,
+        "seam_selection": "guarded_detector_edge_dynamic_programming",
         "minimum_core_height_ratio": args.scan_minimum_core_height_ratio,
         "horizontal_extent": "full_image_width",
         "schema_version": GEOMETRY_SCHEMA_VERSION,
@@ -857,8 +1030,12 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
         crop_root / "statistics.csv",
         crop_root / "gallery" / "index.html",
     ]
-    if (args.output_dir / "horizontal_scan_v2" / "detector_scan_crops.jsonl").is_file():
-        required_outputs.append(crop_root / "v2_v3_coordinate_compare.csv")
+    if (
+        args.output_dir
+        / "horizontal_scan_v3_no_overlap"
+        / "detector_scan_crops.jsonl"
+    ).is_file():
+        required_outputs.append(crop_root / "v3_v4_coordinate_compare.csv")
     if getattr(args, "resume", False) and state_path.is_file() and all(
         path.is_file() for path in required_outputs
     ):
@@ -938,6 +1115,10 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
             context_pixels=args.scan_context_pixels,
             minimum_core_height_ratio=args.scan_minimum_core_height_ratio,
             strict_vertical_partition=args.strict_vertical_partition,
+            target_guard_ratio=args.target_guard_ratio,
+            target_guard_min_pixels=args.target_guard_min_pixels,
+            target_guard_max_pixels=args.target_guard_max_pixels,
+            seam_candidates=args.seam_candidates,
         )
         row = {
             "image_id": detected["image_id"],
@@ -964,7 +1145,7 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
     rows.sort(key=lambda row: row["image_id"])
 
     atomic_write_jsonl(scan_manifest_path, rows)
-    coordinate_comparison = _write_v2_v3_coordinate_comparison(
+    coordinate_comparison = _write_v3_v4_coordinate_comparison(
         args.output_dir, crop_root, rows
     )
     by_density = {
@@ -1014,16 +1195,34 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
     selection_limit = int(selection.get("max_images_per_task", 0))
     inferred_scope = "preview" if selection_limit > 0 else "full_test"
     cache_scope = inferred_scope if args.cache_scope == "auto" else args.cache_scope
+    guarded_band_digest = cache_json_digest(
+        [
+            {
+                "image_id": row["image_id"],
+                "bands": row["guarded_protected_vertical_bands"],
+            }
+            for row in rows
+        ]
+    )
+    geometry_state_digest = cache_json_digest(
+        {
+            "config": geometry_config,
+            "merged_detection_sha256": sha256_file(paths.merged),
+            "guarded_band_digest": guarded_band_digest,
+        }
+    )
     summary = {
         "format_version": SCAN_FORMAT_VERSION,
         "scan_name": args.scan_name,
         "mode": "detector_scan",
-        "description": "GT-free strict non-overlapping full-width horizontal seam partition",
+        "description": "GT-free guarded-detector-edge-aligned strict horizontal partition",
         "cache_scope": cache_scope,
         "max_images_per_task": selection_limit,
         "unique_images": len(rows),
         "image_id_digest": digest_ids(row["image_id"] for row in rows),
         "geometry_config": geometry_config,
+        "guarded_band_digest": guarded_band_digest,
+        "geometry_state_digest": geometry_state_digest,
         "overall": _metric_summary(rows),
         "by_density": by_density,
         "by_task": by_task,
@@ -1041,7 +1240,7 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
                 for density in ("sparse", "medium", "dense")
             },
         },
-        "v2_v3_coordinate_comparison": coordinate_comparison,
+        "v3_v4_coordinate_comparison": coordinate_comparison,
         "raw_detector_files_unchanged": True,
         "gt_used": False,
     }
@@ -1054,6 +1253,15 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
         "image_id", "image_path", "width", "height", "density", "detector_box_count",
         "connected_band_count", "tile_count", "lossless_pixel_coverage_ratio",
         "horizontal_seam_count", "horizontal_seams", "seam_source_counts",
+        "target_guard_ratio", "target_guard_pixels_min",
+        "target_guard_pixels_max", "target_guard_pixels_effective",
+        "guarded_protected_vertical_bands", "detector_edge_candidates",
+        "detector_edge_candidate_count", "seam_edge_provenance",
+        "seam_nearest_guarded_edge_distance_pixels", "non_edge_seam_count",
+        "gap_interior_seam_count", "every_seam_is_guarded_detector_edge",
+        "guarded_bbox_count", "guarded_bbox_unique_containment_count",
+        "guarded_bbox_unique_containment_rate",
+        "guarded_bbox_crossed_by_seam_count",
         "strict_vertical_partition", "adjacent_overlap_pixels",
         "adjacent_overlap_pixels_total", "adjacent_gap_pixels",
         "adjacent_gap_pixels_total", "sum_tile_area", "union_tile_area",
@@ -1061,6 +1269,7 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
         "safe_seam_count", "desired_tile_count", "actual_tile_count",
         "tile_count_reduction_reason", "balanced_fallback_seam_count",
         "detector_bbox_containment_rate", "detector_bbox_unique_containment_count",
+        "detector_bbox_unique_containment_rate",
         "uncontained_detector_bbox_count",
         "seam_crossed_detector_bbox_count", "full_tile_in_multi_plan_count",
         "duplicate_tile_count", "nested_tile_count", "minimum_core_height",
@@ -1159,7 +1368,13 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.scan_context_pixels != 0:
         raise ValueError("--scan-context-pixels must be 0 for strict vertical partition")
     if args.strict_vertical_partition is not True:
-        raise ValueError("--strict-vertical-partition is mandatory for schema-v3 scans")
+        raise ValueError("--strict-vertical-partition is mandatory for schema-v4 scans")
+    if not 0 <= args.target_guard_ratio <= 0.10:
+        raise ValueError("--target-guard-ratio must be in [0, 0.10]")
+    if not 0 <= args.target_guard_min_pixels <= args.target_guard_max_pixels:
+        raise ValueError("target guard pixel bounds are invalid")
+    if args.seam_candidates != "detector-edges-only":
+        raise ValueError("--seam-candidates must be detector-edges-only")
     if not 0 < args.scan_minimum_core_height_ratio <= 1:
         raise ValueError("--scan-minimum-core-height-ratio must be in (0, 1]")
     if args.visualization_samples < 0:

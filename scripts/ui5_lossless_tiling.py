@@ -19,13 +19,13 @@ from typing import Any, Iterable, Mapping, Sequence
 BBox = tuple[int, int, int, int]
 
 
-def _normalized_detector_boxes(
+def _normalized_detector_records(
     boxes: Iterable[Sequence[int] | Mapping[str, Any]],
     width: int,
     height: int,
-) -> list[BBox]:
-    normalized: list[BBox] = []
-    for item in boxes:
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for detector_index, item in enumerate(boxes):
         raw = item.get("bbox") if isinstance(item, Mapping) else item
         if raw is None or len(raw) != 4:
             continue
@@ -33,126 +33,194 @@ def _normalized_detector_boxes(
         x1, x2 = sorted((max(0, min(width, x1)), max(0, min(width, x2))))
         y1, y2 = sorted((max(0, min(height, y1)), max(0, min(height, y2))))
         if x2 > x1 and y2 > y1:
-            normalized.append((x1, y1, x2, y2))
-    return sorted(set(normalized), key=lambda box: (box[1], box[3], box[0], box[2]))
+            source = str(item.get("source", "unknown")) if isinstance(item, Mapping) else "unknown"
+            source = source if source in {"text", "icon"} else "unknown"
+            detector_id = (
+                str(item.get("id") or item.get("detector_id") or f"{source}_{detector_index:06d}")
+                if isinstance(item, Mapping)
+                else f"unknown_{detector_index:06d}"
+            )
+            normalized.append(
+                {
+                    "bbox": (x1, y1, x2, y2),
+                    "source": source,
+                    "detector_index": detector_index,
+                    "detector_id": detector_id,
+                }
+            )
+    return normalized
 
 
-def _occupied_y_intervals(
-    boxes: Sequence[BBox], *, height: int, margin: int
-) -> list[tuple[int, int]]:
-    """Return only genuinely overlapping/touching detector y projections.
+def _normalized_detector_boxes(
+    boxes: Iterable[Sequence[int] | Mapping[str, Any]],
+    width: int,
+    height: int,
+) -> list[BBox]:
+    return [record["bbox"] for record in _normalized_detector_records(boxes, width, height)]
 
-    The old implementation linked nearby rows and then padded a whole connected
-    component by 20% of its height.  On dense pages that turns most of the page
-    into one protected band.  Seam selection needs the much narrower notion of
-    detector occupancy used here.
-    """
 
-    projected = sorted(
-        (max(0, box[1] - margin), min(height, box[3] + margin)) for box in boxes
+def build_guarded_detector_geometry(
+    width: int,
+    height: int,
+    detector_boxes: Iterable[Sequence[int] | Mapping[str, Any]],
+    *,
+    target_guard_ratio: float = 0.015,
+    target_guard_min_pixels: int = 16,
+    target_guard_max_pixels: int = 64,
+) -> dict[str, Any]:
+    """Build guarded detector records, merged bands, and edge-only candidates."""
+
+    if not 0 <= target_guard_ratio <= 0.10:
+        raise ValueError("target_guard_ratio must be in [0, 0.10]")
+    if not 0 <= target_guard_min_pixels <= target_guard_max_pixels:
+        raise ValueError("target guard pixel bounds are invalid")
+    records = _normalized_detector_records(detector_boxes, int(width), int(height))
+    guard_px = min(
+        int(target_guard_max_pixels),
+        max(int(target_guard_min_pixels), round(float(target_guard_ratio) * int(height))),
     )
-    merged: list[list[int]] = []
-    for start, end in projected:
-        if merged and start <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], end)
+    for record in records:
+        _x1, y1, _x2, y2 = record["bbox"]
+        record["guarded_y_interval"] = [
+            max(0, int(math.floor(y1 - guard_px))),
+            min(int(height), int(math.ceil(y2 + guard_px))),
+        ]
+
+    merged: list[dict[str, Any]] = []
+    for record in sorted(
+        records,
+        key=lambda item: (
+            item["guarded_y_interval"][0],
+            item["guarded_y_interval"][1],
+            item["detector_index"],
+        ),
+    ):
+        start, end = record["guarded_y_interval"]
+        if merged and start <= merged[-1]["y2"]:
+            band = merged[-1]
+            band["y2"] = max(int(band["y2"]), int(end))
         else:
-            merged.append([start, end])
-    return [(start, end) for start, end in merged]
+            band = {"y1": int(start), "y2": int(end), "records": []}
+            merged.append(band)
+        band["records"].append(record)
+
+    bands: list[dict[str, Any]] = []
+    edge_provenance: dict[int, dict[str, Any]] = {}
+    for band_index, merged_band in enumerate(merged):
+        band_records = merged_band.pop("records")
+        text_records = [item for item in band_records if item["source"] == "text"]
+        icon_records = [item for item in band_records if item["source"] == "icon"]
+        source = (
+            "mixed"
+            if text_records and icon_records
+            else "text"
+            if text_records
+            else "icon"
+            if icon_records
+            else "unknown"
+        )
+        band = {
+            "band_index": band_index,
+            "bbox": [int(merged_band["y1"]), int(merged_band["y2"])],
+            "y1": int(merged_band["y1"]),
+            "y2": int(merged_band["y2"]),
+            "source": source,
+            "text_bbox_count": len(text_records),
+            "icon_bbox_count": len(icon_records),
+            "bbox_count": len(band_records),
+            "bbox_indices": [int(item["detector_index"]) for item in band_records],
+            "bbox_ids": [str(item["detector_id"]) for item in band_records],
+            "guard_px": guard_px,
+        }
+        bands.append(band)
+        for edge, coordinate in (("band_top", band["y1"]), ("band_bottom", band["y2"])):
+            if coordinate in {0, int(height)}:
+                continue
+            edge_provenance[int(coordinate)] = {
+                "seam": int(coordinate),
+                "edge": edge,
+                "band_index": band_index,
+                "source": source,
+                "text_bbox_count": len(text_records),
+                "icon_bbox_count": len(icon_records),
+                "guard_px": guard_px,
+            }
+    candidates = sorted(edge_provenance)
+    return {
+        "records": records,
+        "raw_boxes": [record["bbox"] for record in records],
+        "guarded_boxes": [record["guarded_y_interval"] for record in records],
+        "guard_px": guard_px,
+        "protected_bands": bands,
+        "edge_candidates": candidates,
+        "edge_provenance": edge_provenance,
+    }
 
 
-def _free_y_gaps(
-    occupied: Sequence[tuple[int, int]], *, height: int
-) -> list[tuple[int, int]]:
-    gaps: list[tuple[int, int]] = []
-    cursor = 0
-    for start, end in occupied:
-        if start > cursor:
-            gaps.append((cursor, start))
-        cursor = max(cursor, end)
-    if cursor < height:
-        gaps.append((cursor, height))
-    return gaps
-
-
-def _choose_safe_horizontal_seams(
+def _choose_detector_edge_seams(
     *,
     height: int,
     count: int,
-    gaps: Sequence[tuple[int, int]],
+    candidate_edges: Sequence[int],
     minimum_core_height: int,
 ) -> list[int] | None:
-    """Choose globally safe seams with a small dynamic-programming search.
-
-    One seam candidate is derived from every detector-free gap for every ideal
-    division point.  The DP minimizes core-height imbalance while requiring
-    increasing seam coordinates and the requested minimum core height.  No
-    detector-crossing fallback exists: callers reduce the tile count instead.
-    """
+    """Select only guarded detector edges with an exact deterministic DP."""
 
     if count <= 1:
         return []
-    target_core = height / count
-    candidates_by_index: list[list[tuple[int, int, int]]] = []
+    candidates = sorted(
+        set(int(value) for value in candidate_edges if 0 < int(value) < int(height))
+    )
+    # Cost is multiplied by N^2, so all comparisons remain exact integers:
+    # (segment - H/N)^2 * N^2 == (segment*N - H)^2.
+    states: dict[int, tuple[int, int, tuple[int, ...]]] = {}
     for seam_index in range(1, count):
-        desired = seam_index * target_core
-        global_lower = seam_index * minimum_core_height
-        global_upper = height - (count - seam_index) * minimum_core_height
-        candidates: list[tuple[float, int, int, int]] = []
-        for gap_index, (gap_start, gap_end) in enumerate(gaps):
-            allowed_start = max(1, gap_start, global_lower)
-            allowed_end = min(height - 1, gap_end, global_upper)
-            if allowed_end < allowed_start:
+        remaining_segments = count - seam_index
+        next_states: dict[int, tuple[int, int, tuple[int, ...]]] = {}
+        for position in candidates:
+            if position < seam_index * minimum_core_height:
                 continue
-            position = int(round(min(max(desired, allowed_start), allowed_end)))
-            gap_width = max(0, gap_end - gap_start)
-            local_cost = ((position - desired) / max(1.0, target_core)) ** 2
-            # Width is only a tie-breaker after safety/count/height balance.
-            local_cost -= min(1.0, gap_width / max(1, height)) * 1e-6
-            candidates.append((local_cost, position, gap_index, gap_width))
-        # Retain the globally best candidates, plus extremes that can be needed
-        # for a feasible monotonic combination on pages with hundreds of gaps.
-        candidates.sort(key=lambda item: (item[0], -item[3], item[1]))
-        retained = candidates[:96]
-        if candidates:
-            retained.extend((min(candidates, key=lambda item: item[1]), max(candidates, key=lambda item: item[1])))
-        dedup = {
-            (position, gap_index): (position, gap_index, gap_width)
-            for _cost, position, gap_index, gap_width in retained
-        }
-        candidates_by_index.append(sorted(dedup.values(), key=lambda item: item[0]))
-
-    # state: candidate -> (cost, seam tuple).  Cost includes completed core
-    # heights; the final core is added after the last seam.
-    states: dict[tuple[int, int], tuple[float, tuple[int, ...]]] = {}
-    for position, gap_index, gap_width in candidates_by_index[0]:
-        core_cost = ((position - target_core) / max(1.0, target_core)) ** 2
-        core_cost -= min(1.0, gap_width / max(1, height)) * 1e-6
-        states[(position, gap_index)] = (core_cost, (position,))
-    for candidates in candidates_by_index[1:]:
-        next_states: dict[tuple[int, int], tuple[float, tuple[int, ...]]] = {}
-        for position, gap_index, gap_width in candidates:
-            best: tuple[float, tuple[int, ...]] | None = None
-            for (previous, previous_gap), (cost, seams) in states.items():
-                if gap_index < previous_gap or position - previous < minimum_core_height:
-                    continue
-                segment_cost = ((position - previous - target_core) / max(1.0, target_core)) ** 2
-                total = cost + segment_cost - min(1.0, gap_width / max(1, height)) * 1e-6
-                candidate_state = (total, (*seams, position))
-                if best is None or candidate_state < best:
-                    best = candidate_state
+            if height - position < remaining_segments * minimum_core_height:
+                continue
+            best: tuple[int, int, tuple[int, ...]] | None = None
+            if seam_index == 1:
+                segment_height = position
+                rank = (
+                    (segment_height * count - height) ** 2,
+                    segment_height,
+                    (position,),
+                )
+                best = rank
+            else:
+                for previous, (cost, maximum_height, seams) in states.items():
+                    segment_height = position - previous
+                    if segment_height < minimum_core_height:
+                        continue
+                    rank = (
+                        cost + (segment_height * count - height) ** 2,
+                        max(maximum_height, segment_height),
+                        (*seams, position),
+                    )
+                    if best is None or rank < best:
+                        best = rank
             if best is not None:
-                next_states[(position, gap_index)] = best
+                next_states[position] = best
         states = next_states
         if not states:
             return None
-    feasible = [
-        (cost + ((height - position - target_core) / max(1.0, target_core)) ** 2, seams)
-        for (position, _gap), (cost, seams) in states.items()
-        if height - position >= minimum_core_height
-    ]
-    if not feasible:
-        return None
-    return list(min(feasible)[1])
+    feasible: list[tuple[int, int, tuple[int, ...]]] = []
+    for position, (cost, maximum_height, seams) in states.items():
+        last_height = height - position
+        if last_height < minimum_core_height:
+            continue
+        feasible.append(
+            (
+                cost + (last_height * count - height) ** 2,
+                max(maximum_height, last_height),
+                seams,
+            )
+        )
+    return list(min(feasible)[2]) if feasible else None
 
 
 def strict_vertical_partition_metrics(
@@ -257,12 +325,16 @@ def generate_detector_scan_plan(
     context_pixels: int = 0,
     minimum_core_height_ratio: float = 0.35,
     strict_vertical_partition: bool = True,
+    target_guard_ratio: float = 0.015,
+    target_guard_min_pixels: int = 16,
+    target_guard_max_pixels: int = 64,
+    seam_candidates: str = "detector-edges-only",
 ) -> dict[str, Any]:
-    """Build a GT-free strict partition from detector-safe horizontal seams.
+    """Build a GT-free strict partition from guarded detector edges only.
 
     Every final tile is exactly one continuous core.  If the desired number of
-    safe seams is unavailable, the tile count is reduced; no seam may cross a
-    detector box and no overlap/expansion fallback exists.
+    protected-band edges is unavailable, the tile count is reduced; no seam
+    may be synthesized inside a gap and no overlap/expansion fallback exists.
     """
 
     width, height = int(width), int(height)
@@ -289,16 +361,25 @@ def generate_detector_scan_plan(
         raise ValueError("strict detector scan requires context_pixels=0")
     if strict_vertical_partition is not True:
         raise ValueError("detector scan requires strict_vertical_partition=true")
+    if seam_candidates != "detector-edges-only":
+        raise ValueError("detector scan requires seam_candidates=detector-edges-only")
     if not 0 < minimum_core_height_ratio <= 1:
         raise ValueError("minimum_core_height_ratio must be in (0, 1]")
 
-    boxes = _normalized_detector_boxes(detector_boxes, width, height)
-    detector_margin = min(
-        detector_margin_max,
-        max(detector_margin_min, round(detector_margin_ratio * height)),
+    guarded_geometry = build_guarded_detector_geometry(
+        width,
+        height,
+        detector_boxes,
+        target_guard_ratio=target_guard_ratio,
+        target_guard_min_pixels=target_guard_min_pixels,
+        target_guard_max_pixels=target_guard_max_pixels,
     )
-    occupied = _occupied_y_intervals(boxes, height=height, margin=detector_margin)
-    gaps = _free_y_gaps(occupied, height=height)
+    boxes = guarded_geometry["raw_boxes"]
+    guarded_boxes = guarded_geometry["guarded_boxes"]
+    protected_bands = guarded_geometry["protected_bands"]
+    edge_candidates = guarded_geometry["edge_candidates"]
+    edge_provenance = guarded_geometry["edge_provenance"]
+    guard_px = int(guarded_geometry["guard_px"])
     normalized_task = str(task or "").removeprefix("ui_")
     fallback_reason: str | None = None
     desired_tile_count = min(max_tiles, max(1, math.ceil(height / target_tile_height)))
@@ -307,13 +388,17 @@ def generate_detector_scan_plan(
         desired_tile_count = 1
     elif height <= target_tile_height or max_tiles == 1:
         fallback_reason = "short_page_single_scan"
+    elif not boxes:
+        fallback_reason = "detector_empty_full_image"
 
     if fallback_reason is not None:
         tiles = [[0, 0, width, height]]
         seams: list[int] = []
         seam_sources: list[str] = []
         cores = [[0, height]]
-        tile_count_reduction_reason: str | None = None
+        tile_count_reduction_reason: str | None = (
+            fallback_reason if desired_tile_count > 1 else None
+        )
     else:
         seams = []
         actual_tile_count = 1
@@ -323,27 +408,27 @@ def generate_detector_scan_plan(
                 max(32, round(target_core * minimum_core_height_ratio)),
                 max(1, height // candidate_count),
             )
-            candidate_seams = _choose_safe_horizontal_seams(
+            candidate_seams = _choose_detector_edge_seams(
                 height=height,
                 count=candidate_count,
-                gaps=gaps,
+                candidate_edges=edge_candidates,
                 minimum_core_height=minimum_core_height,
             )
             if candidate_seams is not None:
                 seams = candidate_seams
                 actual_tile_count = candidate_count
                 break
-        seam_sources = ["detector_gap"] * len(seams)
+        seam_sources = ["detector_edge"] * len(seams)
         core_edges = [0, *seams, height]
         cores = [[left, right] for left, right in zip(core_edges, core_edges[1:])]
         tiles = [[0, int(y1), width, int(y2)] for y1, y2 in cores]
         tile_count_reduction_reason = (
             None
             if actual_tile_count == desired_tile_count
-            else "insufficient_safe_detector_free_seams"
+            else "insufficient_guarded_detector_edges"
         )
         if actual_tile_count == 1:
-            fallback_reason = "dense_page_no_safe_seam"
+            fallback_reason = "dense_page_no_valid_detector_edge_seam"
 
     assert_lossless_coverage(width, height, tiles)
     cuts = detector_boundary_cut_count(tiles, boxes)
@@ -379,9 +464,35 @@ def generate_detector_scan_plan(
         == 1
         for box in boxes
     )
+    guarded_unique_containment_count = sum(
+        sum(tile[1] <= box[0] and tile[3] >= box[1] for tile in tiles) == 1
+        for box in guarded_boxes
+    )
+    guarded_crossed = sum(
+        any(box[0] < seam < box[1] for seam in seams) for box in guarded_boxes
+    )
     seam_crossed = sum(
         any(box[1] < seam < box[3] for seam in seams) for box in boxes
     )
+    non_edge_seam_count = sum(seam not in edge_candidates for seam in seams)
+    nearest_edge_distances = [
+        min((abs(seam - edge) for edge in edge_candidates), default=height)
+        for seam in seams
+    ]
+    seam_edge_provenance = []
+    for seam_index, seam in enumerate(seams, 1):
+        provenance = dict(edge_provenance[seam])
+        provenance["distance_to_ideal_partition"] = round(
+            abs(seam - seam_index * height / len(tiles))
+        )
+        seam_edge_provenance.append(provenance)
+    if non_edge_seam_count or guarded_crossed:
+        raise AssertionError(
+            "edge-only seam invariant failed: "
+            f"non_edge={non_edge_seam_count}, guarded_crossed={guarded_crossed}"
+        )
+    if guarded_unique_containment_count != len(guarded_boxes):
+        raise AssertionError("not every guarded detector bbox belongs to exactly one crop")
     core_heights = [right - left for left, right in cores]
     partition = strict_vertical_partition_metrics(width, height, tiles)
     if not partition["strict_vertical_partition"]:
@@ -394,16 +505,26 @@ def generate_detector_scan_plan(
         "tiles": tiles,
         "tile_count": len(tiles),
         "detector_box_count": len(boxes),
-        "connected_band_count": len(occupied),
-        "protected_vertical_bands": [list(band) for band in occupied],
-        "detector_margin_pixels": detector_margin,
+        "connected_band_count": len(protected_bands),
+        "protected_vertical_bands": [band["bbox"] for band in protected_bands],
+        "detector_margin_pixels": guard_px,
+        "target_guard_ratio": float(target_guard_ratio),
+        "target_guard_pixels_min": int(target_guard_min_pixels),
+        "target_guard_pixels_max": int(target_guard_max_pixels),
+        "target_guard_pixels_effective": guard_px,
+        "guarded_protected_vertical_bands": protected_bands,
+        "detector_edge_candidates": edge_candidates,
+        "detector_edge_candidate_count": len(edge_candidates),
         "horizontal_seams": seams,
         "horizontal_seam_count": len(seams),
-        "safe_seam_count": sum(
-            max(1, start) <= min(height - 1, end) for start, end in gaps
-        ),
+        "safe_seam_count": len(edge_candidates),
         "seam_source": seam_sources,
         "seam_source_counts": dict(sorted(Counter(seam_sources).items())),
+        "seam_edge_provenance": seam_edge_provenance,
+        "seam_nearest_guarded_edge_distance_pixels": nearest_edge_distances,
+        "non_edge_seam_count": non_edge_seam_count,
+        "gap_interior_seam_count": non_edge_seam_count,
+        "every_seam_is_guarded_detector_edge": non_edge_seam_count == 0,
         "core_spans": cores,
         "minimum_core_height": min(core_heights),
         "maximum_core_height": max(core_heights),
@@ -423,8 +544,19 @@ def generate_detector_scan_plan(
         "detector_bbox_contained_count": contained_count,
         "detector_bbox_containment_rate": contained_count / len(boxes) if boxes else 1.0,
         "detector_bbox_unique_containment_count": unique_containment_count,
+        "detector_bbox_unique_containment_rate": (
+            unique_containment_count / len(boxes) if boxes else 1.0
+        ),
         "uncontained_detector_bbox_count": len(not_contained),
         "seam_crossed_detector_bbox_count": seam_crossed,
+        "guarded_bbox_count": len(guarded_boxes),
+        "guarded_bbox_unique_containment_count": guarded_unique_containment_count,
+        "guarded_bbox_unique_containment_rate": (
+            guarded_unique_containment_count / len(guarded_boxes)
+            if guarded_boxes
+            else 1.0
+        ),
+        "guarded_bbox_crossed_by_seam_count": guarded_crossed,
         "full_tile_in_multi_plan_count": full_in_multi,
         "duplicate_tile_count": duplicate,
         "nested_tile_count": nested,
