@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import posixpath
 from pathlib import Path
@@ -38,6 +39,72 @@ TASK_ISSUE_NAMES = {
 # content-unique images.  Keep this separate from the 17,281-image training
 # pool used by crop_audit_v4_gt_repair.
 DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES = 1555
+
+
+def _finite_gate_probability(value: Any) -> float | None:
+    """Return a finite Gate probability without accepting booleans as numbers."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    return numeric if math.isfinite(numeric) else None
+
+
+def aggregate_tiled_gate_diagnostics(
+    tile_gates: list[dict[str, Any]],
+    *,
+    crop_mode: str,
+) -> dict[str, Any]:
+    """Aggregate per-tile image-Gate diagnostics into one source-image record.
+
+    Detector-scan inference evaluates several non-overlapping views for one
+    source image.  The source image is positive when any view is positive, so
+    its image-level Gate score is the maximum finite per-view ``p_defect``.
+    Keeping the original tile diagnostics makes the aggregation auditable and
+    lets historical runs created before the top-level score was added recover
+    without repeating model inference.
+    """
+
+    scores = [
+        score
+        for row in tile_gates
+        if (score := _finite_gate_probability(row.get("p_defect"))) is not None
+    ]
+    available_count = sum(bool(row.get("available")) for row in tile_gates)
+    return {
+        "available": available_count > 0,
+        "available_tile_count": available_count,
+        "p_defect": max(scores) if scores else None,
+        "p_defect_tile_count": len(scores),
+        "p_defect_aggregation": "max_tile",
+        "would_pass": any(bool(row.get("would_pass")) for row in tile_gates),
+        "gate_filtered": bool(tile_gates)
+        and all(bool(row.get("gate_filtered")) for row in tile_gates),
+        "mode": crop_mode,
+        "tile_count": len(tile_gates),
+        "tile_union_full_image": True,
+        "gt_repair_used": False,
+        "tile_gates": tile_gates,
+    }
+
+
+def image_gate_probability(record: Mapping[str, Any]) -> tuple[float | None, str]:
+    """Read an image Gate score, recovering legacy tiled sidecars when needed."""
+
+    top_level = _finite_gate_probability(record.get("p_defect"))
+    if top_level is not None:
+        return top_level, "top_level"
+    tile_gates = record.get("tile_gates")
+    if isinstance(tile_gates, list):
+        scores = [
+            score
+            for row in tile_gates
+            if isinstance(row, dict)
+            and (score := _finite_gate_probability(row.get("p_defect"))) is not None
+        ]
+        if scores:
+            return max(scores), "legacy_tile_gates_max"
+    return None, "missing"
 
 
 def parse_bool(value: Any, *, name: str = "value") -> bool:

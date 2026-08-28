@@ -88,6 +88,7 @@ from PIL import Image, ImageDraw, ImageFont
 from transformers import AutoConfig, AutoModel, AutoProcessor, AutoTokenizer
 
 from eaglevl.model.locany.relation_modules import UI_RELATION_PROMPT_SPECS
+from locany_ui5_common import aggregate_tiled_gate_diagnostics
 from ui5_lossless_tiling import (
     assert_lossless_coverage,
     generate_lossless_tiles,
@@ -1762,16 +1763,10 @@ def predict_with_lossless_tiles(
         warnings=warnings,
     )
     tile_gates = [row["gate"] for row in tile_records]
-    gate_diagnostics = {
-        "available": any(bool(row.get("available")) for row in tile_gates),
-        "would_pass": any(bool(row.get("would_pass")) for row in tile_gates),
-        "gate_filtered": all(bool(row.get("gate_filtered")) for row in tile_gates),
-        "mode": crop_mode,
-        "tile_count": len(tiles),
-        "tile_union_full_image": True,
-        "gt_repair_used": False,
-        "tile_gates": tile_gates,
-    }
+    gate_diagnostics = aggregate_tiled_gate_diagnostics(
+        tile_gates,
+        crop_mode=crop_mode,
+    )
     return (
         json.dumps(tile_records, ensure_ascii=False),
         parsed,

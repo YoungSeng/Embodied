@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from locany_ui5_common import TASK_ISSUE_NAMES, TASKS
+from locany_ui5_common import TASK_ISSUE_NAMES, TASKS, image_gate_probability
 from eaglevl.train.ui5_excel_logger import (
     UI5ExcelLogger,
     build_eval_rows,
@@ -212,12 +212,20 @@ def collect_gate_metrics(
         negatives: list[float] = []
         sweep_samples: list[dict[str, Any]] = []
         gate_tp = gate_fp = gate_fn = 0
+        p_defect_sources: dict[str, int] = {}
+        missing_p_defect = 0
+        missing_label = 0
         labels = ground_truth.get(task, {})
         for record in records:
-            p_defect = record.get("p_defect")
+            p_defect, p_defect_source = image_gate_probability(record)
+            p_defect_sources[p_defect_source] = (
+                p_defect_sources.get(p_defect_source, 0) + 1
+            )
             image_path = str(record.get("image_path", ""))
             label = labels.get(image_path, labels.get(Path(image_path).name))
-            if isinstance(p_defect, (int, float)) and label is not None:
+            missing_p_defect += int(p_defect is None)
+            missing_label += int(label is None)
+            if p_defect is not None and label is not None:
                 (positives if label else negatives).append(float(p_defect))
                 predicted = bool(record.get("would_pass", record.get("gate_passed")))
                 gate_tp += int(label and predicted)
@@ -240,7 +248,9 @@ def collect_gate_metrics(
         if records and len(sweep_samples) != len(records):
             raise RuntimeError(
                 f"Gate sidecars are incomplete for task={task}: "
-                f"labeled_p_defect={len(sweep_samples)}, records={len(records)}"
+                f"labeled_p_defect={len(sweep_samples)}, records={len(records)}, "
+                f"missing_p_defect={missing_p_defect}, missing_label={missing_label}, "
+                f"p_defect_sources={p_defect_sources}"
             )
         result[task] = {
             "samples": len(records),
@@ -266,6 +276,10 @@ def collect_gate_metrics(
             "gate_precision": gate_precision,
             "gate_recall": gate_recall,
             "gate_f1": gate_f1,
+            "p_defect_sources": p_defect_sources,
+            "legacy_tile_gate_recovered": p_defect_sources.get(
+                "legacy_tile_gates_max", 0
+            ),
             "_sweep_samples": sweep_samples,
         }
     return result

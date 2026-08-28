@@ -660,6 +660,87 @@ class CheckpointTests(unittest.TestCase):
 
 
 class HistoryTests(unittest.TestCase):
+    def test_tiled_gate_aggregation_keeps_image_probability(self) -> None:
+        diagnostics = locany_ui5_common.aggregate_tiled_gate_diagnostics(
+            [
+                {
+                    "available": True,
+                    "p_defect": 0.27,
+                    "would_pass": False,
+                    "gate_filtered": True,
+                },
+                {
+                    "available": True,
+                    "p_defect": 0.81,
+                    "would_pass": True,
+                    "gate_filtered": False,
+                },
+            ],
+            crop_mode="detector_scan",
+        )
+        self.assertEqual(diagnostics["p_defect"], 0.81)
+        self.assertEqual(diagnostics["p_defect_aggregation"], "max_tile")
+        self.assertEqual(diagnostics["p_defect_tile_count"], 2)
+        self.assertTrue(diagnostics["would_pass"])
+        self.assertFalse(diagnostics["gate_filtered"])
+
+    def test_collect_gate_metrics_recovers_legacy_detector_scan_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            gt_dir = root / "gt"
+            scorer_root = root / "scorer"
+            prediction_dir = root / "predictions"
+            gt_dir.mkdir()
+            scorer_root.mkdir()
+            image = root / "images" / "same.jpg"
+            source = gt_dir / locany_ui5_common.TASK_JSONL["occlusion"]
+            source.write_text(
+                json.dumps({"images": str(image), "positive": True}) + "\n",
+                encoding="utf-8",
+            )
+            (scorer_root / "qwen3vl_merge_and_score_fixed_5tasks.py").write_text(
+                textwrap.dedent(
+                    """
+                    def get_gt_payload(sample):
+                        return sample.get("positive", False)
+
+                    def extract_bboxes_for_issue(payload, issue):
+                        return [[0, 0, 1, 1]] if payload else []
+                    """
+                ),
+                encoding="utf-8",
+            )
+            gate_dir = prediction_dir / "occlusion" / "gate"
+            gate_dir.mkdir(parents=True)
+            (gate_dir / "same.json").write_text(
+                json.dumps(
+                    {
+                        "image_path": str(image),
+                        "prediction_status": "defect",
+                        "p_defect": None,
+                        "would_pass": True,
+                        "tile_gates": [
+                            {"available": True, "p_defect": 0.24},
+                            {"available": True, "p_defect": 0.76},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            metrics = collect_ui5_metrics.collect_gate_metrics(
+                prediction_dir,
+                gt_dir,
+                scorer_root,
+            )
+
+        self.assertEqual(metrics["occlusion"]["samples"], 1)
+        self.assertEqual(metrics["occlusion"]["p_defect_pos"], 0.76)
+        self.assertEqual(metrics["occlusion"]["legacy_tile_gate_recovered"], 1)
+        self.assertEqual(
+            metrics["occlusion"]["_sweep_samples"][0]["p_defect"], 0.76
+        )
+
     def test_gate_sweep_zero_is_raw_and_selects_without_regeneration(self) -> None:
         metrics = {
             task: {"_sweep_samples": []}
