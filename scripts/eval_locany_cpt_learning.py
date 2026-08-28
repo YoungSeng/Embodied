@@ -18,6 +18,7 @@ import shutil
 import sys
 import tempfile
 import time
+import traceback
 from collections import Counter, OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -53,7 +54,7 @@ from scripts.inference_ui_defect_locany import LocateAnythingInferencer  # noqa:
 
 
 IMAGE_TOKEN_RE = re.compile(r"<image(?:-\d+)?>")
-EVALUATOR_PROTOCOL_VERSION = 2
+EVALUATOR_PROTOCOL_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -509,16 +510,20 @@ def run_model(
             torch.manual_seed(args.seed + index)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(args.seed + index)
+            phase = "image_load"
             try:
                 with Image.open(example.image) as opened:
                     image = opened.convert("RGB")
                 with torch.inference_mode():
+                    phase = "generation"
                     prediction = inferencer.predict(image=image, question=example.prompt)
+                    phase = "teacher_forced"
                     teacher_forced = (
                         teacher_forced_main_ce(inferencer, image, example)
                         if args.teacher_forced
                         else {}
                     )
+                phase = "scoring"
                 results[example.key] = {
                     "prediction": prediction,
                     "error": None,
@@ -526,7 +531,8 @@ def run_model(
                     **teacher_forced,
                 }
             except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
+                original_traceback = traceback.format_exc()
+                error = f"phase={phase}; {type(exc).__name__}: {exc}"
                 results[example.key] = {
                     "prediction": "",
                     "error": error,
@@ -535,7 +541,12 @@ def run_model(
                     "teacher_forced_main_tokens": 0,
                     "teacher_forced_main_token_ce": None,
                 }
-                print(f"[ERROR] {example.key}: {exc}", file=sys.stderr, flush=True)
+                print(
+                    f"[ERROR] {example.key} phase={phase}: {exc}\n"
+                    f"{original_traceback.rstrip()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 # CUDA OOM exceptions retain traceback frames containing large
                 # tensors. Drop the traceback before emptying the allocator so
                 # a single bad sample cannot poison every following example.
@@ -549,7 +560,9 @@ def run_model(
                 if getattr(args, "fail_fast_inference_errors", False):
                     raise RuntimeError(
                         "evaluation stopped on the first inference error: "
-                        f"example={example.key}; {error}"
+                        f"example={example.key}; {error}\n"
+                        "original traceback:\n"
+                        f"{original_traceback.rstrip()}"
                     ) from None
     finally:
         del inferencer

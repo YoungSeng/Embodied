@@ -81,6 +81,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MethodType
 from typing import Any, Sequence
 
 import torch
@@ -1061,6 +1062,21 @@ class LocateAnythingInferencer:
             self.model,
             args.vision_attn_implementation,
         )
+        # Hugging Face snapshots and intermediate Trainer checkpoints can carry
+        # an older copy of the custom ``generate`` method.  In particular that
+        # implementation assumes the pre-Transformers-4.57 tuple KV-cache and
+        # crashes during slow AR evaluation when a modern Cache object is
+        # returned.  Keep weights/config loading remote-code compatible, then
+        # bind the repository's tested inference implementation to both Base
+        # and checkpoint models so they use exactly the same decoding code.
+        from eaglevl.utils.locany.modeling_locateanything import (
+            LocateAnythingForConditionalGeneration as RepositoryInferenceModel,
+        )
+
+        self.model.generate = MethodType(
+            RepositoryInferenceModel.generate,
+            self.model,
+        )
         self.model = self.model.to(self.device).eval()
         backend_report = attention_backend_report(self.model)
         print(f"attention top config    : {backend_report['top_config']}")
@@ -1069,6 +1085,10 @@ class LocateAnythingInferencer:
         print(f"vision attention config : {backend_report['vision_config']}")
         print(f"vision layer backend    : {backend_report['vision_first_layer']}")
         print(f"vision blocks configured: {changed_vision_blocks}")
+        print(
+            "generation implementation: "
+            "eaglevl.utils.locany.modeling_locateanything (repository)"
+        )
         requested_backend = args.attn_implementation
         if (
             requested_backend != "auto"

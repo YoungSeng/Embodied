@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import sys
 import types
 import unittest
@@ -180,6 +181,12 @@ class FakeInferencer:
         return "正确"
 
 
+class FailingInferencer(FakeInferencer):
+    def predict(self, *, image, question):
+        del image, question
+        raise TypeError("generation sentinel")
+
+
 class CPTEvaluatorEndToEndTest(unittest.TestCase):
     @staticmethod
     def example(evaluator):
@@ -272,6 +279,40 @@ class CPTEvaluatorEndToEndTest(unittest.TestCase):
         self.assertAlmostEqual(result["teacher_forced_main_token_ce"], 2.5)
         self.assertEqual(result["metrics"]["vqa_accuracy"], 1.0)
         self.assertEqual(len(FakeInferencer.instances[0].model.calls), 1)
+
+    def test_run_model_fail_fast_preserves_phase_and_original_traceback(self):
+        evaluator = load_evaluator_module()
+        args = SimpleNamespace(
+            processor_path=None,
+            base_model="/models/base",
+            device="cuda:0",
+            dtype="bf16",
+            attn_implementation="sdpa",
+            vision_attn_implementation="flash_attention_2",
+            max_new_tokens=32,
+            allow_download=False,
+            teacher_forced=True,
+            fail_fast_inference_errors=True,
+            seed=20260826,
+        )
+        stderr = io.StringIO()
+        with mock.patch.object(
+            evaluator, "LocateAnythingInferencer", FailingInferencer
+        ), mock.patch.object(
+            evaluator.Image, "open", return_value=FakeOpenedImage()
+        ), mock.patch.object(evaluator.sys, "stderr", stderr):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"(?s)phase=generation; TypeError: generation sentinel.*original traceback",
+            ):
+                evaluator.run_model(
+                    "base", "/models/base", [self.example(evaluator)], args
+                )
+
+        diagnostic = stderr.getvalue()
+        self.assertIn("phase=generation", diagnostic)
+        self.assertIn("in predict", diagnostic)
+        self.assertIn("TypeError: generation sentinel", diagnostic)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
@@ -42,6 +43,23 @@ from .relation_modules import (
 )
 
 logger = logging.get_logger(__name__)
+
+
+def _generation_cache_seq_length(past_key_values) -> int:
+    """Return the current KV length for modern Cache or legacy tuple state."""
+    if past_key_values is None:
+        return 0
+    if isinstance(past_key_values, Cache):
+        return int(past_key_values.get_seq_length())
+    if not past_key_values:
+        return 0
+    first_layer = past_key_values[0]
+    if first_layer is None or len(first_layer) < 2:
+        raise RuntimeError(
+            "language model returned an invalid legacy KV cache; "
+            f"first_layer={first_layer!r}"
+        )
+    return int(first_layer[0].size(2))
 
 
 LOCATEANYTHING_START_DOCSTRING = r"""
@@ -565,6 +583,12 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
 
 
         use_mtp = generation_mode in ('fast', 'hybrid')
+        # Slow/teacher-style AR decoding does not need the MTP window cropping
+        # below.  Starting with a Cache object prevents the language model from
+        # converting its result to a legacy tuple, whose representation changed
+        # in recent Transformers releases.
+        if not use_mtp:
+            past_key_values = DynamicCache()
         switch_to_ar_count = 0
         box_anchor_hidden = None
         coordinate_logits = None
@@ -603,7 +627,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             ) # [batch_size, seq_len + 1 +  n_future_tokens - 1]
 
             # Update pe for kvcache
-            start_idx = past_key_values[0][0].size(2) if past_key_values is not None else 0
+            start_idx = _generation_cache_seq_length(past_key_values)
             position_ids = full_position_ids[:, start_idx : generated_with_mask.size(1)].clone()
             position_ids[0, -n_future_tokens:] -= 1
 
@@ -619,17 +643,25 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
 
 
         def _prepare_input_in_ar(generated):
-            start_idx = past_key_values[0][0].size(2) if past_key_values is not None else 0
+            start_idx = _generation_cache_seq_length(past_key_values)
+            # Do not delegate this to the checkpoint's vendored
+            # ``prepare_inputs_for_generation``.  Old LocateAnything snapshots
+            # access Cache.seen_tokens/get_max_length, both removed by the
+            # pinned Transformers 4.57 runtime.  For batch-size-one AR the
+            # correct contract is simply the tokens not covered by the cache.
+            uncached_ids = generated[:, start_idx:]
+            if uncached_ids.shape[1] == 0:
+                uncached_ids = generated[:, -1:]
+                start_idx = generated.size(1) - 1
             position_ids = full_position_ids[:, start_idx : generated.size(1)]
-            prepare_inputs = self.language_model.prepare_inputs_for_generation(
-                generated,
-                past_key_values,
-                None,
-                inputs_embeds=None,
-                use_cache=True,
-                position_ids=position_ids
-            )
-            return prepare_inputs
+            return {
+                "input_ids": uncached_ids,
+                "past_key_values": past_key_values,
+                "attention_mask": None,
+                "inputs_embeds": None,
+                "use_cache": True,
+                "position_ids": position_ids,
+            }
 
 
         def _sample_token_in_mtp(generated, outputs):
@@ -754,10 +786,25 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                             self.language_model.lm_head.weight[coord_start:coord_end],
                         )
 
-            past_key_values = tuple(
-                (kv[0][:, :, :generated.shape[1], :], kv[1][:, :, :generated.shape[1], :])
-                for kv in outputs.past_key_values
-            )
+            if outputs.past_key_values is None:
+                raise RuntimeError(
+                    "language model returned no KV cache although use_cache=True"
+                )
+            if use_mtp:
+                # MTP appends speculative mask positions; discard them before
+                # the next round.  This path deliberately retains the legacy
+                # representation used by the original MTP implementation.
+                past_key_values = tuple(
+                    (
+                        kv[0][:, :, :generated.shape[1], :],
+                        kv[1][:, :, :generated.shape[1], :],
+                    )
+                    for kv in outputs.past_key_values
+                )
+            else:
+                # Preserve DynamicCache during pure AR generation.  Converting
+                # it by iteration is not stable across Transformers versions.
+                past_key_values = outputs.past_key_values
 
             # Step 3: Sample tokens
             if use_mtp:

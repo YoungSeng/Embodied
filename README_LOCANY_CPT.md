@@ -107,6 +107,29 @@ bash shell/run_locany_cpt_eval_merlin.sh a100
 命令中增加 `EVAL_RETRY_FAILED=1`；runner 会显式重试 failed row，Base cache 和指标写入
 均使用与 eval queue 相同的 ByteNAS 兼容锁。
 
+例如 checkpoint-10 已标记为 failed 时，先确认当前目录就是同步了最新代码的 clone
+（若实际使用 `Eagle_LocateUI5_v4/Embodied-CPT`，就进入该目录），再完整执行：
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-CPT
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+RUN_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_models/locany-3b-ui-cpt-v4-v2-a100x4-smoke \
+DATA_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4_split_v2_smoke \
+EVAL_MAX_PENDING=2 \
+EVAL_SAMPLES_PER_TASK=10 \
+EVAL_RETRY_FAILED=1 \
+bash shell/run_locany_cpt_eval_merlin.sh a100
+```
+
+新日志应出现
+`generation implementation: eaglevl.utils.locany.modeling_locateanything (repository)`；
+评测协议 v3 会自动使用新的 Base cache key，不会复用旧版失败缓存。若仍失败，日志会明确
+打印 `phase=generation|teacher_forced` 以及模型内部完整 traceback，不能再只保留顶层
+`NoneType` 文本。
+
 ### 0.4 YG：执行 A800 最终 validator
 
 ```bash
