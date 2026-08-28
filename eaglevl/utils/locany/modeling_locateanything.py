@@ -917,15 +917,21 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 relation_output is not None
                 and gate_mode == "soft"
                 and self.relation_pyramid.soft_gate
+                and iter_round == 1
             ):
-                outputs.logits = apply_soft_gate_logit_prior(
-                    outputs.logits,
+                # Match SFT exactly: image Gate affects one initial box/none
+                # decision, not coordinate/text logits in every generation
+                # round.  Only the last prompt position is sampled here.
+                decision_logits = apply_soft_gate_logit_prior(
+                    outputs.logits[:, -1:, :],
                     relation_output.p_defect,
                     defect_type,
                     self.relation_pyramid.soft_gate_beta,
                     int(self.config.box_start_token_id),
                     int(self.config.none_token_id),
                 )
+                outputs.logits = outputs.logits.clone()
+                outputs.logits[:, -1:, :] = decision_logits
 
             if outputs.past_key_values is None:
                 raise RuntimeError(

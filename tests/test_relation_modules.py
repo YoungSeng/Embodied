@@ -117,7 +117,9 @@ class RelationModulesTest(unittest.TestCase):
         pbd = RelationToPBD(256, 2048)
         added = sum(parameter.numel() for parameter in pyramid.parameters())
         added += sum(parameter.numel() for parameter in pbd.parameters())
-        self.assertEqual(added, 2_624_790)
+        # Includes the five image-level Gate heads introduced when image
+        # defectness was separated from slot objectness.
+        self.assertEqual(added, 2_709_915)
         self.assertLess(added, 0.05 * 3_000_000_000)
 
     def test_family_prior_survives_construction_and_task_router_can_separate_tasks(self):
@@ -143,6 +145,17 @@ class RelationModulesTest(unittest.TestCase):
             image_flags=torch.tensor([1, 1]),
         )
         self.assertFalse(torch.allclose(output.scale_weights[0], output.scale_weights[1]))
+
+    def test_family_prior_audit_accepts_only_the_bfloat16_representation(self):
+        module = RelationConditionedDetailPyramid(
+            8, 8, 2, 4, task_scale_router=True
+        ).to(dtype=torch.bfloat16)
+        module.reset_parameters()
+        module.assert_family_scale_prior()
+        with torch.no_grad():
+            module.scale_logits[0, 0].add_(0.25)
+        with self.assertRaisesRegex(RuntimeError, "overwritten"):
+            module.assert_family_scale_prior()
 
     def test_hungarian_loss_is_gt_permutation_invariant_and_slots_are_unique(self):
         torch.manual_seed(91)

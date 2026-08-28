@@ -296,7 +296,7 @@ class UIRelationPipelineTest(unittest.TestCase):
         )
         delta = (output.hidden_states - hidden).norm(dim=-1).reshape(-1)
         self.assertEqual(output.active_positions.tolist(), [1])
-        self.assertGreater(float(delta[1]), 0.0)
+        self.assertGreater(float(delta[1].detach()), 0.0)
         torch.testing.assert_close(
             torch.cat((delta[:1], delta[2:])), torch.zeros(6)
         )
@@ -323,7 +323,7 @@ class UIRelationPipelineTest(unittest.TestCase):
         delta = (output.hidden_states - hidden).norm(dim=-1).reshape(-1)
         self.assertEqual(output.active_positions.tolist(), [1])
         self.assertEqual(output.active_samples.tolist(), [0])
-        self.assertGreater(float(delta[1]), 0.0)
+        self.assertGreater(float(delta[1].detach()), 0.0)
         torch.testing.assert_close(delta[2:], torch.zeros(6))
 
     def test_training_inference_pbd_logits_are_numerically_equal(self):

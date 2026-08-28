@@ -105,6 +105,11 @@ set localizer、`m3` 加动态 slot PBD 和 coordinate bridge、`m4` 加 soft Ga
 `m5` 再给 overlap 开 rank-8 adapter。每个阶段必须使用新的 `--run-name`，不能从
 结构不同的旧 checkpoint resume。
 
+Gate 模块并不是到 M4 才存在：M1–M3 仍训练 image Gate 和 slot Gate，slot Gate 也
+参与 slot 路由；只是 image-level `p_defect` 在 `observe` 模式不改写最终生成。M4
+新增的是“把 image Gate 作为一次初始 `<box>/none` soft prior 注入生成”，用于隔离
+定位架构收益和 Gate 输出收益。M5 仅是 overlap rank-8 adapter 消融，不是默认主模型。
+
 M4/M5 的周期评测会先对同一 checkpoint 跑一遍 `observe` 作为真正 raw 对照，再跑
 soft Gate 结果；因此推理耗时约为 M1–M3 的两倍。Excel 的 `raw_*` 与 `soft_*` 来自
 这两次独立生成，离线 threshold sweep 只标记为 diagnostic upper bound。

@@ -827,24 +827,38 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                     flat_gate_labels = labels[..., 1:].contiguous().view(-1)
                     box_id = int(self.config.box_start_token_id)
                     none_id = int(self.config.none_token_id)
-                    gate_positions = (flat_gate_labels == box_id) | (flat_gate_labels == none_id)
+                    candidate_gate_positions = (
+                        (flat_gate_labels == box_id) | (flat_gate_labels == none_id)
+                    )
+                    lengths = ssl_for_fusion.reshape(-1).long()
+                    sample_ids = torch.repeat_interleave(
+                        torch.arange(lengths.numel(), device=lengths.device), lengths
+                    )
+                    shifted_sample_ids = sample_ids[1:]
+                    if shifted_sample_ids.numel() > flat_gate_labels.numel():
+                        shifted_sample_ids = shifted_sample_ids[: flat_gate_labels.numel()]
+                    elif shifted_sample_ids.numel() < flat_gate_labels.numel():
+                        shifted_sample_ids = F.pad(
+                            shifted_sample_ids,
+                            (0, flat_gate_labels.numel() - shifted_sample_ids.numel()),
+                            value=int(lengths.numel() - 1),
+                        )
+                    # Image defectness is one decision per packed sample.  Bias
+                    # only its first <box>/none target; applying it to every
+                    # later box anchor would train a box-count prior while
+                    # generation uses an image-level prior.
+                    gate_positions = torch.zeros_like(candidate_gate_positions)
+                    for sample_index in range(lengths.numel()):
+                        candidates = (
+                            candidate_gate_positions
+                            & (shifted_sample_ids == sample_index)
+                        ).nonzero(as_tuple=False).flatten()
+                        if candidates.numel() > 0:
+                            gate_positions[candidates[0]] = True
                     if bool(gate_positions.any()):
                         base_gate_logits = F.linear(
                             flat_hidden_for_gate[gate_positions], lm_head_weight
                         ).float()
-                        lengths = ssl_for_fusion.reshape(-1).long()
-                        sample_ids = torch.repeat_interleave(
-                            torch.arange(lengths.numel(), device=lengths.device), lengths
-                        )
-                        shifted_sample_ids = sample_ids[1:]
-                        if shifted_sample_ids.numel() > flat_gate_labels.numel():
-                            shifted_sample_ids = shifted_sample_ids[: flat_gate_labels.numel()]
-                        elif shifted_sample_ids.numel() < flat_gate_labels.numel():
-                            shifted_sample_ids = F.pad(
-                                shifted_sample_ids,
-                                (0, flat_gate_labels.numel() - shifted_sample_ids.numel()),
-                                value=int(lengths.numel() - 1),
-                            )
                         selected_samples = shifted_sample_ids[gate_positions]
                         selected_tasks = defect_type[selected_samples].long().clamp(
                             0, self.relation_pyramid.soft_gate_beta.numel() - 1

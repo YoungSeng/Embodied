@@ -408,7 +408,18 @@ class RelationConditionedDetailPyramid(nn.Module):
 
     def assert_family_scale_prior(self, atol: float = 1.0e-6) -> None:
         actual = self.scale_logits.detach().float().softmax(dim=-1)
-        expected = self.family_scale_prior.detach().float()
+        # ``from_pretrained(..., torch_dtype=bfloat16)`` casts the learnable
+        # logits before the optional UI branch is initialized.  Copying the
+        # FP32 log-prior into that parameter therefore produces the *BF16
+        # representation* of the prior, not bitwise FP32 probabilities.  Build
+        # the expected value through the same dtype round-trip so this remains
+        # a real overwrite check instead of rejecting normal quantization.
+        expected = (
+            self.family_scale_prior.detach().float().log()
+            .to(dtype=self.scale_logits.dtype)
+            .float()
+            .softmax(dim=-1)
+        )
         if not torch.allclose(actual, expected, atol=atol, rtol=0.0):
             raise RuntimeError(
                 "TC-MSED family scale prior was overwritten during initialization: "
@@ -1674,7 +1685,14 @@ class RelationToPBD(nn.Module):
                         seen_route_weights[group] = soft_weights
                         seen_selected_slots[group] = chosen
                         soft_anchor_weights.append(soft_weights)
-                        final_slot_usage[sample] += selected
+                        # ``final_slot_usage[sample]`` participates in the
+                        # route_logits graph for this and previous anchors.
+                        # Mutating that storage in place invalidates autograd's
+                        # saved version counter.  Carry coverage state forward
+                        # functionally instead.
+                        updated_usage = final_slot_usage.clone()
+                        updated_usage[sample] = final_slot_usage[sample] + selected
+                        final_slot_usage = updated_usage
                     route_weights = seen_route_weights[group]
                     all_weights[active_index] = route_weights
                     selected_index = seen_selected_slots[group]
