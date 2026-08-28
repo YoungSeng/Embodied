@@ -51,7 +51,19 @@ def parse_args() -> argparse.Namespace:
         choices=("build", "readonly"),
         default="readonly",
     )
-    parser.add_argument("--eval-scan-name", default="horizontal_scan_v2")
+    parser.add_argument(
+        "--eval-scan-name", default="horizontal_scan_v3_no_overlap"
+    )
+    parser.add_argument(
+        "--require-cache-scope",
+        choices=("preview", "full_test"),
+        default="full_test",
+    )
+    parser.add_argument(
+        "--require-strict-nonoverlap",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--eval-expected-unique-images", type=int, default=17281)
     parser.add_argument("--eval-text-python", default=None)
     parser.add_argument("--eval-icon-python", default=None)
@@ -230,6 +242,8 @@ def main() -> int:
         ),
         "detector_cache_mode": args.eval_detector_cache_mode,
         "eval_scan_name": args.eval_scan_name,
+        "required_cache_scope": args.require_cache_scope,
+        "require_strict_nonoverlap": args.require_strict_nonoverlap,
         "checkpoint": str(args.checkpoint),
         "prediction_dir": str(prediction_dir),
         "evaluation_run_dir": str(evaluation_run_dir),
@@ -278,7 +292,11 @@ def main() -> int:
                     "--scan-name", args.eval_scan_name,
                     "--scan-max-crops", str(args.tile_max_count),
                     "--scan-target-height", str(args.scan_target_height),
-                    "--scan-overlap-ratio", str(args.tile_overlap_ratio),
+                    "--scan-context-pixels", "0",
+                    "--strict-vertical-partition",
+                    "--cache-scope", args.require_cache_scope,
+                    "--expected-full-test-unique-images",
+                    str(args.eval_expected_unique_images),
                     "--visualization-samples", str(args.scan_visualization_samples),
                     "--resume",
                 ]
@@ -305,13 +323,17 @@ def main() -> int:
                     expected_unique_images=args.eval_expected_unique_images,
                     require_ready=True,
                     input_dir=args.input_dir,
+                    required_cache_scope=args.require_cache_scope,
+                    require_strict_nonoverlap=args.require_strict_nonoverlap,
                 )
                 detector_crop_manifest_digest = hashlib.sha256(
                     detector_crop_manifest.read_bytes()
                 ).hexdigest()
                 print(
                     "detector cache: readonly validated | "
-                    f"scan={args.eval_scan_name} | images={marker['dataset']['content_unique_images']} | "
+                    f"scan={args.eval_scan_name} | scope={marker['cache_scope']} | "
+                    f"strict_nonoverlap={marker['strict_vertical_partition']} | "
+                    f"images={marker['dataset']['content_unique_images']} | "
                     f"manifest={detector_crop_manifest}",
                     flush=True,
                 )

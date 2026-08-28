@@ -23,7 +23,7 @@ from ui5_eval_detector_cache import validate_eval_detector_cache  # noqa: E402
 from ui5_lossless_tiling import generate_detector_scan_plan  # noqa: E402
 
 
-class HorizontalSeamV5RegressionTest(unittest.TestCase):
+class HorizontalSeamV6RegressionTest(unittest.TestCase):
     def assert_hard_gates(self, plan: dict) -> None:
         self.assertEqual(plan["lossless_pixel_coverage_ratio"], 1.0)
         self.assertEqual(plan["detector_bbox_containment_rate"], 1.0)
@@ -31,16 +31,30 @@ class HorizontalSeamV5RegressionTest(unittest.TestCase):
         self.assertEqual(plan["full_tile_in_multi_plan_count"], 0)
         self.assertEqual(plan["duplicate_tile_count"], 0)
         self.assertEqual(plan["nested_tile_count"], 0)
+        self.assertTrue(plan["strict_vertical_partition"])
+        self.assertEqual(plan["adjacent_overlap_pixels_total"], 0)
+        self.assertEqual(plan["adjacent_gap_pixels_total"], 0)
+        self.assertEqual(plan["duplicate_pixel_area"], 0)
+        self.assertEqual(plan["processed_pixel_ratio"], 1.0)
+        self.assertEqual(plan["seam_crossed_detector_bbox_count"], 0)
+        self.assertEqual(plan["detector_boundary_cut_count"], 0)
+        self.assertEqual(plan["balanced_fallback_seam_count"], 0)
+        self.assertEqual(
+            plan["detector_bbox_unique_containment_count"],
+            plan["detector_box_count"],
+        )
+        self.assertTrue(
+            all(left[3] == right[1] for left, right in zip(plan["tiles"], plan["tiles"][1:]))
+        )
 
-    def test_dense_y_chain_does_not_trigger_full_image_fallback(self) -> None:
-        boxes = [[20 + index % 3 * 250, index * 75, 160 + index % 3 * 250, index * 75 + 115] for index in range(39)]
+    def test_dense_y_chain_reduces_to_full_image_instead_of_cutting(self) -> None:
+        boxes = [[20, 0, 160, 3000]]
         plan = generate_detector_scan_plan(1000, 3000, boxes)
         self.assert_hard_gates(plan)
-        self.assertGreater(plan["tile_count"], 1)
-        self.assertNotIn([0, 0, 1000, 3000], plan["tiles"])
-        self.assertIn("balanced_fallback", plan["seam_source"])
+        self.assertEqual(plan["tile_count"], 1)
+        self.assertEqual(plan["tiles"], [[0, 0, 1000, 3000]])
 
-    def test_wide_gap_is_preferred_and_no_gap_uses_balanced_overlap(self) -> None:
+    def test_wide_gap_is_preferred_and_no_gap_reduces_count(self) -> None:
         gap_plan = generate_detector_scan_plan(
             800, 2000, [[0, 100, 200, 800], [0, 1200, 200, 1900]], target_tile_height=1000
         )
@@ -49,14 +63,11 @@ class HorizontalSeamV5RegressionTest(unittest.TestCase):
         dense_plan = generate_detector_scan_plan(
             800,
             3000,
-            [
-                [20 + index % 2 * 350, index * 100, 300 + index % 2 * 350, index * 100 + 180]
-                for index in range(29)
-            ],
+            [[20, 0, 300, 3000]],
         )
         self.assert_hard_gates(dense_plan)
-        self.assertIn("balanced_fallback", dense_plan["seam_source"])
-        self.assertGreater(dense_plan["seam_crossed_detector_bbox_count"], 0)
+        self.assertEqual(dense_plan["tile_count"], 1)
+        self.assertEqual(dense_plan["seam_source"], [])
 
     def test_old_full_plus_lower_half_shapes_cannot_recur(self) -> None:
         for boxes in (
@@ -68,6 +79,35 @@ class HorizontalSeamV5RegressionTest(unittest.TestCase):
             self.assert_hard_gates(plan)
             self.assertNotIn([0, 0, 1125, 2436], plan["tiles"])
             self.assertEqual(plan["near_full_tile_count"], 0)
+
+    def test_153784_shape_reduces_from_three_parts_to_two_safe_parts(self) -> None:
+        plan = generate_detector_scan_plan(
+            1000, 2160, [[0, 100, 100, 1000], [0, 1160, 100, 2060]]
+        )
+        self.assert_hard_gates(plan)
+        self.assertEqual(plan["desired_tile_count"], 3)
+        self.assertEqual(plan["actual_tile_count"], 2)
+        self.assertTrue(1000 < plan["horizontal_seams"][0] < 1160)
+
+    def test_153790_shape_uses_far_safe_second_seam(self) -> None:
+        plan = generate_detector_scan_plan(
+            1000,
+            2880,
+            [[0, 100, 100, 850], [0, 1050, 100, 2200], [0, 2400, 100, 2800]],
+        )
+        self.assert_hard_gates(plan)
+        self.assertEqual(plan["actual_tile_count"], 3)
+        self.assertTrue(2200 < plan["horizontal_seams"][1] < 2400)
+
+    def test_153781_shape_uses_safe_seam_instead_of_balanced_fallback(self) -> None:
+        plan = generate_detector_scan_plan(
+            1000,
+            2160,
+            [[0, 100, 100, 620], [0, 820, 100, 1120], [0, 1300, 100, 2050]],
+        )
+        self.assert_hard_gates(plan)
+        self.assertEqual(plan["actual_tile_count"], 3)
+        self.assertTrue(1120 < plan["horizontal_seams"][1] < 1300)
 
     def test_random_realistic_boxes_remain_lossless_and_contained(self) -> None:
         rng = random.Random(20260828)
@@ -115,7 +155,9 @@ class DualEnvironmentAndReadonlyCacheTest(unittest.TestCase):
     def test_readonly_cache_missing_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(FileNotFoundError):
-                validate_eval_detector_cache(Path(temporary), scan_name="horizontal_scan_v2")
+                validate_eval_detector_cache(
+                    Path(temporary), scan_name="horizontal_scan_v3_no_overlap"
+                )
 
     def test_readonly_eval_code_guards_detector_build(self) -> None:
         source = (SCRIPTS / "run_ui5_eval.py").read_text(encoding="utf-8")

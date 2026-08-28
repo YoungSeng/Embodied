@@ -63,7 +63,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--eval-detector-cache-mode", choices=("build", "readonly"), default="readonly"
     )
-    parser.add_argument("--eval-scan-name", default="horizontal_scan_v2")
+    parser.add_argument(
+        "--eval-scan-name", default="horizontal_scan_v3_no_overlap"
+    )
+    parser.add_argument(
+        "--require-cache-scope",
+        choices=("preview", "full_test"),
+        default="full_test",
+    )
+    parser.add_argument(
+        "--require-strict-nonoverlap",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--eval-expected-unique-images", type=int, default=17281)
     parser.add_argument("--eval-text-python", default=None)
     parser.add_argument("--eval-icon-python", default=None)
@@ -215,7 +227,15 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "EVAL_DETECTOR_CACHE_MODE": str(
             getattr(args, "eval_detector_cache_mode", "readonly")
         ),
-        "EVAL_SCAN_NAME": str(getattr(args, "eval_scan_name", "horizontal_scan_v2")),
+        "EVAL_SCAN_NAME": str(
+            getattr(args, "eval_scan_name", "horizontal_scan_v3_no_overlap")
+        ),
+        "EVAL_REQUIRE_CACHE_SCOPE": str(
+            getattr(args, "require_cache_scope", "full_test")
+        ),
+        "EVAL_REQUIRE_STRICT_NONOVERLAP": (
+            "1" if getattr(args, "require_strict_nonoverlap", True) else "0"
+        ),
         "EVAL_EXPECTED_UNIQUE_IMAGES": str(
             getattr(args, "eval_expected_unique_images", 17281)
         ),
@@ -371,6 +391,8 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "EVAL_DETECTOR_CACHE",
         "EVAL_DETECTOR_CACHE_MODE",
         "EVAL_SCAN_NAME",
+        "EVAL_REQUIRE_CACHE_SCOPE",
+        "EVAL_REQUIRE_STRICT_NONOVERLAP",
         "EVAL_EXPECTED_UNIQUE_IMAGES",
         "EVAL_TEXT_PYTHON",
         "EVAL_ICON_PYTHON",
@@ -490,6 +512,8 @@ def main() -> int:
         "EVAL_DETECTOR_CACHE",
         "EVAL_DETECTOR_CACHE_MODE",
         "EVAL_SCAN_NAME",
+        "EVAL_REQUIRE_CACHE_SCOPE",
+        "EVAL_REQUIRE_STRICT_NONOVERLAP",
         "EVAL_EXPECTED_UNIQUE_IMAGES",
         "EVAL_TEXT_PYTHON",
         "EVAL_ICON_PYTHON",

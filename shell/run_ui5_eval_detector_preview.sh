@@ -20,12 +20,15 @@ bash shell/run_ui5_eval_detector_preview.sh \
   --icon-python /path/to/LocateAnything/bin/python \
   --max-images-per-task 200 \
   --visualization-samples 60 \
-  --scan-name horizontal_scan_v2 \
+  --scan-name horizontal_scan_v3_no_overlap \
+  --scan-context-pixels 0 \
+  --strict-vertical-partition \
   --resume
 
 原始检测固定保存在 detections/；修改几何时换 --scan-name 并只跑 --stage crop。
-输出重点：horizontal_scan_v2/gallery/index.html、horizontal_scan_v2/summary.json、
-horizontal_scan_v2/statistics.csv、horizontal_scan_v2/preview_crops/。
+输出重点：horizontal_scan_v3_no_overlap/gallery/index.html、
+horizontal_scan_v3_no_overlap/summary.json、horizontal_scan_v3_no_overlap/statistics.csv、
+horizontal_scan_v3_no_overlap/preview_crops/。
 EOF
   exit 2
 fi

@@ -2,10 +2,11 @@
 
 ## 测试集水平 detector scan：先离线缓存，再只读评测
 
-四个区域任务共享同一套 GT-free 水平切图，`ui_content_missing` 单独使用完整原图。水平切图
-先建立连续、互补的 core，再把 seam 吸附到附近 detector-free gap；找不到空隙时保留平衡
-seam，并用有限 overlap 保证每个 text/icon bbox 至少完整进入一张 crop。多 crop plan 禁止
-整图与局部图并存、重复或互相包含。测试 GT、训练侧 crop 和 `manual_gt_repair` 均不参与。
+四个区域任务共享同一套 GT-free 水平切图，`ui_content_missing` 单独使用完整原图。区域切图
+统一采用半开区间 `[y1,y2)`：相邻 crop 必须满足 `left.y2 == right.y1`，面积之和严格等于
+原图面积。seam 只能来自增加少量 detector margin 后的全图安全空隙；安全 seam 不足时减少
+crop 数量，最差保留一张完整原图，绝不穿框、扩张或重叠。测试 GT、训练侧 crop 和
+`manual_gt_repair` 均不参与。
 
 PP-OCRv5 与 icon detector 使用两个固定环境，不要互相安装依赖：
 
@@ -25,14 +26,16 @@ TEXT_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/UI5P
 PYTHON_BIN="${LA_PY}" bash shell/run_ui5_eval_detector_preview.sh \
   --input-dir /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data \
   --parser-root ../ui-region-parser \
-  --output-dir work_dirs/ui5_eval_detector_preview_v2 \
+  --output-dir work_dirs/ui5_eval_detector_preview_v3 \
   --gpus 0,1,2,3 \
   --workers-per-gpu 1 \
   --text-python "${TEXT_PY}" \
   --icon-python "${LA_PY}" \
   --max-images-per-task 200 \
   --visualization-samples 60 \
-  --scan-name horizontal_scan_v2 \
+  --scan-name horizontal_scan_v3_no_overlap \
+  --scan-context-pixels 0 \
+  --strict-vertical-partition \
   --resume
 ```
 
@@ -41,10 +44,11 @@ text 阶段显式使用 `TEXT_PY`，icon 阶段显式使用 `LA_PY`；两个 pre
 启动前完成。OCR 与 icon 不会同时常驻同一 GPU，`--resume` 会跳过已完成 shard。查看：
 
 ```text
-work_dirs/ui5_eval_detector_preview_v2/horizontal_scan_v2/gallery/index.html
-work_dirs/ui5_eval_detector_preview_v2/horizontal_scan_v2/summary.json
-work_dirs/ui5_eval_detector_preview_v2/horizontal_scan_v2/statistics.csv
-work_dirs/ui5_eval_detector_preview_v2/horizontal_scan_v2/preview_crops/
+work_dirs/ui5_eval_detector_preview_v3/horizontal_scan_v3_no_overlap/gallery/index.html
+work_dirs/ui5_eval_detector_preview_v3/horizontal_scan_v3_no_overlap/summary.json
+work_dirs/ui5_eval_detector_preview_v3/horizontal_scan_v3_no_overlap/statistics.csv
+work_dirs/ui5_eval_detector_preview_v3/horizontal_scan_v3_no_overlap/preview_crops/
+work_dirs/ui5_eval_detector_preview_v3/horizontal_scan_v3_no_overlap/v2_v3_coordinate_compare.csv
 ```
 
 如果已有 20 张 raw detections，只换几何 namespace，不重跑 text/icon：
@@ -55,9 +59,12 @@ work_dirs/ui5_eval_detector_preview_v2/horizontal_scan_v2/preview_crops/
   --input-dir /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data \
   --parser-root ../ui-region-parser \
   --output-dir work_dirs/ui5_eval_detector_preview_20260827 \
-  --scan-name horizontal_scan_v2 \
+  --scan-name horizontal_scan_v3_no_overlap \
   --scan-max-crops 10 \
   --scan-target-height 960 \
+  --scan-context-pixels 0 \
+  --strict-vertical-partition \
+  --cache-scope preview \
   --visualization-samples 20 \
   --resume
 ```
@@ -68,14 +75,14 @@ raw 结果始终位于 `detections/{text,icon,merged}/`，不同几何版本写�
 另开终端可实时查看当前阶段、完成数、速度和 ETA：
 
 ```bash
-watch -n 5 'cat work_dirs/ui5_eval_detector_preview_v2/run_status.json'
+watch -n 5 'cat work_dirs/ui5_eval_detector_preview_v3/run_status.json'
 ```
 
 确认 preview 后，必须在训练前完成全量 17,281 张内容唯一图片的离线 cache。训练中的
 step-0/1000/2000 评测不会现场启动 PaddleOCR 或 icon worker：
 
 ```bash
-EVAL_CACHE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v2
+EVAL_CACHE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v3
 
 "${LA_PY}" scripts/prepare_ui5_eval_detector_crops.py \
   --stage all \
@@ -87,24 +94,36 @@ EVAL_CACHE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_L
   --text-python "${TEXT_PY}" \
   --icon-python "${LA_PY}" \
   --icon-model ../ui-region-parser/weights/icon_detect_v3/model.pt \
-  --scan-name horizontal_scan_v2 \
+  --scan-name horizontal_scan_v3_no_overlap \
   --scan-max-crops 10 \
   --scan-target-height 960 \
+  --scan-context-pixels 0 \
+  --strict-vertical-partition \
+  --cache-scope full_test \
   --visualization-samples 60 \
   --resume
 
 "${LA_PY}" scripts/validate_ui5_eval_detector_cache.py \
   --cache-dir "${EVAL_CACHE}" \
-  --scan-name horizontal_scan_v2 \
+  --scan-name horizontal_scan_v3_no_overlap \
+  --cache-scope full_test \
   --expected-unique-images 17281 \
+  --require-strict-nonoverlap \
   --require-ready
 ```
 
 ready marker 最后原子生成并绑定输入 JSONL、内容集合、parser、detector 配置与运行时、shard、
 merged detections、几何配置、scan manifest 和报告 digest。正式评测默认
 `--eval-detector-cache-mode readonly`；缓存缺失或 digest 改变时 fail closed，不回退现场检测或全图。
-主要门禁是像素覆盖率和 detector bbox 完整包含率均为 100%，以及 full-in-multi、duplicate、
-nested 均为 0。`detector_boundary_cut_count` 只保留为诊断项，不再单独代表切图正确。
+schema-v3 硬门禁同时要求：overlap/gap/duplicate pixel 均为 0，tile 面积和、union 面积与原图
+面积严格相等，processed pixel ratio=1，每个 detector bbox 唯一归属一张 crop，seam cross、
+boundary cut、balanced fallback、full-in-multi、duplicate 和 nested 均为 0。schema-v2 marker
+会被拒绝；preview marker 也不能用于正式训练评测。
+
+marker 中的 `cache_scope` 明确区分 `preview` 与 `full_test`。preview 必须记录正数
+`max_images_per_task`；full-test 必须为 0，并绑定显式的 17,281 张预期内容唯一图片。训练/周期
+评测默认要求 `full_test`，所以 20/200 张预览即使几何全部通过也会在 LocateAnything worker
+启动前 fail closed。
 
 全量 validator 通过后，用同一 cache 做只读评测 smoke：
 
@@ -118,7 +137,9 @@ nested 均为 0。`detector_boundary_cut_count` 只保留为诊断项，不再�
   --eval-inference-crop-mode detector_scan \
   --eval-detector-cache "${EVAL_CACHE}" \
   --eval-detector-cache-mode readonly \
-  --eval-scan-name horizontal_scan_v2 \
+  --eval-scan-name horizontal_scan_v3_no_overlap \
+  --require-cache-scope full_test \
+  --require-strict-nonoverlap \
   --eval-max-images-per-task 20 \
   --run-name locany-ui5-detector-scan-readonly-smoke
 ```
@@ -136,7 +157,7 @@ smoke；smoke checkpoint 可恢复后，才提交正式训练。不要一次把�
 cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
 
 UI5_AUDIT_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
-EVAL_CACHE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v2
+EVAL_CACHE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v3
 UI5_CROP_META=${UI5_AUDIT_DIR}/training_recipes/ui_defect_5class_train_full_plus_crop.json
 
 python scripts/validate_ui5_crop_training_ready.py \
@@ -200,7 +221,7 @@ trainer state 和 4 个 dataloader rank state 均完整，才进入正式训练�
 cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
 
 UI5_AUDIT_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
-EVAL_CACHE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v2
+EVAL_CACHE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v3
 
 python scripts/submit_locany_ui5.py \
   --machine a800 \
@@ -217,7 +238,9 @@ python scripts/submit_locany_ui5.py \
   --eval-inference-crop-mode detector_scan \
   --eval-detector-cache "${EVAL_CACHE}" \
   --eval-detector-cache-mode readonly \
-  --eval-scan-name horizontal_scan_v2 \
+  --eval-scan-name horizontal_scan_v3_no_overlap \
+  --require-cache-scope full_test \
+  --require-strict-nonoverlap \
   --max-steps 16000 \
   --save-steps 4000 \
   --run-name locany-ui5-v4-gtcrop-a800x4

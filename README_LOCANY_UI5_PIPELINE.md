@@ -267,22 +267,25 @@ step-0 和周期评测只校验并读取缓存，不再进入 detector pipeline�
 ${EVAL_DETECTOR_CACHE}/
   manifest/
   detections/{text,icon,merged}/
-  horizontal_scan_v2/detector_scan_crops.jsonl
-  horizontal_scan_v2/{summary.json,statistics.csv,eval_detector_cache_ready.json}
-  horizontal_scan_v2/gallery/index.html
+  horizontal_scan_v3_no_overlap/detector_scan_crops.jsonl
+  horizontal_scan_v3_no_overlap/{summary.json,statistics.csv,eval_detector_cache_ready.json}
+  horizontal_scan_v3_no_overlap/gallery/index.html
 ```
 
 离线构建时主进程和 icon worker 使用 LocateAnything Python，text worker 显式使用独立的
 UI5PaddleOCR Python；不要在两个环境之间互装 Torch/Paddle。两个 runtime preflight 均在 GPU
-worker 前执行。几何只读取 text/icon bbox 和图片尺寸：连续 core 精确覆盖整图，seam 优先选择
-附近 detector-free gap；无 gap 时使用 balanced fallback 和小范围 overlap。每个 crop 横向贯穿
-完整宽度，每个 detector bbox 至少被一张 crop 完整包含。多 crop plan 禁止完整原图、重复或
-嵌套 crop。评测/推理禁止读取训练 GT repair；`content_missing` 单独保留完整原图视图。
+worker 前执行。schema-v3 几何只读取 text/icon bbox 和图片尺寸，并采用半开区间 `[y1,y2)`：
+相邻 core 首尾严格相接，既无遗漏也无重复像素行。seam 从全图 detector-free gap 中联合选择；
+安全 seam 不足时减少 crop 数量，最差保留完整原图，不允许 balanced fallback、穿框、context
+扩张或 overlap。每个 crop 横向贯穿完整宽度，每个 detector bbox 唯一完整归属一张 crop。
+评测/推理禁止读取训练 GT repair；`content_missing` 单独保留完整原图视图。
 
 `eval_detector_cache_ready.json` 在输入、detector shard、merged、几何 manifest、summary、CSV 和
 gallery 全部写入并通过门禁后最后原子生成。readonly 会重新校验 dataset/detector/geometry
 digest；缓存缺失、不完整或 digest 不一致时 fail closed，不回退现场 detector 或 full image。
-更改几何时使用新的 `EVAL_SCAN_NAME`，只重跑 CPU crop；raw detector shard 保持不变。
+正式评测还要求 `cache_scope=full_test`、`max_images_per_task=0`、17,281 张内容唯一图片，并拒绝
+schema-v2 或 preview marker。更改几何时使用新的 `EVAL_SCAN_NAME`，只重跑 CPU crop；raw
+detector shard 保持不变。
 
 正式运行前建议先按 [README_UI5_COMMANDS.md](README_UI5_COMMANDS.md) 的单命令预览方式选择
 至少 200 张测试图片，按 sparse/medium/dense 检查 gallery 和统计。完整离线 cache/validator

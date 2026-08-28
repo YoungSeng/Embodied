@@ -359,7 +359,16 @@ def resolve_runtime_config(
             _env_value(env, "EVAL_DETECTOR_CACHE_MODE", "readonly")
         ).lower(),
         "EVAL_SCAN_NAME": str(
-            _env_value(env, "EVAL_SCAN_NAME", "horizontal_scan_v2")
+            _env_value(env, "EVAL_SCAN_NAME", "horizontal_scan_v3_no_overlap")
+        ),
+        "EVAL_REQUIRE_CACHE_SCOPE": str(
+            _env_value(env, "EVAL_REQUIRE_CACHE_SCOPE", "full_test")
+        ).lower(),
+        "EVAL_REQUIRE_STRICT_NONOVERLAP": int(
+            parse_bool(
+                _env_value(env, "EVAL_REQUIRE_STRICT_NONOVERLAP", "1"),
+                name="EVAL_REQUIRE_STRICT_NONOVERLAP",
+            )
         ),
         "EVAL_EXPECTED_UNIQUE_IMAGES": int(
             _env_value(env, "EVAL_EXPECTED_UNIQUE_IMAGES", 17281)
@@ -444,6 +453,8 @@ def resolve_runtime_config(
         raise ValueError("EVAL_DETECTOR_WORKERS_PER_GPU must be 1 or 2")
     if resolved["EVAL_DETECTOR_CACHE_MODE"] not in {"build", "readonly"}:
         raise ValueError("EVAL_DETECTOR_CACHE_MODE must be build or readonly")
+    if resolved["EVAL_REQUIRE_CACHE_SCOPE"] not in {"preview", "full_test"}:
+        raise ValueError("EVAL_REQUIRE_CACHE_SCOPE must be preview or full_test")
     if resolved["EVAL_EXPECTED_UNIQUE_IMAGES"] < 0:
         raise ValueError("EVAL_EXPECTED_UNIQUE_IMAGES cannot be negative")
     if resolved["EVAL_SCAN_TARGET_HEIGHT"] <= 0:

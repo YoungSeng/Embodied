@@ -37,6 +37,7 @@ export EVAL_INFERENCE_CROP_MODE EVAL_TILE_MAX_COUNT EVAL_TILE_TARGET_LONG_SIDE
 export EVAL_TILE_OVERLAP_RATIO EVAL_TILE_NMS_IOU
 export EVAL_PARSER_ROOT EVAL_DETECTOR_CACHE EVAL_TEXT_PYTHON EVAL_ICON_PYTHON
 export EVAL_DETECTOR_CACHE_MODE EVAL_SCAN_NAME EVAL_EXPECTED_UNIQUE_IMAGES
+export EVAL_REQUIRE_CACHE_SCOPE EVAL_REQUIRE_STRICT_NONOVERLAP
 export EVAL_TEXT_MODEL_DIR EVAL_ICON_MODEL EVAL_DETECTOR_WORKERS_PER_GPU
 export EVAL_SCAN_TARGET_HEIGHT EVAL_SCAN_VERTICAL_LINK_RATIO EVAL_SCAN_CONTEXT_RATIO
 export EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO EVAL_SCAN_DENSE_BAND_RATIO
@@ -189,6 +190,8 @@ printf '%-28s: %s\n' \
   "EVAL_DETECTOR_CACHE" "${EVAL_DETECTOR_CACHE}" \
   "EVAL_CACHE_MODE" "${EVAL_DETECTOR_CACHE_MODE}" \
   "EVAL_SCAN_NAME" "${EVAL_SCAN_NAME}" \
+  "EVAL_CACHE_SCOPE" "${EVAL_REQUIRE_CACHE_SCOPE}" \
+  "EVAL_STRICT_NONOVERLAP" "${EVAL_REQUIRE_STRICT_NONOVERLAP}" \
   "EVAL_TEXT_PYTHON" "${EVAL_TEXT_PYTHON:-<pipeline python>}" \
   "EVAL_ICON_PYTHON" "${EVAL_ICON_PYTHON:-<pipeline python>}" \
   "EVAL_ICON_MODEL" "${EVAL_ICON_MODEL}" \
@@ -324,6 +327,7 @@ run_evaluation() {
     --eval-detector-cache "${EVAL_DETECTOR_CACHE}"
     --eval-detector-cache-mode "${EVAL_DETECTOR_CACHE_MODE}"
     --eval-scan-name "${EVAL_SCAN_NAME}"
+    --require-cache-scope "${EVAL_REQUIRE_CACHE_SCOPE}"
     --eval-expected-unique-images "${EVAL_EXPECTED_UNIQUE_IMAGES}"
     --eval-icon-model "${EVAL_ICON_MODEL}"
     --eval-detector-workers-per-gpu "${EVAL_DETECTOR_WORKERS_PER_GPU}"
@@ -338,6 +342,11 @@ run_evaluation() {
     --scan-dense-band-ratio "${EVAL_SCAN_DENSE_BAND_RATIO}"
     --scan-visualization-samples "${EVAL_SCAN_VISUALIZATION_SAMPLES}"
   )
+  if [[ "${EVAL_REQUIRE_STRICT_NONOVERLAP}" == "1" ]]; then
+    command+=(--require-strict-nonoverlap)
+  else
+    command+=(--no-require-strict-nonoverlap)
+  fi
   if [[ -n "${EVAL_TEXT_PYTHON:-}" ]]; then
     command+=(--eval-text-python "${EVAL_TEXT_PYTHON}")
   fi

@@ -2,10 +2,10 @@
 """Prepare GT-free PP-OCR/icon detector crops for UI5 evaluation.
 
 The two GPU detectors run once per unique test image and write resumable shard
-JSONL.  Geometry is CPU-only: it turns the merged detections into full-width,
-overlapping horizontal scan crops whose union covers the complete image and
-whose boundaries never cross a detector box.  No annotation or GT field is
-read by this program.
+JSONL.  Geometry is CPU-only: it turns the merged detections into a strict,
+full-width horizontal partition.  Adjacent crops share a half-open boundary
+but no pixel row, and every boundary is detector-safe.  No annotation or GT
+field is read by this program.
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ from run_ui5_crop_audit import (
     run_detection_stage,
     run_detector_worker,
 )
-from ui5_lossless_tiling import generate_detector_scan_plan
+from ui5_lossless_tiling import generate_detector_scan_plan, strict_vertical_partition_metrics
 from ui5_eval_detector_cache import (
     CACHE_MARKER_SCHEMA_VERSION,
     GEOMETRY_SCHEMA_VERSION,
@@ -51,7 +51,10 @@ from ui5_eval_detector_cache import (
 )
 
 
-FORMAT_VERSION = 2
+# Detector selection/shard identity remains v2 so a geometry-only schema bump
+# never invalidates or rewrites the expensive raw text/icon cache.
+DETECTOR_MANIFEST_FORMAT_VERSION = 2
+SCAN_FORMAT_VERSION = 3
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -84,7 +87,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--enable-mkldnn", action="store_true")
     parser.add_argument("--icon-long-side", type=int, default=1920)
     parser.add_argument("--icon-confidence", type=float, default=0.05)
-    parser.add_argument("--scan-name", default="horizontal_scan_v2")
+    parser.add_argument("--scan-name", default="horizontal_scan_v3_no_overlap")
+    parser.add_argument(
+        "--cache-scope", choices=("auto", "preview", "full_test"), default="auto"
+    )
+    parser.add_argument("--expected-full-test-unique-images", type=int, default=17281)
     parser.add_argument("--scan-max-crops", type=int, default=10)
     parser.add_argument("--scan-target-height", type=int, default=960)
     parser.add_argument("--scan-overlap-ratio", type=float, default=0.12)
@@ -94,7 +101,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--scan-dense-band-ratio", type=float, default=0.80)
     parser.add_argument("--scan-detector-margin-ratio", type=float, default=0.003)
     parser.add_argument("--scan-seam-search-ratio", type=float, default=0.25)
-    parser.add_argument("--scan-context-pixels", type=int, default=48)
+    parser.add_argument("--scan-context-pixels", type=int, default=0)
+    parser.add_argument(
+        "--strict-vertical-partition",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--scan-minimum-core-height-ratio", type=float, default=0.35)
     parser.add_argument("--visualization-samples", type=int, default=60)
     parser.add_argument("--save-preview-crops", action=argparse.BooleanOptionalAction, default=True)
@@ -246,7 +258,7 @@ def prepare_manifest(args: argparse.Namespace) -> list[dict[str, Any]]:
     paths.manifest.mkdir(parents=True, exist_ok=True)
     paths.shards.mkdir(parents=True, exist_ok=True)
     selection = {
-        "format_version": FORMAT_VERSION,
+        "format_version": DETECTOR_MANIFEST_FORMAT_VERSION,
         "input_dir": str(input_dir),
         "task_files": {task: str(path) for task, path in task_files.items()},
         "task_file_digests": {task: sha256_file(path) for task, path in task_files.items()},
@@ -309,12 +321,21 @@ def _percentile(values: Sequence[float], quantile: float) -> float:
 
 def _metric_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     tile_counts = [int(row["tile_count"]) for row in rows]
-    processed = [float(row["processed_pixel_ratio_with_overlap"]) for row in rows]
+    partition_metrics = [
+        strict_vertical_partition_metrics(
+            int(row["width"]), int(row["height"]), row["tiles"]
+        )
+        for row in rows
+    ]
+    processed = [float(metrics["processed_pixel_ratio"]) for metrics in partition_metrics]
     gains = [float(row["mean_vertical_linear_gain"]) for row in rows]
     contain_rates = [float(row.get("detector_bbox_containment_rate", 1.0)) for row in rows]
     detector_total = sum(int(row.get("detector_box_count", 0)) for row in rows)
     detector_contained = sum(
         int(row.get("detector_bbox_contained_count", 0)) for row in rows
+    )
+    detector_unique_contained = sum(
+        int(row.get("detector_bbox_unique_containment_count", 0)) for row in rows
     )
     seam_sources = Counter(
         source for row in rows for source in row.get("seam_source", [])
@@ -329,11 +350,16 @@ def _metric_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "processed_pixel_ratio_with_overlap_mean": mean(processed) if processed else 0.0,
         "processed_pixel_ratio_with_overlap_p50": median(processed) if processed else 0.0,
         "processed_pixel_ratio_with_overlap_p90": _percentile(processed, 0.90),
+        "processed_pixel_ratio_mean": mean(processed) if processed else 0.0,
+        "processed_pixel_ratio_p50": median(processed) if processed else 0.0,
+        "processed_pixel_ratio_p90": _percentile(processed, 0.90),
         "mean_vertical_linear_gain": mean(gains) if gains else 0.0,
         "single_full_image_count": sum(int(row["tile_count"]) == 1 for row in rows),
         "detector_empty_count": sum(int(row["detector_box_count"]) == 0 for row in rows),
         "detector_boundary_cut_count": sum(int(row["detector_boundary_cut_count"]) for row in rows),
         "detector_bbox_contained_count": detector_contained,
+        "detector_bbox_unique_containment_count": detector_unique_contained,
+        "detector_bbox_count": detector_total,
         "detector_bbox_containment_rate": (
             detector_contained / detector_total if detector_total else 1.0
         ),
@@ -348,6 +374,10 @@ def _metric_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             int(row.get("horizontal_seam_count", 0)) for row in rows
         ),
         "seam_source_counts": dict(sorted(seam_sources.items())),
+        "safe_seam_count": sum(int(row.get("safe_seam_count", 0)) for row in rows),
+        "balanced_fallback_seam_count": sum(
+            int(row.get("balanced_fallback_seam_count", 0)) for row in rows
+        ),
         "full_tile_in_multi_plan_count": sum(
             int(row.get("full_tile_in_multi_plan_count", 0)) for row in rows
         ),
@@ -363,6 +393,35 @@ def _metric_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "adjacent_overlap_ratio_mean": mean(
             [float(row.get("adjacent_overlap_ratio_mean", 0.0)) for row in rows]
         ) if rows else 0.0,
+        "strict_vertical_partition_failure_count": sum(
+            metrics["strict_vertical_partition"] is not True for metrics in partition_metrics
+        ),
+        "adjacent_overlap_pixels_total": sum(
+            int(metrics["adjacent_overlap_pixels_total"]) for metrics in partition_metrics
+        ),
+        "adjacent_gap_pixels_total": sum(
+            int(metrics["adjacent_gap_pixels_total"]) for metrics in partition_metrics
+        ),
+        "sum_tile_area": sum(int(metrics["sum_tile_area"]) for metrics in partition_metrics),
+        "union_tile_area": sum(int(metrics["union_tile_area"]) for metrics in partition_metrics),
+        "original_area": sum(int(metrics["original_area"]) for metrics in partition_metrics),
+        "duplicate_pixel_area": sum(int(metrics["duplicate_pixel_area"]) for metrics in partition_metrics),
+        "area_identity_failure_count": sum(
+            not (
+                int(metrics["sum_tile_area"])
+                == int(metrics["union_tile_area"])
+                == int(metrics["original_area"])
+            )
+            for metrics in partition_metrics
+        ),
+        "processed_pixel_ratio_not_one_count": sum(
+            float(metrics["processed_pixel_ratio"]) != 1.0 for metrics in partition_metrics
+        ),
+        "tile_count_reduced_image_count": sum(
+            int(row.get("actual_tile_count", row["tile_count"]))
+            < int(row.get("desired_tile_count", row["tile_count"]))
+            for row in rows
+        ),
         "lossless_coverage_failure_count": sum(
             float(row["lossless_pixel_coverage_ratio"]) != 1.0 for row in rows
         ),
@@ -474,6 +533,93 @@ def _select_visualizations(rows: Sequence[Mapping[str, Any]], count: int) -> lis
     return selected
 
 
+def _write_v2_v3_coordinate_comparison(
+    output_dir: Path,
+    crop_root: Path,
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Compare a preserved v2 scan with v3 without mutating either manifest."""
+
+    old_manifest = output_dir / "horizontal_scan_v2" / "detector_scan_crops.jsonl"
+    comparison_path = crop_root / "v2_v3_coordinate_compare.csv"
+    if not old_manifest.is_file():
+        comparison_path.unlink(missing_ok=True)
+        return {"available": False, "compared_images": 0, "path": None}
+    old_by_id = {str(row["image_id"]): row for row in read_jsonl(old_manifest)}
+    new_by_id = {str(row["image_id"]): row for row in rows}
+    if set(old_by_id) != set(new_by_id):
+        raise RuntimeError(
+            "horizontal_scan_v2/v3 image_id sets differ; refusing a partial coordinate comparison"
+        )
+    fields = (
+        "image_id",
+        "width",
+        "height",
+        "v2_tile_count",
+        "v3_tile_count",
+        "v2_tiles",
+        "v3_tiles",
+        "v2_adjacent_overlap_pixels_total",
+        "v3_adjacent_overlap_pixels_total",
+        "v2_processed_pixel_ratio",
+        "v3_processed_pixel_ratio",
+        "v2_seam_crossed_detector_bbox_count",
+        "v3_seam_crossed_detector_bbox_count",
+        "v2_detector_boundary_cut_count",
+        "v3_detector_boundary_cut_count",
+    )
+    temporary = comparison_path.with_name(f".{comparison_path.name}.tmp-{os.getpid()}")
+    with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for image_id in sorted(new_by_id):
+            old = old_by_id[image_id]
+            new = new_by_id[image_id]
+            old_metrics = strict_vertical_partition_metrics(
+                int(old["width"]), int(old["height"]), old["tiles"]
+            )
+            new_metrics = strict_vertical_partition_metrics(
+                int(new["width"]), int(new["height"]), new["tiles"]
+            )
+            writer.writerow(
+                {
+                    "image_id": image_id,
+                    "width": new["width"],
+                    "height": new["height"],
+                    "v2_tile_count": len(old["tiles"]),
+                    "v3_tile_count": len(new["tiles"]),
+                    "v2_tiles": json.dumps(old["tiles"], separators=(",", ":")),
+                    "v3_tiles": json.dumps(new["tiles"], separators=(",", ":")),
+                    "v2_adjacent_overlap_pixels_total": old_metrics[
+                        "adjacent_overlap_pixels_total"
+                    ],
+                    "v3_adjacent_overlap_pixels_total": new_metrics[
+                        "adjacent_overlap_pixels_total"
+                    ],
+                    "v2_processed_pixel_ratio": old_metrics["processed_pixel_ratio"],
+                    "v3_processed_pixel_ratio": new_metrics["processed_pixel_ratio"],
+                    "v2_seam_crossed_detector_bbox_count": old.get(
+                        "seam_crossed_detector_bbox_count", ""
+                    ),
+                    "v3_seam_crossed_detector_bbox_count": new.get(
+                        "seam_crossed_detector_bbox_count", ""
+                    ),
+                    "v2_detector_boundary_cut_count": old.get(
+                        "detector_boundary_cut_count", ""
+                    ),
+                    "v3_detector_boundary_cut_count": new.get(
+                        "detector_boundary_cut_count", ""
+                    ),
+                }
+            )
+    os.replace(temporary, comparison_path)
+    return {
+        "available": True,
+        "compared_images": len(rows),
+        "path": str(comparison_path),
+    }
+
+
 def _cache_file_record(cache_dir: Path, path: Path, *, jsonl_rows: int | None = None) -> dict[str, Any]:
     resolved = path.resolve(strict=True)
     try:
@@ -489,23 +635,55 @@ def _cache_file_record(cache_dir: Path, path: Path, *, jsonl_rows: int | None = 
 def _geometry_gate(summary: Mapping[str, Any]) -> dict[str, Any]:
     overall = summary["overall"]
     conditions = {
+        "strict_vertical_partition_true": int(overall["strict_vertical_partition_failure_count"]) == 0,
+        "adjacent_overlap_pixels_total_zero": int(overall["adjacent_overlap_pixels_total"]) == 0,
+        "adjacent_gap_pixels_total_zero": int(overall["adjacent_gap_pixels_total"]) == 0,
+        "duplicate_pixel_area_zero": int(overall["duplicate_pixel_area"]) == 0,
+        "sum_tile_area_equals_union_tile_area": int(overall["sum_tile_area"]) == int(overall["union_tile_area"]),
+        "union_tile_area_equals_original_area": int(overall["union_tile_area"]) == int(overall["original_area"]),
+        "processed_pixel_ratio_equals_1": int(overall["processed_pixel_ratio_not_one_count"]) == 0,
         "lossless_pixel_coverage_equals_1": int(overall["lossless_coverage_failure_count"]) == 0,
         "detector_bbox_containment_equals_1": (
             float(overall["detector_bbox_containment_rate"]) == 1.0
             and int(overall["uncontained_detector_bbox_count"]) == 0
         ),
+        "every_detector_bbox_belongs_to_exactly_one_crop": (
+            int(overall["detector_bbox_unique_containment_count"])
+            == int(overall["detector_bbox_count"])
+        ),
         "full_tile_in_multi_plan_count_zero": int(overall["full_tile_in_multi_plan_count"]) == 0,
         "duplicate_tile_count_zero": int(overall["duplicate_tile_count"]) == 0,
         "nested_tile_count_zero": int(overall["nested_tile_count"]) == 0,
-        "processed_pixel_ratio_mean_le_1_20": (
-            float(overall["processed_pixel_ratio_with_overlap_mean"]) <= 1.20
-        ),
-        "processed_pixel_ratio_p90_le_1_30": (
-            float(overall["processed_pixel_ratio_with_overlap_p90"]) <= 1.30
-        ),
+        "seam_crossed_detector_bbox_count_zero": int(overall["seam_crossed_detector_bbox_count"]) == 0,
+        "detector_boundary_cut_count_zero": int(overall["detector_boundary_cut_count"]) == 0,
+        "balanced_fallback_seam_count_zero": int(overall["balanced_fallback_seam_count"]) == 0,
         "gt_not_used": summary.get("gt_used") is False,
     }
     return {"conditions": conditions, "passes": all(conditions.values())}
+
+
+def _resolve_cache_scope(
+    args: argparse.Namespace, selection: Mapping[str, Any], unique_count: int
+) -> tuple[str, int, int]:
+    max_images_per_task = int(selection.get("max_images_per_task", 0))
+    inferred = "preview" if max_images_per_task > 0 else "full_test"
+    requested = str(getattr(args, "cache_scope", "auto"))
+    cache_scope = inferred if requested == "auto" else requested
+    if cache_scope != inferred:
+        raise RuntimeError(
+            f"cache scope contradicts prepared manifest: requested={cache_scope}, "
+            f"max_images_per_task={max_images_per_task}"
+        )
+    expected = (
+        unique_count
+        if cache_scope == "preview"
+        else int(getattr(args, "expected_full_test_unique_images", 17281))
+    )
+    if unique_count != expected:
+        raise RuntimeError(
+            f"{cache_scope} cache unique image count mismatch: {unique_count} != {expected}"
+        )
+    return cache_scope, max_images_per_task, expected
 
 
 def _write_cache_ready_marker(
@@ -519,6 +697,9 @@ def _write_cache_ready_marker(
     paths = AuditPaths(args.output_dir)
     selection_path = paths.manifest / "selection_config.json"
     selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    cache_scope, max_images_per_task, expected_unique_images = _resolve_cache_scope(
+        args, selection, len(rows)
+    )
     task_files = []
     for task in TASKS:
         path = Path(selection["task_files"][task])
@@ -578,10 +759,19 @@ def _write_cache_ready_marker(
             "horizontal scan reports were written, but cache ready marker is withheld; "
             f"failed gates={[name for name, passed in gate['conditions'].items() if not passed]}"
         )
+    if str(summary.get("cache_scope")) != cache_scope:
+        raise RuntimeError(
+            "summary cache_scope changed before ready marker publication: "
+            f"summary={summary.get('cache_scope')}, resolved={cache_scope}"
+        )
     marker = {
         "schema_version": CACHE_MARKER_SCHEMA_VERSION,
         "ready": True,
         "scan_name": args.scan_name,
+        "cache_scope": cache_scope,
+        "max_images_per_task": max_images_per_task,
+        "expected_unique_images": expected_unique_images,
+        "strict_vertical_partition": True,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "created_after_all_checks": True,
         "gt_used": False,
@@ -605,6 +795,7 @@ def _write_cache_ready_marker(
             "config": geometry_config,
             "config_digest": cache_json_digest(geometry_config),
             "gate_passes": True,
+            "strict_vertical_partition": True,
             "scan_manifest": _cache_file_record(
                 args.output_dir,
                 crop_root / "detector_scan_crops.jsonl",
@@ -615,6 +806,11 @@ def _write_cache_ready_marker(
             "gallery": _cache_file_record(args.output_dir, crop_root / "gallery" / "index.html"),
         },
     }
+    comparison_path = crop_root / "v2_v3_coordinate_compare.csv"
+    if comparison_path.is_file():
+        marker["geometry"]["v2_v3_coordinate_comparison"] = _cache_file_record(
+            args.output_dir, comparison_path
+        )
     atomic_write_json(cache_marker_path(args.output_dir, args.scan_name), marker)
     return marker
 
@@ -630,11 +826,13 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
             "context_ratio": args.scan_context_ratio,
             "min_context_image_ratio": args.scan_min_context_image_ratio,
             "dense_band_ratio": args.scan_dense_band_ratio,
+            "seam_search_ratio": args.scan_seam_search_ratio,
         },
         "detector_margin_ratio": args.scan_detector_margin_ratio,
         "detector_margin_pixels": [2, 12],
-        "seam_search_ratio": args.scan_seam_search_ratio,
         "context_pixels": args.scan_context_pixels,
+        "strict_vertical_partition": args.strict_vertical_partition,
+        "seam_selection": "global_detector_free_gap_dynamic_programming",
         "minimum_core_height_ratio": args.scan_minimum_core_height_ratio,
         "horizontal_extent": "full_image_width",
         "schema_version": GEOMETRY_SCHEMA_VERSION,
@@ -644,7 +842,7 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
     state_path = crop_root / "scan_state.json"
     scan_manifest_path = crop_root / "detector_scan_crops.jsonl"
     current_state = {
-        "format_version": FORMAT_VERSION,
+        "format_version": SCAN_FORMAT_VERSION,
         "scan_name": args.scan_name,
         "merged_detection_digest": _file_digest(paths.merged),
         "unique_manifest_digest": _file_digest(paths.unique_images),
@@ -653,12 +851,14 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
         "visualization_samples": args.visualization_samples,
         "save_preview_crops": args.save_preview_crops,
     }
-    required_outputs = (
+    required_outputs = [
         scan_manifest_path,
         crop_root / "summary.json",
         crop_root / "statistics.csv",
         crop_root / "gallery" / "index.html",
-    )
+    ]
+    if (args.output_dir / "horizontal_scan_v2" / "detector_scan_crops.jsonl").is_file():
+        required_outputs.append(crop_root / "v2_v3_coordinate_compare.csv")
     if getattr(args, "resume", False) and state_path.is_file() and all(
         path.is_file() for path in required_outputs
     ):
@@ -666,15 +866,20 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
         if previous_state == current_state:
             cached = read_jsonl(scan_manifest_path)
             ready_path = cache_marker_path(args.output_dir, args.scan_name)
-            if not ready_path.is_file():
-                cached_summary = json.loads((crop_root / "summary.json").read_text(encoding="utf-8"))
-                _write_cache_ready_marker(
-                    args,
-                    rows=cached,
-                    summary=cached_summary,
-                    crop_root=crop_root,
-                    geometry_config=geometry_config,
-                )
+            # A ready marker is always the final atomic publication.  Rebuild
+            # it from the digest-bound reports even on a geometry resume, so a
+            # stale/partial marker can never survive a successful invocation.
+            ready_path.unlink(missing_ok=True)
+            cached_summary = json.loads(
+                (crop_root / "summary.json").read_text(encoding="utf-8")
+            )
+            _write_cache_ready_marker(
+                args,
+                rows=cached,
+                summary=cached_summary,
+                crop_root=crop_root,
+                geometry_config=geometry_config,
+            )
             print(
                 f"[eval crop] --resume validated {len(cached)} cached scan plans; "
                 "skip geometry, preview rendering and crop PNG writes",
@@ -709,7 +914,7 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
         interval_seconds=float(getattr(args, "progress_interval_seconds", 10.0)),
         unit="images",
     )
-    reporter.update(0, detail="纯 CPU 横向连通扫描几何；GT disabled", force=True)
+    reporter.update(0, detail="纯 CPU 严格无重叠水平分区；GT disabled", force=True)
     for detected_index, detected in enumerate(merged, 1):
         manifest = unique[detected["image_id"]]
         detector_items = [
@@ -732,6 +937,7 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
             seam_search_ratio=args.scan_seam_search_ratio,
             context_pixels=args.scan_context_pixels,
             minimum_core_height_ratio=args.scan_minimum_core_height_ratio,
+            strict_vertical_partition=args.strict_vertical_partition,
         )
         row = {
             "image_id": detected["image_id"],
@@ -758,6 +964,9 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
     rows.sort(key=lambda row: row["image_id"])
 
     atomic_write_jsonl(scan_manifest_path, rows)
+    coordinate_comparison = _write_v2_v3_coordinate_comparison(
+        args.output_dir, crop_root, rows
+    )
     by_density = {
         density: _metric_summary([row for row in rows if row["density"] == density])
         for density in ("sparse", "medium", "dense")
@@ -772,7 +981,10 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
                 {
                     **row,
                     "tile_count": 1,
+                    "desired_tile_count": 1,
+                    "actual_tile_count": 1,
                     "processed_pixel_ratio_with_overlap": 1.0,
+                    "processed_pixel_ratio": 1.0,
                     "mean_vertical_linear_gain": 1.0,
                     "detector_boundary_cut_count": 0,
                     "lossless_pixel_coverage_ratio": 1.0,
@@ -798,11 +1010,17 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
         }
     selected = _select_visualizations(rows, args.visualization_samples)
     gallery_density_counts = Counter(str(row["density"]) for row in selected)
+    selection = json.loads((paths.manifest / "selection_config.json").read_text(encoding="utf-8"))
+    selection_limit = int(selection.get("max_images_per_task", 0))
+    inferred_scope = "preview" if selection_limit > 0 else "full_test"
+    cache_scope = inferred_scope if args.cache_scope == "auto" else args.cache_scope
     summary = {
-        "format_version": FORMAT_VERSION,
+        "format_version": SCAN_FORMAT_VERSION,
         "scan_name": args.scan_name,
         "mode": "detector_scan",
-        "description": "GT-free balanced full-width horizontal seam scan",
+        "description": "GT-free strict non-overlapping full-width horizontal seam partition",
+        "cache_scope": cache_scope,
+        "max_images_per_task": selection_limit,
         "unique_images": len(rows),
         "image_id_digest": digest_ids(row["image_id"] for row in rows),
         "geometry_config": geometry_config,
@@ -823,6 +1041,7 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
                 for density in ("sparse", "medium", "dense")
             },
         },
+        "v2_v3_coordinate_comparison": coordinate_comparison,
         "raw_detector_files_unchanged": True,
         "gt_used": False,
     }
@@ -835,7 +1054,14 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
         "image_id", "image_path", "width", "height", "density", "detector_box_count",
         "connected_band_count", "tile_count", "lossless_pixel_coverage_ratio",
         "horizontal_seam_count", "horizontal_seams", "seam_source_counts",
-        "detector_bbox_containment_rate", "uncontained_detector_bbox_count",
+        "strict_vertical_partition", "adjacent_overlap_pixels",
+        "adjacent_overlap_pixels_total", "adjacent_gap_pixels",
+        "adjacent_gap_pixels_total", "sum_tile_area", "union_tile_area",
+        "original_area", "duplicate_pixel_area", "processed_pixel_ratio",
+        "safe_seam_count", "desired_tile_count", "actual_tile_count",
+        "tile_count_reduction_reason", "balanced_fallback_seam_count",
+        "detector_bbox_containment_rate", "detector_bbox_unique_containment_count",
+        "uncontained_detector_bbox_count",
         "seam_crossed_detector_bbox_count", "full_tile_in_multi_plan_count",
         "duplicate_tile_count", "nested_tile_count", "minimum_core_height",
         "maximum_core_height", "core_height_ratio", "min_crop_height_ratio",
@@ -930,12 +1156,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--scan-detector-margin-ratio must be in [0, 0.05]")
     if not 0 <= args.scan_seam_search_ratio <= 0.5:
         raise ValueError("--scan-seam-search-ratio must be in [0, 0.5]")
-    if args.scan_context_pixels < 0:
-        raise ValueError("--scan-context-pixels cannot be negative")
+    if args.scan_context_pixels != 0:
+        raise ValueError("--scan-context-pixels must be 0 for strict vertical partition")
+    if args.strict_vertical_partition is not True:
+        raise ValueError("--strict-vertical-partition is mandatory for schema-v3 scans")
     if not 0 < args.scan_minimum_core_height_ratio <= 1:
         raise ValueError("--scan-minimum-core-height-ratio must be in (0, 1]")
     if args.visualization_samples < 0:
         raise ValueError("--visualization-samples cannot be negative")
+    if args.expected_full_test_unique_images <= 0:
+        raise ValueError("--expected-full-test-unique-images must be positive")
     if args.shard_size <= 0 or args.image_loader_threads <= 0:
         raise ValueError("--shard-size and --image-loader-threads must be positive")
     if args.workers_per_gpu == 2 and not args.allow_two_processes_per_gpu:

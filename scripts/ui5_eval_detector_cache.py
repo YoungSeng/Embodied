@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from locany_ui5_common import TASK_JSONL
+from ui5_lossless_tiling import strict_vertical_partition_metrics
 
 
-CACHE_MARKER_SCHEMA_VERSION = 2
-GEOMETRY_SCHEMA_VERSION = 2
+CACHE_MARKER_SCHEMA_VERSION = 3
+GEOMETRY_SCHEMA_VERSION = 3
 
 
 def sha256_file(path: Path) -> str:
@@ -90,10 +91,16 @@ def validate_eval_detector_cache(
     expected_unique_images: int = 0,
     require_ready: bool = True,
     input_dir: Path | None = None,
+    required_cache_scope: str | None = None,
+    require_strict_nonoverlap: bool = False,
 ) -> dict[str, Any]:
     """Fail closed unless every dataset/detector/geometry digest still matches."""
 
     cache_dir = cache_dir.expanduser().resolve(strict=False)
+    if required_cache_scope == "full_test" and int(expected_unique_images) <= 0:
+        raise ValueError(
+            "full_test cache validation requires an explicit positive expected_unique_images"
+        )
     ready_path = marker_path(cache_dir, scan_name)
     if not ready_path.is_file():
         if require_ready:
@@ -113,9 +120,25 @@ def validate_eval_detector_cache(
         raise RuntimeError("detector cache marker was not written after all checks")
     if marker.get("gt_used") is not False:
         raise RuntimeError("evaluation detector cache must declare gt_used=false")
+    if marker.get("strict_vertical_partition") is not True:
+        raise RuntimeError("schema-v3 marker must declare strict_vertical_partition=true")
+    cache_scope = str(marker.get("cache_scope", ""))
+    if cache_scope not in {"preview", "full_test"}:
+        raise RuntimeError("detector cache marker has no valid cache_scope")
+    if required_cache_scope and cache_scope != required_cache_scope:
+        raise RuntimeError(
+            f"detector cache scope mismatch: cache={cache_scope}, required={required_cache_scope}"
+        )
+    max_images_per_task = int(marker.get("max_images_per_task", -1))
+    if cache_scope == "preview" and max_images_per_task <= 0:
+        raise RuntimeError("preview detector cache must have max_images_per_task > 0")
+    if cache_scope == "full_test" and max_images_per_task != 0:
+        raise RuntimeError("full_test detector cache requires max_images_per_task=0")
 
     dataset = marker.get("dataset") or {}
     unique_count = int(dataset.get("content_unique_images", -1))
+    if int(marker.get("expected_unique_images", -1)) != unique_count:
+        raise RuntimeError("detector cache expected_unique_images does not match its dataset")
     if expected_unique_images and unique_count != int(expected_unique_images):
         raise RuntimeError(
             f"detector cache unique image count mismatch: {unique_count} != {expected_unique_images}"
@@ -182,11 +205,94 @@ def validate_eval_detector_cache(
         raise RuntimeError("horizontal scan geometry schema does not match this code")
     if geometry.get("config_digest") != json_digest(geometry.get("config")):
         raise RuntimeError("horizontal scan geometry configuration digest mismatch")
-    for key in ("scan_manifest", "summary", "statistics", "gallery"):
-        _validate_file_record(cache_dir, geometry[key], label=f"geometry {key}")
+    geometry_files = {
+        key: _validate_file_record(cache_dir, geometry[key], label=f"geometry {key}")
+        for key in ("scan_manifest", "summary", "statistics", "gallery")
+    }
+    if geometry.get("v2_v3_coordinate_comparison"):
+        _validate_file_record(
+            cache_dir,
+            geometry["v2_v3_coordinate_comparison"],
+            label="geometry v2/v3 coordinate comparison",
+        )
     scan_manifest = _resolve_recorded_file(cache_dir, geometry["scan_manifest"])
     if count_jsonl(scan_manifest) != unique_count:
         raise RuntimeError("horizontal scan manifest count does not match cache dataset")
     if geometry.get("gate_passes") is not True:
         raise RuntimeError("horizontal scan geometry gates did not pass")
+    config = geometry.get("config") or {}
+    if (
+        geometry.get("strict_vertical_partition") is not True
+        or config.get("strict_vertical_partition") is not True
+        or int(config.get("context_pixels", -1)) != 0
+    ):
+        raise RuntimeError("schema-v3 cache is not a strict zero-context vertical partition")
+    if require_strict_nonoverlap and geometry.get("strict_vertical_partition") is not True:
+        raise RuntimeError("strict non-overlap cache was required")
+    summary = json.loads(geometry_files["summary"].read_text(encoding="utf-8"))
+    if (
+        summary.get("cache_scope") != cache_scope
+        or summary.get("scan_name") != scan_name
+        or summary.get("gt_used") is not False
+    ):
+        raise RuntimeError("horizontal scan summary identity/scope declaration is invalid")
+    gate = summary.get("geometry_gate") or {}
+    if gate.get("passes") is not True or not all(
+        value is True for value in (gate.get("conditions") or {}).values()
+    ):
+        raise RuntimeError("horizontal scan summary does not contain a passing hard gate")
+    for row in read_jsonl(scan_manifest):
+        metrics = strict_vertical_partition_metrics(
+            int(row["width"]), int(row["height"]), row["tiles"]
+        )
+        if not metrics["strict_vertical_partition"]:
+            raise RuntimeError(f"scan row is not a strict partition: {row.get('image_id')}")
+        for key in (
+            "adjacent_overlap_pixels_total",
+            "adjacent_gap_pixels_total",
+            "duplicate_pixel_area",
+        ):
+            if int(metrics[key]) != 0 or int(row.get(key, -1)) != 0:
+                raise RuntimeError(f"scan row violates {key}: {row.get('image_id')}")
+        for key in ("sum_tile_area", "union_tile_area", "original_area"):
+            if int(row.get(key, -1)) != int(metrics[key]):
+                raise RuntimeError(
+                    f"scan row recorded {key} does not match recomputation: {row.get('image_id')}"
+                )
+        if not (
+            metrics["sum_tile_area"]
+            == metrics["union_tile_area"]
+            == metrics["original_area"]
+        ):
+            raise RuntimeError(f"scan row area identity failed: {row.get('image_id')}")
+        if (
+            float(metrics["processed_pixel_ratio"]) != 1.0
+            or float(row.get("processed_pixel_ratio", -1)) != 1.0
+            or float(row.get("lossless_pixel_coverage_ratio", -1)) != 1.0
+        ):
+            raise RuntimeError(f"scan row processed_pixel_ratio is not 1: {row.get('image_id')}")
+        zero_fields = (
+            "seam_crossed_detector_bbox_count",
+            "detector_boundary_cut_count",
+            "uncontained_detector_bbox_count",
+            "full_tile_in_multi_plan_count",
+            "duplicate_tile_count",
+            "nested_tile_count",
+            "balanced_fallback_seam_count",
+        )
+        for key in zero_fields:
+            if int(row.get(key, -1)) != 0:
+                raise RuntimeError(f"scan row violates {key}: {row.get('image_id')}")
+        detector_count = int(row.get("detector_box_count", -1))
+        if (
+            detector_count < 0
+            or int(row.get("detector_bbox_contained_count", -1)) != detector_count
+            or int(row.get("detector_bbox_unique_containment_count", -1)) != detector_count
+            or float(row.get("detector_bbox_containment_rate", -1)) != 1.0
+        ):
+            raise RuntimeError(
+                f"scan row does not uniquely contain every detector bbox: {row.get('image_id')}"
+            )
+        if row.get("gt_used") is not False:
+            raise RuntimeError(f"scan row must declare gt_used=false: {row.get('image_id')}")
     return marker
