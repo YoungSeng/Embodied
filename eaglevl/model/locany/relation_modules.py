@@ -391,7 +391,7 @@ class RelationConditionedDetailPyramid(nn.Module):
         nn.init.normal_(self.evidence_queries, std=0.02)
         nn.init.normal_(self.context_queries, std=0.02)
         with torch.no_grad():
-            self.scale_logits.copy_(self.family_scale_prior.log())
+            self.scale_logits.copy_(self.expected_family_scale_logits())
         if self.task_scale_router:
             nn.init.zeros_(self.task_scale_projection.weight)
             nn.init.zeros_(self.image_scale_projection.weight)
@@ -406,6 +406,24 @@ class RelationConditionedDetailPyramid(nn.Module):
         for head in self.image_gate_heads:
             nn.init.constant_(head[-1].bias, -2.0)
 
+    def expected_family_scale_logits(self) -> torch.Tensor:
+        """Return canonical FP32 log-priors cast to the parameter contract.
+
+        DeepSpeed may cast the module to BF16 *after* the UI branch is
+        initialized.  A tensor buffer follows that cast, so recomputing
+        ``log(buffer)`` later is not equivalent to casting the original FP32
+        log-prior.  Keep the source of truth in the module-level FP32 constant
+        so initialization-before-cast and initialization-after-cast agree.
+        """
+
+        return (
+            FAMILY_SCALE_PRIOR.to(
+                device=self.scale_logits.device, dtype=torch.float32
+            )
+            .log()
+            .to(dtype=self.scale_logits.dtype)
+        )
+
     def expected_family_scale_weights(self) -> torch.Tensor:
         """Return the configured prior through the module's real dtype path.
 
@@ -416,12 +434,7 @@ class RelationConditionedDetailPyramid(nn.Module):
         BF16, because those are two different numerical operations.
         """
 
-        return (
-            self.family_scale_prior.detach().float().log()
-            .to(dtype=self.scale_logits.dtype)
-            .float()
-            .softmax(dim=-1)
-        )
+        return self.expected_family_scale_logits().float().softmax(dim=-1)
 
     def assert_family_scale_prior(self, atol: float = 1.0e-6) -> None:
         actual = self.scale_logits.detach().float().softmax(dim=-1)

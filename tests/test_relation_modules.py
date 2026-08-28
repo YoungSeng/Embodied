@@ -147,15 +147,23 @@ class RelationModulesTest(unittest.TestCase):
         self.assertFalse(torch.allclose(output.scale_weights[0], output.scale_weights[1]))
 
     def test_family_prior_audit_accepts_only_the_bfloat16_representation(self):
-        module = RelationConditionedDetailPyramid(
+        initialized_before_cast = RelationConditionedDetailPyramid(
+            8, 8, 2, 4, task_scale_router=True
+        )
+        initialized_before_cast.reset_parameters()
+        initialized_before_cast.to(dtype=torch.bfloat16)
+        initialized_before_cast.assert_family_scale_prior()
+
+        initialized_after_cast = RelationConditionedDetailPyramid(
             8, 8, 2, 4, task_scale_router=True
         ).to(dtype=torch.bfloat16)
-        module.reset_parameters()
-        module.assert_family_scale_prior()
+        initialized_after_cast.reset_parameters()
+        initialized_after_cast.assert_family_scale_prior()
         torch.testing.assert_close(
-            module.scale_logits.detach().float().softmax(dim=-1),
-            module.expected_family_scale_weights(),
+            initialized_before_cast.scale_logits,
+            initialized_after_cast.scale_logits,
         )
+        module = initialized_after_cast
         with torch.no_grad():
             module.scale_logits[0, 0].add_(0.25)
         with self.assertRaisesRegex(RuntimeError, "overwritten"):

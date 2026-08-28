@@ -296,7 +296,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                     nn.init.normal_(self.relation_pyramid.evidence_queries, mean=0.0, std=0.02)
                     nn.init.normal_(self.relation_pyramid.context_queries, mean=0.0, std=0.02)
                     self.relation_pyramid.scale_logits.copy_(
-                        self.relation_pyramid.family_scale_prior.log()
+                        self.relation_pyramid.expected_family_scale_logits()
                     )
                     if self.relation_pyramid.task_scale_router:
                         nn.init.zeros_(self.relation_pyramid.task_scale_projection.weight)
