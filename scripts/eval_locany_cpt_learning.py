@@ -14,7 +14,6 @@ import json
 import os
 import random
 import re
-import shutil
 import sys
 import tempfile
 import threading
@@ -48,6 +47,7 @@ from eaglevl.train.cpt_eval_metrics import (  # noqa: E402
     task_macro_primary,
 )
 from eaglevl.train.cpt_checkpoint_selection import select_checkpoint  # noqa: E402
+from eaglevl.train.cpt_checkpoint_files import ensure_local_checkpoint_files  # noqa: E402
 from eaglevl.train.cpt_eval_queue import (  # noqa: E402
     exclusive_file_lock,
     fsync_if_supported,
@@ -193,20 +193,13 @@ def stable_hash(*values: object) -> str:
 
 
 def ensure_checkpoint_remote_code(checkpoint: str, base_model: str) -> None:
-    checkpoint_dir = Path(checkpoint).expanduser().resolve()
-    base_dir = Path(base_model).expanduser().resolve()
-    if not checkpoint_dir.is_dir() or not (checkpoint_dir / "config.json").is_file():
-        raise RuntimeError(f"invalid checkpoint directory: {checkpoint_dir}")
-    if not base_dir.is_dir():
-        raise RuntimeError(f"base model directory does not exist: {base_dir}")
-    for source in sorted(base_dir.glob("*.py")):
-        destination = checkpoint_dir / source.name
-        if not destination.is_file() or destination.stat().st_size == 0:
-            shutil.copy2(source, destination)
-    required = ("configuration_locateanything.py", "modeling_locateanything.py")
-    missing = [name for name in required if not (checkpoint_dir / name).is_file()]
-    if missing:
-        raise RuntimeError(f"checkpoint remote code is incomplete: missing={missing}")
+    report = ensure_local_checkpoint_files(checkpoint, base_model)
+    if report["copied"]:
+        print(
+            "checkpoint compatibility files copied from Base: "
+            + ", ".join(report["copied"]),
+            flush=True,
+        )
 
 
 def _resolve_recipe_path(value: str, recipe: Path, relative: bool) -> Path:

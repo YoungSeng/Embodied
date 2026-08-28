@@ -88,6 +88,7 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 from transformers import AutoConfig, AutoModel, AutoProcessor, AutoTokenizer
 
+from eaglevl.train.cpt_checkpoint_files import ensure_local_checkpoint_files
 from eaglevl.model.locany.relation_modules import UI_RELATION_PROMPT_SPECS
 
 
@@ -948,6 +949,15 @@ class LocateAnythingInferencer:
         self.dtype = resolve_dtype(args.dtype)
 
         processor_source = args.processor_path or args.checkpoint
+        compatibility_report = ensure_local_checkpoint_files(
+            args.checkpoint,
+            processor_source,
+        )
+        if compatibility_report["copied"]:
+            print(
+                "checkpoint compatibility files copied from Base: "
+                + ", ".join(compatibility_report["copied"])
+            )
         common_kwargs = {
             "trust_remote_code": args.trust_remote_code,
             "local_files_only": args.local_files_only,
