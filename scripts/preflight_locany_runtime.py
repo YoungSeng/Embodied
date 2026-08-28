@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-fast runtime check for UI5 inference dependencies and processor loading."""
+"""Fail-fast LocateAnything runtime check for OpenCV and processor loading."""
 
 from __future__ import annotations
 

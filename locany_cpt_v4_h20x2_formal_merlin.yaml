@@ -60,6 +60,7 @@ jobRunParams:
 
   envsList:
     CUDA_DEVICES: "0,1"
+    INSTALL_SYSTEM_RUNTIME_DEPS: "1"
     GPU_COUNT: "2"
     DATA_DIR: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4_split_v2"
     RECIPE_NAME: "locany_cpt_train.json"

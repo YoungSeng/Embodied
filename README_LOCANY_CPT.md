@@ -54,9 +54,25 @@ rejected。已确认的 ref/box 换行异常和退化框计入 `known_dropped`�
 cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle/Embodied-CPT
 ```
 
+用 `--cluster` 选择 A800 调度资源组。普通 YG 资源组使用：
+
 ```bash
-mlx job submitv2 --path locany_cpt_v4_a100x4_smoke_merlin.yaml
+/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python \
+scripts/submit_locany_cpt.py --mode smoke --cluster yg
 ```
+
+如果希望改到 `ies_aiai_experience/AIAI_locate` 排队，只执行下面这条，不要与上一条同时提交：
+
+```bash
+/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python \
+scripts/submit_locany_cpt.py --mode smoke --cluster aiai_locate
+```
+
+`yg` 对应 group 1602 和默认 queue；`aiai_locate` 对应 group 2146 和
+`compute-3302-yg-cloudnative-ai-aiai.locate-guarantee`。两者仍属于 YG、挂载同一个
+`/mnt/bn/intelligent-service-yg`，所以 recipe、图片路径和 `RUN_NAME` 都不需要修改。
+提交器会把最终 YAML 写到 `jobs/rendered/`，打印 group/queue 后再调用
+`mlx job submitv2`。只想检查 YAML 而不提交时追加 `--render-only`。
 
 该 job 实际申请 `A800_SXM_40GB × 4`，先保存 checkpoint-10，再从 checkpoint-10
 自动 resume 到 checkpoint-20。必须等 job 正常完成后再执行下一步。
@@ -301,10 +317,16 @@ bash shell/run_locany_cpt.sh h20 formal
 Merlin 入口：
 
 ```bash
-mlx job submitv2 --path locany_cpt_v4_a100x4_smoke_merlin.yaml
-mlx job submitv2 --path locany_cpt_v4_a100x4_formal_merlin.yaml
+/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python \
+  scripts/submit_locany_cpt.py --mode smoke --cluster yg
+/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python \
+  scripts/submit_locany_cpt.py --mode formal --cluster yg
 mlx job submitv2 --path locany_cpt_v4_h20x2_formal_merlin.yaml
 ```
+
+上述两条 A800 命令都可将 `--cluster yg` 改为 `--cluster aiai_locate`。该参数只控制
+调度资源组，不切换代码、ByteNAS、数据或 recipe。第一阶段流程仍只需要 smoke；不要因为
+这里给出了 A800 formal 命令就同时启动另一场正式实验。
 
 当前 formal 启动前只要求 A800 smoke：它先在 step 10 强制保存并退出 segment，再从同一
 checkpoint 自动 resume 到 step 20，因此一个 job 同时覆盖多卡训练与断点续训。H20×2
@@ -526,6 +548,24 @@ python scripts/validate_locany_cpt_smoke.py \
 `CPTEvalMetrics` 表至少包含十任务加一行 macro，而不只是存在空的 sheet。
 
 常见失败含义：
+
+- `ImportError: libGL.so.1`：OpenCV wheel 缺少任务容器的系统动态库，不是 CUDA/NCCL
+  错误。所有 CPT train/eval YAML 默认设置 `INSTALL_SYSTEM_RUNTIME_DEPS=1`；launcher 会在
+  `torchrun` 前预检，仅在确实缺失时通过 `sudo apt-get` 安装 `libgl1 libglib2.0-0`，随后
+  再次验证 `import cv2`。在 master/login 节点单独安装不能修复下一次新建的 Merlin
+  容器。若镜像已预装，预检直接通过且不会执行 apt。需要禁止自动安装时，A800 提交命令
+  追加 `--no-install-system-runtime-deps`，或直接运行时设置
+  `INSTALL_SYSTEM_RUNTIME_DEPS=0`。
+
+  如需立即修复并验证**当前这个容器**，可逐条执行；新提交的 Merlin 容器仍由 launcher
+  自动处理：
+
+  ```bash
+  sudo apt-get update
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+  /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python \
+    -c 'import cv2; print(cv2.__version__, cv2.__file__)'
+  ```
 
 - `DummyOptim ... param_groups`：旧版 CPT 自定义 optimizer 路径；当前兼容层不再直接假定
   DummyOptim 暴露 `param_groups`。

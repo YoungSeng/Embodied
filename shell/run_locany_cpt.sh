@@ -98,6 +98,9 @@ fi
 export PATH="${ENV_DIR}/bin:${PATH}"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 export CPT_SAMPLING_MODE="${CPT_SAMPLING_MODE:-sample_equal}"
+export INSTALL_SYSTEM_RUNTIME_DEPS="${INSTALL_SYSTEM_RUNTIME_DEPS:-1}"
+export PROJECT_ROOT ENV_DIR
+bash "${PROJECT_ROOT}/shell/ensure_locany_cpt_runtime.sh"
 _LOCANY_VALIDATE_ARGS=(
   --recipe "${META_PATH}"
   --records-per-dataset "${VALIDATE_RECORDS_PER_DATASET:-8}"

@@ -53,6 +53,7 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
                 for value in expected:
                     self.assertIn(value, text)
                 self.assertIn("Embodied-CPT", text)
+                self.assertIn('INSTALL_SYSTEM_RUNTIME_DEPS: "1"', text)
 
     def test_yaml_pins_smoke_and_formal_training_parameters(self):
         smoke = (REPO_ROOT / "locany_cpt_v4_a100x4_smoke_merlin.yaml").read_text(
@@ -188,6 +189,21 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("scripts/run_locany_cpt_eval_queue.py", eval_launcher)
         self.assertIn("--require-zero-inference-errors", eval_launcher)
+        self.assertIn("shell/ensure_locany_cpt_runtime.sh", eval_launcher)
+
+    def test_cpt_runtime_preflight_installs_libgl_before_worker_imports(self):
+        helper = (
+            REPO_ROOT / "shell" / "ensure_locany_cpt_runtime.sh"
+        ).read_text(encoding="utf-8")
+        launcher = (REPO_ROOT / "shell" / "run_locany_cpt.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("scripts/preflight_locany_runtime.py", helper)
+        self.assertIn("preflight_code != 42", helper)
+        self.assertIn("apt-get install -y", helper)
+        self.assertIn("libgl1 libglib2.0-0", helper)
+        self.assertIn("sudo -n", helper)
+        self.assertIn("shell/ensure_locany_cpt_runtime.sh", launcher)
 
 
 if __name__ == "__main__":

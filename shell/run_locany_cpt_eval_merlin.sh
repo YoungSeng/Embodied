@@ -58,9 +58,12 @@ export TORCH_HOME="${WORKSPACE}/cache/torch"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
+export INSTALL_SYSTEM_RUNTIME_DEPS="${INSTALL_SYSTEM_RUNTIME_DEPS:-1}"
+export PROJECT_ROOT ENV_DIR
 
 cd "${PROJECT_ROOT}"
 bash -n shell/run_locany_cpt_eval_merlin.sh
+bash shell/ensure_locany_cpt_runtime.sh
 "${ENV_DIR}/bin/python" - <<'PY'
 import torch
 if not torch.cuda.is_available() or torch.cuda.device_count() != 1:

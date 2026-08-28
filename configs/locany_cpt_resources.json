@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "a800": {
+    "base_cluster_id": 24,
+    "base_group_id": 1602,
+    "resource_groups": {
+      "yg": {
+        "display_name": "YG default/1602",
+        "group_id": 1602,
+        "queue_name": ""
+      },
+      "aiai_locate": {
+        "display_name": "ies_aiai_experience/AIAI_locate",
+        "group_id": 2146,
+        "queue_name": "compute-3302-yg-cloudnative-ai-aiai.locate-guarantee"
+      }
+    }
+  }
+}
