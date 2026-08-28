@@ -94,6 +94,8 @@ jobRunParams:
     EVAL_VISION_ATTN_IMPLEMENTATION: "flash_attention_2"
     EVAL_DTYPE: "bf16"
     EVAL_MAX_NEW_TOKENS: "1024"
+    # One threshold for held-out bbox metrics and external UI5 scoring.
+    EVAL_IOU_THRESHOLD: "0.1"
     EVAL_EXTERNAL_MAX_NEW_TOKENS: "4096"
     EVAL_EXTERNAL_MAX_IMAGES_PER_TASK: "0"
     REPORT_TO: "tensorboard"

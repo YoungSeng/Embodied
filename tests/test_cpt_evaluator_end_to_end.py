@@ -3,7 +3,9 @@ from __future__ import annotations
 import ast
 import importlib.util
 import io
+import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -335,6 +337,58 @@ class CPTEvaluatorEndToEndTest(unittest.TestCase):
         self.assertIn("fsync_if_supported", source)
         self.assertNotIn("fcntl.flock", source)
 
+    def test_new_point_one_rows_remove_stale_point_five_heldout_rows(self):
+        evaluator = load_evaluator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_dir = root / "eval/checkpoint-20"
+            output_dir.mkdir(parents=True)
+            append_path = root / "diagnostics/cpt_eval_metrics.jsonl"
+            append_path.parent.mkdir(parents=True)
+            append_path.write_text(
+                "".join(
+                    json.dumps(row) + "\n"
+                    for row in (
+                        {
+                            "evaluation_id": "old-heldout",
+                            "checkpoint": "/run/checkpoint-10",
+                            "step": 10,
+                            "split": "heldout",
+                            "task": "ui_defect",
+                            "iou_threshold": 0.5,
+                        },
+                        {
+                            "evaluation_id": "external",
+                            "checkpoint": "/run/checkpoint-10",
+                            "step": 10,
+                            "split": "external_ui5",
+                            "task": "ui_defect_external",
+                            "iou_threshold": 0.1,
+                        },
+                    )
+                ),
+                encoding="utf-8",
+            )
+            current = {
+                "evaluation_id": "new-heldout",
+                "checkpoint": "/run/checkpoint-20",
+                "step": 20,
+                "split": "heldout",
+                "task": "ui_defect",
+                "iou_threshold": 0.1,
+            }
+
+            evaluator.write_eval_metric_rows(output_dir, [current], append_path)
+
+            rows = [
+                json.loads(line)
+                for line in append_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                {row["evaluation_id"] for row in rows},
+                {"external", "new-heldout"},
+            )
+
     def test_repository_generation_supports_legacy_base_without_relation_attribute(self):
         inferencer_source = INFERENCER.read_text(encoding="utf-8")
         model_source = REPOSITORY_MODEL.read_text(encoding="utf-8")
@@ -357,6 +411,7 @@ class CPTEvaluatorEndToEndTest(unittest.TestCase):
             attn_implementation="sdpa",
             vision_attn_implementation="sdpa",
             max_new_tokens=32,
+            iou_threshold=0.1,
             allow_download=False,
             teacher_forced=True,
             seed=20260826,
@@ -395,6 +450,7 @@ class CPTEvaluatorEndToEndTest(unittest.TestCase):
             attn_implementation="sdpa",
             vision_attn_implementation="flash_attention_2",
             max_new_tokens=32,
+            iou_threshold=0.1,
             allow_download=False,
             teacher_forced=True,
             fail_fast_inference_errors=True,

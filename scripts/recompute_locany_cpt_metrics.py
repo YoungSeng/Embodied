@@ -22,7 +22,7 @@ from eaglevl.train.cpt_eval_metrics import (
 )
 
 
-def recompute(predictions: Path) -> dict[str, Any]:
+def recompute(predictions: Path, *, iou_threshold: float = 0.1) -> dict[str, Any]:
     by_model_task: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
         lambda: defaultdict(list)
     )
@@ -45,7 +45,12 @@ def recompute(predictions: Path) -> dict[str, Any]:
                     f"{predictions}:{line_number}: mixed split labels {split!r}/{row_split!r}"
                 )
             split = split or row_split
-            metrics = score_task(task, str(row.get("prediction", "")), str(row["target"]))
+            metrics = score_task(
+                task,
+                str(row.get("prediction", "")),
+                str(row["target"]),
+                iou_threshold=iou_threshold,
+            )
             if row.get("error"):
                 metrics["evaluation_error"] = 1.0
                 metrics["primary_metric"] = 0.0
@@ -67,7 +72,12 @@ def recompute(predictions: Path) -> dict[str, Any]:
     models = {}
     for model, task_values in by_model_task.items():
         per_task = {
-            task: aggregate_scores(task, scores) for task, scores in task_values.items()
+            task: aggregate_scores(
+                task,
+                scores,
+                iou_threshold=iou_threshold,
+            )
+            for task, scores in task_values.items()
         }
         for task, metrics in per_task.items():
             totals = token_losses[model][task]
@@ -92,6 +102,7 @@ def recompute(predictions: Path) -> dict[str, Any]:
         "schema_version": 2,
         "source": str(predictions.resolve()),
         "split": split,
+        "iou_threshold": iou_threshold,
         "models": models,
         "rows": rewritten,
     }
@@ -101,18 +112,25 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--predictions", type=Path, required=True)
     parser.add_argument("--output-summary", type=Path, required=True)
+    parser.add_argument("--iou-threshold", type=float, default=0.1)
     parser.add_argument(
         "--rewrite-predictions",
         type=Path,
         default=None,
         help="optional JSONL with refreshed parsed metrics",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not 0.0 < args.iou_threshold <= 1.0:
+        parser.error("--iou-threshold must be in (0, 1]")
+    return args
 
 
 def main() -> int:
     args = parse_args()
-    result = recompute(args.predictions.expanduser().resolve())
+    result = recompute(
+        args.predictions.expanduser().resolve(),
+        iou_threshold=args.iou_threshold,
+    )
     args.output_summary.parent.mkdir(parents=True, exist_ok=True)
     args.output_summary.write_text(
         json.dumps({key: value for key, value in result.items() if key != "rows"}, ensure_ascii=False, indent=2)

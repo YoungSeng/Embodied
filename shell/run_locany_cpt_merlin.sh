@@ -189,6 +189,7 @@ run_integrated_eval_phase() {
   DATA_DIR="${DATA_DIR}" \
   EVAL_MAX_PENDING="${EVAL_MAX_PENDING:-20}" \
   EVAL_SAMPLES_PER_TASK="${EVAL_SAMPLES_PER_TASK:-10}" \
+  EVAL_IOU_THRESHOLD="${EVAL_IOU_THRESHOLD:-0.1}" \
   EVAL_RETRY_FAILED="${EVAL_RETRY_FAILED:-1}" \
   bash "${PROJECT_ROOT}/shell/run_locany_cpt_eval_merlin.sh" "${MACHINE_TYPE}" \
     2>&1 | tee -a "${LAUNCH_LOG}"
@@ -217,10 +218,11 @@ run_initial_eval_phase() {
     --attn-implementation "${EVAL_ATTN_IMPLEMENTATION:-sdpa}" \
     --vision-attn-implementation "${EVAL_VISION_ATTN_IMPLEMENTATION:-flash_attention_2}" \
     --max-new-tokens "${EVAL_MAX_NEW_TOKENS:-1024}" \
+    --iou-threshold "${EVAL_IOU_THRESHOLD:-0.1}" \
     --external-ui5-data-dir "${CPT_EXTERNAL_UI5_DATA_DIR:-${WORKSPACE}/data}" \
     --external-max-new-tokens "${EVAL_EXTERNAL_MAX_NEW_TOKENS:-4096}" \
     --external-max-images-per-task "${EVAL_EXTERNAL_MAX_IMAGES_PER_TASK:-0}" \
-    --external-iou-thresholds 0.1 \
+    --external-iou-thresholds "${EVAL_IOU_THRESHOLD:-0.1}" \
     --seed "${CPT_EVAL_SEED:-20260826}" \
     2>&1 | tee -a "${LAUNCH_LOG}"
   eval_exit_code="${PIPESTATUS[0]}"

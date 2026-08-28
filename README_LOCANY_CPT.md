@@ -605,12 +605,13 @@ RUN_DIR=/path/to/run DATA_DIR=/path/to/locany_cpt_v4_split_v2 \
 ```bash
 python scripts/recompute_locany_cpt_metrics.py \
   --predictions "$RUN_DIR/eval/checkpoint-STEP/predictions.jsonl" \
+  --iou-threshold 0.1 \
   --output-summary "$RUN_DIR/eval/checkpoint-STEP/summary.recomputed.json"
 ```
 
 primary metrics 分别为 caption ROUGE-L、agent action type+point、agent grounding point
-Hit@50、class-aware defect Macro-F1@0.5、all-elements one-to-one F1@0.5、single
-grounding Recall@0.5、OCR one-to-one label-aware F1@0.5、referring/referring_kg
+Hit@50、class-aware defect Macro-F1@0.1、all-elements one-to-one F1@0.1、single
+grounding Recall@0.1、OCR one-to-one label-aware F1@0.1、referring/referring_kg
 ROUGE-L、VQA 正确/错误 accuracy；Char-F1 均作为附属指标。Point 支持两种语法且坐标必须位于 `[0,1000]`；box
 采用一对一最大总 IoU 匹配，UI defect 只允许同类匹配。综合分数仅为十任务 primary 的
 等权 `heldout_task_macro_primary`。
@@ -647,9 +648,9 @@ python scripts/run_locany_cpt_external_ui5_eval.py \
 
 UI defect 的 hash 子集会在数据可用时强制覆盖文字溢出、文本省略、元素遮挡/重叠、元素
 裁切、内容缺失五类。每次 Base/checkpoint 真实推理结束都会在日志打印五类的 image-level
-P/R/F1 与 class-aware bbox P/R/F1@0.5，以及总的 image macro/micro F1 和 bbox
-macro/micro F1@0.5。相同内容同时保存在 `summary.json`、`cpt_eval_metrics.jsonl` 和 Excel，
-不是仅打印后丢失；bbox macro F1@0.5 仍是 ui_defect 的 primary metric，image F1 是额外
+P/R/F1 与 class-aware bbox P/R/F1@0.1，以及总的 image macro/micro F1 和 bbox
+macro/micro F1@0.1。相同内容同时保存在 `summary.json`、`cpt_eval_metrics.jsonl` 和 Excel，
+不是仅打印后丢失；bbox macro F1@0.1 是 ui_defect 的 primary metric，image F1 是额外
 诊断指标。
 
 ### 6.1 上一版 CPT 的八个 checkpoint 在双 H20 上跑五类测试集
@@ -720,7 +721,8 @@ Magi；跨模型严谨对比则必须让所有待比较模型使用同一 backen
 训练和集成评测均由 YAML 固定为 SDPA，与这个旧 CPT sweep 是两个实验协议。
 
 `0.1` 与仓库现有 `qwen3vl_merge_and_score_fixed_5tasks.py` 的历史默认口径一致，和既有
-Qwen/同事模型报告比较时统一使用该阈值；formal 不再生成外部 IoU=0.5 指标。
+Qwen/同事模型报告比较时统一使用该阈值；formal 的 held-out 和 external UI5 都只使用
+IoU=0.1，不再生成或选择 IoU=0.5 指标。
 
 推理逐图片断点续跑；Ctrl-C 后重新执行同一条完整命令即可，已有图片不会重推。每个
 checkpoint 的预测保存在 `predictions/checkpoint-STEP/`，原始文本在各任务的 `raw/`。
@@ -791,7 +793,7 @@ python scripts/build_locany_cpt_excel.py \
 - `EvalMetrics`：同时保存 `split=heldout` 的十任务 CE/primary/Base delta/best，以及
   `split=external_ui5` 的外部五类总体指标；
 - `UIDefectMetrics`：held-out 与 external_ui5 的 Base/checkpoint × 五类 × image/bbox
-  P/R/F1 和 macro/micro；外部五类的 `iou_threshold` 固定为 0.1。
+  P/R/F1 和 macro/micro；held-out 与外部五类的 `iou_threshold` 都固定为 0.1。
 
 缺失值保持空白，不写成 0。`openpyxl` 缺失或保存失败只产生 warning，不会终止训练；
 JSON/JSONL 仍是 source of truth，Excel 可随时重建。

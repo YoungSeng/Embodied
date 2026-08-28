@@ -173,12 +173,16 @@ class CPTEvalQueueTest(unittest.TestCase):
                 },
                 "defect_image_macro_f1": 0.5,
                 "defect_image_micro_f1": 0.5,
-                "defect_bbox_macro_f1_50": 0.5,
-                "defect_bbox_micro_f1_50": 0.5,
+                "iou_threshold": 0.1,
+                "defect_bbox_macro_f1": 0.5,
+                "defect_bbox_micro_f1": 0.5,
             }
         )
+        for task in ("all_ui_elements", "single_grounding", "ocr"):
+            per_task[task]["iou_threshold"] = 0.1
         summary = {
             "split": "heldout",
+            "iou_threshold": 0.1,
             "teacher_forced": True,
             "task_counts": {task: 10 for task in CPT_TASKS},
             "base": {

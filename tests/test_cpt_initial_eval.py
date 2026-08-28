@@ -34,10 +34,13 @@ def summary_fixture() -> dict:
             },
             "defect_image_macro_f1": 0.5,
             "defect_image_micro_f1": 0.5,
-            "defect_bbox_macro_f1_50": 0.5,
-            "defect_bbox_micro_f1_50": 0.5,
+            "iou_threshold": 0.1,
+            "defect_bbox_macro_f1": 0.5,
+            "defect_bbox_micro_f1": 0.5,
         }
     )
+    for task in ("all_ui_elements", "single_grounding", "ocr"):
+        per_task[task]["iou_threshold"] = 0.1
     aggregate = {
         "per_task": per_task,
         "heldout_task_macro_primary": 0.5,
@@ -47,6 +50,7 @@ def summary_fixture() -> dict:
         "step": 0,
         "split": "heldout",
         "teacher_forced": True,
+        "iou_threshold": 0.1,
         "task_counts": {task: 10 for task in CPT_TASKS},
         "manifest_id": "manifest",
         "evaluation_protocol_id": "protocol",
@@ -82,8 +86,10 @@ class CPTInitialEvalTest(unittest.TestCase):
                     parser = argparse.ArgumentParser(allow_abbrev=False)
                     parser.add_argument('--output-dir', required=True)
                     parser.add_argument('--checkpoint-step', type=int, required=True)
+                    parser.add_argument('--iou-threshold', type=float, required=True)
                     args, _ = parser.parse_known_args()
                     assert args.checkpoint_step == 0
+                    assert args.iou_threshold == 0.1
                     output = Path(args.output_dir)
                     output.mkdir(parents=True, exist_ok=True)
                     calls = Path({str(calls)!r})

@@ -74,14 +74,14 @@ class CPTEvalMetricsTest(unittest.TestCase):
             "<box><10><20><30><40></box>",
             "<box><10><20><30><40></box>",
         )
-        self.assertEqual(score["box_recall_50"], 1.0)
+        self.assertEqual(score["box_recall"], 1.0)
 
     def test_ui_defect_requires_matching_class_even_for_identical_box(self):
         metrics = defect_metrics(
             pair("元素重叠", (100, 100, 300, 300)),
             pair("元素被裁切", (100, 100, 300, 300)),
         )
-        self.assertEqual(metrics["defect_macro_f1_50"], 0.0)
+        self.assertEqual(metrics["defect_macro_f1"], 0.0)
         self.assertEqual(metrics["defect_per_class"]["cropping"]["tp"], 0)
         self.assertEqual(metrics["defect_confusion"]["cropping->occlusion"], 1)
 
@@ -116,21 +116,42 @@ class CPTEvalMetricsTest(unittest.TestCase):
         self.assertEqual(metrics["per_class"]["text_overflow"]["bbox"]["fn"], 1)
         self.assertIsNone(metrics["per_class"]["text_ellipsis"]["image"]["f1"])
         self.assertAlmostEqual(metrics["defect_image_macro_f1"], 0.5)
-        self.assertAlmostEqual(metrics["defect_bbox_macro_f1_50"], 0.5)
+        self.assertAlmostEqual(metrics["defect_bbox_macro_f1"], 0.5)
         self.assertAlmostEqual(metrics["primary_metric"], 0.5)
+
+    def test_all_bbox_tasks_use_the_configured_iou_point_one_threshold(self):
+        target = pair("元素裁切", (0, 0, 100, 100))
+        prediction = pair("元素裁切", (50, 0, 150, 100))  # IoU = 1/3
+
+        at_point_one = score_task(
+            "ui_defect",
+            prediction,
+            target,
+            iou_threshold=0.1,
+        )
+        at_point_five = score_task(
+            "ui_defect",
+            prediction,
+            target,
+            iou_threshold=0.5,
+        )
+
+        self.assertEqual(at_point_one["defect_macro_f1"], 1.0)
+        self.assertEqual(at_point_five["defect_macro_f1"], 0.0)
+        self.assertEqual(at_point_one["iou_threshold"], 0.1)
 
     def test_ocr_reports_location_and_label_aware_results(self):
         target = pair("设置", (10, 10, 100, 100))
         score = score_task("ocr", pair("设置信", (10, 10, 100, 100)), target)
         self.assertEqual(score["location_metrics"]["f1"], 1.0)
-        self.assertEqual(score["ocr_f1_50"], 0.0)
+        self.assertEqual(score["ocr_f1"], 0.0)
         self.assertGreater(score["matched_label_char_f1"], 0.0)
 
     def test_all_elements_reports_type_accuracy_separately(self):
         target = pair("设置 | type=button", (10, 10, 100, 100))
         prediction = pair("设置 | type=text", (10, 10, 100, 100))
         score = score_task("all_ui_elements", prediction, target)
-        self.assertEqual(score["box_f1_50"], 1.0)
+        self.assertEqual(score["box_f1"], 1.0)
         self.assertEqual(score["label_accuracy"], 1.0)
         self.assertEqual(score["type_accuracy"], 0.0)
 

@@ -141,6 +141,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument(
+        "--iou-threshold",
+        type=float,
+        default=0.1,
+        help="single IoU threshold used by every held-out bbox metric",
+    )
+    parser.add_argument(
         "--progress-every",
         type=int,
         default=1,
@@ -165,6 +171,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--samples-per-task must be positive")
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be positive")
+    if not 0.0 < args.iou_threshold <= 1.0:
+        parser.error("--iou-threshold must be in (0, 1]")
     if args.progress_every <= 0:
         parser.error("--progress-every must be positive")
     if args.progress_heartbeat_seconds < 0:
@@ -571,8 +579,19 @@ def teacher_forced_main_ce(
     }
 
 
-def score_result(example: Example, prediction: str, error: str | None) -> dict[str, Any]:
-    metrics = score_task(example.task, prediction, example.target)
+def score_result(
+    example: Example,
+    prediction: str,
+    error: str | None,
+    *,
+    iou_threshold: float = 0.1,
+) -> dict[str, Any]:
+    metrics = score_task(
+        example.task,
+        prediction,
+        example.target,
+        iou_threshold=iou_threshold,
+    )
     if error:
         metrics["evaluation_error"] = 1.0
         metrics["primary_metric"] = 0.0
@@ -684,7 +703,12 @@ def run_model(
                 results[example.key] = {
                     "prediction": prediction,
                     "error": None,
-                    "metrics": score_result(example, prediction, None),
+                    "metrics": score_result(
+                        example,
+                        prediction,
+                        None,
+                        iou_threshold=args.iou_threshold,
+                    ),
                     **teacher_forced,
                 }
                 status = "ok"
@@ -695,7 +719,12 @@ def run_model(
                 results[example.key] = {
                     "prediction": "",
                     "error": error,
-                    "metrics": score_result(example, "", error),
+                    "metrics": score_result(
+                        example,
+                        "",
+                        error,
+                        iou_threshold=args.iou_threshold,
+                    ),
                     "teacher_forced_main_loss_sum": None,
                     "teacher_forced_main_tokens": 0,
                     "teacher_forced_main_token_ce": None,
@@ -755,7 +784,11 @@ def run_model(
 
 
 def summarize(
-    examples: list[Example], results: dict[str, dict[str, Any]], *, split: str
+    examples: list[Example],
+    results: dict[str, dict[str, Any]],
+    *,
+    split: str,
+    iou_threshold: float = 0.1,
 ) -> dict[str, Any]:
     grouped: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
     errors = Counter()
@@ -764,7 +797,10 @@ def summarize(
         if result["error"]:
             errors[example.task] += 1
         grouped.setdefault(example.task, []).append(result["metrics"])
-    per_task = {task: aggregate_scores(task, scores) for task, scores in grouped.items()}
+    per_task = {
+        task: aggregate_scores(task, scores, iou_threshold=iou_threshold)
+        for task, scores in grouped.items()
+    }
     total_loss_sum = 0.0
     total_loss_tokens = 0
     for task in per_task:
@@ -794,6 +830,7 @@ def summarize(
     ]
     return {
         "split": split,
+        "iou_threshold": iou_threshold,
         "examples": len(examples),
         "successful": len(examples) - sum(errors.values()),
         "errors": dict(sorted(errors.items())),
@@ -839,8 +876,10 @@ def print_ui_defect_breakdown(model_label: str, summary: dict[str, Any]) -> None
         "overall "
         f"image_macro_f1={display(metrics.get('defect_image_macro_f1'))} "
         f"image_micro_f1={display(metrics.get('defect_image_micro_f1'))} "
-        f"bbox_macro_f1@0.5={display(metrics.get('defect_bbox_macro_f1_50'))} "
-        f"bbox_micro_f1@0.5={display(metrics.get('defect_bbox_micro_f1_50'))}",
+        f"bbox_macro_f1@{float(metrics.get('iou_threshold', 0.1)):g}="
+        f"{display(metrics.get('defect_bbox_macro_f1'))} "
+        f"bbox_micro_f1@{float(metrics.get('iou_threshold', 0.1)):g}="
+        f"{display(metrics.get('defect_bbox_micro_f1'))}",
         flush=True,
     )
 
@@ -897,6 +936,7 @@ def load_or_run_base(
                         example,
                         str(result.get("prediction", "")),
                         result.get("error"),
+                        iou_threshold=args.iou_threshold,
                     )
                 return results, path, True
         results = run_model("base", args.base_model, examples, args)
@@ -990,6 +1030,7 @@ def write_outputs(
                     **asdict(example),
                     "model": model_label,
                     "checkpoint": args.base_model if model_label == "base" else args.checkpoint,
+                    "iou_threshold": args.iou_threshold,
                     "prediction": result["prediction"],
                     "parsed_target": parsed_value(example.task, example.target),
                     "parsed_prediction": parsed_value(example.task, result["prediction"]),
@@ -1001,6 +1042,8 @@ def write_outputs(
                 }
                 output.write(json.dumps(row, ensure_ascii=False) + "\n")
                 primary = result["metrics"].get("primary_metric") if result["metrics"] else None
+                # This is a normalized primary-score review cutoff, not an IoU
+                # matching threshold. Bbox matching is exclusively args.iou_threshold.
                 if result["error"] or (isinstance(primary, (int, float)) and primary < 0.5):
                     error_output.write(json.dumps(row, ensure_ascii=False) + "\n")
 
@@ -1009,6 +1052,7 @@ def write_outputs(
         "",
         f"- split: `{args.eval_split}`",
         f"- subset strategy: `{args.subset_strategy}`",
+        f"- IoU threshold: `{args.iou_threshold:g}`",
         "",
     ]
     seen: Counter[str] = Counter()
@@ -1120,6 +1164,7 @@ def build_eval_metric_rows(
         args.dtype,
         args.attn_implementation,
         args.vision_attn_implementation,
+        args.iou_threshold,
         Path(args.processor_path or args.base_model).expanduser().resolve(),
         *sorted(checkpoint_per_task),
     )
@@ -1139,6 +1184,7 @@ def build_eval_metric_rows(
             "manifest_id": summary["manifest_id"],
             "subset_strategy": args.subset_strategy,
             "samples_per_task": args.samples_per_task,
+            "iou_threshold": args.iou_threshold,
             "step": step,
             "split": args.eval_split,
             "task": task,
@@ -1185,6 +1231,7 @@ def build_eval_metric_rows(
         "manifest_id": summary["manifest_id"],
         "subset_strategy": args.subset_strategy,
         "samples_per_task": args.samples_per_task,
+        "iou_threshold": args.iou_threshold,
         "step": step,
         "split": args.eval_split,
         "task": "__task_macro__",
@@ -1203,7 +1250,10 @@ def build_eval_metric_rows(
     macro["complete_ten_task_heldout"] = complete_heldout
     current_checkpoint = macro["checkpoint"]
     prior_history = [
-        row for row in history if row.get("checkpoint") != current_checkpoint
+        row
+        for row in history
+        if row.get("checkpoint") != current_checkpoint
+        and row.get("evaluation_protocol_id") == evaluation_protocol_id
     ]
     selection = select_checkpoint(macro, checkpoint_per_task, prior_history)
     selection["complete_ten_task_heldout"] = complete_heldout
@@ -1231,10 +1281,41 @@ def write_eval_metric_rows(
             try:
                 existing = _read_jsonl_rows(append_path)
                 replacement_ids = {row["evaluation_id"] for row in rows}
+                active_heldout_thresholds = {
+                    float(row["iou_threshold"])
+                    for row in rows
+                    if row.get("split") == "heldout"
+                    and isinstance(row.get("iou_threshold"), (int, float))
+                }
+                replacement_keys = {
+                    (
+                        row.get("checkpoint"),
+                        row.get("step"),
+                        row.get("split"),
+                        row.get("task"),
+                    )
+                    for row in rows
+                }
                 retained = [
                     row
                     for row in existing
                     if row.get("evaluation_id") not in replacement_ids
+                    and not (
+                        row.get("split") == "heldout"
+                        and active_heldout_thresholds
+                        and (
+                            not isinstance(row.get("iou_threshold"), (int, float))
+                            or float(row["iou_threshold"])
+                            not in active_heldout_thresholds
+                        )
+                    )
+                    and (
+                        row.get("checkpoint"),
+                        row.get("step"),
+                        row.get("split"),
+                        row.get("task"),
+                    )
+                    not in replacement_keys
                 ]
                 with tempfile.NamedTemporaryFile(
                     "w",
@@ -1298,13 +1379,23 @@ def main() -> int:
         checkpoint_results = base_results
     else:
         checkpoint_results = run_model("checkpoint", args.checkpoint, examples, args)
-    base_summary = summarize(examples, base_results, split=args.eval_split)
-    checkpoint_summary = summarize(examples, checkpoint_results, split=args.eval_split)
+    base_summary = summarize(
+        examples,
+        base_results,
+        split=args.eval_split,
+        iou_threshold=args.iou_threshold,
+    )
+    checkpoint_summary = summarize(
+        examples,
+        checkpoint_results,
+        split=args.eval_split,
+        iou_threshold=args.iou_threshold,
+    )
     print_ui_defect_breakdown("base", base_summary)
     print_ui_defect_breakdown("checkpoint", checkpoint_summary)
     apply_manual_referring_review(checkpoint_summary, args.manual_review_jsonl)
     summary = {
-        "schema_version": 2,
+        "schema_version": 3,
         "evaluation_kind": (
             "heldout_generalization"
             if args.eval_split == "heldout"
@@ -1317,6 +1408,7 @@ def main() -> int:
         "subset_strategy": args.subset_strategy,
         "seed": args.seed,
         "samples_per_task": args.samples_per_task,
+        "iou_threshold": args.iou_threshold,
         "task_counts": dict(counts),
         "base_model": args.base_model,
         "checkpoint": args.checkpoint,

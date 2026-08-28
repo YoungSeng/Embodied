@@ -72,6 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--vision-attn-implementation", default="flash_attention_2")
     parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--iou-threshold", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=20260826)
     parser.add_argument(
         "--require-zero-inference-errors",
@@ -84,6 +85,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--samples-per-task and --max-new-tokens must be positive")
     if args.external_max_new_tokens <= 0 or args.external_max_images_per_task < 0:
         parser.error("invalid external UI5 token/image limit")
+    if not 0.0 < args.iou_threshold <= 1.0:
+        parser.error("--iou-threshold must be in (0, 1]")
     return args
 
 
@@ -100,6 +103,7 @@ def expected_identity(args: argparse.Namespace) -> dict[str, Any]:
         "attn_implementation": args.attn_implementation,
         "vision_attn_implementation": args.vision_attn_implementation,
         "max_new_tokens": int(args.max_new_tokens),
+        "heldout_iou_threshold": float(args.iou_threshold),
         "seed": int(args.seed),
         "external_ui5_data_dir": str(args.external_ui5_data_dir),
         "external_max_new_tokens": int(args.external_max_new_tokens),
@@ -116,6 +120,7 @@ def validate_summary(path: Path, args: argparse.Namespace) -> dict[str, Any]:
         summary,
         samples_per_task=args.samples_per_task,
         require_zero_errors=args.require_zero_inference_errors,
+        iou_threshold=args.iou_threshold,
     )
     if summary.get("step") != 0:
         raise RuntimeError(f"initial evaluation summary step is not 0: {summary.get('step')!r}")
@@ -172,10 +177,9 @@ def main() -> int:
     if marker_path.is_file() and not args.force:
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
         previous_identity = marker.get("identity")
-        legacy_identity = (
-            isinstance(previous_identity, dict)
-            and not any(str(key).startswith("external_") for key in previous_identity)
-            and all(identity.get(key) == value for key, value in previous_identity.items())
+        legacy_identity = isinstance(previous_identity, dict) and all(
+            identity.get(key) == value
+            for key, value in previous_identity.items()
         )
         if previous_identity != identity and not legacy_identity:
             raise RuntimeError(
@@ -192,7 +196,7 @@ def main() -> int:
             return 0
         print(
             "INITIAL_CPT_EVAL=UPGRADE_LEGACY_COMPLETION "
-            "reason=external_ui5_was_not_part_of_the_old_step0_gate"
+            "reason=evaluation_protocol_added_or_changed"
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -235,6 +239,8 @@ def main() -> int:
         args.vision_attn_implementation,
         "--max-new-tokens",
         str(args.max_new_tokens),
+        "--iou-threshold",
+        str(args.iou_threshold),
         "--seed",
         str(args.seed),
         "--teacher-forced",

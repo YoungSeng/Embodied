@@ -57,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--vision-attn-implementation", default="sdpa")
     parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--iou-threshold", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=20260826)
     parser.add_argument(
         "--require-zero-inference-errors",
@@ -68,6 +69,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--samples-per-task and --max-pending must be positive")
     if args.external_max_new_tokens <= 0 or args.external_max_images_per_task < 0:
         parser.error("invalid external UI5 token/image limit")
+    if not 0.0 < args.iou_threshold <= 1.0:
+        parser.error("--iou-threshold must be in (0, 1]")
     return args
 
 
@@ -76,11 +79,17 @@ def validate_eval_summary(
     *,
     samples_per_task: int,
     require_zero_errors: bool,
+    iou_threshold: float = 0.1,
 ) -> None:
     if summary.get("split") != "heldout":
         raise RuntimeError(f"eval summary is not held-out: split={summary.get('split')!r}")
     if summary.get("teacher_forced") is not True:
         raise RuntimeError("eval summary did not run teacher-forced CE")
+    if float(summary.get("iou_threshold", -1.0)) != float(iou_threshold):
+        raise RuntimeError(
+            "held-out eval IoU threshold mismatch: "
+            f"actual={summary.get('iou_threshold')!r}, expected={iou_threshold}"
+        )
     task_counts = {str(key): int(value) for key, value in summary.get("task_counts", {}).items()}
     if set(task_counts) != set(CPT_TASKS):
         raise RuntimeError(
@@ -107,6 +116,15 @@ def validate_eval_summary(
                     f"{label} task={task} inference_error_count="
                     f"{metrics.get('inference_error_count')}"
                 )
+        for task in ("ui_defect", "all_ui_elements", "single_grounding", "ocr"):
+            actual_threshold = per_task[task].get("iou_threshold")
+            if not isinstance(actual_threshold, (int, float)) or float(
+                actual_threshold
+            ) != float(iou_threshold):
+                raise RuntimeError(
+                    f"{label} task={task} IoU threshold mismatch: "
+                    f"actual={actual_threshold!r}, expected={iou_threshold}"
+                )
         defect = per_task["ui_defect"]
         defect_classes = defect.get("per_class", {})
         missing_defect_classes = set(UI_DEFECT_CLASSES).difference(defect_classes)
@@ -118,8 +136,8 @@ def validate_eval_summary(
         for metric in (
             "defect_image_macro_f1",
             "defect_image_micro_f1",
-            "defect_bbox_macro_f1_50",
-            "defect_bbox_micro_f1_50",
+            "defect_bbox_macro_f1",
+            "defect_bbox_micro_f1",
         ):
             if defect.get(metric) is None:
                 raise RuntimeError(f"{label} ui_defect has no {metric}")
@@ -148,6 +166,7 @@ def evaluator_command(args: argparse.Namespace, row: Mapping[str, Any], output_d
         "--attn-implementation", args.attn_implementation,
         "--vision-attn-implementation", args.vision_attn_implementation,
         "--max-new-tokens", str(args.max_new_tokens),
+        "--iou-threshold", str(args.iou_threshold),
         "--seed", str(args.seed),
         "--teacher-forced",
         "--fail-fast-inference-errors",
@@ -171,6 +190,7 @@ def run_claim(args: argparse.Namespace, row: Mapping[str, Any]) -> dict[str, Any
                 summary,
                 samples_per_task=args.samples_per_task,
                 require_zero_errors=args.require_zero_inference_errors,
+                iou_threshold=args.iou_threshold,
             )
             if int(summary.get("step") or -1) != step:
                 raise RuntimeError(
@@ -195,6 +215,7 @@ def run_claim(args: argparse.Namespace, row: Mapping[str, Any]) -> dict[str, Any
             summary,
             samples_per_task=args.samples_per_task,
             require_zero_errors=args.require_zero_inference_errors,
+            iou_threshold=args.iou_threshold,
         )
     external_summary_path = None
     if args.external_ui5_eval:

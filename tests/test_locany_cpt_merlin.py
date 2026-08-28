@@ -238,8 +238,17 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("scripts/run_locany_cpt_eval_queue.py", eval_launcher)
         self.assertIn("--external-ui5-data-dir", eval_launcher)
-        self.assertIn("--external-iou-thresholds 0.1", eval_launcher)
-        self.assertNotIn("--external-iou-thresholds 0.1 0.5", eval_launcher)
+        self.assertIn(
+            '--external-iou-thresholds "${EVAL_IOU_THRESHOLD:-0.1}"',
+            eval_launcher,
+        )
+        self.assertIn('--iou-threshold "${EVAL_IOU_THRESHOLD:-0.1}"', eval_launcher)
+        for filename in (
+            "locany_cpt_v4_h20x2_formal_merlin.yaml",
+            "locany_cpt_v4_h20x4_formal_merlin.yaml",
+        ):
+            formal_yaml = (REPO_ROOT / filename).read_text(encoding="utf-8")
+            self.assertIn('EVAL_IOU_THRESHOLD: "0.1"', formal_yaml)
         self.assertIn("--require-zero-inference-errors", eval_launcher)
         self.assertIn("shell/ensure_locany_cpt_runtime.sh", eval_launcher)
         self.assertIn("EVAL_VISION_ATTN_IMPLEMENTATION:-flash_attention_2", eval_launcher)

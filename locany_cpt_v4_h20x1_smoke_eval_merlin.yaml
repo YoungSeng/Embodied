@@ -70,5 +70,6 @@ jobRunParams:
     EVAL_VISION_ATTN_IMPLEMENTATION: "flash_attention_2"
     EVAL_DTYPE: "bf16"
     EVAL_MAX_NEW_TOKENS: "1024"
+    EVAL_IOU_THRESHOLD: "0.1"
 
 namespace: /user/sicheng.yang

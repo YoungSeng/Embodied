@@ -29,16 +29,17 @@ TAP_POINT_RE = re.compile(
 )
 SPECIAL_END_RE = re.compile(r"(?:<\|im_end\|>|<\|endoftext\|>)+\s*$")
 BOX_NONE_RE = re.compile(r"<box>\s*(?:none|null|无)\s*</box>", re.IGNORECASE)
+DEFAULT_IOU_THRESHOLD = 0.1
 
 
 PRIMARY_METRIC_BY_TASK = {
     "ui_caption": "rouge_l",
     "agent_action": "action_hit50",
     "agent_grounding": "point_hit50",
-    "ui_defect": "defect_macro_f1_50",
-    "all_ui_elements": "box_f1_50",
-    "single_grounding": "box_recall_50",
-    "ocr": "ocr_f1_50",
+    "ui_defect": "defect_macro_f1",
+    "all_ui_elements": "box_f1",
+    "single_grounding": "box_recall",
+    "ocr": "ocr_f1",
     "referring_kg": "rouge_l",
     "referring": "rouge_l",
     "vqa": "vqa_accuracy",
@@ -307,7 +308,7 @@ def one_to_one_boxes(
     prediction: str,
     target: str,
     *,
-    iou_threshold: float = 0.5,
+    iou_threshold: float = DEFAULT_IOU_THRESHOLD,
     label_aware: bool = False,
 ) -> dict[str, Any]:
     predicted = parse_labeled_boxes(prediction)
@@ -433,7 +434,12 @@ def point_metrics(prediction: str, target: str) -> dict[str, Any]:
     }
 
 
-def defect_metrics(prediction: str, target: str) -> dict[str, Any]:
+def defect_metrics(
+    prediction: str,
+    target: str,
+    *,
+    iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+) -> dict[str, Any]:
     predicted, gold = parse_labeled_boxes(prediction), parse_labeled_boxes(target)
     for item in [*predicted, *gold]:
         item["label"] = canonical_defect_label(item["label"])
@@ -454,7 +460,12 @@ def defect_metrics(prediction: str, target: str) -> dict[str, Any]:
             for item in gold
             if item["label"] == label
         )
-        per_class[label] = one_to_one_boxes(pred_text, gold_text, label_aware=True)
+        per_class[label] = one_to_one_boxes(
+            pred_text,
+            gold_text,
+            iou_threshold=iou_threshold,
+            label_aware=True,
+        )
 
     image_classes = [*UI_DEFECT_CLASSES]
     image_classes.extend(sorted(observed_classes.difference(UI_DEFECT_CLASSES)))
@@ -481,11 +492,12 @@ def defect_metrics(prediction: str, target: str) -> dict[str, Any]:
         for g in gold
     ]
     for left, right, iou in maximum_weight_matching(weights):
-        if iou >= 0.5:
+        if iou >= iou_threshold:
             confusion[f"{gold[left]['label']}->{predicted[right]['label']}"] += 1
     macro_values = [value["f1"] for value in per_class.values()]
     return {
-        "defect_macro_f1_50": sum(macro_values) / len(macro_values) if macro_values else 1.0,
+        "iou_threshold": iou_threshold,
+        "defect_macro_f1": sum(macro_values) / len(macro_values) if macro_values else 1.0,
         "defect_per_class": per_class,
         "defect_image_per_class": image_per_class,
         "defect_confusion": dict(sorted(confusion.items())),
@@ -502,7 +514,13 @@ def defect_metrics(prediction: str, target: str) -> dict[str, Any]:
     }
 
 
-def score_task(task: str, prediction: str, target: str) -> dict[str, Any]:
+def score_task(
+    task: str,
+    prediction: str,
+    target: str,
+    *,
+    iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+) -> dict[str, Any]:
     base = {
         "exact_match": float(normalize_text(prediction) == normalize_text(target)),
         "char_f1": char_f1(prediction, target),
@@ -540,16 +558,33 @@ def score_task(task: str, prediction: str, target: str) -> dict[str, Any]:
                 }
             )
     elif task == "ui_defect":
-        base.update(defect_metrics(prediction, target))
+        base.update(
+            defect_metrics(
+                prediction,
+                target,
+                iou_threshold=iou_threshold,
+            )
+        )
     elif task in {"all_ui_elements", "ocr"}:
-        location = one_to_one_boxes(prediction, target, label_aware=False)
-        label = one_to_one_boxes(prediction, target, label_aware=True)
+        location = one_to_one_boxes(
+            prediction,
+            target,
+            iou_threshold=iou_threshold,
+            label_aware=False,
+        )
+        label = one_to_one_boxes(
+            prediction,
+            target,
+            iou_threshold=iou_threshold,
+            label_aware=True,
+        )
         prefix = "ocr" if task == "ocr" else "box"
         base.update(
             {
-                f"{prefix}_precision_50": label["precision"] if task == "ocr" else location["precision"],
-                f"{prefix}_recall_50": label["recall"] if task == "ocr" else location["recall"],
-                f"{prefix}_f1_50": label["f1"] if task == "ocr" else location["f1"],
+                "iou_threshold": iou_threshold,
+                f"{prefix}_precision": label["precision"] if task == "ocr" else location["precision"],
+                f"{prefix}_recall": label["recall"] if task == "ocr" else location["recall"],
+                f"{prefix}_f1": label["f1"] if task == "ocr" else location["f1"],
                 "location_metrics": location,
                 "label_aware_metrics": label,
                 "label_accuracy": (
@@ -571,7 +606,12 @@ def score_task(task: str, prediction: str, target: str) -> dict[str, Any]:
             }
         )
     elif task == "single_grounding":
-        location = one_to_one_boxes(prediction, target, label_aware=False)
+        location = one_to_one_boxes(
+            prediction,
+            target,
+            iou_threshold=iou_threshold,
+            label_aware=False,
+        )
         gold = parse_labeled_boxes(target)
         predicted = parse_labeled_boxes(prediction)
         weights = [
@@ -587,10 +627,9 @@ def score_task(task: str, prediction: str, target: str) -> dict[str, Any]:
         best_ious = [weight for _, _, weight in assignments]
         base.update(
             {
-                "box_recall_50": location["recall"],
-                "box_recall_75": sum(value >= 0.75 for value in best_ious) / len(gold) if gold else float(not predicted),
+                "iou_threshold": iou_threshold,
+                "box_recall": location["recall"],
                 "mean_iou": sum(best_ious) / len(gold) if gold else None,
-                "box_hits_75": sum(value >= 0.75 for value in best_ious),
                 "box_iou_sum": sum(best_ious),
                 "format_valid": location["format_valid"],
                 "location_metrics": location,
@@ -608,7 +647,12 @@ def _mean(values: Iterable[Any]) -> float | None:
     return sum(numeric) / len(numeric) if numeric else None
 
 
-def aggregate_scores(task: str, scores: Sequence[dict[str, Any]]) -> dict[str, Any]:
+def aggregate_scores(
+    task: str,
+    scores: Sequence[dict[str, Any]],
+    *,
+    iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+) -> dict[str, Any]:
     scalar_keys = sorted(
         {
             key
@@ -689,21 +733,19 @@ def aggregate_scores(task: str, scores: Sequence[dict[str, Any]]) -> dict[str, A
     if task == "single_grounding":
         gold = sum(int(score["location_metrics"]["gold_count"]) for score in scores)
         predictions = sum(int(score["location_metrics"]["pred_count"]) for score in scores)
-        hits50 = sum(int(score["location_metrics"]["tp"]) for score in scores)
-        hits75 = sum(int(score.get("box_hits_75", 0)) for score in scores)
+        hits = sum(int(score["location_metrics"]["tp"]) for score in scores)
         iou_sum = sum(float(score.get("box_iou_sum", 0.0)) for score in scores)
         output.update(
             {
                 "box_gold_count": gold,
                 "box_pred_count": predictions,
-                "box_hits_50": hits50,
-                "box_hits_75": hits75,
-                "box_recall_50": hits50 / gold if gold else float(predictions == 0),
-                "box_recall_75": hits75 / gold if gold else float(predictions == 0),
+                "iou_threshold": iou_threshold,
+                "box_hits": hits,
+                "box_recall": hits / gold if gold else float(predictions == 0),
                 "mean_iou": iou_sum / gold if gold else None,
             }
         )
-        output["primary_metric"] = output["box_recall_50"]
+        output["primary_metric"] = output["box_recall"]
     if task == "vqa":
         output["confusion"] = dict(sorted(Counter(score.get("vqa_confusion") for score in scores).items()))
     if task == "ui_defect":
@@ -791,13 +833,12 @@ def aggregate_scores(task: str, scores: Sequence[dict[str, Any]]) -> dict[str, A
         output["image_macro"] = image_macro
         output["bbox_micro"] = bbox_micro
         output["image_micro"] = image_micro
-        output["defect_bbox_macro_f1_50"] = bbox_macro["f1"]
+        output["iou_threshold"] = iou_threshold
+        output["defect_bbox_macro_f1"] = bbox_macro["f1"]
         output["defect_image_macro_f1"] = image_macro["f1"]
-        output["defect_bbox_micro_f1_50"] = bbox_micro["f1"]
+        output["defect_bbox_micro_f1"] = bbox_micro["f1"]
         output["defect_image_micro_f1"] = image_micro["f1"]
-        # Preserve the original primary metric name while making its bbox
-        # granularity explicit in the additional fields above.
-        output["defect_macro_f1_50"] = bbox_macro["f1"]
+        output["defect_macro_f1"] = bbox_macro["f1"]
         output["confusion"] = dict(sorted(confusion.items()))
         output["primary_metric"] = bbox_macro["f1"]
     if task in {"all_ui_elements", "ocr"}:

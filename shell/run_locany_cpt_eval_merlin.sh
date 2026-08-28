@@ -72,6 +72,7 @@ export PROJECT_ROOT ENV_DIR
 
 cd "${PROJECT_ROOT}"
 echo "heldout_eval         : enabled"
+echo "heldout_iou          : ${EVAL_IOU_THRESHOLD:-0.1}"
 echo "external_ui5_eval    : ${EXTERNAL_UI5_EVAL}"
 echo "external_ui5_data    : ${EXTERNAL_UI5_DATA_DIR}"
 bash -n shell/run_locany_cpt_eval_merlin.sh
@@ -105,11 +106,12 @@ EVAL_ARGS=(
   --attn-implementation "${EVAL_ATTN_IMPLEMENTATION:-sdpa}"
   --vision-attn-implementation "${EVAL_VISION_ATTN_IMPLEMENTATION:-flash_attention_2}"
   --max-new-tokens "${EVAL_MAX_NEW_TOKENS:-1024}"
+  --iou-threshold "${EVAL_IOU_THRESHOLD:-0.1}"
   --seed "${CPT_EVAL_SEED:-20260826}"
   --require-zero-inference-errors
   --external-max-new-tokens "${EVAL_EXTERNAL_MAX_NEW_TOKENS:-4096}"
   --external-max-images-per-task "${EVAL_EXTERNAL_MAX_IMAGES_PER_TASK:-0}"
-  --external-iou-thresholds 0.1
+  --external-iou-thresholds "${EVAL_IOU_THRESHOLD:-0.1}"
 )
 if [[ "${EXTERNAL_UI5_EVAL}" == "1" ]]; then
   EVAL_ARGS+=(--external-ui5-eval --external-ui5-data-dir "${EXTERNAL_UI5_DATA_DIR}")
