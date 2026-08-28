@@ -8,7 +8,6 @@ checks require ``--eval-split train_pool`` and cannot select a best checkpoint.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import gc
 import hashlib
 import json
@@ -45,28 +44,15 @@ from eaglevl.train.cpt_eval_metrics import (  # noqa: E402
     task_macro_primary,
 )
 from eaglevl.train.cpt_checkpoint_selection import select_checkpoint  # noqa: E402
+from eaglevl.train.cpt_eval_queue import (  # noqa: E402
+    exclusive_file_lock,
+    fsync_if_supported,
+)
 from eaglevl.train.cpt_observability import CPT_TASKS  # noqa: E402
 from scripts.inference_ui_defect_locany import LocateAnythingInferencer  # noqa: E402
 
 
 IMAGE_TOKEN_RE = re.compile(r"<image(?:-\d+)?>")
-
-
-@contextlib.contextmanager
-def exclusive_file_lock(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
-        try:
-            import fcntl
-        except ImportError:  # Windows/local evaluator development fallback.
-            fcntl = None
-        if fcntl is not None:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 @dataclass(frozen=True)
@@ -972,15 +958,8 @@ def write_eval_metric_rows(
     if append_path is not None:
         append_path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = append_path.with_suffix(append_path.suffix + ".lock")
-        with lock_path.open("a+", encoding="utf-8") as lock_handle:
-            try:
-                import fcntl
-
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-            except ImportError:
-                # Windows development runs are single-process; formal Merlin
-                # evaluation runs on Linux and use the lock above.
-                fcntl = None
+        with exclusive_file_lock(lock_path):
+            temporary: Path | None = None
             try:
                 existing = _read_jsonl_rows(append_path)
                 replacement_ids = {row["evaluation_id"] for row in rows}
@@ -1002,11 +981,11 @@ def write_eval_metric_rows(
                             json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
                         )
                     handle.flush()
-                    os.fsync(handle.fileno())
+                    fsync_if_supported(handle, path=temporary)
                 os.replace(temporary, append_path)
             finally:
-                if fcntl is not None:
-                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
 
 
 def main() -> int:

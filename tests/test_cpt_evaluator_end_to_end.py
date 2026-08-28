@@ -212,6 +212,13 @@ class CPTEvaluatorEndToEndTest(unittest.TestCase):
         self.assertIn("image_grid_hws", model.calls[0])
         self.assertIn("image_flags", model.calls[0])
 
+    def test_evaluator_uses_shared_nas_compatible_lock(self):
+        source = EVALUATOR.read_text(encoding="utf-8")
+        self.assertIn("from eaglevl.train.cpt_eval_queue import", source)
+        self.assertIn("exclusive_file_lock", source)
+        self.assertIn("fsync_if_supported", source)
+        self.assertNotIn("fcntl.flock", source)
+
     def test_run_model_keeps_teacher_forced_result_in_prediction_row(self):
         evaluator = load_evaluator_module()
         args = SimpleNamespace(

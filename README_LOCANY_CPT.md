@@ -103,6 +103,10 @@ bash shell/run_locany_cpt_eval_merlin.sh a100
 十任务 Base/checkpoint teacher-forced CE 均非空、inference error 为 0，并生成真实
 `cpt_eval_metrics.jsonl` 和三 sheet Excel。
 
+如果 eval 因基础设施或依赖问题退出，对应 queue row 会变为 `failed`。修复代码后在同一
+命令中增加 `EVAL_RETRY_FAILED=1`；runner 会显式重试 failed row，Base cache 和指标写入
+均使用与 eval queue 相同的 ByteNAS 兼容锁。
+
 ### 0.4 YG：执行 A800 最终 validator
 
 ```bash

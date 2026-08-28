@@ -49,7 +49,7 @@ def read_eval_queue(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _fsync_if_supported(handle: Any, *, path: Path) -> None:
+def fsync_if_supported(handle: Any, *, path: Path) -> None:
     try:
         os.fsync(handle.fileno())
     except OSError as exc:
@@ -72,7 +72,7 @@ def _atomic_write(path: Path, rows: list[dict[str, Any]]) -> None:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
         handle.flush()
-        _fsync_if_supported(handle, path=temporary)
+        fsync_if_supported(handle, path=temporary)
     os.replace(temporary, path)
 
 
@@ -146,8 +146,9 @@ def _directory_queue_lock(lock_path: Path) -> Iterator[None]:
 
 
 @contextmanager
-def eval_queue_lock(path: Path) -> Iterator[None]:
-    lock_path = path.with_suffix(path.suffix + ".lock")
+def exclusive_file_lock(lock_path: Path) -> Iterator[None]:
+    """Cross-process lock with a ByteNAS-safe fallback when flock is absent."""
+
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as handle:
         fcntl_module = _acquire_flock(handle)
@@ -159,6 +160,13 @@ def eval_queue_lock(path: Path) -> Iterator[None]:
             yield
         finally:
             fcntl_module.flock(handle.fileno(), fcntl_module.LOCK_UN)
+
+
+@contextmanager
+def eval_queue_lock(path: Path) -> Iterator[None]:
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with exclusive_file_lock(lock_path):
+        yield
 
 
 def enqueue_pending_eval(path: Path, row: Mapping[str, Any]) -> bool:
