@@ -303,11 +303,62 @@ def iter_source_records(source: RecipeSource) -> Iterator[tuple[int, dict[str, A
             yield line_number, value
 
 
-def stable_record_id(source: RecipeSource, line_number: int, record: dict[str, Any]) -> str:
-    existing = record.get("cpt_record_id", record.get("id"))
+def source_record_id(record: Mapping[str, Any]) -> str | None:
+    existing = record.get(
+        "cpt_source_record_id",
+        record.get("cpt_record_id", record.get("id")),
+    )
     if existing is not None and str(existing).strip():
+        return str(existing).strip()
+    return None
+
+
+def base_record_id(
+    source: RecipeSource, line_number: int, record: Mapping[str, Any]
+) -> str:
+    existing = source_record_id(record)
+    if existing is not None:
         return f"{source.task}:{existing}"
     return f"{source.task}:{source.annotation.name}:{line_number}"
+
+
+def record_source_locator(
+    source: RecipeSource, line_number: int, record: Mapping[str, Any]
+) -> tuple[str, int]:
+    """Return a cluster-portable source row locator for ID disambiguation."""
+
+    raw_source = str(record.get("cpt_source") or source.annotation.name)
+    normalized_source = raw_source.replace("\\", "/").strip()
+    raw_line = record.get("cpt_source_line", line_number)
+    try:
+        source_line = int(raw_line)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"invalid cpt_source_line={raw_line!r} for {source.annotation}:{line_number}"
+        ) from exc
+    return normalized_source, source_line
+
+
+def stable_record_id(
+    source: RecipeSource,
+    line_number: int,
+    record: Mapping[str, Any],
+    *,
+    duplicate_base_ids: set[str] | frozenset[str] = frozenset(),
+) -> str:
+    """Keep unique business IDs readable and deterministically disambiguate duplicates."""
+
+    base = base_record_id(source, line_number, record)
+    if base not in duplicate_base_ids:
+        return base
+    source_name, source_line = record_source_locator(source, line_number, record)
+    suffix = stable_hash(
+        "duplicate-record-id-v1",
+        source.task,
+        source_name,
+        source_line,
+    )[:16]
+    return f"{base}:dup-{suffix}"
 
 
 @dataclass
@@ -501,7 +552,7 @@ def split_recipe(
         )
 
     identity_union = ImageIdentityUnion()
-    record_ids: set[str] = set()
+    base_record_id_counts: Counter[str] = Counter()
     path_duplicate_candidates: dict[tuple[str, int], set[str]] = defaultdict(set)
     phase = "hash_images_and_connect_groups"
     phase_started = time.time()
@@ -523,13 +574,9 @@ def split_recipe(
                         ].add(path.as_posix())
                 _, _, content_digests = image_group_id(paths, cache, group_id_mode)
                 identity_union.connect(content_digests)
-                record_id = stable_record_id(source, line_number, record)
-                if record_id in record_ids:
-                    raise ValueError(
-                        f"duplicate record_id={record_id!r}; source row IDs must be unique "
-                        "within each CPT task"
-                    )
-                record_ids.add(record_id)
+                base_record_id_counts[
+                    base_record_id(source, line_number, record)
+                ] += 1
                 phase_rows += 1
                 if progress_every and phase_rows % progress_every == 0:
                     report_progress(phase, phase_rows, phase_started)
@@ -540,6 +587,22 @@ def split_recipe(
         cache.save()
     report_progress(phase, phase_rows, phase_started, done=True)
     identity_to_group = identity_union.group_ids()
+    duplicate_base_ids = {
+        record_id
+        for record_id, count in base_record_id_counts.items()
+        if count > 1
+    }
+    duplicate_source_record_rows = sum(
+        base_record_id_counts[record_id] for record_id in duplicate_base_ids
+    )
+    if duplicate_base_ids:
+        print(
+            "[split] duplicate source record IDs will be deterministically "
+            f"disambiguated: ids={len(duplicate_base_ids):,} "
+            f"rows={duplicate_source_record_rows:,} "
+            f"examples={sorted(duplicate_base_ids)[:5]}",
+            flush=True,
+        )
 
     # Aggregate tasks and label strata only after shared-image connected
     # components are complete. This prevents a multi-image record [A, B] from
@@ -603,6 +666,8 @@ def split_recipe(
     phase = "write_train_val_and_manifest"
     phase_started = time.time()
     phase_rows = 0
+    final_record_ids: set[str] = set()
+    duplicate_record_details: dict[str, list[dict[str, Any]]] = defaultdict(list)
     print(f"[split] phase={phase} state=START", flush=True)
     try:
         for source in sources:
@@ -612,13 +677,29 @@ def split_recipe(
                     paths, cache, identity_to_group, group_id_mode
                 )
                 split = "val" if group_id in validation_groups else "train"
-                record_id = stable_record_id(source, line_number, record)
+                base_id = base_record_id(source, line_number, record)
+                record_id = stable_record_id(
+                    source,
+                    line_number,
+                    record,
+                    duplicate_base_ids=duplicate_base_ids,
+                )
+                if record_id in final_record_ids:
+                    raise ValueError(
+                        "duplicate record_id remains after source-row disambiguation: "
+                        f"record_id={record_id!r}, annotation={source.annotation}, "
+                        f"line={line_number}; check whether the same annotation source "
+                        "was listed more than once"
+                    )
+                final_record_ids.add(record_id)
+                original_record_id = source_record_id(record)
                 strata = sorted(record_strata(source.task, record))
                 output_record = dict(record)
                 output_record.update(
                     {
                         "cpt_task": source.task,
                         "cpt_record_id": record_id,
+                        "cpt_source_record_id": original_record_id,
                         "cpt_group_id": group_id,
                         "cpt_split": "heldout" if split == "val" else "train",
                     }
@@ -644,6 +725,7 @@ def split_recipe(
                     "split": "heldout" if split == "val" else "train",
                     "task": source.task,
                     "record_id": record_id,
+                    "source_record_id": original_record_id,
                     "record_id_hash": stable_hash64(record_id),
                     "group_id_hash": stable_hash64(group_id),
                     "source": str(record.get("cpt_source") or source.annotation),
@@ -655,6 +737,18 @@ def split_recipe(
                     "strata": strata,
                 }
                 manifest_handle.write(json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n")
+                if base_id in duplicate_base_ids:
+                    duplicate_record_details[base_id].append(
+                        {
+                            "record_id": record_id,
+                            "task": source.task,
+                            "source_record_id": original_record_id,
+                            "source": manifest["source"],
+                            "line": manifest["line"],
+                            "annotation": manifest["annotation"],
+                            "annotation_line": manifest["annotation_line"],
+                        }
+                    )
                 phase_rows += 1
                 if progress_every and phase_rows % progress_every == 0:
                     report_progress(phase, phase_rows, phase_started)
@@ -664,6 +758,18 @@ def split_recipe(
         manifest_handle.close()
     report_progress(phase, phase_rows, phase_started, done=True)
     cache.save()
+    duplicate_report_path = diagnostics_dir / "duplicate_record_ids.json"
+    atomic_write_json(
+        duplicate_report_path,
+        {
+            "schema_version": 1,
+            "policy": "preserve unique task:source_id values; append a stable source-row hash only to duplicates",
+            "duplicate_source_record_id_count": len(duplicate_base_ids),
+            "duplicate_source_record_row_count": duplicate_source_record_rows,
+            "duplicates": dict(sorted(duplicate_record_details.items())),
+        },
+        sort_keys=True,
+    )
 
     # Ensure empty task files exist so recipes are schema-stable and validation
     # can produce a clear empty-split error rather than FileNotFoundError.
@@ -762,6 +868,9 @@ def split_recipe(
         "val_groups": len(validation_groups),
         "group_intersection": 0,
         "path_duplicate_suspect_count": len(path_duplicate_suspects),
+        "duplicate_source_record_id_count": len(duplicate_base_ids),
+        "duplicate_source_record_row_count": duplicate_source_record_rows,
+        "duplicate_record_id_report": str(duplicate_report_path),
         "tasks": summary_tasks,
     }
     atomic_write_json(diagnostics_dir / "split_summary.json", summary)

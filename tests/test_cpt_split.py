@@ -134,6 +134,82 @@ class CPTSplitTest(unittest.TestCase):
                 {"断言结果是否正确: 正确", "断言结果是否正确: 错误"},
             )
 
+    def test_duplicate_business_ids_get_stable_source_row_suffixes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            recipe = self._fixture(root)
+            duplicate_image = root / "images" / "duplicate-business-id.png"
+            duplicate_image.write_bytes(b"duplicate-business-id-image")
+            duplicate = record(
+                "caption-0",
+                duplicate_image,
+                "ui_caption",
+            )
+            duplicate.update(
+                cpt_source="caption/source-b.jsonl",
+                cpt_source_line=73,
+            )
+            annotation = root / "annotations" / "ui_caption.jsonl"
+            original_rows = [
+                json.loads(line)
+                for line in annotation.read_text(encoding="utf-8").splitlines()
+            ]
+            original_rows[0].update(
+                cpt_source="caption/source-a.jsonl",
+                cpt_source_line=11,
+            )
+            original_rows.append(duplicate)
+            annotation.write_text(
+                "".join(
+                    json.dumps(row, ensure_ascii=False) + "\n"
+                    for row in original_rows
+                ),
+                encoding="utf-8",
+            )
+
+            first = root / "duplicate-first"
+            second = root / "duplicate-second"
+            for output in (first, second):
+                split_recipe(
+                    recipe,
+                    output,
+                    seed=20260826,
+                    val_fraction=0.2,
+                    val_fast_per_task=3,
+                )
+
+            first_manifest = (first / "diagnostics" / "split_manifest.jsonl").read_text(
+                encoding="utf-8"
+            )
+            self.assertEqual(
+                first_manifest,
+                (second / "diagnostics" / "split_manifest.jsonl").read_text(
+                    encoding="utf-8"
+                ),
+            )
+            duplicate_rows = [
+                row
+                for row in map(json.loads, first_manifest.splitlines())
+                if row.get("source_record_id") == "caption-0"
+            ]
+            self.assertEqual(len(duplicate_rows), 2)
+            self.assertEqual(len({row["record_id"] for row in duplicate_rows}), 2)
+            self.assertTrue(
+                all(
+                    row["record_id"].startswith("ui_caption:caption-0:dup-")
+                    for row in duplicate_rows
+                )
+            )
+            report = json.loads(
+                (first / "diagnostics" / "duplicate_record_ids.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(report["duplicate_source_record_id_count"], 1)
+            self.assertEqual(report["duplicate_source_record_row_count"], 2)
+            self.assertEqual(len(report["duplicates"]["ui_caption:caption-0"]), 2)
+            validate_split_manifest(first / "diagnostics" / "split_manifest.jsonl")
+
     def test_multi_image_record_connects_every_shared_image(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

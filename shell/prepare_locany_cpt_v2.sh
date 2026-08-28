@@ -72,7 +72,26 @@ if [[ "${OVERWRITE:-0}" == "1" ]]; then
 fi
 
 cd "${PROJECT_ROOT}"
-"${ENV_DIR}/bin/python" scripts/prepare_locany_cpt.py "${PREPARE_ARGS[@]}"
+if [[ "${SPLIT_ONLY:-0}" == "1" ]]; then
+  COMBINED_RECIPE="${DATA_DIR}/recipe/locany_cpt_all.json"
+  test -f "${COMBINED_RECIPE}" || {
+    echo "ERROR: SPLIT_ONLY=1 requires existing normalized recipe: ${COMBINED_RECIPE}" >&2
+    exit 22
+  }
+  echo "CPT_V2_SPLIT_ONLY=1"
+  echo "CPT_V2_REUSE_HASH_CACHE=${DATA_DIR}/diagnostics/image_hash_cache.json"
+  "${ENV_DIR}/bin/python" scripts/split_locany_cpt.py \
+    --recipe "${COMBINED_RECIPE}" \
+    --output-dir "${DATA_DIR}" \
+    --seed "${CPT_SPLIT_SEED:-20260826}" \
+    --val-fraction "${CPT_VAL_FRACTION:-0.02}" \
+    --val-fast-per-task "${VAL_FAST_PER_TASK}" \
+    --group-id-mode "${CPT_GROUP_ID_MODE:-sha256}" \
+    --train-recipe-name "${RECIPE_NAME}" \
+    --progress-every "${CPT_SPLIT_PROGRESS_EVERY:-1000}"
+else
+  "${ENV_DIR}/bin/python" scripts/prepare_locany_cpt.py "${PREPARE_ARGS[@]}"
+fi
 
 MANIFEST="${DATA_DIR}/diagnostics/split_manifest.jsonl"
 "${ENV_DIR}/bin/python" scripts/validate_locany_cpt.py \

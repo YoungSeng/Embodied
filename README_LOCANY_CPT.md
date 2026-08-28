@@ -237,6 +237,22 @@ JSONL 转换更久，这是正常阶段，不要看到最后一条 VQA 日志就
 进程后使用同一命令加 `OVERWRITE=1` 重跑，可复用已完成的图片哈希。只有最终出现
 `CPT_V2_DATA_READY=...` 才算 recipe 完成。
 
+如果归一化已完成、错误发生在 `split_locany_cpt.py` 内（例如原始业务 ID 重复），更新修复
+代码后不必再转换全部 JSONL。使用 `SPLIT_ONLY=1` 从已有的
+`recipe/locany_cpt_all.json` 恢复，并复用 `diagnostics/image_hash_cache.json`：
+
+```bash
+SOURCE_ROOT=/mnt/bn/intelligent-service-yg/dataset/gui/gui_base/sample/raw_data_v4.1_hl_norm1k/raw_data_v4.1_hl \
+DATA_DIR=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data/locany_cpt_v4_split_v2 \
+SPLIT_ONLY=1 \
+bash shell/prepare_locany_cpt_v2.sh a100 formal
+```
+
+真实源数据中重复的 `task:id` 不再导致整次准备失败：仅这些重复项会追加由
+`cpt_source + cpt_source_line` 生成的稳定后缀；原始业务 ID 保存在
+`cpt_source_record_id`/manifest `source_record_id`。所有重复项写入
+`diagnostics/duplicate_record_ids.json`，若来源定位符仍冲突则继续非零退出，绝不静默覆盖。
+
 ### 0.7 HL：直接提交 H20×4 formal（含每 6 小时集成评测）
 
 ```bash
