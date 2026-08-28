@@ -19,7 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from ui5_lossless_tiling import (  # noqa: E402
     assert_lossless_coverage,
-    build_guarded_detector_geometry,
+    build_raw_detector_edge_geometry,
     detector_boundary_cut_count,
     generate_detector_scan_plan,
     strict_vertical_partition_metrics,
@@ -76,16 +76,20 @@ class DetectorScanGeometryTest(unittest.TestCase):
             plan["detector_box_count"],
         )
         self.assertEqual(plan["detector_bbox_unique_containment_rate"], 1.0)
-        self.assertTrue(plan["every_seam_is_guarded_detector_edge"])
-        self.assertEqual(plan["non_edge_seam_count"], 0)
-        self.assertEqual(plan["gap_interior_seam_count"], 0)
-        self.assertEqual(plan["guarded_bbox_crossed_by_seam_count"], 0)
-        self.assertEqual(plan["guarded_bbox_unique_containment_rate"], 1.0)
+        self.assertTrue(plan["every_seam_is_raw_detector_edge"])
+        self.assertEqual(plan["non_raw_edge_seam_count"], 0)
         self.assertTrue(
-            set(plan["horizontal_seams"]).issubset(plan["detector_edge_candidates"])
+            set(plan["horizontal_seams"]).issubset(
+                plan["safe_raw_detector_edge_candidates"]
+            )
         )
         self.assertTrue(
-            all(value == 0 for value in plan["seam_nearest_guarded_edge_distance_pixels"])
+            all(
+                value == 0
+                for value in plan[
+                    "seam_nearest_raw_detector_edge_distance_pixels"
+                ]
+            )
         )
 
     def test_left_and_right_detections_protect_complete_horizontal_strip(self) -> None:
@@ -103,7 +107,9 @@ class DetectorScanGeometryTest(unittest.TestCase):
         self.assertTrue(
             any(tile[1] <= 900 and tile[3] >= 1000 for tile in plan["tiles"])
         )
-        self.assertEqual(plan["connected_band_count"], 1)
+        # The two inner raw edges are unsafe because they lie strictly inside
+        # the other detector bbox; only the outer envelope edges remain.
+        self.assertEqual(plan["safe_raw_detector_edge_candidates"], [820, 1060])
 
     def test_random_page_sizes_are_lossless_and_never_cut_detector_boxes(self) -> None:
         randomizer = random.Random(20260827)
@@ -126,7 +132,9 @@ class DetectorScanGeometryTest(unittest.TestCase):
         boxes = [[10, 0, 100, 3000]]
         plan = generate_detector_scan_plan(1000, 3000, boxes)
         self.assertEqual(plan["tiles"], [[0, 0, 1000, 3000]])
-        self.assertEqual(plan["fallback_reason"], "dense_page_no_valid_detector_edge_seam")
+        self.assertEqual(
+            plan["fallback_reason"], "dense_page_no_valid_raw_detector_edge_seam"
+        )
         self.assert_strict(plan, 1000, 3000)
 
     def test_safe_gap_is_global_and_tile_count_reduces_before_cutting_boxes(self) -> None:
@@ -136,9 +144,15 @@ class DetectorScanGeometryTest(unittest.TestCase):
         plan = generate_detector_scan_plan(1000, 2160, boxes)
         self.assertEqual(plan["desired_tile_count"], 3)
         self.assertEqual(plan["actual_tile_count"], 2)
-        self.assertEqual(plan["tile_count_reduction_reason"], "insufficient_guarded_detector_edges")
-        self.assertEqual(plan["seam_source"], ["detector_edge"])
-        self.assertIn(plan["horizontal_seams"][0], plan["detector_edge_candidates"])
+        self.assertEqual(
+            plan["tile_count_reduction_reason"],
+            "insufficient_safe_raw_detector_edges",
+        )
+        self.assertEqual(plan["seam_source"], ["raw_detector_edge"])
+        self.assertIn(
+            plan["horizontal_seams"][0],
+            plan["safe_raw_detector_edge_candidates"],
+        )
         self.assert_strict(plan, 1000, 2160)
 
     def test_safe_gaps_support_expected_tile_count(self) -> None:
@@ -147,8 +161,8 @@ class DetectorScanGeometryTest(unittest.TestCase):
         self.assertEqual(plan["desired_tile_count"], 3)
         self.assertEqual(plan["actual_tile_count"], 3)
         self.assertEqual(len(plan["horizontal_seams"]), 2)
-        self.assertTrue(850 < plan["horizontal_seams"][0] < 1050)
-        self.assertTrue(2200 < plan["horizontal_seams"][1] < 2400)
+        self.assertIn(plan["horizontal_seams"][0], {850, 1050})
+        self.assertIn(plan["horizontal_seams"][1], {2200, 2400})
         self.assert_strict(plan, 1000, 2880)
 
     def test_current_153784_153790_153781_regression_shapes(self) -> None:
@@ -163,11 +177,7 @@ class DetectorScanGeometryTest(unittest.TestCase):
         for height, boxes, tile_count, final_seam_range in cases:
             plan = generate_detector_scan_plan(1000, height, boxes)
             self.assertEqual(plan["tile_count"], tile_count)
-            self.assertTrue(
-                final_seam_range[0]
-                < plan["horizontal_seams"][-1]
-                < final_seam_range[1]
-            )
+            self.assertIn(plan["horizontal_seams"][-1], set(final_seam_range))
             self.assert_strict(plan, 1000, height)
 
     def test_context_or_non_strict_mode_is_rejected(self) -> None:
@@ -190,9 +200,9 @@ class DetectorScanGeometryTest(unittest.TestCase):
         self.assertEqual(plan["fallback_reason"], "detector_empty_full_image")
         self.assert_strict(plan, 1000, 5000)
 
-    def test_gap_midpoint_is_forbidden_and_seam_is_exact_band_edge(self) -> None:
-        # With zero guard the free gap is [100,300).  The ideal point 200 is
-        # forbidden: only the protected-band edges 100 and 300 are candidates.
+    def test_gap_midpoint_is_forbidden_and_seam_is_exact_raw_edge(self) -> None:
+        # The free gap is [100,300).  The ideal point 200 is forbidden: only
+        # the original detector bbox edges 100 and 300 are candidates.
         plan = generate_detector_scan_plan(
             800,
             400,
@@ -206,24 +216,56 @@ class DetectorScanGeometryTest(unittest.TestCase):
         self.assertIn(plan["horizontal_seams"][0], {100, 300})
         self.assert_strict(plan, 800, 400)
 
-    def test_guard_clamp_and_text_icon_provenance(self) -> None:
-        for height, expected in ((500, 16), (2000, 30), (10000, 64)):
-            geometry = build_guarded_detector_geometry(
-                500,
-                height,
-                [
-                    {"bbox": [0, 100, 20, 200], "source": "text", "id": "t0"},
-                    {"bbox": [30, 180, 50, 240], "source": "icon", "id": "i0"},
-                ],
-            )
-            self.assertEqual(geometry["guard_px"], expected)
-            band = geometry["protected_bands"][0]
-            self.assertEqual(band["source"], "mixed")
-            self.assertEqual(band["text_bbox_count"], 1)
-            self.assertEqual(band["icon_bbox_count"], 1)
-            self.assertEqual(band["bbox_ids"], ["t0", "i0"])
+    def test_selected_seam_can_match_raw_text_or_icon_y1_or_y2(self) -> None:
+        cases = (
+            ("text", [0, 500, 50, 700], "y1"),
+            ("text", [0, 300, 50, 500], "y2"),
+            ("icon", [0, 500, 50, 700], "y1"),
+            ("icon", [0, 300, 50, 500], "y2"),
+        )
+        for source, bbox, expected_edge in cases:
+            with self.subTest(source=source, edge=expected_edge):
+                plan = generate_detector_scan_plan(
+                    400,
+                    1000,
+                    [{"bbox": bbox, "source": source, "id": f"{source}_0"}],
+                    target_tile_height=500,
+                )
+                self.assertEqual(plan["horizontal_seams"], [500])
+                provenance = plan["seam_raw_edge_provenance"][0]
+                self.assertEqual(provenance["matched_bbox_ids"], [f"{source}_0"])
+                self.assertEqual(provenance["matched_sources"], [source])
+                self.assertEqual(provenance["matched_edges"], [expected_edge])
+                self.assert_strict(plan, 400, 1000)
 
-    def test_band_bottom_or_top_edge_assigns_guarded_box_uniquely(self) -> None:
+    def test_raw_edge_inside_another_bbox_is_filtered(self) -> None:
+        geometry = build_raw_detector_edge_geometry(
+            500,
+            1000,
+            [
+                {"bbox": [0, 100, 20, 500], "source": "text", "id": "t0"},
+                {"bbox": [30, 200, 50, 300], "source": "icon", "id": "i0"},
+            ],
+        )
+        self.assertEqual(geometry["raw_edge_candidates"], [100, 200, 300, 500])
+        self.assertEqual(geometry["safe_raw_edge_candidates"], [100, 500])
+        self.assertEqual(geometry["unsafe_raw_edge_candidates"], [200, 300])
+
+    def test_shared_raw_edge_preserves_all_bbox_provenance(self) -> None:
+        geometry = build_raw_detector_edge_geometry(
+            500,
+            1000,
+            [
+                {"bbox": [0, 100, 20, 300], "source": "text", "id": "t0"},
+                {"bbox": [30, 300, 50, 450], "source": "icon", "id": "i0"},
+            ],
+        )
+        provenance = geometry["edge_provenance"][300]
+        self.assertEqual(provenance["matched_bbox_ids"], ["t0", "i0"])
+        self.assertEqual(provenance["matched_sources"], ["text", "icon"])
+        self.assertEqual(provenance["matched_edges"], ["y2", "y1"])
+
+    def test_raw_text_and_icon_edges_assign_boxes_uniquely(self) -> None:
         plan = generate_detector_scan_plan(
             400,
             1000,
@@ -234,9 +276,23 @@ class DetectorScanGeometryTest(unittest.TestCase):
             target_tile_height=500,
         )
         self.assert_strict(plan, 400, 1000)
-        self.assertEqual(plan["guarded_bbox_unique_containment_count"], 2)
-        self.assertEqual(len(plan["seam_edge_provenance"]), 1)
-        self.assertIn(plan["seam_edge_provenance"][0]["edge"], {"band_top", "band_bottom"})
+        self.assertEqual(plan["detector_bbox_unique_containment_count"], 2)
+        self.assertEqual(len(plan["seam_raw_edge_provenance"]), 1)
+        self.assertIn(
+            plan["seam_raw_edge_provenance"][0]["matched_edges"][0],
+            {"y1", "y2"},
+        )
+
+    def test_raw_edge_mode_rejects_nonzero_guard(self) -> None:
+        with self.assertRaisesRegex(ValueError, "target guard 0/0/0"):
+            generate_detector_scan_plan(
+                1000,
+                2000,
+                [[0, 100, 100, 300]],
+                target_guard_ratio=0.015,
+                target_guard_min_pixels=16,
+                target_guard_max_pixels=64,
+            )
 
     def test_gt_data_cannot_change_geometry(self) -> None:
         detections = [[10, 100, 50, 200], [10, 1300, 50, 1400]]
@@ -263,13 +319,14 @@ class DetectorScanGeometryTest(unittest.TestCase):
                 "tiles": bad_tiles,
             }
             summary = {
-                "scan_name": "horizontal_scan_v4_detector_edge_aligned",
+                "scan_name": "horizontal_scan_v5_raw_detector_edge_aligned",
                 "geometry_config": {
-                    "schema_version": 4,
-                    "seam_selection": "guarded_detector_edge_dynamic_programming",
-                    "target_guard_ratio": 0.015,
-                    "target_guard_pixels_min": 16,
-                    "target_guard_pixels_max": 64,
+                    "schema_version": 5,
+                    "seam_edge_reference": "raw_detector_bbox",
+                    "seam_selection": "raw_detector_edge_dynamic_programming",
+                    "target_guard_ratio": 0.0,
+                    "target_guard_pixels_min": 0,
+                    "target_guard_pixels_max": 0,
                 },
                 "overall": preparer._metric_summary([row]),
                 "gt_used": False,
@@ -277,7 +334,7 @@ class DetectorScanGeometryTest(unittest.TestCase):
             gate = preparer._geometry_gate(summary)
             self.assertFalse(gate["passes"])
 
-    def test_geometry_gate_rejects_seam_one_pixel_off_guarded_edge(self) -> None:
+    def test_geometry_gate_rejects_seam_one_pixel_off_raw_edge(self) -> None:
         row = {
             **generate_detector_scan_plan(
                 800, 2000, [[0, 100, 100, 400], [0, 1400, 100, 1700]]
@@ -289,50 +346,52 @@ class DetectorScanGeometryTest(unittest.TestCase):
             "density": "sparse",
         }
         self.assertTrue(row["horizontal_seams"])
-        row["non_edge_seam_count"] = 1
-        row["gap_interior_seam_count"] = 1
-        row["every_seam_is_guarded_detector_edge"] = False
-        row["seam_nearest_guarded_edge_distance_pixels"] = [1]
+        row["non_raw_edge_seam_count"] = 1
+        row["every_seam_is_raw_detector_edge"] = False
+        row["seam_nearest_raw_detector_edge_distance_pixels"] = [1]
         summary = {
-            "scan_name": "horizontal_scan_v4_detector_edge_aligned",
+            "scan_name": "horizontal_scan_v5_raw_detector_edge_aligned",
             "geometry_config": {
-                "schema_version": 4,
-                "seam_selection": "guarded_detector_edge_dynamic_programming",
-                "target_guard_ratio": 0.015,
-                "target_guard_pixels_min": 16,
-                "target_guard_pixels_max": 64,
+                "schema_version": 5,
+                "seam_edge_reference": "raw_detector_bbox",
+                "seam_selection": "raw_detector_edge_dynamic_programming",
+                "target_guard_ratio": 0.0,
+                "target_guard_pixels_min": 0,
+                "target_guard_pixels_max": 0,
             },
             "overall": preparer._metric_summary([row]),
             "gt_used": False,
         }
         gate = preparer._geometry_gate(summary)
         self.assertFalse(gate["passes"])
-        self.assertFalse(gate["conditions"]["non_edge_seam_count_zero"])
-        self.assertFalse(gate["conditions"]["seam_guarded_edge_distance_max_zero"])
+        self.assertFalse(gate["conditions"]["non_raw_edge_seam_count_zero"])
+        self.assertFalse(gate["conditions"]["seam_raw_edge_distance_max_zero"])
 
 
 class DetectorScanPipelineTest(unittest.TestCase):
     def test_geometry_schema_bump_does_not_invalidate_raw_detector_manifest(self) -> None:
         self.assertEqual(preparer.DETECTOR_MANIFEST_FORMAT_VERSION, 2)
-        self.assertEqual(preparer.SCAN_FORMAT_VERSION, 4)
+        self.assertEqual(preparer.SCAN_FORMAT_VERSION, 5)
 
-    def test_schema_v3_ready_marker_is_rejected(self) -> None:
+    def test_schema_v4_ready_marker_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            marker = root / "horizontal_scan_v3_no_overlap" / "eval_detector_cache_ready.json"
+            marker = root / "horizontal_scan_v4_detector_edge_aligned" / "eval_detector_cache_ready.json"
             marker.parent.mkdir(parents=True)
             marker.write_text(
                 json.dumps(
                     {
-                        "schema_version": 3,
-                        "scan_name": "horizontal_scan_v3_no_overlap",
+                        "schema_version": 4,
+                        "scan_name": "horizontal_scan_v4_detector_edge_aligned",
                         "ready": True,
                     }
                 ),
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(RuntimeError, "unsupported.*schema"):
-                validate_eval_detector_cache(root, scan_name="horizontal_scan_v3_no_overlap")
+                validate_eval_detector_cache(
+                    root, scan_name="horizontal_scan_v4_detector_edge_aligned"
+                )
 
     def test_eval_pipeline_defaults_to_readonly_cache_before_locany_workers(self) -> None:
         source = (SCRIPTS / "run_ui5_eval.py").read_text(encoding="utf-8")
@@ -422,7 +481,7 @@ class DetectorScanPipelineTest(unittest.TestCase):
                 (stage_dir / "shard_00000.done.json").write_text(
                     json.dumps({"stage": stage_name, "count": 1}), encoding="utf-8"
                 )
-            old_scan = root / "horizontal_scan_v3_no_overlap"
+            old_scan = root / "horizontal_scan_v4_detector_edge_aligned"
             old_scan.mkdir()
             (old_scan / "detector_scan_crops.jsonl").write_text(
                 json.dumps(
@@ -441,7 +500,7 @@ class DetectorScanPipelineTest(unittest.TestCase):
             )
             args = argparse.Namespace(
                 output_dir=root,
-                scan_name="horizontal_scan_v4_detector_edge_aligned",
+                scan_name="horizontal_scan_v5_raw_detector_edge_aligned",
                 cache_scope="preview",
                 expected_full_test_unique_images=17281,
                 scan_max_crops=10,
@@ -454,10 +513,11 @@ class DetectorScanPipelineTest(unittest.TestCase):
                 scan_detector_margin_ratio=0.003,
                 scan_seam_search_ratio=0.25,
                 scan_context_pixels=0,
-                target_guard_ratio=0.015,
-                target_guard_min_pixels=16,
-                target_guard_max_pixels=64,
-                seam_candidates="detector-edges-only",
+                target_guard_ratio=0.0,
+                target_guard_min_pixels=0,
+                target_guard_max_pixels=0,
+                seam_edge_reference="raw-detector-bbox",
+                seam_candidates="safe-raw-detector-edges-only",
                 strict_vertical_partition=True,
                 scan_minimum_core_height_ratio=0.35,
                 visualization_samples=1,
@@ -469,35 +529,35 @@ class DetectorScanPipelineTest(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertFalse(rows[0]["gt_used"])
             self.assertEqual(rows[0]["detector_boundary_cut_count"], 0)
-            scan_root = root / "horizontal_scan_v4_detector_edge_aligned"
+            scan_root = root / "horizontal_scan_v5_raw_detector_edge_aligned"
             self.assertTrue((scan_root / "summary.json").is_file())
             self.assertTrue((scan_root / "statistics.csv").is_file())
             self.assertTrue((scan_root / "gallery" / "index.html").is_file())
             self.assertTrue((scan_root / "eval_detector_cache_ready.json").is_file())
-            self.assertTrue((scan_root / "v3_v4_coordinate_compare.csv").is_file())
-            with (scan_root / "v3_v4_coordinate_compare.csv").open(
+            self.assertTrue((scan_root / "v4_v5_coordinate_compare.csv").is_file())
+            with (scan_root / "v4_v5_coordinate_compare.csv").open(
                 "r", encoding="utf-8-sig", newline=""
             ) as handle:
                 comparison = next(csv.DictReader(handle))
-            self.assertEqual(float(comparison["v3_processed_pixel_ratio"]), 1.0)
             self.assertEqual(float(comparison["v4_processed_pixel_ratio"]), 1.0)
-            self.assertEqual(int(comparison["v4_non_edge_seam_count"]), 0)
+            self.assertEqual(float(comparison["v5_processed_pixel_ratio"]), 1.0)
+            self.assertEqual(int(comparison["v5_non_raw_edge_seam_count"]), 0)
             self.assertTrue(list((scan_root / "preview_crops").glob("*.png")))
             marker = validate_eval_detector_cache(
                 root,
-                scan_name="horizontal_scan_v4_detector_edge_aligned",
+                scan_name="horizontal_scan_v5_raw_detector_edge_aligned",
                 expected_unique_images=1,
                 required_cache_scope="preview",
                 require_strict_nonoverlap=True,
-                require_detector_edge_alignment=True,
-                require_guarded_bbox_unique_containment=True,
+                require_raw_detector_edge_alignment=True,
+                require_detector_unique_containment=True,
             )
-            self.assertEqual(marker["schema_version"], 4)
+            self.assertEqual(marker["schema_version"], 5)
             self.assertEqual(marker["geometry"]["config"]["context_pixels"], 0)
             with self.assertRaisesRegex(RuntimeError, "scope mismatch"):
                 validate_eval_detector_cache(
                     root,
-                    scan_name="horizontal_scan_v4_detector_edge_aligned",
+                    scan_name="horizontal_scan_v5_raw_detector_edge_aligned",
                     expected_unique_images=1,
                     required_cache_scope="full_test",
                 )
@@ -512,7 +572,7 @@ class DetectorScanPipelineTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
                 validate_eval_detector_cache(
                     root,
-                    scan_name="horizontal_scan_v4_detector_edge_aligned",
+                    scan_name="horizontal_scan_v5_raw_detector_edge_aligned",
                     expected_unique_images=1,
                     required_cache_scope="preview",
                 )
@@ -564,14 +624,27 @@ class DetectorScanPipelineTest(unittest.TestCase):
         self.assertTrue(config["EVAL_ICON_MODEL"].endswith("icon_detect_v3/model.pt"))
         self.assertEqual(config["EVAL_DETECTOR_WORKERS_PER_GPU"], 1)
         self.assertEqual(config["EVAL_DETECTOR_CACHE_MODE"], "readonly")
-        self.assertEqual(config["EVAL_SCAN_NAME"], "horizontal_scan_v4_detector_edge_aligned")
+        self.assertEqual(config["EVAL_SCAN_NAME"], "horizontal_scan_v5_raw_detector_edge_aligned")
         self.assertEqual(config["EVAL_REQUIRE_CACHE_SCOPE"], "full_test")
         self.assertEqual(config["EVAL_REQUIRE_STRICT_NONOVERLAP"], 1)
-        self.assertEqual(config["EVAL_REQUIRE_DETECTOR_EDGE_ALIGNMENT"], 1)
-        self.assertEqual(config["EVAL_REQUIRE_GUARDED_BBOX_UNIQUE_CONTAINMENT"], 1)
-        self.assertEqual(config["EVAL_SCAN_TARGET_GUARD_RATIO"], 0.015)
-        self.assertEqual(config["EVAL_SCAN_TARGET_GUARD_MIN_PIXELS"], 16)
-        self.assertEqual(config["EVAL_SCAN_TARGET_GUARD_MAX_PIXELS"], 64)
+        self.assertEqual(config["EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT"], 1)
+        self.assertEqual(config["EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT"], 1)
+        self.assertEqual(config["EVAL_SCAN_TARGET_GUARD_RATIO"], 0.0)
+        self.assertEqual(config["EVAL_SCAN_TARGET_GUARD_MIN_PIXELS"], 0)
+        self.assertEqual(config["EVAL_SCAN_TARGET_GUARD_MAX_PIXELS"], 0)
+
+    def test_runtime_preflight_rejects_nonzero_guard_in_raw_edge_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "target guard 0/0/0"):
+            common.resolve_runtime_config(
+                {
+                    "MACHINE_TYPE": "a800",
+                    "GPU_COUNT": "4",
+                    "EVAL_INFERENCE_CROP_MODE": "detector_scan",
+                    "EVAL_SCAN_TARGET_GUARD_RATIO": "0.015",
+                    "EVAL_SCAN_TARGET_GUARD_MIN_PIXELS": "16",
+                    "EVAL_SCAN_TARGET_GUARD_MAX_PIXELS": "64",
+                }
+            )
 
 
 if __name__ == "__main__":

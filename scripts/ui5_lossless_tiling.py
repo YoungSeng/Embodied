@@ -59,112 +59,66 @@ def _normalized_detector_boxes(
     return [record["bbox"] for record in _normalized_detector_records(boxes, width, height)]
 
 
-def build_guarded_detector_geometry(
+def build_raw_detector_edge_geometry(
     width: int,
     height: int,
     detector_boxes: Iterable[Sequence[int] | Mapping[str, Any]],
-    *,
-    target_guard_ratio: float = 0.015,
-    target_guard_min_pixels: int = 16,
-    target_guard_max_pixels: int = 64,
 ) -> dict[str, Any]:
-    """Build guarded detector records, merged bands, and edge-only candidates."""
+    """Build raw bbox edges, provenance, and globally safe seam candidates."""
 
-    if not 0 <= target_guard_ratio <= 0.10:
-        raise ValueError("target_guard_ratio must be in [0, 0.10]")
-    if not 0 <= target_guard_min_pixels <= target_guard_max_pixels:
-        raise ValueError("target guard pixel bounds are invalid")
     records = _normalized_detector_records(detector_boxes, int(width), int(height))
-    guard_px = min(
-        int(target_guard_max_pixels),
-        max(int(target_guard_min_pixels), round(float(target_guard_ratio) * int(height))),
-    )
+    matches_by_edge: dict[int, list[dict[str, Any]]] = {}
     for record in records:
-        _x1, y1, _x2, y2 = record["bbox"]
-        record["guarded_y_interval"] = [
-            max(0, int(math.floor(y1 - guard_px))),
-            min(int(height), int(math.ceil(y2 + guard_px))),
-        ]
-
-    merged: list[dict[str, Any]] = []
-    for record in sorted(
-        records,
-        key=lambda item: (
-            item["guarded_y_interval"][0],
-            item["guarded_y_interval"][1],
-            item["detector_index"],
-        ),
-    ):
-        start, end = record["guarded_y_interval"]
-        if merged and start <= merged[-1]["y2"]:
-            band = merged[-1]
-            band["y2"] = max(int(band["y2"]), int(end))
-        else:
-            band = {"y1": int(start), "y2": int(end), "records": []}
-            merged.append(band)
-        band["records"].append(record)
-
-    bands: list[dict[str, Any]] = []
-    edge_provenance: dict[int, dict[str, Any]] = {}
-    for band_index, merged_band in enumerate(merged):
-        band_records = merged_band.pop("records")
-        text_records = [item for item in band_records if item["source"] == "text"]
-        icon_records = [item for item in band_records if item["source"] == "icon"]
-        source = (
-            "mixed"
-            if text_records and icon_records
-            else "text"
-            if text_records
-            else "icon"
-            if icon_records
-            else "unknown"
-        )
-        band = {
-            "band_index": band_index,
-            "bbox": [int(merged_band["y1"]), int(merged_band["y2"])],
-            "y1": int(merged_band["y1"]),
-            "y2": int(merged_band["y2"]),
-            "source": source,
-            "text_bbox_count": len(text_records),
-            "icon_bbox_count": len(icon_records),
-            "bbox_count": len(band_records),
-            "bbox_indices": [int(item["detector_index"]) for item in band_records],
-            "bbox_ids": [str(item["detector_id"]) for item in band_records],
-            "guard_px": guard_px,
-        }
-        bands.append(band)
-        for edge, coordinate in (("band_top", band["y1"]), ("band_bottom", band["y2"])):
+        x1, y1, x2, y2 = record["bbox"]
+        for edge_name, coordinate in (("y1", y1), ("y2", y2)):
             if coordinate in {0, int(height)}:
                 continue
-            edge_provenance[int(coordinate)] = {
-                "seam": int(coordinate),
-                "edge": edge,
-                "band_index": band_index,
-                "source": source,
-                "text_bbox_count": len(text_records),
-                "icon_bbox_count": len(icon_records),
-                "guard_px": guard_px,
-            }
-    candidates = sorted(edge_provenance)
+            matches_by_edge.setdefault(int(coordinate), []).append(
+                {
+                    "bbox_id": str(record["detector_id"]),
+                    "detector_index": int(record["detector_index"]),
+                    "source": str(record["source"]),
+                    "edge": edge_name,
+                    "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                }
+            )
+    raw_edges = sorted(matches_by_edge)
+    safe_edges: list[int] = []
+    unsafe_edges: list[int] = []
+    for edge in raw_edges:
+        if any(record["bbox"][1] < edge < record["bbox"][3] for record in records):
+            unsafe_edges.append(edge)
+        else:
+            safe_edges.append(edge)
+    edge_provenance = {
+        edge: {
+            "seam": edge,
+            "matched_bbox_ids": [item["bbox_id"] for item in matches_by_edge[edge]],
+            "matched_sources": [item["source"] for item in matches_by_edge[edge]],
+            "matched_edges": [item["edge"] for item in matches_by_edge[edge]],
+            "matches": matches_by_edge[edge],
+            "nearest_raw_edge_distance": 0,
+        }
+        for edge in safe_edges
+    }
     return {
         "records": records,
         "raw_boxes": [record["bbox"] for record in records],
-        "guarded_boxes": [record["guarded_y_interval"] for record in records],
-        "guard_px": guard_px,
-        "protected_bands": bands,
-        "edge_candidates": candidates,
+        "raw_edge_candidates": raw_edges,
+        "safe_raw_edge_candidates": safe_edges,
+        "unsafe_raw_edge_candidates": unsafe_edges,
         "edge_provenance": edge_provenance,
     }
 
 
-def _choose_detector_edge_seams(
+def _choose_raw_detector_edge_seams(
     *,
     height: int,
     count: int,
     candidate_edges: Sequence[int],
     minimum_core_height: int,
 ) -> list[int] | None:
-    """Select only guarded detector edges with an exact deterministic DP."""
+    """Select only globally safe raw detector edges with deterministic DP."""
 
     if count <= 1:
         return []
@@ -325,15 +279,16 @@ def generate_detector_scan_plan(
     context_pixels: int = 0,
     minimum_core_height_ratio: float = 0.35,
     strict_vertical_partition: bool = True,
-    target_guard_ratio: float = 0.015,
-    target_guard_min_pixels: int = 16,
-    target_guard_max_pixels: int = 64,
-    seam_candidates: str = "detector-edges-only",
+    target_guard_ratio: float = 0.0,
+    target_guard_min_pixels: int = 0,
+    target_guard_max_pixels: int = 0,
+    seam_edge_reference: str = "raw-detector-bbox",
+    seam_candidates: str = "safe-raw-detector-edges-only",
 ) -> dict[str, Any]:
-    """Build a GT-free strict partition from guarded detector edges only.
+    """Build a GT-free strict partition from globally safe raw bbox edges only.
 
     Every final tile is exactly one continuous core.  If the desired number of
-    protected-band edges is unavailable, the tile count is reduced; no seam
+    safe raw detector edges is unavailable, the tile count is reduced; no seam
     may be synthesized inside a gap and no overlap/expansion fallback exists.
     """
 
@@ -361,25 +316,27 @@ def generate_detector_scan_plan(
         raise ValueError("strict detector scan requires context_pixels=0")
     if strict_vertical_partition is not True:
         raise ValueError("detector scan requires strict_vertical_partition=true")
-    if seam_candidates != "detector-edges-only":
-        raise ValueError("detector scan requires seam_candidates=detector-edges-only")
+    if (target_guard_ratio, target_guard_min_pixels, target_guard_max_pixels) != (
+        0.0,
+        0,
+        0,
+    ):
+        raise ValueError("raw detector-edge mode requires target guard 0/0/0")
+    if seam_edge_reference != "raw-detector-bbox":
+        raise ValueError("detector scan requires seam_edge_reference=raw-detector-bbox")
+    if seam_candidates != "safe-raw-detector-edges-only":
+        raise ValueError(
+            "detector scan requires seam_candidates=safe-raw-detector-edges-only"
+        )
     if not 0 < minimum_core_height_ratio <= 1:
         raise ValueError("minimum_core_height_ratio must be in (0, 1]")
 
-    guarded_geometry = build_guarded_detector_geometry(
-        width,
-        height,
-        detector_boxes,
-        target_guard_ratio=target_guard_ratio,
-        target_guard_min_pixels=target_guard_min_pixels,
-        target_guard_max_pixels=target_guard_max_pixels,
-    )
-    boxes = guarded_geometry["raw_boxes"]
-    guarded_boxes = guarded_geometry["guarded_boxes"]
-    protected_bands = guarded_geometry["protected_bands"]
-    edge_candidates = guarded_geometry["edge_candidates"]
-    edge_provenance = guarded_geometry["edge_provenance"]
-    guard_px = int(guarded_geometry["guard_px"])
+    raw_geometry = build_raw_detector_edge_geometry(width, height, detector_boxes)
+    boxes = raw_geometry["raw_boxes"]
+    raw_edge_candidates = raw_geometry["raw_edge_candidates"]
+    safe_raw_edge_candidates = raw_geometry["safe_raw_edge_candidates"]
+    unsafe_raw_edge_candidates = raw_geometry["unsafe_raw_edge_candidates"]
+    edge_provenance = raw_geometry["edge_provenance"]
     normalized_task = str(task or "").removeprefix("ui_")
     fallback_reason: str | None = None
     desired_tile_count = min(max_tiles, max(1, math.ceil(height / target_tile_height)))
@@ -408,27 +365,27 @@ def generate_detector_scan_plan(
                 max(32, round(target_core * minimum_core_height_ratio)),
                 max(1, height // candidate_count),
             )
-            candidate_seams = _choose_detector_edge_seams(
+            candidate_seams = _choose_raw_detector_edge_seams(
                 height=height,
                 count=candidate_count,
-                candidate_edges=edge_candidates,
+                candidate_edges=safe_raw_edge_candidates,
                 minimum_core_height=minimum_core_height,
             )
             if candidate_seams is not None:
                 seams = candidate_seams
                 actual_tile_count = candidate_count
                 break
-        seam_sources = ["detector_edge"] * len(seams)
+        seam_sources = ["raw_detector_edge"] * len(seams)
         core_edges = [0, *seams, height]
         cores = [[left, right] for left, right in zip(core_edges, core_edges[1:])]
         tiles = [[0, int(y1), width, int(y2)] for y1, y2 in cores]
         tile_count_reduction_reason = (
             None
             if actual_tile_count == desired_tile_count
-            else "insufficient_guarded_detector_edges"
+            else "insufficient_safe_raw_detector_edges"
         )
         if actual_tile_count == 1:
-            fallback_reason = "dense_page_no_valid_detector_edge_seam"
+            fallback_reason = "dense_page_no_valid_raw_detector_edge_seam"
 
     assert_lossless_coverage(width, height, tiles)
     cuts = detector_boundary_cut_count(tiles, boxes)
@@ -464,35 +421,30 @@ def generate_detector_scan_plan(
         == 1
         for box in boxes
     )
-    guarded_unique_containment_count = sum(
-        sum(tile[1] <= box[0] and tile[3] >= box[1] for tile in tiles) == 1
-        for box in guarded_boxes
-    )
-    guarded_crossed = sum(
-        any(box[0] < seam < box[1] for seam in seams) for box in guarded_boxes
-    )
     seam_crossed = sum(
         any(box[1] < seam < box[3] for seam in seams) for box in boxes
     )
-    non_edge_seam_count = sum(seam not in edge_candidates for seam in seams)
-    nearest_edge_distances = [
-        min((abs(seam - edge) for edge in edge_candidates), default=height)
+    non_raw_edge_seam_count = sum(
+        seam not in safe_raw_edge_candidates for seam in seams
+    )
+    nearest_raw_edge_distances = [
+        min((abs(seam - edge) for edge in raw_edge_candidates), default=height)
         for seam in seams
     ]
-    seam_edge_provenance = []
+    seam_raw_edge_provenance = []
     for seam_index, seam in enumerate(seams, 1):
         provenance = dict(edge_provenance[seam])
         provenance["distance_to_ideal_partition"] = round(
             abs(seam - seam_index * height / len(tiles))
         )
-        seam_edge_provenance.append(provenance)
-    if non_edge_seam_count or guarded_crossed:
+        seam_raw_edge_provenance.append(provenance)
+    if non_raw_edge_seam_count or seam_crossed:
         raise AssertionError(
-            "edge-only seam invariant failed: "
-            f"non_edge={non_edge_seam_count}, guarded_crossed={guarded_crossed}"
+            "raw-edge-only seam invariant failed: "
+            f"non_raw_edge={non_raw_edge_seam_count}, raw_crossed={seam_crossed}"
         )
-    if guarded_unique_containment_count != len(guarded_boxes):
-        raise AssertionError("not every guarded detector bbox belongs to exactly one crop")
+    if unique_containment_count != len(boxes):
+        raise AssertionError("not every raw detector bbox belongs to exactly one crop")
     core_heights = [right - left for left, right in cores]
     partition = strict_vertical_partition_metrics(width, height, tiles)
     if not partition["strict_vertical_partition"]:
@@ -505,26 +457,28 @@ def generate_detector_scan_plan(
         "tiles": tiles,
         "tile_count": len(tiles),
         "detector_box_count": len(boxes),
-        "connected_band_count": len(protected_bands),
-        "protected_vertical_bands": [band["bbox"] for band in protected_bands],
-        "detector_margin_pixels": guard_px,
-        "target_guard_ratio": float(target_guard_ratio),
-        "target_guard_pixels_min": int(target_guard_min_pixels),
-        "target_guard_pixels_max": int(target_guard_max_pixels),
-        "target_guard_pixels_effective": guard_px,
-        "guarded_protected_vertical_bands": protected_bands,
-        "detector_edge_candidates": edge_candidates,
-        "detector_edge_candidate_count": len(edge_candidates),
+        "connected_band_count": 0,
+        "protected_vertical_bands": [],
+        "detector_margin_pixels": 0,
+        "target_guard_ratio": 0.0,
+        "target_guard_pixels_min": 0,
+        "target_guard_pixels_max": 0,
+        "target_guard_pixels_effective": 0,
+        "seam_edge_reference": "raw_detector_bbox",
+        "raw_detector_edge_candidates": raw_edge_candidates,
+        "safe_raw_detector_edge_candidates": safe_raw_edge_candidates,
+        "unsafe_raw_detector_edge_candidates": unsafe_raw_edge_candidates,
+        "raw_detector_edge_candidate_count": len(raw_edge_candidates),
+        "safe_raw_detector_edge_candidate_count": len(safe_raw_edge_candidates),
         "horizontal_seams": seams,
         "horizontal_seam_count": len(seams),
-        "safe_seam_count": len(edge_candidates),
+        "safe_seam_count": len(safe_raw_edge_candidates),
         "seam_source": seam_sources,
         "seam_source_counts": dict(sorted(Counter(seam_sources).items())),
-        "seam_edge_provenance": seam_edge_provenance,
-        "seam_nearest_guarded_edge_distance_pixels": nearest_edge_distances,
-        "non_edge_seam_count": non_edge_seam_count,
-        "gap_interior_seam_count": non_edge_seam_count,
-        "every_seam_is_guarded_detector_edge": non_edge_seam_count == 0,
+        "seam_raw_edge_provenance": seam_raw_edge_provenance,
+        "seam_nearest_raw_detector_edge_distance_pixels": nearest_raw_edge_distances,
+        "non_raw_edge_seam_count": non_raw_edge_seam_count,
+        "every_seam_is_raw_detector_edge": non_raw_edge_seam_count == 0,
         "core_spans": cores,
         "minimum_core_height": min(core_heights),
         "maximum_core_height": max(core_heights),
@@ -549,14 +503,6 @@ def generate_detector_scan_plan(
         ),
         "uncontained_detector_bbox_count": len(not_contained),
         "seam_crossed_detector_bbox_count": seam_crossed,
-        "guarded_bbox_count": len(guarded_boxes),
-        "guarded_bbox_unique_containment_count": guarded_unique_containment_count,
-        "guarded_bbox_unique_containment_rate": (
-            guarded_unique_containment_count / len(guarded_boxes)
-            if guarded_boxes
-            else 1.0
-        ),
-        "guarded_bbox_crossed_by_seam_count": guarded_crossed,
         "full_tile_in_multi_plan_count": full_in_multi,
         "duplicate_tile_count": duplicate,
         "nested_tile_count": nested,

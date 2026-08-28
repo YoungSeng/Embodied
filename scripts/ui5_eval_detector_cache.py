@@ -9,13 +9,13 @@ from typing import Any, Mapping
 
 from locany_ui5_common import TASK_JSONL
 from ui5_lossless_tiling import (
-    build_guarded_detector_geometry,
+    build_raw_detector_edge_geometry,
     strict_vertical_partition_metrics,
 )
 
 
-CACHE_MARKER_SCHEMA_VERSION = 4
-GEOMETRY_SCHEMA_VERSION = 4
+CACHE_MARKER_SCHEMA_VERSION = 5
+GEOMETRY_SCHEMA_VERSION = 5
 
 
 def sha256_file(path: Path) -> str:
@@ -96,8 +96,8 @@ def validate_eval_detector_cache(
     input_dir: Path | None = None,
     required_cache_scope: str | None = None,
     require_strict_nonoverlap: bool = False,
-    require_detector_edge_alignment: bool = False,
-    require_guarded_bbox_unique_containment: bool = False,
+    require_raw_detector_edge_alignment: bool = False,
+    require_detector_unique_containment: bool = False,
 ) -> dict[str, Any]:
     """Fail closed unless every dataset/detector/geometry digest still matches."""
 
@@ -126,12 +126,12 @@ def validate_eval_detector_cache(
     if marker.get("gt_used") is not False:
         raise RuntimeError("evaluation detector cache must declare gt_used=false")
     if marker.get("strict_vertical_partition") is not True:
-        raise RuntimeError("schema-v4 marker must declare strict_vertical_partition=true")
-    if marker.get("detector_edge_aligned") is not True:
-        raise RuntimeError("schema-v4 marker must declare detector_edge_aligned=true")
-    if marker.get("guarded_bbox_unique_containment") is not True:
+        raise RuntimeError("schema-v5 marker must declare strict_vertical_partition=true")
+    if marker.get("raw_detector_edge_aligned") is not True:
+        raise RuntimeError("schema-v5 marker must declare raw_detector_edge_aligned=true")
+    if marker.get("detector_bbox_unique_containment") is not True:
         raise RuntimeError(
-            "schema-v4 marker must declare guarded_bbox_unique_containment=true"
+            "schema-v5 marker must declare detector_bbox_unique_containment=true"
         )
     cache_scope = str(marker.get("cache_scope", ""))
     if cache_scope not in {"preview", "full_test"}:
@@ -227,11 +227,11 @@ def validate_eval_detector_cache(
         _validate_file_record(cache_dir, record, label=f"geometry gallery file {index}")
     if geometry.get("gallery_digest") != json_digest(gallery_files):
         raise RuntimeError("horizontal scan gallery digest mismatch")
-    if geometry.get("v3_v4_coordinate_comparison"):
+    if geometry.get("v4_v5_coordinate_comparison"):
         _validate_file_record(
             cache_dir,
-            geometry["v3_v4_coordinate_comparison"],
-            label="geometry v3/v4 coordinate comparison",
+            geometry["v4_v5_coordinate_comparison"],
+            label="geometry v4/v5 coordinate comparison",
         )
     scan_manifest = _resolve_recorded_file(cache_dir, geometry["scan_manifest"])
     if count_jsonl(scan_manifest) != unique_count:
@@ -241,30 +241,34 @@ def validate_eval_detector_cache(
     config = geometry.get("config") or {}
     if (
         geometry.get("strict_vertical_partition") is not True
-        or geometry.get("detector_edge_aligned") is not True
-        or geometry.get("guarded_bbox_unique_containment") is not True
+        or geometry.get("raw_detector_edge_aligned") is not True
+        or geometry.get("detector_bbox_unique_containment") is not True
         or config.get("strict_vertical_partition") is not True
         or int(config.get("context_pixels", -1)) != 0
-        or config.get("seam_candidates") != "detector-edges-only"
+        or config.get("seam_edge_reference") != "raw_detector_bbox"
+        or config.get("seam_candidates") != "safe-raw-detector-edges-only"
         or config.get("seam_selection")
-        != "guarded_detector_edge_dynamic_programming"
-        or float(config.get("target_guard_ratio", -1)) != 0.015
-        or int(config.get("target_guard_pixels_min", -1)) != 16
-        or int(config.get("target_guard_pixels_max", -1)) != 64
-        or scan_name != "horizontal_scan_v4_detector_edge_aligned"
+        != "raw_detector_edge_dynamic_programming"
+        or float(config.get("target_guard_ratio", -1)) != 0.0
+        or int(config.get("target_guard_pixels_min", -1)) != 0
+        or int(config.get("target_guard_pixels_max", -1)) != 0
+        or scan_name != "horizontal_scan_v5_raw_detector_edge_aligned"
     ):
         raise RuntimeError(
-            "schema-v4 cache is not strict, guarded, and detector-edge aligned"
+            "schema-v5 cache is not strict and raw-detector-bbox-edge aligned"
         )
     if require_strict_nonoverlap and geometry.get("strict_vertical_partition") is not True:
         raise RuntimeError("strict non-overlap cache was required")
-    if require_detector_edge_alignment and geometry.get("detector_edge_aligned") is not True:
-        raise RuntimeError("guarded detector-edge alignment was required")
     if (
-        require_guarded_bbox_unique_containment
-        and geometry.get("guarded_bbox_unique_containment") is not True
+        require_raw_detector_edge_alignment
+        and geometry.get("raw_detector_edge_aligned") is not True
     ):
-        raise RuntimeError("guarded bbox unique containment was required")
+        raise RuntimeError("raw detector bbox-edge alignment was required")
+    if (
+        require_detector_unique_containment
+        and geometry.get("detector_bbox_unique_containment") is not True
+    ):
+        raise RuntimeError("detector bbox unique containment was required")
     summary = json.loads(geometry_files["summary"].read_text(encoding="utf-8"))
     if (
         summary.get("cache_scope") != cache_scope
@@ -278,7 +282,7 @@ def validate_eval_detector_cache(
     ):
         raise RuntimeError("horizontal scan summary does not contain a passing hard gate")
     scan_rows = read_jsonl(scan_manifest)
-    guarded_band_records: list[dict[str, Any]] = []
+    raw_edge_records: list[dict[str, Any]] = []
     for row in scan_rows:
         if row.get("geometry_config_digest") != geometry.get("config_digest"):
             raise RuntimeError(
@@ -315,11 +319,9 @@ def validate_eval_detector_cache(
             raise RuntimeError(f"scan row processed_pixel_ratio is not 1: {row.get('image_id')}")
         zero_fields = (
             "seam_crossed_detector_bbox_count",
-            "guarded_bbox_crossed_by_seam_count",
             "detector_boundary_cut_count",
             "uncontained_detector_bbox_count",
-            "non_edge_seam_count",
-            "gap_interior_seam_count",
+            "non_raw_edge_seam_count",
             "full_tile_in_multi_plan_count",
             "duplicate_tile_count",
             "nested_tile_count",
@@ -344,93 +346,92 @@ def validate_eval_detector_cache(
             for source, key in (("text", "text_detections"), ("icon", "icon_detections"))
             for item in row.get(key, [])
         ]
-        guarded = build_guarded_detector_geometry(
-            int(row["width"]),
-            int(row["height"]),
-            detector_items,
-            target_guard_ratio=float(config["target_guard_ratio"]),
-            target_guard_min_pixels=int(config["target_guard_pixels_min"]),
-            target_guard_max_pixels=int(config["target_guard_pixels_max"]),
+        raw_geometry = build_raw_detector_edge_geometry(
+            int(row["width"]), int(row["height"]), detector_items
         )
-        if int(row.get("target_guard_pixels_effective", -1)) != int(
-            guarded["guard_px"]
-        ) or (
-            float(row.get("target_guard_ratio", -1))
-            != float(config["target_guard_ratio"])
-            or int(row.get("target_guard_pixels_min", -1))
-            != int(config["target_guard_pixels_min"])
-            or int(row.get("target_guard_pixels_max", -1))
-            != int(config["target_guard_pixels_max"])
+        if (
+            float(row.get("target_guard_ratio", -1)) != 0.0
+            or int(row.get("target_guard_pixels_min", -1)) != 0
+            or int(row.get("target_guard_pixels_max", -1)) != 0
+            or int(row.get("target_guard_pixels_effective", -1)) != 0
+            or row.get("seam_edge_reference") != "raw_detector_bbox"
         ):
-            raise RuntimeError(f"guard pixel mismatch: {row.get('image_id')}")
-        if row.get("guarded_protected_vertical_bands") != guarded["protected_bands"]:
-            raise RuntimeError(f"guarded protected bands changed: {row.get('image_id')}")
-        if row.get("detector_edge_candidates") != guarded["edge_candidates"]:
-            raise RuntimeError(f"detector edge candidates changed: {row.get('image_id')}")
-        if int(row.get("detector_edge_candidate_count", -1)) != len(
-            guarded["edge_candidates"]
+            raise RuntimeError(f"raw-edge mode has nonzero guard: {row.get('image_id')}")
+        for row_key, geometry_key in (
+            ("raw_detector_edge_candidates", "raw_edge_candidates"),
+            ("safe_raw_detector_edge_candidates", "safe_raw_edge_candidates"),
+            ("unsafe_raw_detector_edge_candidates", "unsafe_raw_edge_candidates"),
         ):
-            raise RuntimeError(f"detector edge candidate count changed: {row.get('image_id')}")
+            if row.get(row_key) != raw_geometry[geometry_key]:
+                raise RuntimeError(
+                    f"raw detector edge candidates changed ({row_key}): {row.get('image_id')}"
+                )
+        if int(row.get("raw_detector_edge_candidate_count", -1)) != len(
+            raw_geometry["raw_edge_candidates"]
+        ) or int(row.get("safe_raw_detector_edge_candidate_count", -1)) != len(
+            raw_geometry["safe_raw_edge_candidates"]
+        ):
+            raise RuntimeError(f"raw detector edge count changed: {row.get('image_id')}")
         seams = [int(value) for value in row.get("horizontal_seams", [])]
-        if any(seam not in guarded["edge_candidates"] for seam in seams):
-            raise RuntimeError(f"scan row contains a non-edge seam: {row.get('image_id')}")
+        if any(seam not in raw_geometry["safe_raw_edge_candidates"] for seam in seams):
+            raise RuntimeError(f"scan row contains a non-safe-raw-edge seam: {row.get('image_id')}")
         distances = [
             min(
-                (abs(seam - edge) for edge in guarded["edge_candidates"]),
+                (abs(seam - edge) for edge in raw_geometry["raw_edge_candidates"]),
                 default=int(row["height"]),
             )
             for seam in seams
         ]
         if (
-            row.get("every_seam_is_guarded_detector_edge") is not True
-            or distances != row.get("seam_nearest_guarded_edge_distance_pixels")
+            row.get("every_seam_is_raw_detector_edge") is not True
+            or distances
+            != row.get("seam_nearest_raw_detector_edge_distance_pixels")
             or max(distances, default=0) != 0
         ):
-            raise RuntimeError(f"seam/guarded-edge alignment failed: {row.get('image_id')}")
-        provenance = row.get("seam_edge_provenance", [])
+            raise RuntimeError(f"seam/raw-edge alignment failed: {row.get('image_id')}")
+        provenance = row.get("seam_raw_edge_provenance", [])
         if len(provenance) != len(seams):
             raise RuntimeError(f"seam provenance count mismatch: {row.get('image_id')}")
         for seam, item in zip(seams, provenance):
-            expected = guarded["edge_provenance"][seam]
+            expected = raw_geometry["edge_provenance"][seam]
             if any(item.get(key) != expected.get(key) for key in expected):
                 raise RuntimeError(f"seam provenance changed: {row.get('image_id')}")
-        guarded_unique = sum(
+        raw_unique = sum(
             sum(
-                int(tile[1]) <= int(box[0]) and int(tile[3]) >= int(box[1])
+                int(tile[0]) <= int(box[0])
+                and int(tile[1]) <= int(box[1])
+                and int(tile[2]) >= int(box[2])
+                and int(tile[3]) >= int(box[3])
                 for tile in row["tiles"]
             )
             == 1
-            for box in guarded["guarded_boxes"]
+            for box in raw_geometry["raw_boxes"]
         )
-        if (
-            int(row.get("guarded_bbox_count", -1)) != len(guarded["guarded_boxes"])
-            or int(row.get("guarded_bbox_unique_containment_count", -1))
-            != guarded_unique
-            or guarded_unique != len(guarded["guarded_boxes"])
-            or float(row.get("guarded_bbox_unique_containment_rate", -1)) != 1.0
-        ):
+        if raw_unique != len(raw_geometry["raw_boxes"]):
             raise RuntimeError(
-                f"guarded bbox unique containment failed: {row.get('image_id')}"
+                f"raw detector bbox unique containment failed: {row.get('image_id')}"
             )
-        guarded_band_records.append(
+        raw_edge_records.append(
             {
                 "image_id": row["image_id"],
-                "bands": row["guarded_protected_vertical_bands"],
+                "raw_edges": row["raw_detector_edge_candidates"],
+                "safe_raw_edges": row["safe_raw_detector_edge_candidates"],
+                "unsafe_raw_edges": row["unsafe_raw_detector_edge_candidates"],
             }
         )
         if row.get("gt_used") is not False:
             raise RuntimeError(f"scan row must declare gt_used=false: {row.get('image_id')}")
-    guarded_band_digest = json_digest(guarded_band_records)
+    raw_detector_edge_digest = json_digest(raw_edge_records)
     if (
-        geometry.get("guarded_band_digest") != guarded_band_digest
-        or summary.get("guarded_band_digest") != guarded_band_digest
+        geometry.get("raw_detector_edge_digest") != raw_detector_edge_digest
+        or summary.get("raw_detector_edge_digest") != raw_detector_edge_digest
     ):
-        raise RuntimeError("guarded protected-band digest mismatch")
+        raise RuntimeError("raw detector edge digest mismatch")
     geometry_state_digest = json_digest(
         {
             "config": config,
             "merged_detection_sha256": sha256_file(merged_path),
-            "guarded_band_digest": guarded_band_digest,
+            "raw_detector_edge_digest": raw_detector_edge_digest,
         }
     )
     if (

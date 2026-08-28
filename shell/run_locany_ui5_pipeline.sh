@@ -38,7 +38,7 @@ export EVAL_TILE_OVERLAP_RATIO EVAL_TILE_NMS_IOU
 export EVAL_PARSER_ROOT EVAL_DETECTOR_CACHE EVAL_TEXT_PYTHON EVAL_ICON_PYTHON
 export EVAL_DETECTOR_CACHE_MODE EVAL_SCAN_NAME EVAL_EXPECTED_UNIQUE_IMAGES
 export EVAL_REQUIRE_CACHE_SCOPE EVAL_REQUIRE_STRICT_NONOVERLAP
-export EVAL_REQUIRE_DETECTOR_EDGE_ALIGNMENT EVAL_REQUIRE_GUARDED_BBOX_UNIQUE_CONTAINMENT
+export EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT
 export EVAL_TEXT_MODEL_DIR EVAL_ICON_MODEL EVAL_DETECTOR_WORKERS_PER_GPU
 export EVAL_SCAN_TARGET_HEIGHT EVAL_SCAN_VERTICAL_LINK_RATIO EVAL_SCAN_CONTEXT_RATIO
 export EVAL_SCAN_TARGET_GUARD_RATIO EVAL_SCAN_TARGET_GUARD_MIN_PIXELS
@@ -195,8 +195,8 @@ printf '%-28s: %s\n' \
   "EVAL_SCAN_NAME" "${EVAL_SCAN_NAME}" \
   "EVAL_CACHE_SCOPE" "${EVAL_REQUIRE_CACHE_SCOPE}" \
   "EVAL_STRICT_NONOVERLAP" "${EVAL_REQUIRE_STRICT_NONOVERLAP}" \
-  "EVAL_EDGE_ALIGNMENT" "${EVAL_REQUIRE_DETECTOR_EDGE_ALIGNMENT}" \
-  "EVAL_GUARDED_UNIQUE" "${EVAL_REQUIRE_GUARDED_BBOX_UNIQUE_CONTAINMENT}" \
+  "EVAL_RAW_EDGE_ALIGNMENT" "${EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT}" \
+  "EVAL_DETECTOR_UNIQUE" "${EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT}" \
   "EVAL_TEXT_PYTHON" "${EVAL_TEXT_PYTHON:-<pipeline python>}" \
   "EVAL_ICON_PYTHON" "${EVAL_ICON_PYTHON:-<pipeline python>}" \
   "EVAL_ICON_MODEL" "${EVAL_ICON_MODEL}" \
@@ -358,15 +358,15 @@ run_evaluation() {
   else
     command+=(--no-require-strict-nonoverlap)
   fi
-  if [[ "${EVAL_REQUIRE_DETECTOR_EDGE_ALIGNMENT}" == "1" ]]; then
-    command+=(--require-detector-edge-alignment)
+  if [[ "${EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT}" == "1" ]]; then
+    command+=(--require-raw-detector-edge-alignment)
   else
-    command+=(--no-require-detector-edge-alignment)
+    command+=(--no-require-raw-detector-edge-alignment)
   fi
-  if [[ "${EVAL_REQUIRE_GUARDED_BBOX_UNIQUE_CONTAINMENT}" == "1" ]]; then
-    command+=(--require-guarded-bbox-unique-containment)
+  if [[ "${EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT}" == "1" ]]; then
+    command+=(--require-detector-unique-containment)
   else
-    command+=(--no-require-guarded-bbox-unique-containment)
+    command+=(--no-require-detector-unique-containment)
   fi
   if [[ -n "${EVAL_TEXT_PYTHON:-}" ]]; then
     command+=(--eval-text-python "${EVAL_TEXT_PYTHON}")

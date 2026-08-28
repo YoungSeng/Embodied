@@ -17,9 +17,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-unique-images", type=int, default=0)
     parser.add_argument("--cache-scope", choices=("preview", "full_test"), default=None)
     parser.add_argument("--require-strict-nonoverlap", action="store_true")
-    parser.add_argument("--require-detector-edge-alignment", action="store_true")
+    parser.add_argument("--require-raw-detector-edge-alignment", action="store_true")
     parser.add_argument(
-        "--require-guarded-bbox-unique-containment", action="store_true"
+        "--require-detector-unique-containment", action="store_true"
     )
     parser.add_argument("--require-ready", action="store_true")
     return parser.parse_args(argv)
@@ -34,10 +34,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_ready=args.require_ready,
         required_cache_scope=args.cache_scope,
         require_strict_nonoverlap=args.require_strict_nonoverlap,
-        require_detector_edge_alignment=args.require_detector_edge_alignment,
-        require_guarded_bbox_unique_containment=(
-            args.require_guarded_bbox_unique_containment
-        ),
+        require_raw_detector_edge_alignment=args.require_raw_detector_edge_alignment,
+        require_detector_unique_containment=args.require_detector_unique_containment,
     )
     print(
         json.dumps(
@@ -51,11 +49,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "strict_vertical_partition": marker.get("geometry", {}).get(
                     "strict_vertical_partition"
                 ),
-                "detector_edge_aligned": marker.get("geometry", {}).get(
-                    "detector_edge_aligned"
+                "raw_detector_edge_aligned": marker.get("geometry", {}).get(
+                    "raw_detector_edge_aligned"
                 ),
-                "guarded_bbox_unique_containment": marker.get("geometry", {}).get(
-                    "guarded_bbox_unique_containment"
+                "detector_bbox_unique_containment": marker.get("geometry", {}).get(
+                    "detector_bbox_unique_containment"
                 ),
                 "scan_manifest": marker.get("geometry", {}).get("scan_manifest", {}).get(
                     "path"

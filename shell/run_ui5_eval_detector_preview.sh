@@ -20,19 +20,20 @@ bash shell/run_ui5_eval_detector_preview.sh \
   --icon-python /path/to/LocateAnything/bin/python \
   --max-images-per-task 200 \
   --visualization-samples 60 \
-  --scan-name horizontal_scan_v4_detector_edge_aligned \
+  --scan-name horizontal_scan_v5_raw_detector_edge_aligned \
   --scan-context-pixels 0 \
-  --target-guard-ratio 0.015 \
-  --target-guard-min-pixels 16 \
-  --target-guard-max-pixels 64 \
-  --seam-candidates detector-edges-only \
+  --target-guard-ratio 0 \
+  --target-guard-min-pixels 0 \
+  --target-guard-max-pixels 0 \
+  --seam-edge-reference raw-detector-bbox \
+  --seam-candidates safe-raw-detector-edges-only \
   --strict-vertical-partition \
   --resume
 
 原始检测固定保存在 detections/；修改几何时换 --scan-name 并只跑 --stage crop。
-输出重点：horizontal_scan_v4_detector_edge_aligned/gallery/index.html、
-horizontal_scan_v4_detector_edge_aligned/summary.json、
-horizontal_scan_v4_detector_edge_aligned/statistics.csv、preview_crops/。
+输出重点：horizontal_scan_v5_raw_detector_edge_aligned/gallery/index.html、
+horizontal_scan_v5_raw_detector_edge_aligned/summary.json、
+horizontal_scan_v5_raw_detector_edge_aligned/statistics.csv、preview_crops/。
 EOF
   exit 2
 fi

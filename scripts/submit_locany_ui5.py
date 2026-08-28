@@ -64,7 +64,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--eval-detector-cache-mode", choices=("build", "readonly"), default="readonly"
     )
     parser.add_argument(
-        "--eval-scan-name", default="horizontal_scan_v4_detector_edge_aligned"
+        "--eval-scan-name", default="horizontal_scan_v5_raw_detector_edge_aligned"
     )
     parser.add_argument(
         "--require-cache-scope",
@@ -77,12 +77,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
     )
     parser.add_argument(
-        "--require-detector-edge-alignment",
+        "--require-raw-detector-edge-alignment",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
     parser.add_argument(
-        "--require-guarded-bbox-unique-containment",
+        "--require-detector-unique-containment",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
@@ -97,9 +97,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--eval-tile-overlap-ratio", type=float, default=0.10)
     parser.add_argument("--eval-tile-nms-iou", type=float, default=0.50)
     parser.add_argument("--eval-scan-target-height", type=int, default=960)
-    parser.add_argument("--eval-scan-target-guard-ratio", type=float, default=0.015)
-    parser.add_argument("--eval-scan-target-guard-min-pixels", type=int, default=16)
-    parser.add_argument("--eval-scan-target-guard-max-pixels", type=int, default=64)
+    parser.add_argument("--eval-scan-target-guard-ratio", type=float, default=0.0)
+    parser.add_argument("--eval-scan-target-guard-min-pixels", type=int, default=0)
+    parser.add_argument("--eval-scan-target-guard-max-pixels", type=int, default=0)
     parser.add_argument("--eval-scan-vertical-link-ratio", type=float, default=0.025)
     parser.add_argument("--eval-scan-context-ratio", type=float, default=0.20)
     parser.add_argument("--eval-scan-min-context-image-ratio", type=float, default=0.015)
@@ -241,7 +241,11 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
             getattr(args, "eval_detector_cache_mode", "readonly")
         ),
         "EVAL_SCAN_NAME": str(
-            getattr(args, "eval_scan_name", "horizontal_scan_v4_detector_edge_aligned")
+            getattr(
+                args,
+                "eval_scan_name",
+                "horizontal_scan_v5_raw_detector_edge_aligned",
+            )
         ),
         "EVAL_REQUIRE_CACHE_SCOPE": str(
             getattr(args, "require_cache_scope", "full_test")
@@ -249,12 +253,14 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "EVAL_REQUIRE_STRICT_NONOVERLAP": (
             "1" if getattr(args, "require_strict_nonoverlap", True) else "0"
         ),
-        "EVAL_REQUIRE_DETECTOR_EDGE_ALIGNMENT": (
-            "1" if getattr(args, "require_detector_edge_alignment", True) else "0"
-        ),
-        "EVAL_REQUIRE_GUARDED_BBOX_UNIQUE_CONTAINMENT": (
+        "EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT": (
             "1"
-            if getattr(args, "require_guarded_bbox_unique_containment", True)
+            if getattr(args, "require_raw_detector_edge_alignment", True)
+            else "0"
+        ),
+        "EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT": (
+            "1"
+            if getattr(args, "require_detector_unique_containment", True)
             else "0"
         ),
         "EVAL_EXPECTED_UNIQUE_IMAGES": str(
@@ -270,13 +276,13 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "EVAL_TILE_NMS_IOU": str(getattr(args, "eval_tile_nms_iou", 0.50)),
         "EVAL_SCAN_TARGET_HEIGHT": str(getattr(args, "eval_scan_target_height", 960)),
         "EVAL_SCAN_TARGET_GUARD_RATIO": str(
-            getattr(args, "eval_scan_target_guard_ratio", 0.015)
+            getattr(args, "eval_scan_target_guard_ratio", 0.0)
         ),
         "EVAL_SCAN_TARGET_GUARD_MIN_PIXELS": str(
-            getattr(args, "eval_scan_target_guard_min_pixels", 16)
+            getattr(args, "eval_scan_target_guard_min_pixels", 0)
         ),
         "EVAL_SCAN_TARGET_GUARD_MAX_PIXELS": str(
-            getattr(args, "eval_scan_target_guard_max_pixels", 64)
+            getattr(args, "eval_scan_target_guard_max_pixels", 0)
         ),
         "EVAL_SCAN_VERTICAL_LINK_RATIO": str(
             getattr(args, "eval_scan_vertical_link_ratio", 0.025)
@@ -423,8 +429,8 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "EVAL_SCAN_NAME",
         "EVAL_REQUIRE_CACHE_SCOPE",
         "EVAL_REQUIRE_STRICT_NONOVERLAP",
-        "EVAL_REQUIRE_DETECTOR_EDGE_ALIGNMENT",
-        "EVAL_REQUIRE_GUARDED_BBOX_UNIQUE_CONTAINMENT",
+        "EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT",
+        "EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT",
         "EVAL_EXPECTED_UNIQUE_IMAGES",
         "EVAL_TEXT_PYTHON",
         "EVAL_ICON_PYTHON",
@@ -549,8 +555,8 @@ def main() -> int:
         "EVAL_SCAN_NAME",
         "EVAL_REQUIRE_CACHE_SCOPE",
         "EVAL_REQUIRE_STRICT_NONOVERLAP",
-        "EVAL_REQUIRE_DETECTOR_EDGE_ALIGNMENT",
-        "EVAL_REQUIRE_GUARDED_BBOX_UNIQUE_CONTAINMENT",
+        "EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT",
+        "EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT",
         "EVAL_EXPECTED_UNIQUE_IMAGES",
         "EVAL_TEXT_PYTHON",
         "EVAL_ICON_PYTHON",
