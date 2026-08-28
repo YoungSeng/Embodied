@@ -3093,7 +3093,7 @@ class StreamPackingMTPTrainer(Trainer):
                         families = relation_family_for_audit.detach().reshape(-1).long().clamp(
                             0, self.model.relation_pyramid.family_scale_prior.shape[0] - 1
                         )
-                        expected_prior = self.model.relation_pyramid.family_scale_prior[
+                        expected_prior = self.model.relation_pyramid.expected_family_scale_weights()[
                             families[: detail_weights_for_audit.shape[0]]
                         ].to(
                             device=detail_weights_for_audit.device,

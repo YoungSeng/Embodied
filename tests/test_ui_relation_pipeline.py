@@ -266,7 +266,7 @@ class UIRelationPipelineTest(unittest.TestCase):
             hidden, relation_summary, best_relation
         )
         delta = enabled - hidden
-        self.assertGreater(float(delta.norm()), 0.0)
+        self.assertGreater(float(delta.detach().norm()), 0.0)
         head = torch.randn(7, 10)
         disabled_logits = torch.nn.functional.linear(hidden, head)
         enabled_logits = torch.nn.functional.linear(enabled, head)

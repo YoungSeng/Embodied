@@ -152,6 +152,10 @@ class RelationModulesTest(unittest.TestCase):
         ).to(dtype=torch.bfloat16)
         module.reset_parameters()
         module.assert_family_scale_prior()
+        torch.testing.assert_close(
+            module.scale_logits.detach().float().softmax(dim=-1),
+            module.expected_family_scale_weights(),
+        )
         with torch.no_grad():
             module.scale_logits[0, 0].add_(0.25)
         with self.assertRaisesRegex(RuntimeError, "overwritten"):

@@ -406,6 +406,23 @@ class RelationConditionedDetailPyramid(nn.Module):
         for head in self.image_gate_heads:
             nn.init.constant_(head[-1].bias, -2.0)
 
+    def expected_family_scale_weights(self) -> torch.Tensor:
+        """Return the configured prior through the module's real dtype path.
+
+        ``family_scale_prior`` and ``scale_logits`` are cast with the model.
+        Reconstructing the expectation this way mirrors ``reset_parameters``
+        followed by the FP32 softmax used in ``forward``.  In particular, it
+        must not compare that result with probabilities rounded directly to
+        BF16, because those are two different numerical operations.
+        """
+
+        return (
+            self.family_scale_prior.detach().float().log()
+            .to(dtype=self.scale_logits.dtype)
+            .float()
+            .softmax(dim=-1)
+        )
+
     def assert_family_scale_prior(self, atol: float = 1.0e-6) -> None:
         actual = self.scale_logits.detach().float().softmax(dim=-1)
         # ``from_pretrained(..., torch_dtype=bfloat16)`` casts the learnable
@@ -414,12 +431,7 @@ class RelationConditionedDetailPyramid(nn.Module):
         # representation* of the prior, not bitwise FP32 probabilities.  Build
         # the expected value through the same dtype round-trip so this remains
         # a real overwrite check instead of rejecting normal quantization.
-        expected = (
-            self.family_scale_prior.detach().float().log()
-            .to(dtype=self.scale_logits.dtype)
-            .float()
-            .softmax(dim=-1)
-        )
+        expected = self.expected_family_scale_weights()
         if not torch.allclose(actual, expected, atol=atol, rtol=0.0):
             raise RuntimeError(
                 "TC-MSED family scale prior was overwritten during initialization: "
@@ -1740,9 +1752,19 @@ class RelationToPBD(nn.Module):
                     unique_slot_count = hidden_states.new_tensor(unique_per_sample).mean()
                     duplicate_slot_rate = hidden_states.new_tensor(float(duplicates / max(total, 1)))
                     coverage_loss = coverage_loss / max(total, 1)
-            flat_hidden[active_positions] = self.enhance_prediction_hidden(
-                flat_hidden[active_positions], safe_summaries, safe_best_tokens
+            active_hidden = flat_hidden.index_select(0, active_positions)
+            enhanced_active_hidden = self.enhance_prediction_hidden(
+                active_hidden, safe_summaries, safe_best_tokens
             )
+            # The replacement is computed from ``flat_hidden`` itself.  An
+            # indexed in-place write into that storage invalidates the views
+            # saved by autograd (and fails during dynamic-slot backward).
+            # ``index_copy`` returns fresh storage and keeps both AR and MTP
+            # routing fully differentiable.
+            flat_hidden = flat_hidden.index_copy(
+                0, active_positions, enhanced_active_hidden
+            )
+            enhanced = flat_hidden.reshape_as(hidden_states)
 
         anchor_mask = flat_ids[active_positions] == int(box_start_token_id)
         anchor_positions = active_positions[anchor_mask]
