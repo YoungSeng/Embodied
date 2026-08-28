@@ -136,6 +136,11 @@ packed/causal mask 构造分支；其 attention、MLP 和 dropout 子层仍保�
 结束后 decoder 状态也会恢复。这个兼容处理用于解决旧 Base remote code 在
 `inputs_embeds` 路径错误下标访问 `input_ids=None` 的问题，不会改变训练代码。
 
+ByteNAS 的目录锁现在写入 `owner.json`（host/PID/token），并持续刷新 heartbeat。同主机
+owner PID 已退出时立即回收；跨主机 owner 仅在 heartbeat 超过 stale 阈值后回收。旧版本
+遗留的空 `.lock.mkdir` 没有 owner，默认不会贸然抢占；确认没有 evaluator 进程后可用
+精确 `rmdir` 清理，禁止对 run 目录执行递归删除。
+
 ### 0.4 YG：执行 A800 最终 validator
 
 ```bash

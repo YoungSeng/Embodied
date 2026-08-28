@@ -36,6 +36,8 @@ from .relation_modules import (
     DEFECT_TYPES,
     RelationConditionedDetailPyramid,
     RelationToPBD,
+    apply_coordinate_logit_prior,
+    apply_soft_gate_logit_prior,
     match_ui_relation_prompt,
     pbd_active_delta_norm,
     replace_pbd_active_logits,
@@ -180,8 +182,17 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 adapter_bottleneck=int(getattr(config, "relation_adapter_bottleneck", 64)),
                 focal_gamma=float(getattr(config, "relation_focal_gamma", 2.0)),
                 focal_beta=float(getattr(config, "relation_focal_beta", 0.999)),
+                task_scale_router=bool(getattr(config, "relation_task_scale_router", False)),
+                set_localizer=bool(getattr(config, "relation_set_localizer", False)),
+                soft_gate=bool(getattr(config, "relation_soft_gate", False)),
             )
-            self.relation_pbd = RelationToPBD(detail_hidden_size, llm_hidden_size)
+            self.relation_pbd = RelationToPBD(
+                detail_hidden_size,
+                llm_hidden_size,
+                dynamic_slot=bool(getattr(config, "relation_dynamic_slot_pbd", False)),
+                overlap_adapter=bool(getattr(config, "relation_overlap_adapter", False)),
+                coordinate_bridge=bool(getattr(config, "relation_coordinate_bridge", False)),
+            )
         self._last_ui_defect_interface = None
 
         if config.use_backbone_lora:

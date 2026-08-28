@@ -34,6 +34,8 @@ from .relation_modules import (
     RelationConditionedDetailPyramid,
     RelationPyramidOutput,
     RelationToPBD,
+    apply_coordinate_logit_prior,
+    apply_soft_gate_logit_prior,
     pbd_active_delta_norm,
 )
 from .ui_relation_setup import ui_relation_collective_device
@@ -198,8 +200,17 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 adapter_bottleneck=int(getattr(config, "relation_adapter_bottleneck", 64)),
                 focal_gamma=float(getattr(config, "relation_focal_gamma", 2.0)),
                 focal_beta=float(getattr(config, "relation_focal_beta", 0.999)),
+                task_scale_router=bool(getattr(config, "relation_task_scale_router", False)),
+                set_localizer=bool(getattr(config, "relation_set_localizer", False)),
+                soft_gate=bool(getattr(config, "relation_soft_gate", False)),
             )
-            self.relation_pbd = RelationToPBD(detail_hidden_size, llm_hidden_size)
+            self.relation_pbd = RelationToPBD(
+                detail_hidden_size,
+                llm_hidden_size,
+                dynamic_slot=bool(getattr(config, "relation_dynamic_slot_pbd", False)),
+                overlap_adapter=bool(getattr(config, "relation_overlap_adapter", False)),
+                coordinate_bridge=bool(getattr(config, "relation_coordinate_bridge", False)),
+            )
 
         if config.use_backbone_lora:
             self.wrap_backbone_lora(r=config.use_backbone_lora, lora_alpha=2 * config.use_backbone_lora)
@@ -261,13 +272,30 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                                 nn.init.normal_(module.weight, mean=0.0, std=std)
                     nn.init.normal_(self.relation_pyramid.evidence_queries, mean=0.0, std=0.02)
                     nn.init.normal_(self.relation_pyramid.context_queries, mean=0.0, std=0.02)
-                    nn.init.zeros_(self.relation_pyramid.scale_logits)
+                    self.relation_pyramid.scale_logits.copy_(
+                        self.relation_pyramid.family_scale_prior.log()
+                    )
+                    if self.relation_pyramid.task_scale_router:
+                        nn.init.zeros_(self.relation_pyramid.task_scale_projection.weight)
+                        nn.init.zeros_(self.relation_pyramid.image_scale_projection.weight)
+                    if self.relation_pyramid.set_localizer:
+                        nn.init.zeros_(self.relation_pyramid.coarse_box_head[-1].weight)
+                        nn.init.zeros_(self.relation_pyramid.coarse_box_head[-1].bias)
+                    if self.relation_pyramid.soft_gate:
+                        nn.init.zeros_(self.relation_pyramid.soft_gate_beta)
                     for adapter in self.relation_pyramid.family_adapters:
                         adapter.scale.fill_(0.1)
                     for head in (*self.relation_pyramid.gate_heads, *self.relation_pyramid.image_gate_heads):
                         nn.init.constant_(head[-1].bias, -2.0)
                     self.relation_pbd.semantic_scale.fill_(0.01)
                     self.relation_pbd.box_scale.fill_(0.01)
+                    if self.relation_pbd.dynamic_slot:
+                        self.relation_pbd.coverage_gamma.fill_(1.0)
+                    if self.relation_pbd.overlap_adapter:
+                        nn.init.zeros_(self.relation_pbd.overlap_adapter_up.weight)
+                    if self.relation_pbd.coordinate_bridge:
+                        nn.init.zeros_(self.relation_pbd.coord_prior_lambda)
+                    self.relation_pyramid.assert_family_scale_prior()
 
         self.config.ui_relation_initialization_seed = int(seed)
         self.config.ui_relation_initialization_reason = str(reason)

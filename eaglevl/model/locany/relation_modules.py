@@ -23,6 +23,15 @@ DEFECT_TYPES = (
     "missing",
 )
 DEFAULT_UI_DETAIL_LAYERS = (5, 15, 26)
+FAMILY_SCALE_PRIOR = torch.tensor(
+    [
+        [0.50, 0.35, 0.15],  # boundary
+        [0.15, 0.40, 0.45],  # pairwise
+        [0.40, 0.25, 0.35],  # text
+        [0.10, 0.20, 0.70],  # presence
+    ],
+    dtype=torch.float32,
+)
 
 
 @dataclass(frozen=True)
@@ -129,6 +138,19 @@ class RelationPyramidOutput:
     per_task_image_gate_loss: Optional[Dict[int, torch.Tensor]] = None
     per_task_slot_gate_loss: Optional[Dict[int, torch.Tensor]] = None
     attention_loss: Optional[torch.Tensor] = None
+    attention_kl_loss: Optional[torch.Tensor] = None
+    attention_ce_diagnostic: Optional[torch.Tensor] = None
+    box_l1_loss: Optional[torch.Tensor] = None
+    box_giou_loss: Optional[torch.Tensor] = None
+    matched_slot_indices: Optional[torch.Tensor] = None
+    scale_entropy: Optional[torch.Tensor] = None
+    scale_batch_std: Optional[torch.Tensor] = None
+    coarse_iou_mean: Optional[torch.Tensor] = None
+    coarse_recall_03: Optional[torch.Tensor] = None
+    coarse_recall_05: Optional[torch.Tensor] = None
+    matched_slots: Optional[torch.Tensor] = None
+    unmatched_slots: Optional[torch.Tensor] = None
+    slot_usage_entropy: Optional[torch.Tensor] = None
 
 
 def class_balanced_focal_loss(
@@ -173,6 +195,78 @@ def class_balanced_focal_loss(
     return (balance_weight * (1.0 - p_t).pow(gamma) * bce).mean()
 
 
+def canonicalize_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+    """Clamp boxes to the UI coordinate range and enforce x1<=x2/y1<=y2."""
+
+    first = torch.minimum(boxes[..., :2], boxes[..., 2:])
+    second = torch.maximum(boxes[..., :2], boxes[..., 2:])
+    return torch.cat((first, second), dim=-1).clamp(0.0, 1000.0)
+
+
+def aligned_generalized_box_iou(
+    boxes1: torch.Tensor, boxes2: torch.Tensor
+) -> torch.Tensor:
+    """Aligned GIoU for equally-shaped ``[..., 4]`` xyxy tensors."""
+
+    boxes1 = canonicalize_xyxy(boxes1.float())
+    boxes2 = canonicalize_xyxy(boxes2.float())
+    intersection_xy1 = torch.maximum(boxes1[..., :2], boxes2[..., :2])
+    intersection_xy2 = torch.minimum(boxes1[..., 2:], boxes2[..., 2:])
+    intersection = (intersection_xy2 - intersection_xy1).clamp_min(0.0).prod(dim=-1)
+    area1 = (boxes1[..., 2:] - boxes1[..., :2]).clamp_min(0.0).prod(dim=-1)
+    area2 = (boxes2[..., 2:] - boxes2[..., :2]).clamp_min(0.0).prod(dim=-1)
+    union = area1 + area2 - intersection
+    iou = intersection / union.clamp_min(1.0e-7)
+    enclosing_xy1 = torch.minimum(boxes1[..., :2], boxes2[..., :2])
+    enclosing_xy2 = torch.maximum(boxes1[..., 2:], boxes2[..., 2:])
+    enclosing = (enclosing_xy2 - enclosing_xy1).clamp_min(0.0).prod(dim=-1)
+    return iou - (enclosing - union) / enclosing.clamp_min(1.0e-7)
+
+
+def pairwise_generalized_box_iou(
+    boxes1: torch.Tensor, boxes2: torch.Tensor
+) -> torch.Tensor:
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return boxes1.new_zeros((boxes1.shape[0], boxes2.shape[0]), dtype=torch.float32)
+    return aligned_generalized_box_iou(boxes1[:, None, :], boxes2[None, :, :])
+
+
+def hungarian_assignment(cost: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Exact rectangular assignment for small UI slot sets without SciPy.
+
+    UI5 uses at most eight slots/boxes, so dynamic programming over slot bitmasks
+    is deterministic and cheaper than adding a runtime SciPy dependency.
+    """
+
+    if cost.ndim != 2:
+        raise ValueError(f"Hungarian cost must be rank-2, got {tuple(cost.shape)}")
+    slots, targets = cost.shape
+    if targets == 0 or slots == 0:
+        empty = torch.zeros(0, device=cost.device, dtype=torch.long)
+        return empty, empty
+    if targets > slots:
+        raise ValueError(f"targets ({targets}) cannot exceed slots ({slots})")
+    detached = cost.detach().float().cpu()
+    states: Dict[int, Tuple[float, Tuple[int, ...]]] = {0: (0.0, tuple())}
+    for target in range(targets):
+        next_states: Dict[int, Tuple[float, Tuple[int, ...]]] = {}
+        for used_mask, (value, assignment) in states.items():
+            for slot in range(slots):
+                bit = 1 << slot
+                if used_mask & bit:
+                    continue
+                candidate = value + float(detached[slot, target].item())
+                new_mask = used_mask | bit
+                previous = next_states.get(new_mask)
+                if previous is None or candidate < previous[0]:
+                    next_states[new_mask] = (candidate, assignment + (slot,))
+        states = next_states
+    _, best_assignment = min(states.values(), key=lambda item: item[0])
+    target_indices = torch.arange(targets, device=cost.device, dtype=torch.long)
+    slot_indices = torch.tensor(best_assignment, device=cost.device, dtype=torch.long)
+    return slot_indices, target_indices
+
+
 class ResidualAdapter(nn.Module):
     def __init__(self, hidden_size: int, bottleneck: int) -> None:
         super().__init__()
@@ -199,6 +293,9 @@ class RelationConditionedDetailPyramid(nn.Module):
         num_defect_types: int = 5,
         focal_gamma: float = 2.0,
         focal_beta: float = 0.999,
+        task_scale_router: bool = False,
+        set_localizer: bool = False,
+        soft_gate: bool = False,
     ) -> None:
         super().__init__()
         self.detail_hidden_size = detail_hidden_size
@@ -207,6 +304,9 @@ class RelationConditionedDetailPyramid(nn.Module):
         self.num_defect_types = num_defect_types
         self.focal_gamma = focal_gamma
         self.focal_beta = focal_beta
+        self.task_scale_router = bool(task_scale_router)
+        self.set_localizer = bool(set_localizer)
+        self.soft_gate = bool(soft_gate)
 
         self.level_projections = nn.ModuleList(
             [
@@ -219,16 +319,15 @@ class RelationConditionedDetailPyramid(nn.Module):
         )
 
         # early / middle / final initialization.  These remain fully learnable.
-        initial_scale_weights = torch.tensor(
-            [
-                [0.50, 0.35, 0.15],  # boundary
-                [0.15, 0.40, 0.45],  # pairwise
-                [0.40, 0.25, 0.35],  # text
-                [0.10, 0.20, 0.70],  # presence
-            ],
-            dtype=torch.float32,
+        initial_scale_weights = FAMILY_SCALE_PRIOR.clone()
+        self.register_buffer(
+            "family_scale_prior", initial_scale_weights.clone(), persistent=False
         )
         self.scale_logits = nn.Parameter(initial_scale_weights.log())
+        if self.task_scale_router:
+            self.task_scale_embedding = nn.Embedding(num_defect_types, detail_hidden_size)
+            self.task_scale_projection = nn.Linear(detail_hidden_size, 3, bias=False)
+            self.image_scale_projection = nn.Linear(detail_hidden_size, 3, bias=False)
 
         self.evidence_queries = nn.Parameter(
             torch.empty(num_families, num_slots, detail_hidden_size)
@@ -277,17 +376,44 @@ class RelationConditionedDetailPyramid(nn.Module):
                 for _ in range(num_defect_types)
             ]
         )
+        if self.set_localizer:
+            self.coarse_box_head = nn.Sequential(
+                nn.LayerNorm(detail_hidden_size),
+                nn.Linear(detail_hidden_size, adapter_bottleneck),
+                nn.GELU(),
+                nn.Linear(adapter_bottleneck, 4),
+            )
+        if self.soft_gate:
+            self.soft_gate_beta = nn.Parameter(torch.zeros(num_defect_types))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.evidence_queries, std=0.02)
         nn.init.normal_(self.context_queries, std=0.02)
-        nn.init.zeros_(self.scale_logits)
+        with torch.no_grad():
+            self.scale_logits.copy_(self.family_scale_prior.log())
+        if self.task_scale_router:
+            nn.init.zeros_(self.task_scale_projection.weight)
+            nn.init.zeros_(self.image_scale_projection.weight)
+        if self.set_localizer:
+            nn.init.zeros_(self.coarse_box_head[-1].weight)
+            nn.init.zeros_(self.coarse_box_head[-1].bias)
+        if self.soft_gate:
+            nn.init.zeros_(self.soft_gate_beta)
         # Start conservatively: an unseen slot should prefer non-defect.
         for head in self.gate_heads:
             nn.init.constant_(head[-1].bias, -2.0)
         for head in self.image_gate_heads:
             nn.init.constant_(head[-1].bias, -2.0)
+
+    def assert_family_scale_prior(self, atol: float = 1.0e-6) -> None:
+        actual = self.scale_logits.detach().float().softmax(dim=-1)
+        expected = self.family_scale_prior.detach().float()
+        if not torch.allclose(actual, expected, atol=atol, rtol=0.0):
+            raise RuntimeError(
+                "TC-MSED family scale prior was overwritten during initialization: "
+                f"actual={actual.tolist()}, expected={expected.tolist()}"
+            )
 
     @staticmethod
     def _sanitize(hidden_states: torch.Tensor, limit: float = 128.0) -> torch.Tensor:
@@ -369,6 +495,51 @@ class RelationConditionedDetailPyramid(nn.Module):
             active_slots[slot] = 1.0
         return evidence, context, active_slots
 
+    def _box_attention_targets(
+        self,
+        boxes: torch.Tensor,
+        box_mask: torch.Tensor,
+        height: int,
+        width: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return one spatial target per GT box, independent of slot order."""
+
+        valid_indices = box_mask.nonzero(as_tuple=False).flatten()[: self.num_slots]
+        if valid_indices.numel() == 0:
+            empty = torch.zeros(0, height * width, device=device)
+            return empty, empty, boxes.new_zeros((0, 4), device=device).float()
+        coords = self._patch_coordinates(height, width, device)
+        evidence: List[torch.Tensor] = []
+        context: List[torch.Tensor] = []
+        valid_boxes: List[torch.Tensor] = []
+        for box_index in valid_indices.tolist():
+            raw_box = canonicalize_xyxy(boxes[box_index].float().to(device=device))
+            box = raw_box / 1000.0
+            x1, y1, x2, y2 = box.unbind()
+            inside = (
+                (coords[:, 0] >= x1)
+                & (coords[:, 0] <= x2)
+                & (coords[:, 1] >= y1)
+                & (coords[:, 1] <= y2)
+            )
+            center = torch.stack(((x1 + x2) * 0.5, (y1 + y2) * 0.5))
+            center_distance = (coords - center).square().sum(dim=-1)
+            evidence.append(self._mask_distribution(inside, center_distance))
+            half_width = (x2 - x1) * 1.5
+            half_height = (y2 - y1) * 1.5
+            expanded = (
+                (coords[:, 0] >= center[0] - half_width)
+                & (coords[:, 0] <= center[0] + half_width)
+                & (coords[:, 1] >= center[1] - half_height)
+                & (coords[:, 1] <= center[1] + half_height)
+            )
+            ring = expanded & ~inside
+            outside_distance = center_distance.masked_fill(inside, float("inf"))
+            context.append(self._mask_distribution(ring, outside_distance))
+            valid_boxes.append(raw_box)
+        return torch.stack(evidence), torch.stack(context), torch.stack(valid_boxes)
+
     @staticmethod
     def _coarse_boxes(attention: torch.Tensor, height: int, width: int) -> torch.Tensor:
         coords = RelationConditionedDetailPyramid._patch_coordinates(
@@ -443,6 +614,14 @@ class RelationConditionedDetailPyramid(nn.Module):
         }
         fused_norms: List[torch.Tensor] = []
         relation_context_norms: List[torch.Tensor] = []
+        box_l1_losses: List[torch.Tensor] = []
+        box_giou_losses: List[torch.Tensor] = []
+        attention_kl_losses: List[torch.Tensor] = []
+        attention_ce_values: List[torch.Tensor] = []
+        matched_indices_list: List[torch.Tensor] = []
+        coarse_ious: List[torch.Tensor] = []
+        matched_counts: List[torch.Tensor] = []
+        unmatched_counts: List[torch.Tensor] = []
 
         image_index = 0
         parameter_zero = self.evidence_queries.sum() * 0.0
@@ -468,6 +647,11 @@ class RelationConditionedDetailPyramid(nn.Module):
                 attention_list.append(torch.zeros(2, self.num_slots, 1, device=empty_tokens.device, dtype=empty_tokens.dtype))
                 scale_weights_list.append(scale_weights_all[family])
                 gate_targets_list.append(torch.zeros(self.num_slots, device=empty_tokens.device, dtype=empty_tokens.dtype))
+                matched_indices_list.append(
+                    torch.full((self.num_slots,), -1, device=empty_tokens.device, dtype=torch.long)
+                )
+                matched_counts.append(parameter_zero.detach().float())
+                unmatched_counts.append(parameter_zero.detach().float() + self.num_slots)
                 fused_norms.append(parameter_zero.detach().float())
                 relation_context_norms.append(parameter_zero.detach().float())
                 # Even text-only samples carry one dummy 2x2 grid in the base
@@ -480,7 +664,23 @@ class RelationConditionedDetailPyramid(nn.Module):
             levels = image_features[image_index]
             height, width = [int(v) for v in grid_hws[image_index].tolist()]
             image_index += num_images
-            weights = scale_weights_all[family]
+            if self.task_scale_router:
+                image_descriptor = torch.stack(
+                    [level.float().mean(dim=0) for level in levels], dim=0
+                ).mean(dim=0)
+                task_residual = self.task_scale_projection(
+                    self.task_scale_embedding.weight[task]
+                ).float()
+                image_residual = self.image_scale_projection(
+                    image_descriptor.to(dtype=self.image_scale_projection.weight.dtype)
+                ).float()
+                weights = (
+                    self.scale_logits[family].float()
+                    + task_residual
+                    + image_residual
+                ).softmax(dim=-1)
+            else:
+                weights = scale_weights_all[family]
             fused = sum(
                 weights[level].to(device=levels[level].device, dtype=levels[level].dtype)
                 * levels[level]
@@ -549,12 +749,97 @@ class RelationConditionedDetailPyramid(nn.Module):
             relation_tokens_list.append(gated_relation)
             gate_logits_list.append(gate_logits)
             image_gate_logits_list.append(image_gate_logit)
-            coarse_boxes_list.append(self._coarse_boxes(evidence_attention, height, width))
+            attention_boxes = self._coarse_boxes(evidence_attention, height, width)
+            if self.set_localizer:
+                residual = 100.0 * torch.tanh(self.coarse_box_head(adapted_relation).float())
+                sample_coarse_boxes = canonicalize_xyxy(attention_boxes.float() + residual)
+            else:
+                sample_coarse_boxes = attention_boxes
+            coarse_boxes_list.append(sample_coarse_boxes.to(dtype=gated_relation.dtype))
             attention_list.append(torch.stack((evidence_attention, context_attention), dim=0))
             scale_weights_list.append(weights)
 
             gate_targets = torch.zeros(self.num_slots, device=fused.device, dtype=fused.dtype)
-            if target_boxes is not None and target_box_mask is not None:
+            matched_for_sample = torch.full(
+                (self.num_slots,), -1, device=fused.device, dtype=torch.long
+            )
+            if target_boxes is not None and target_box_mask is not None and self.set_localizer:
+                box_evidence, box_context, valid_boxes = self._box_attention_targets(
+                    target_boxes[sample_index],
+                    target_box_mask[sample_index].bool(),
+                    height,
+                    width,
+                    fused.device,
+                )
+                if valid_boxes.shape[0] > 0:
+                    positive_focal_cost = (
+                        (1.0 - torch.sigmoid(gate_logits.float())).pow(self.focal_gamma)
+                        * F.softplus(-gate_logits.float())
+                    )[:, None]
+                    l1_cost = torch.cdist(
+                        sample_coarse_boxes.float() / 1000.0,
+                        valid_boxes.float() / 1000.0,
+                        p=1,
+                    )
+                    giou_cost = 1.0 - pairwise_generalized_box_iou(
+                        sample_coarse_boxes.float(), valid_boxes.float()
+                    )
+                    evidence_log = evidence_attention.float().clamp_min(1.0e-7).log()
+                    target_log = box_evidence.float().clamp_min(1.0e-7).log()
+                    attention_kl_cost = (
+                        box_evidence[None].float()
+                        * (target_log[None] - evidence_log[:, None])
+                    ).sum(dim=-1)
+                    cost = (
+                        positive_focal_cost
+                        + 5.0 * l1_cost
+                        + 2.0 * giou_cost
+                        + attention_kl_cost
+                    )
+                    matched_slots, matched_targets = hungarian_assignment(cost)
+                    matched_for_sample[matched_targets] = matched_slots
+                    gate_targets[matched_slots] = 1.0
+                    predicted = sample_coarse_boxes[matched_slots].float()
+                    expected = valid_boxes[matched_targets].float()
+                    sample_l1 = F.l1_loss(
+                        predicted / 1000.0, expected / 1000.0, reduction="mean"
+                    )
+                    sample_giou = (
+                        1.0 - aligned_generalized_box_iou(predicted, expected)
+                    ).mean()
+                    box_l1_losses.append(sample_l1)
+                    box_giou_losses.append(sample_giou)
+                    matched_evidence = evidence_attention[matched_slots].float().clamp_min(1.0e-7)
+                    matched_context = context_attention[matched_slots].float().clamp_min(1.0e-7)
+                    target_evidence = box_evidence[matched_targets].float()
+                    target_context = box_context[matched_targets].float()
+                    evidence_ce = -(target_evidence * matched_evidence.log()).sum(dim=-1)
+                    context_ce = -(target_context * matched_context.log()).sum(dim=-1)
+                    evidence_entropy = -(
+                        target_evidence * target_evidence.clamp_min(1.0e-7).log()
+                    ).sum(dim=-1)
+                    context_entropy = -(
+                        target_context * target_context.clamp_min(1.0e-7).log()
+                    ).sum(dim=-1)
+                    sample_attention_kl = (
+                        evidence_ce - evidence_entropy + context_ce - context_entropy
+                    ).mean()
+                    sample_attention_ce = (evidence_ce + context_ce).mean()
+                    attention_kl_losses.append(sample_attention_kl)
+                    attention_ce_values.append(sample_attention_ce)
+                    evidence_losses.append(sample_attention_kl)
+                    attention_losses_by_task[task].append(sample_attention_kl)
+                    coarse_ious.append(
+                        aligned_generalized_box_iou(predicted, expected).clamp(0.0, 1.0)
+                    )
+                    matched_counts.append(predicted.new_tensor(float(predicted.shape[0])))
+                    unmatched_counts.append(
+                        predicted.new_tensor(float(self.num_slots - predicted.shape[0]))
+                    )
+                else:
+                    matched_counts.append(parameter_zero.detach().float())
+                    unmatched_counts.append(parameter_zero.detach().float() + self.num_slots)
+            elif target_boxes is not None and target_box_mask is not None:
                 evidence_target, context_target, gate_targets = self._attention_targets(
                     target_boxes[sample_index],
                     target_box_mask[sample_index].bool(),
@@ -573,7 +858,19 @@ class RelationConditionedDetailPyramid(nn.Module):
                     sample_attention_loss = (evidence_ce + context_ce).mean()
                     evidence_losses.append(sample_attention_loss)
                     attention_losses_by_task[task].append(sample_attention_loss)
+                matched_count = int(gate_targets.sum().item())
+                matched_for_sample[:matched_count] = torch.arange(
+                    matched_count, device=fused.device, dtype=torch.long
+                )
+                matched_counts.append(parameter_zero.detach().float() + matched_count)
+                unmatched_counts.append(
+                    parameter_zero.detach().float() + self.num_slots - matched_count
+                )
+            else:
+                matched_counts.append(parameter_zero.detach().float())
+                unmatched_counts.append(parameter_zero.detach().float() + self.num_slots)
             gate_targets_list.append(gate_targets)
+            matched_indices_list.append(matched_for_sample)
 
         relation_tokens = torch.stack(relation_tokens_list, dim=0)
         slot_gate_logits = torch.stack(gate_logits_list, dim=0)
@@ -635,6 +932,14 @@ class RelationConditionedDetailPyramid(nn.Module):
                             beta=self.focal_beta,
                         )
         attention_loss = torch.stack(evidence_losses).mean() if evidence_losses else None
+        attention_kl_loss = (
+            torch.stack(attention_kl_losses).mean() if attention_kl_losses else None
+        )
+        attention_ce_diagnostic = (
+            torch.stack(attention_ce_values).mean() if attention_ce_values else None
+        )
+        box_l1_loss = torch.stack(box_l1_losses).mean() if box_l1_losses else None
+        box_giou_loss = torch.stack(box_giou_losses).mean() if box_giou_losses else None
         per_task_attention_loss = {
             task: torch.stack(values).mean()
             for task, values in attention_losses_by_task.items()
@@ -660,6 +965,28 @@ class RelationConditionedDetailPyramid(nn.Module):
         )
         fused_feature_norm = torch.stack(fused_norms).mean()
         relation_context_norm = torch.stack(relation_context_norms).mean()
+        scale_entropy = -(
+            scale_weights.float() * scale_weights.float().clamp_min(1.0e-7).log()
+        ).sum(dim=-1)
+        scale_batch_std = scale_weights.float().std(dim=0, unbiased=False)
+        matched_slot_indices = torch.stack(matched_indices_list, dim=0)
+        if coarse_ious:
+            flat_coarse_iou = torch.cat([value.reshape(-1) for value in coarse_ious])
+            coarse_iou_mean = flat_coarse_iou.mean()
+            coarse_recall_03 = (flat_coarse_iou >= 0.3).float().mean()
+            coarse_recall_05 = (flat_coarse_iou >= 0.5).float().mean()
+        else:
+            coarse_iou_mean = parameter_zero.detach().float()
+            coarse_recall_03 = parameter_zero.detach().float()
+            coarse_recall_05 = parameter_zero.detach().float()
+        usage = gate_targets.float().sum(dim=0) if gate_targets is not None else None
+        if usage is not None and float(usage.sum().item()) > 0:
+            usage_probability = usage / usage.sum()
+            slot_usage_entropy = -(
+                usage_probability * usage_probability.clamp_min(1.0e-7).log()
+            ).sum()
+        else:
+            slot_usage_entropy = parameter_zero.detach().float()
 
         return RelationPyramidOutput(
             relation_tokens=relation_tokens,
@@ -689,6 +1016,19 @@ class RelationConditionedDetailPyramid(nn.Module):
             image_gate_loss=image_gate_loss,
             slot_gate_loss=slot_gate_loss,
             attention_loss=attention_loss,
+            attention_kl_loss=attention_kl_loss,
+            attention_ce_diagnostic=attention_ce_diagnostic,
+            box_l1_loss=box_l1_loss,
+            box_giou_loss=box_giou_loss,
+            matched_slot_indices=matched_slot_indices,
+            scale_entropy=scale_entropy,
+            scale_batch_std=scale_batch_std,
+            coarse_iou_mean=coarse_iou_mean,
+            coarse_recall_03=coarse_recall_03,
+            coarse_recall_05=coarse_recall_05,
+            matched_slots=torch.stack(matched_counts).mean(),
+            unmatched_slots=torch.stack(unmatched_counts).mean(),
+            slot_usage_entropy=slot_usage_entropy,
         )
 
     def parameter_count(self) -> int:
@@ -793,6 +1133,120 @@ def pbd_active_delta_norm(
     return delta.float().norm(dim=-1).mean()
 
 
+def pbd_prediction_groups(
+    input_ids: torch.Tensor,
+    sub_sample_lengths: torch.Tensor,
+    box_start_token_id: int,
+    text_mask_token_id: int,
+    block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return active positions plus sample/anchor/offset routing identities.
+
+    This is the single grouping rule used by dynamic PBD in training and
+    generation.  Anchor ordinals restart at every packed-sample boundary.
+    """
+
+    positions, samples = pbd_prediction_positions(
+        input_ids,
+        sub_sample_lengths,
+        box_start_token_id,
+        text_mask_token_id,
+        block_size,
+    )
+    if positions.numel() == 0:
+        return positions, samples, positions.clone(), positions.clone()
+    flat_ids = input_ids.reshape(-1)
+    anchor_ordinals = torch.zeros_like(positions)
+    offsets = torch.zeros_like(positions)
+    per_sample_anchor = [0 for _ in range(int(samples.max().item()) + 1)]
+    cursor = 0
+    while cursor < positions.numel():
+        sample = int(samples[cursor].item())
+        anchor = int(positions[cursor].item())
+        width = 1
+        while (
+            cursor + width < positions.numel()
+            and int(samples[cursor + width].item()) == sample
+            and int(positions[cursor + width].item()) == anchor + width
+            and int(flat_ids[anchor].item()) == int(box_start_token_id)
+            and int(flat_ids[anchor + width].item()) == int(text_mask_token_id)
+        ):
+            width += 1
+        anchor_ordinals[cursor : cursor + width] = per_sample_anchor[sample]
+        offsets[cursor : cursor + width] = torch.arange(
+            width, device=positions.device, dtype=torch.long
+        )
+        per_sample_anchor[sample] += 1
+        cursor += width
+    return positions, samples, anchor_ordinals, offsets
+
+
+def apply_coordinate_logit_prior(
+    logits: torch.Tensor,
+    active_positions: torch.Tensor,
+    active_offsets: torch.Tensor,
+    active_samples: torch.Tensor,
+    selected_coarse_boxes: torch.Tensor,
+    defect_type: torch.Tensor,
+    task_lambdas: torch.Tensor,
+    coord_start_token_id: int,
+    coord_end_token_id: int,
+    sigma: float = 0.05,
+) -> torch.Tensor:
+    """Add a Gaussian coarse-geometry prior only to coordinate-token logits."""
+
+    if float(sigma) <= 0.0:
+        raise ValueError("coordinate prior sigma must be positive")
+    output = logits.clone()
+    flat = output.reshape(-1, output.shape[-1])
+    coord_count = int(coord_end_token_id) - int(coord_start_token_id) + 1
+    if coord_count <= 0:
+        raise ValueError("invalid coordinate token range")
+    coordinate_values = torch.linspace(
+        0.0, 1000.0, coord_count, device=flat.device, dtype=torch.float32
+    )
+    for index in range(active_positions.numel()):
+        dimension = int(active_offsets[index].item())
+        if dimension < 0 or dimension >= 4:
+            continue
+        position = int(active_positions[index].item())
+        sample = int(active_samples[index].item())
+        task = int(defect_type[sample].clamp(0, task_lambdas.numel() - 1).item())
+        strength = task_lambdas[task].float()
+        if not bool((strength.detach().abs() > 0).item()):
+            continue
+        center = selected_coarse_boxes[index, dimension].float()
+        width = 1000.0 * float(sigma)
+        prior = -strength * (coordinate_values - center).square() / (2.0 * width * width)
+        flat[position, int(coord_start_token_id) : int(coord_end_token_id) + 1] += prior.to(
+            dtype=flat.dtype
+        )
+    return output
+
+
+def apply_soft_gate_logit_prior(
+    logits: torch.Tensor,
+    p_defect: torch.Tensor,
+    defect_type: torch.Tensor,
+    task_betas: torch.Tensor,
+    box_token_id: int,
+    none_token_id: int,
+) -> torch.Tensor:
+    """Apply task-specific soft none/box evidence without hard early exit."""
+
+    output = logits.clone()
+    if logits.ndim < 2:
+        raise ValueError("soft gate expects logits with a vocabulary dimension")
+    batch = logits.shape[0]
+    for sample in range(batch):
+        task = int(defect_type[sample].clamp(0, task_betas.numel() - 1).item())
+        beta = task_betas[task].to(dtype=output.dtype, device=output.device)
+        probability = p_defect[sample].to(dtype=output.dtype, device=output.device)
+        output[sample, ..., int(box_token_id)] += beta * probability
+        output[sample, ..., int(none_token_id)] += beta * (1.0 - probability)
+    return output
+
+
 def replace_pbd_active_logits(
     destination_logits: torch.Tensor,
     replacement_logits: torch.Tensor,
@@ -842,12 +1296,30 @@ class PBDForwardOutput:
     box_anchor_samples: torch.Tensor
     active_positions: torch.Tensor
     active_samples: torch.Tensor
+    active_anchor_ordinals: Optional[torch.Tensor] = None
+    active_offsets: Optional[torch.Tensor] = None
+    selected_slot_indices: Optional[torch.Tensor] = None
+    routing_weights: Optional[torch.Tensor] = None
+    selected_coarse_boxes: Optional[torch.Tensor] = None
+    final_slot_usage: Optional[torch.Tensor] = None
+    coverage_loss: Optional[torch.Tensor] = None
+    unique_slot_count: Optional[torch.Tensor] = None
+    duplicate_slot_rate: Optional[torch.Tensor] = None
 
 
 class RelationToPBD(nn.Module):
     """Inject relation evidence into semantic/negative and box anchor states."""
 
-    def __init__(self, relation_hidden_size: int, language_hidden_size: int) -> None:
+    def __init__(
+        self,
+        relation_hidden_size: int,
+        language_hidden_size: int,
+        dynamic_slot: bool = False,
+        overlap_adapter: bool = False,
+        coordinate_bridge: bool = False,
+        num_defect_types: int = 5,
+        adapter_rank: int = 8,
+    ) -> None:
         super().__init__()
         self.semantic_projection = nn.Sequential(
             nn.LayerNorm(relation_hidden_size),
@@ -861,6 +1333,20 @@ class RelationToPBD(nn.Module):
         # the pretrained decoder distribution at step zero.
         self.semantic_scale = nn.Parameter(torch.tensor(0.01))
         self.box_scale = nn.Parameter(torch.tensor(0.01))
+        self.dynamic_slot = bool(dynamic_slot)
+        self.overlap_adapter = bool(overlap_adapter)
+        self.coordinate_bridge = bool(coordinate_bridge)
+        if self.dynamic_slot:
+            self.router_query = nn.Linear(language_hidden_size, relation_hidden_size, bias=False)
+            self.router_key = nn.Linear(relation_hidden_size, relation_hidden_size, bias=False)
+            self.router_value = nn.Linear(relation_hidden_size, relation_hidden_size, bias=False)
+            self.coverage_gamma = nn.Parameter(torch.tensor(1.0))
+        if self.overlap_adapter:
+            self.overlap_adapter_down = nn.Linear(relation_hidden_size, adapter_rank, bias=False)
+            self.overlap_adapter_up = nn.Linear(adapter_rank, relation_hidden_size, bias=False)
+            nn.init.zeros_(self.overlap_adapter_up.weight)
+        if self.coordinate_bridge:
+            self.coord_prior_lambda = nn.Parameter(torch.zeros(num_defect_types))
 
     def enhance_prediction_hidden(
         self,
@@ -899,6 +1385,12 @@ class RelationToPBD(nn.Module):
         box_start_token_id: int,
         text_mask_token_id: int,
         block_size: int,
+        relation_tokens: Optional[torch.Tensor] = None,
+        slot_gate_logits: Optional[torch.Tensor] = None,
+        coarse_boxes: Optional[torch.Tensor] = None,
+        matched_slot_indices: Optional[torch.Tensor] = None,
+        defect_type: Optional[torch.Tensor] = None,
+        initial_slot_usage: Optional[torch.Tensor] = None,
     ) -> PBDForwardOutput:
         enhanced = hidden_states.clone()
         flat_hidden = enhanced.reshape(-1, enhanced.shape[-1])
@@ -908,13 +1400,20 @@ class RelationToPBD(nn.Module):
                 "PBD hidden/input token counts disagree: "
                 f"hidden_tokens={flat_hidden.shape[0]}, input_tokens={flat_ids.numel()}"
             )
-        active_positions, active_samples = pbd_prediction_positions(
+        active_positions, active_samples, active_anchor_ordinals, active_offsets = pbd_prediction_groups(
             input_ids=input_ids,
             sub_sample_lengths=sub_sample_lengths,
             box_start_token_id=box_start_token_id,
             text_mask_token_id=text_mask_token_id,
             block_size=block_size,
         )
+        selected_slot_indices = torch.full_like(active_positions, -1)
+        routing_weights = None
+        selected_coarse_boxes = hidden_states.new_zeros((active_positions.numel(), 4))
+        final_slot_usage = None
+        coverage_loss = hidden_states.new_zeros((), dtype=torch.float32)
+        unique_slot_count = hidden_states.new_zeros((), dtype=torch.float32)
+        duplicate_slot_rate = hidden_states.new_zeros((), dtype=torch.float32)
         if active_positions.numel() > 0:
             required_samples = int(active_samples.max().item()) + 1
             if relation_summary.shape[0] < required_samples:
@@ -926,19 +1425,94 @@ class RelationToPBD(nn.Module):
                     "best_relation_token has fewer samples than the packed PBD selection"
                 )
             safe_summaries = torch.nan_to_num(
-                relation_summary[active_samples],
-                nan=0.0,
-                posinf=32.0,
-                neginf=-32.0,
+                relation_summary[active_samples], nan=0.0, posinf=32.0, neginf=-32.0
             ).clamp(-32.0, 32.0)
-            # Training and generation intentionally use the same best relation
-            # token for every active prediction position in the sample.
             safe_best_tokens = torch.nan_to_num(
-                best_relation_token[active_samples],
-                nan=0.0,
-                posinf=32.0,
-                neginf=-32.0,
+                best_relation_token[active_samples], nan=0.0, posinf=32.0, neginf=-32.0
             ).clamp(-32.0, 32.0)
+            if self.dynamic_slot:
+                if relation_tokens is None or slot_gate_logits is None:
+                    raise ValueError("dynamic slot PBD requires relation_tokens and slot_gate_logits")
+                num_samples, num_slots, relation_dim = relation_tokens.shape
+                if initial_slot_usage is None:
+                    final_slot_usage = relation_tokens.new_zeros((num_samples, num_slots)).float()
+                else:
+                    final_slot_usage = initial_slot_usage.to(
+                        device=relation_tokens.device, dtype=torch.float32
+                    ).clone()
+                routed_tokens = safe_best_tokens.clone()
+                all_weights = relation_tokens.new_zeros(
+                    (active_positions.numel(), num_slots), dtype=torch.float32
+                )
+                soft_anchor_weights: List[torch.Tensor] = []
+                seen_groups: Dict[Tuple[int, int], torch.Tensor] = {}
+                for active_index in range(active_positions.numel()):
+                    sample = int(active_samples[active_index].item())
+                    ordinal = int(active_anchor_ordinals[active_index].item())
+                    group = (sample, ordinal)
+                    if group not in seen_groups:
+                        query = self.router_query(flat_hidden[active_positions[active_index]]).float()
+                        keys = self.router_key(relation_tokens[sample]).float()
+                        route_logits = (
+                            query @ keys.transpose(0, 1) / math.sqrt(float(relation_dim))
+                            + F.logsigmoid(slot_gate_logits[sample].float())
+                            - self.coverage_gamma.float().abs() * final_slot_usage[sample]
+                        )
+                        soft_weights = route_logits.softmax(dim=-1)
+                        chosen = int(soft_weights.argmax().item())
+                        if matched_slot_indices is not None and ordinal < matched_slot_indices.shape[1]:
+                            teacher_slot = int(matched_slot_indices[sample, ordinal].item())
+                            if teacher_slot >= 0:
+                                coverage_loss = coverage_loss + F.cross_entropy(
+                                    route_logits.unsqueeze(0),
+                                    torch.tensor([teacher_slot], device=route_logits.device),
+                                )
+                                chosen = teacher_slot
+                        selected = F.one_hot(
+                            torch.tensor(chosen, device=route_logits.device), num_slots
+                        ).float()
+                        seen_groups[group] = selected
+                        soft_anchor_weights.append(soft_weights)
+                        final_slot_usage[sample] += selected
+                    selected = seen_groups[group]
+                    all_weights[active_index] = selected
+                    selected_index = int(selected.argmax().item())
+                    selected_slot_indices[active_index] = selected_index
+                    token = self.router_value(relation_tokens[sample, selected_index])
+                    if self.overlap_adapter and defect_type is not None and int(defect_type[sample].item()) == 2:
+                        token = token + self.overlap_adapter_up(
+                            self.overlap_adapter_down(token)
+                        )
+                    routed_tokens[active_index] = token
+                    if coarse_boxes is not None:
+                        selected_coarse_boxes[active_index] = coarse_boxes[sample, selected_index]
+                if len(soft_anchor_weights) > 1:
+                    by_sample: Dict[int, List[torch.Tensor]] = {}
+                    for (sample, _), weights in zip(seen_groups.keys(), soft_anchor_weights):
+                        by_sample.setdefault(sample, []).append(weights)
+                    overlap_terms = []
+                    for values in by_sample.values():
+                        for left in range(len(values)):
+                            for right in range(left + 1, len(values)):
+                                overlap_terms.append((values[left] * values[right]).sum())
+                    if overlap_terms:
+                        coverage_loss = coverage_loss + torch.stack(overlap_terms).mean()
+                routing_weights = all_weights
+                safe_best_tokens = routed_tokens
+                anchor_selected = []
+                for group, selected in seen_groups.items():
+                    anchor_selected.append((group[0], int(selected.argmax().item())))
+                if anchor_selected:
+                    total = len(anchor_selected)
+                    unique_per_sample = []
+                    duplicates = 0
+                    for sample in sorted({item[0] for item in anchor_selected}):
+                        values = [slot for owner, slot in anchor_selected if owner == sample]
+                        unique_per_sample.append(float(len(set(values))))
+                        duplicates += len(values) - len(set(values))
+                    unique_slot_count = hidden_states.new_tensor(unique_per_sample).mean()
+                    duplicate_slot_rate = hidden_states.new_tensor(float(duplicates / max(total, 1)))
+                    coverage_loss = coverage_loss / max(total, 1)
             flat_hidden[active_positions] = self.enhance_prediction_hidden(
                 flat_hidden[active_positions], safe_summaries, safe_best_tokens
             )
@@ -957,4 +1531,13 @@ class RelationToPBD(nn.Module):
             box_anchor_samples=box_anchor_samples,
             active_positions=active_positions,
             active_samples=active_samples,
+            active_anchor_ordinals=active_anchor_ordinals,
+            active_offsets=active_offsets,
+            selected_slot_indices=selected_slot_indices,
+            routing_weights=routing_weights,
+            selected_coarse_boxes=selected_coarse_boxes,
+            final_slot_usage=final_slot_usage,
+            coverage_loss=coverage_loss,
+            unique_slot_count=unique_slot_count,
+            duplicate_slot_rate=duplicate_slot_rate,
         )

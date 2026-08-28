@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import errno
+import json
+import os
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,6 +48,74 @@ class CPTEvalQueueTest(unittest.TestCase):
                     )
                 )
             self.assertEqual(read_eval_queue(queue)[0]["step"], 10)
+
+    def test_dead_same_host_directory_lock_is_reclaimed_immediately(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_path = Path(temporary) / "base.json.lock"
+            directory = Path(str(lock_path) + ".mkdir")
+            directory.mkdir()
+            (directory / "owner.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "token": "dead-owner",
+                        "hostname": socket.gethostname(),
+                        "pid": 999999999,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                cpt_eval_queue, "_acquire_flock", return_value=None
+            ), mock.patch.object(cpt_eval_queue, "_pid_is_alive", return_value=False):
+                with cpt_eval_queue.exclusive_file_lock(lock_path):
+                    owner = json.loads(
+                        (directory / "owner.json").read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(owner["pid"], os.getpid())
+                    self.assertNotEqual(owner["token"], "dead-owner")
+            self.assertFalse(directory.exists())
+
+    def test_live_same_host_owner_is_not_stolen_even_when_age_threshold_is_zero(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "queue.lock.mkdir"
+            directory.mkdir()
+            (directory / "owner.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "token": "live-owner",
+                        "hostname": socket.gethostname(),
+                        "pid": os.getpid(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CPT_EVAL_QUEUE_LOCK_TIMEOUT_SECONDS": "0",
+                    "CPT_EVAL_QUEUE_LOCK_STALE_SECONDS": "0",
+                },
+            ):
+                with self.assertRaisesRegex(TimeoutError, "live-owner"):
+                    with cpt_eval_queue._directory_queue_lock(
+                        Path(temporary) / "queue.lock"
+                    ):
+                        self.fail("live owner lock must not be stolen")
+
+    def test_expired_legacy_empty_lock_can_be_reclaimed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_path = Path(temporary) / "base.json.lock"
+            directory = Path(str(lock_path) + ".mkdir")
+            directory.mkdir()
+            with mock.patch.dict(
+                os.environ,
+                {"CPT_EVAL_QUEUE_LEGACY_LOCK_STALE_SECONDS": "0"},
+            ), mock.patch.object(cpt_eval_queue, "_acquire_flock", return_value=None):
+                with cpt_eval_queue.exclusive_file_lock(lock_path):
+                    self.assertTrue((directory / "owner.json").is_file())
+            self.assertFalse(directory.exists())
 
     def test_queue_deduplicates_claims_and_records_terminal_state(self):
         with tempfile.TemporaryDirectory() as temporary:

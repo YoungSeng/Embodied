@@ -9,7 +9,9 @@ import logging
 import os
 import socket
 import tempfile
+import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -22,6 +24,114 @@ _UNSUPPORTED_FLOCK_ERRNOS = {
     getattr(errno, "ENOTSUP", errno.EINVAL),
     getattr(errno, "EOPNOTSUPP", errno.EINVAL),
 }
+_DIRECTORY_LOCK_OWNER = "owner.json"
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Best-effort liveness check for an owner on the current host."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        return exc.errno != errno.ESRCH
+    return True
+
+
+def _read_directory_lock_owner(directory: Path) -> dict[str, Any] | None:
+    owner_path = directory / _DIRECTORY_LOCK_OWNER
+    try:
+        value = json.loads(owner_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _write_directory_lock_owner(directory: Path, owner: Mapping[str, Any]) -> None:
+    owner_path = directory / _DIRECTORY_LOCK_OWNER
+    temporary = directory / f".{_DIRECTORY_LOCK_OWNER}.{owner['token']}.tmp"
+    temporary.write_text(
+        json.dumps(dict(owner), ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, owner_path)
+
+
+def _directory_lock_age_seconds(directory: Path) -> float:
+    owner_path = directory / _DIRECTORY_LOCK_OWNER
+    try:
+        modified = owner_path.stat().st_mtime
+    except FileNotFoundError:
+        modified = directory.stat().st_mtime
+    return max(0.0, time.time() - modified)
+
+
+def _directory_lock_is_stale(
+    directory: Path,
+    *,
+    stale_seconds: float,
+    legacy_stale_seconds: float,
+) -> tuple[bool, str, float]:
+    """Return staleness without stealing a live same-host process lock."""
+    age_seconds = _directory_lock_age_seconds(directory)
+    owner = _read_directory_lock_owner(directory)
+    if owner is None:
+        return (
+            age_seconds > legacy_stale_seconds,
+            "legacy lock has no owner metadata",
+            age_seconds,
+        )
+    hostname = str(owner.get("hostname") or "")
+    try:
+        pid = int(owner.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if hostname == socket.gethostname() and pid > 0:
+        alive = _pid_is_alive(pid)
+        return (not alive, f"same-host owner pid={pid} alive={alive}", age_seconds)
+    return (
+        age_seconds > stale_seconds,
+        f"remote/unknown owner host={hostname!r} pid={pid}",
+        age_seconds,
+    )
+
+
+def _reclaim_directory_lock(directory: Path, *, reason: str, age_seconds: float) -> bool:
+    """Atomically move a stale lock aside, then remove only known metadata files."""
+    quarantine = directory.with_name(
+        f"{directory.name}.stale-{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    try:
+        directory.rename(quarantine)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        for child in quarantine.iterdir():
+            if child.is_file() and (
+                child.name == _DIRECTORY_LOCK_OWNER
+                or child.name.startswith(f".{_DIRECTORY_LOCK_OWNER}.")
+            ):
+                child.unlink(missing_ok=True)
+        quarantine.rmdir()
+    except OSError as exc:
+        logger.warning(
+            "stale eval lock was quarantined but cleanup was incomplete: path=%s error=%s",
+            quarantine,
+            exc,
+        )
+    logger.warning(
+        "reclaimed stale eval directory lock: path=%s age=%.1fs reason=%s",
+        directory,
+        age_seconds,
+        reason,
+    )
+    return True
 
 
 def _queue_id(row: Mapping[str, Any]) -> str:
@@ -99,48 +209,99 @@ def _acquire_flock(handle: Any) -> Any | None:
 
 @contextmanager
 def _directory_queue_lock(lock_path: Path) -> Iterator[None]:
-    """Portable NAS fallback based on atomic mkdir/rmdir."""
+    """Portable NAS lock with owner liveness and heartbeat-based recovery."""
 
     directory = Path(str(lock_path) + ".mkdir")
     timeout_seconds = float(os.environ.get("CPT_EVAL_QUEUE_LOCK_TIMEOUT_SECONDS", "120"))
     stale_seconds = float(os.environ.get("CPT_EVAL_QUEUE_LOCK_STALE_SECONDS", "600"))
+    legacy_stale_seconds = float(
+        os.environ.get("CPT_EVAL_QUEUE_LEGACY_LOCK_STALE_SECONDS", "600")
+    )
+    heartbeat_seconds = max(
+        0.1,
+        float(os.environ.get("CPT_EVAL_QUEUE_LOCK_HEARTBEAT_SECONDS", "30")),
+    )
+    owner = {
+        "schema_version": 1,
+        "token": uuid.uuid4().hex,
+        "hostname": socket.gethostname(),
+        "pid": os.getpid(),
+        "acquired_at_unix": time.time(),
+        "heartbeat_at_unix": time.time(),
+    }
     deadline = time.monotonic() + timeout_seconds
     while True:
         try:
             directory.mkdir()
+            try:
+                _write_directory_lock_owner(directory, owner)
+            except Exception:
+                try:
+                    (directory / _DIRECTORY_LOCK_OWNER).unlink(missing_ok=True)
+                    for temporary in directory.glob(
+                        f".{_DIRECTORY_LOCK_OWNER}.*.tmp"
+                    ):
+                        temporary.unlink(missing_ok=True)
+                    directory.rmdir()
+                except OSError:
+                    pass
+                raise
             break
         except FileExistsError:
             try:
-                age_seconds = time.time() - directory.stat().st_mtime
+                stale, reason, age_seconds = _directory_lock_is_stale(
+                    directory,
+                    stale_seconds=stale_seconds,
+                    legacy_stale_seconds=legacy_stale_seconds,
+                )
             except FileNotFoundError:
                 continue
-            if age_seconds > stale_seconds:
-                removed_stale_lock = False
-                try:
-                    directory.rmdir()
-                    removed_stale_lock = True
-                    logger.warning(
-                        "removed stale eval queue directory lock: path=%s age=%.1fs",
-                        directory,
-                        age_seconds,
-                    )
-                except FileNotFoundError:
-                    removed_stale_lock = True
-                except OSError:
-                    removed_stale_lock = False
-                if removed_stale_lock:
+            if stale:
+                if _reclaim_directory_lock(
+                    directory,
+                    reason=reason,
+                    age_seconds=age_seconds,
+                ):
                     continue
             if time.monotonic() >= deadline:
+                owner_info = _read_directory_lock_owner(directory)
                 raise TimeoutError(
                     f"timed out waiting for eval queue lock {directory} after "
-                    f"{timeout_seconds:.1f}s"
+                    f"{timeout_seconds:.1f}s; owner={owner_info}"
                 )
             time.sleep(0.1)
+
+    stop_heartbeat = threading.Event()
+
+    def heartbeat() -> None:
+        while not stop_heartbeat.wait(heartbeat_seconds):
+            current = _read_directory_lock_owner(directory)
+            if current is None or current.get("token") != owner["token"]:
+                return
+            owner["heartbeat_at_unix"] = time.time()
+            try:
+                _write_directory_lock_owner(directory, owner)
+            except (FileNotFoundError, OSError):
+                return
+
+    heartbeat_thread = threading.Thread(
+        target=heartbeat,
+        name="cpt-eval-lock-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
     try:
         yield
     finally:
+        stop_heartbeat.set()
+        heartbeat_thread.join(timeout=max(1.0, heartbeat_seconds + 1.0))
         try:
-            directory.rmdir()
+            current = _read_directory_lock_owner(directory)
+            if current is not None and current.get("token") == owner["token"]:
+                (directory / _DIRECTORY_LOCK_OWNER).unlink(missing_ok=True)
+                for temporary in directory.glob(f".{_DIRECTORY_LOCK_OWNER}.*.tmp"):
+                    temporary.unlink(missing_ok=True)
+                directory.rmdir()
         except FileNotFoundError:
             pass
 
