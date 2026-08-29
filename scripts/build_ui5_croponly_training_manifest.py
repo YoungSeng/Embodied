@@ -38,8 +38,15 @@ from run_ui5_gt_repair import EXCLUDED_SAMPLE_ID, EXCLUDED_TASK
 from ui5_lossless_tiling import generate_detector_scan_plan, strict_vertical_partition_metrics
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_NAME = "crop_only_horizontal_v5_train_repair"
+SCRIPT_DIR = Path(__file__).resolve().parent
+IMPLEMENTATION_FILES = (
+    SCRIPT_DIR / "build_ui5_croponly_training_manifest.py",
+    SCRIPT_DIR / "ui5_lossless_tiling.py",
+    SCRIPT_DIR / "run_ui5_crop_audit.py",
+    SCRIPT_DIR / "run_ui5_gt_repair.py",
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -57,6 +64,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def _digest_json(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _implementation_state() -> dict[str, Any]:
+    files = {
+        path.name: content_fingerprint(path.resolve(strict=True))
+        for path in IMPLEMENTATION_FILES
+    }
+    return {"files": files, "digest": _digest_json(files)}
 
 
 def _detection_boxes(row: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -164,8 +179,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     if int(args.target_height) <= 0:
         raise ValueError("--target-height must be positive")
 
+    implementation = _implementation_state()
     input_state = {
         "schema_version": SCHEMA_VERSION,
+        "implementation_files": implementation["files"],
+        "implementation_digest": implementation["digest"],
         "detections_digest": content_fingerprint(detections_path),
         "task_samples_digest": content_fingerprint(task_samples_path),
         "repair_actions_digest": content_fingerprint(repair_actions_path),

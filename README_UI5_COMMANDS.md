@@ -59,10 +59,11 @@ crop-only recipe，最后才原子刷新 `training_ready.json`：
 cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
 
 PROJECT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+DATA_PROJECT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied
 LA_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python
 AUDIT=${PROJECT}/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
-BASE_META=${PROJECT}/data/ui_defect_locany_v3/recipe/ui_defect_5class_train.json
-TRAIN_DATA=${PROJECT}/data/ui_defect_locany_v3
+BASE_META=${DATA_PROJECT}/data/ui_defect_locany_v3/recipe/ui_defect_5class_train.json
+TRAIN_DATA=${DATA_PROJECT}/data/ui_defect_locany_v3
 TEST_DATA=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data
 
 PYTHON_BIN="${LA_PY}" bash shell/run_ui5_croponly_recipe.sh \
@@ -70,16 +71,24 @@ PYTHON_BIN="${LA_PY}" bash shell/run_ui5_croponly_recipe.sh \
   --base-meta "${BASE_META}" \
   --validation-data-dir "${TRAIN_DATA}" \
   --test-data-dir "${TEST_DATA}" \
-  --output-name crop_only_horizontal_v5_train_repair \
+  --output-name crop_only_horizontal_v5_train_repair_f04503b \
   --max-crops 10 \
-  --target-height 960 \
-  --resume
+  --target-height 960
 ```
+
+这里的 `--target-height 960` 是按原图像素计算的“期望水平 strip 高度”，只用于估算
+`ceil(image_height / 960)` 个分段并在合法 detector edge 中选择较均衡的 seam；它不会把图片
+resize 到 960，也不是模型输入分辨率或 token 上限。合法 edge 不足时会自动减少 crop 数。
+
+YG 集群的 `ui_defect_locany_v3` 位于旧的同级 `Embodied` checkout，因此 `BASE_META` 和
+`TRAIN_DATA` 必须从上面的 `DATA_PROJECT` 取，不能写成新 worktree 下的 `${PROJECT}/data/...`。
+首次生成新的 `--output-name` 不加 `--resume`；后续续跑会同时校验输入与相关实现代码 digest，
+代码改变后不会静默复用旧 manifest。
 
 成功时必须打印 `active crop retention=100%`，并存在：
 
 ```bash
-test -s "${AUDIT}/crop_only_horizontal_v5_train_repair/task_aware_manifest.jsonl"
+test -s "${AUDIT}/crop_only_horizontal_v5_train_repair_f04503b/task_aware_manifest.jsonl"
 test -s "${AUDIT}/training_recipes/ui_defect_5class_train_crop_only.json"
 test -s "${AUDIT}/training_recipes/ui_defect_5class_train_crop_only.jsonl"
 test -s "${AUDIT}/training_recipes/crop_only_recipe_summary.json"
@@ -103,9 +112,10 @@ partial-negative=0、四局部任务 full-image=0、所有负 strips 保留、tr
 cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
 
 PROJECT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+DATA_PROJECT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied
 LA_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python
 TEXT_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/UI5PaddleOCR/bin/python
-TRAIN_DATA=${PROJECT}/data/ui_defect_locany_v3
+TRAIN_DATA=${DATA_PROJECT}/data/ui_defect_locany_v3
 VAL_INPUT=${PROJECT}/work_dirs/ui5_validation_eval_input_v1
 VAL_CACHE=${PROJECT}/work_dirs/ui5_validation_detector_cache_horizontal_v5
 PARSER_ROOT=${PROJECT}/../ui-region-parser

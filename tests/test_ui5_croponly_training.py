@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
@@ -111,6 +112,8 @@ class CropOnlyTrainingManifestTests(unittest.TestCase):
             self.assertEqual(summary["partial_negative_count"], 0)
             self.assertTrue(summary["all_legal_strips_retained"])
             self.assertTrue(summary["all_repair_gt_mapped"])
+            self.assertEqual(summary["schema_version"], 2)
+            self.assertTrue(summary["input_state"]["implementation_digest"])
 
     def test_resume_reuses_matching_manifest_without_detector_work(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -119,6 +122,29 @@ class CropOnlyTrainingManifestTests(unittest.TestCase):
             args.resume = True
             second = croponly.build(args)
             self.assertEqual(first, second)
+
+    def test_resume_is_invalidated_when_implementation_digest_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = self._fixture(Path(temporary))
+            first = croponly.build(args)
+            args.resume = True
+            changed = {
+                "files": {"build_ui5_croponly_training_manifest.py": "changed"},
+                "digest": "changed-implementation",
+            }
+            with (
+                mock.patch.object(croponly, "_implementation_state", return_value=changed),
+                mock.patch.object(croponly, "_materialize", wraps=croponly._materialize) as materialize,
+            ):
+                second = croponly.build(args)
+            self.assertNotEqual(
+                first["input_state_digest"], second["input_state_digest"]
+            )
+            self.assertEqual(
+                second["input_state"]["implementation_digest"],
+                "changed-implementation",
+            )
+            self.assertGreater(materialize.call_count, 0)
 
 
 if __name__ == "__main__":

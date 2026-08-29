@@ -31,6 +31,19 @@ if [[ -z "${AUDIT_DIR}" || -z "${BASE_META}" || -z "${VALIDATION_DATA_DIR}" || -
   echo "Usage: $0 --audit-dir PATH --base-meta PATH --validation-data-dir PATH --test-data-dir PATH [--resume]" >&2
   exit 2
 fi
+if [[ ! -d "${AUDIT_DIR}" ]]; then
+  echo "[ERROR] Audit directory does not exist: ${AUDIT_DIR}" >&2
+  exit 1
+fi
+if [[ ! -s "${BASE_META}" ]]; then
+  echo "[ERROR] Base meta does not exist or is empty: ${BASE_META}" >&2
+  echo "[HINT] On YG the data is normally under the sibling Embodied/data/ui_defect_locany_v3 directory, not this Git worktree." >&2
+  exit 1
+fi
+if [[ ! -d "${VALIDATION_DATA_DIR}" || ! -d "${TEST_DATA_DIR}" ]]; then
+  echo "[ERROR] Validation or test data directory is missing: validation=${VALIDATION_DATA_DIR}, test=${TEST_DATA_DIR}" >&2
+  exit 1
+fi
 AUDIT_DIR="$(cd "${AUDIT_DIR}" && pwd)"
 BASE_META="$(cd "$(dirname "${BASE_META}")" && pwd)/$(basename "${BASE_META}")"
 MANIFEST_DIR="${AUDIT_DIR}/${OUTPUT_NAME}"
@@ -45,8 +58,8 @@ if [[ ! -s "${AUDIT_DIR}/../detections/merged/detections.jsonl" ]]; then
   echo "[ERROR] Missing immutable merged detections: ${AUDIT_DIR}/../detections/merged/detections.jsonl" >&2
   exit 1
 fi
-if [[ ! -s "${BASE_META}" || ! -s "${EXCLUDED}" ]]; then
-  echo "[ERROR] Base meta or exclusion manifest is missing." >&2
+if [[ ! -s "${EXCLUDED}" ]]; then
+  echo "[ERROR] Exclusion manifest is missing: ${EXCLUDED}" >&2
   exit 1
 fi
 
