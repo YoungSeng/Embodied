@@ -47,6 +47,19 @@ class TaskRoutedExpertBankTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "known UI5 defect_type"):
             bank(torch.randn(1, 8), torch.tensor([-1]))
 
+    def test_reset_parameters_repairs_checkpoint_missing_alpha(self):
+        bank = TaskRoutedExpertBank(
+            8,
+            rank=2,
+            num_defect_types=5,
+            initial_alpha=0.1,
+        )
+        with torch.no_grad():
+            bank.alpha.fill_(float("nan"))
+        bank.reset_parameters()
+        self.assertTrue(torch.isfinite(bank.alpha).all())
+        torch.testing.assert_close(bank.alpha, torch.full_like(bank.alpha, 0.1))
+
 
 if __name__ == "__main__":
     unittest.main()

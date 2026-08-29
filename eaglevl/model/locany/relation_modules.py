@@ -306,6 +306,7 @@ class TaskRoutedExpertBank(nn.Module):
         self.hidden_size = int(hidden_size)
         self.rank = int(rank)
         self.num_defect_types = int(num_defect_types)
+        self.initial_alpha = float(initial_alpha)
         self.experts = nn.ModuleList(
             [
                 nn.ModuleDict(
@@ -319,11 +320,16 @@ class TaskRoutedExpertBank(nn.Module):
             ]
         )
         self.alpha = nn.Parameter(
-            torch.full((num_defect_types,), float(initial_alpha))
+            torch.full((num_defect_types,), self.initial_alpha)
         )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        # ``from_pretrained(..., low_cpu_mem_usage=True)`` may materialize
+        # checkpoint-missing direct Parameters with uninitialized storage.
+        # Resetting only child Linear modules is therefore insufficient.
+        with torch.no_grad():
+            self.alpha.fill_(self.initial_alpha)
         for expert in self.experts:
             nn.init.zeros_(expert["up"].weight)
 
