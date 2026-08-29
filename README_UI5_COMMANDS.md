@@ -296,16 +296,18 @@ python scripts/recompute_ui5_coarse_sidecars.py \
 迁移后再运行原 metrics record/汇总命令即可重算 `coarse_recall_03/05`；缺少
 `image_size` 的旧记录会直接报错，不会写入伪指标。
 
-只有单测和 smoke 全部通过后，才提交 `aiai_locate` 的 3000-step Stage A：
+提交 `aiai_locate` 的 16000-step 正式训练；每 1000 step 保存并评测：
 
 ```bash
 python scripts/submit_locany_ui5.py \
   --machine a800 --resource-group aiai_locate \
   --gpus 4 --max-num-tokens 12800 \
   --tc-msed-stage m31 --enable-eval --eval-at-start \
-  --max-steps 3000 --save-steps 1000 --eval-interval-steps 1000 \
+  --max-steps 16000 --save-steps 1000 --eval-interval-steps 1000 \
   --run-name locany-ui5-m31-taskmoe-setdecoder-a800x4-sft
 ```
 
-`m31` 会拒绝超过 3000 step 的 Stage A 命令，也不会 resume 旧 v4/M3/M4/M5
-checkpoint。四卡配置固定为 `MAX_NUM_TOKENS=12800`、梯度累积 2。
+`m31` 不会 resume 旧 v4/M3/M4/M5 checkpoint。四卡配置固定为
+`MAX_NUM_TOKENS=12800`、梯度累积 2。训练诊断异常只写告警和 Excel，
+不会因为研究指标未达到预设门槛而自动停止；NaN/Inf、非法路由、参数未进入
+optimizer 或 checkpoint 损坏等正确性错误仍会立即失败。

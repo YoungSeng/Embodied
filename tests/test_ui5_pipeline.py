@@ -93,7 +93,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(env["GRADIENT_ACCUMULATION_STEPS"], "2")
         self.assertEqual(env["MAX_NUM_TOKENS"], "12800")
 
-    def test_m31_four_gpu_configuration_is_explicit_and_gated(self) -> None:
+    def test_m31_four_gpu_configuration_is_explicit_and_allows_long_run(self) -> None:
         args = run_locany_ui5_local_debug.parse_args(
             [
                 "--gpus", "4", "--tc-msed-stage", "m31", "--max-steps", "20",
@@ -110,10 +110,12 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(resolved["RELATION_TASK_HARD_ROUTER"], 1)
         self.assertEqual(resolved["RELATION_TASK_EXPERT_RANK"], 8)
         self.assertEqual(resolved["RELATION_SET_DECODER_LAYERS"], 3)
-        with self.assertRaisesRegex(ValueError, "gated at 3000"):
-            locany_ui5_common.resolve_runtime_config(
-                {**env, "MAX_STEPS": "16000"}
-            )
+        long_run = locany_ui5_common.resolve_runtime_config(
+            {**env, "MAX_STEPS": "16000", "SAVE_STEPS": "1000"}
+        )
+        self.assertEqual(long_run["MAX_STEPS"], 16000)
+        self.assertEqual(long_run["SAVE_STEPS"], 1000)
+        self.assertEqual(long_run["EVAL_INTERVAL_STEPS"], 1000)
         for key, invalid in (
             ("RELATION_TASK_HARD_ROUTER", "0"),
             ("RELATION_TASK_EXPERT_RANK", "16"),

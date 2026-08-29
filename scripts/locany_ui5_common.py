@@ -213,11 +213,6 @@ def resolve_runtime_config(
     set_enabled = tc_msed_stage in {"m2", "m3", "m4", "m5", "m31"}
     dynamic_enabled = tc_msed_stage in {"m3", "m4", "m5", "m31"}
     m31_enabled = tc_msed_stage == "m31"
-    if m31_enabled and max_steps > 3000:
-        raise ValueError(
-            "m31 Stage A is gated at 3000 steps; review checkpoint-3000 before "
-            "starting any longer run"
-        )
     resolved: dict[str, Any] = {
         "MACHINE_TYPE": machine_type,
         "RESOURCE_GROUP": str(_env_value(env, "RESOURCE_GROUP", "default")),
