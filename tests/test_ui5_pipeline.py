@@ -290,6 +290,90 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertIn('INSTALL_SYSTEM_RUNTIME_DEPS: "0"', rendered)
         self.assertEqual(runtime["INSTALL_SYSTEM_RUNTIME_DEPS"], 0)
 
+    def test_validation_early_stop_defaults_off_and_is_explicitly_switchable(self) -> None:
+        default_args = submit_locany_ui5.parse_args(
+            ["--machine", "a800", "--gpus", "4", "--render-only"]
+        )
+        default_env = submit_locany_ui5.build_submission_environment(default_args)
+        self.assertFalse(default_args.validation_early_stop)
+        self.assertEqual(default_env["EVAL_VALIDATION_EARLY_STOP"], "0")
+
+        enabled_args = submit_locany_ui5.parse_args(
+            [
+                "--machine",
+                "a800",
+                "--gpus",
+                "4",
+                "--validation-early-stop",
+                "--render-only",
+            ]
+        )
+        rendered, runtime = submit_locany_ui5.render_job(enabled_args)
+        self.assertTrue(enabled_args.validation_early_stop)
+        self.assertEqual(runtime["EVAL_VALIDATION_EARLY_STOP"], 1)
+        self.assertIn('EVAL_VALIDATION_EARLY_STOP: "1"', rendered)
+
+        disabled_args = submit_locany_ui5.parse_args(
+            [
+                "--machine",
+                "a800",
+                "--gpus",
+                "4",
+                "--no-validation-early-stop",
+                "--render-only",
+            ]
+        )
+        disabled_env = submit_locany_ui5.build_submission_environment(disabled_args)
+        self.assertFalse(disabled_args.validation_early_stop)
+        self.assertEqual(disabled_env["EVAL_VALIDATION_EARLY_STOP"], "0")
+
+        pipeline = (PROJECT_ROOT / "shell" / "run_locany_ui5_pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            '[[ "${EVAL_VALIDATION_EARLY_STOP:-0}" == "1"', pipeline
+        )
+        self.assertIn('&& "${EVAL_DATA_SPLIT}" == "validation"', pipeline)
+
+    def test_runtime_config_defaults_validation_early_stop_off(self) -> None:
+        default = locany_ui5_common.resolve_runtime_config(
+            {
+                "MACHINE_TYPE": "a800",
+                "GPU_COUNT": "4",
+                "CUDA_DEVICES": "0,1,2,3",
+            }
+        )
+        enabled = locany_ui5_common.resolve_runtime_config(
+            {
+                "MACHINE_TYPE": "a800",
+                "GPU_COUNT": "4",
+                "CUDA_DEVICES": "0,1,2,3",
+                "EVAL_VALIDATION_EARLY_STOP": "1",
+            }
+        )
+        self.assertEqual(default["EVAL_VALIDATION_EARLY_STOP"], 0)
+        self.assertEqual(enabled["EVAL_VALIDATION_EARLY_STOP"], 1)
+
+    def test_gpu_parity_rejects_validation_early_stop_drift(self) -> None:
+        four = locany_ui5_common.resolve_runtime_config(
+            {
+                "MACHINE_TYPE": "a800",
+                "GPU_COUNT": "4",
+                "CUDA_DEVICES": "0,1,2,3",
+                "EVAL_VALIDATION_EARLY_STOP": "0",
+            }
+        )
+        eight = locany_ui5_common.resolve_runtime_config(
+            {
+                "MACHINE_TYPE": "a800",
+                "GPU_COUNT": "8",
+                "CUDA_DEVICES": "0,1,2,3,4,5,6,7",
+                "EVAL_VALIDATION_EARLY_STOP": "1",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "EVAL_VALIDATION_EARLY_STOP"):
+            locany_ui5_common.assert_gpu_mode_consistency(four, eight)
+
     def test_preflight_uses_distinct_libgl_exit_code(self) -> None:
         self.assertEqual(preflight_locany_runtime.EXIT_LIBGL_MISSING, 42)
 

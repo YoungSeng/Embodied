@@ -306,6 +306,10 @@ def resolve_runtime_config(
     eval_fail_policy = str(_env_value(env, "EVAL_FAIL_POLICY", "stop")).lower()
     if eval_fail_policy not in {"stop", "warn"}:
         raise ValueError("EVAL_FAIL_POLICY must be 'stop' or 'warn'")
+    eval_validation_early_stop = parse_bool(
+        _env_value(env, "EVAL_VALIDATION_EARLY_STOP", "0"),
+        name="EVAL_VALIDATION_EARLY_STOP",
+    )
     eval_data_split = str(
         _env_value(env, "EVAL_DATA_SPLIT", "validation")
     ).lower()
@@ -429,6 +433,7 @@ def resolve_runtime_config(
         "EVAL_AT_START": int(eval_at_start),
         "EVAL_INTERVAL_STEPS": eval_interval,
         "EVAL_FAIL_POLICY": eval_fail_policy,
+        "EVAL_VALIDATION_EARLY_STOP": int(eval_validation_early_stop),
         "EVAL_DATA_SPLIT": eval_data_split,
         "EVAL_FROZEN_GATE_THRESHOLDS": str(
             _env_value(env, "EVAL_FROZEN_GATE_THRESHOLDS", "")

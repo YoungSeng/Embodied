@@ -26,6 +26,11 @@ checkpoint 选定后运行一次。两者都使用 GT-free、strict non-overlap�
 5000-step 训练和一次性 test 的完整无省略命令见 `README_UI5_COMMANDS.md` 的
 “v5 crop-only F1 修复”章节。
 
+Validation 自动早停默认关闭：提交参数 `--no-validation-early-stop` 对应
+`EVAL_VALIDATION_EARLY_STOP=0`，周期评测和 Excel 记录仍会继续执行。只有显式传入
+`--validation-early-stop` 时，pipeline 才会在 validation 连续两次 Image/BBox macro 均无改善后
+停止；`EVAL_FAIL_POLICY` 仅控制评测失败，不控制该开关。
+
 统一入口为：
 
 ```bash

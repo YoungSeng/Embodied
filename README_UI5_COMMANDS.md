@@ -236,6 +236,7 @@ VAL_UNIQUE=$("${LA_PY}" -c 'import json,sys; print(json.load(open(sys.argv[1]))[
   --eval-interval-steps 1000 \
   --eval-input-dir "${VAL_INPUT}" \
   --eval-data-split validation \
+  --no-validation-early-stop \
   --eval-inference-crop-mode detector_scan \
   --eval-detector-cache "${VAL_CACHE}" \
   --eval-detector-cache-mode readonly \
@@ -248,8 +249,10 @@ VAL_UNIQUE=$("${LA_PY}" -c 'import json,sys; print(json.load(open(sys.argv[1]))[
 ```
 
 四卡固定 `MAX_NUM_TOKENS=12800`、梯度累积 2。每 1000 step 写一次
-`sampling_coverage_step_<N>.json` 并完整 validation；连续两个 validation 点的 raw Image 与 BBox
-macro 均未改善时 pipeline 停止。Gate 主结果是 `observe` raw 指标；validation 同时生成冻结
+`sampling_coverage_step_<N>.json` 并完整 validation。正式命令显式使用
+`--no-validation-early-stop`，因此 pipeline 不会依据中间指标自动停止，可直接查看 Excel；如确实
+需要恢复原来的连续两次未改善自动停止，显式改为 `--validation-early-stop`。Gate 主结果是
+`observe` raw 指标；validation 同时生成冻结
 阈值并用独立 prediction tree 重新调用 scorer，因此 gated Image/BBox 是两套真实重评分指标。
 
 ### 5. 选定 checkpoint 后，只运行一次正式 test

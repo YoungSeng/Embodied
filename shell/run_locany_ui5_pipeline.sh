@@ -45,7 +45,7 @@ export EVAL_SCAN_TARGET_GUARD_RATIO EVAL_SCAN_TARGET_GUARD_MIN_PIXELS
 export EVAL_SCAN_TARGET_GUARD_MAX_PIXELS
 export EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO EVAL_SCAN_DENSE_BAND_RATIO
 export EVAL_SCAN_VISUALIZATION_SAMPLES
-export EVAL_DATA_SPLIT EVAL_FROZEN_GATE_THRESHOLDS
+export EVAL_DATA_SPLIT EVAL_FROZEN_GATE_THRESHOLDS EVAL_VALIDATION_EARLY_STOP
 export ATTN_IMPLEMENTATION MAX_SEQ_LENGTH MAX_NUM_TOKENS_PER_SAMPLE MAX_NUM_TOKENS
 export MAX_STEPS WARMUP_STEPS LEARNING_RATE SAVE_STEPS
 
@@ -198,6 +198,7 @@ printf '%-28s: %s\n' \
   "ENABLE_EVAL" "${ENABLE_EVAL}" \
   "EVAL_AT_START" "${EVAL_AT_START}" \
   "EVAL_INTERVAL_STEPS" "${EVAL_INTERVAL_STEPS}" \
+  "EVAL_VALIDATION_EARLY_STOP" "${EVAL_VALIDATION_EARLY_STOP}" \
   "EVAL_INFERENCE_CROP_MODE" "${EVAL_INFERENCE_CROP_MODE}" \
   "EVAL_PARSER_ROOT" "${EVAL_PARSER_ROOT}" \
   "EVAL_DETECTOR_CACHE" "${EVAL_DETECTOR_CACHE}" \
@@ -634,7 +635,8 @@ while (( current_step < MAX_STEPS )); do
     "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/locany_ui5_checkpoint.py" cleanup \
       --output-dir "${OUTPUT_DIR}" --formal-interval "${SAVE_STEPS}" \
       --latest-step "${next_step}" --expected-ranks "${GPU_COUNT}"
-    if [[ "${EVAL_DATA_SPLIT}" == "validation" ]]; then
+    if [[ "${EVAL_VALIDATION_EARLY_STOP:-0}" == "1" \
+          && "${EVAL_DATA_SPLIT}" == "validation" ]]; then
       if "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/check_ui5_validation_early_stop.py" \
           --history "${OUTPUT_DIR}/evaluation/evaluation_history.json" \
           --patience 2; then

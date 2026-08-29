@@ -152,6 +152,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--eval-fail-policy", choices=("stop", "warn"), default="stop")
     parser.add_argument(
+        "--validation-early-stop",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Stop after two consecutive validation points improve neither raw Image "
+            "nor BBox macro F1; disabled by default so Excel can be inspected manually"
+        ),
+    )
+    parser.add_argument(
         "--relation-gate-mode", choices=("observe", "hard"), default="observe"
     )
     parser.add_argument("--relation-gate-threshold", type=float, default=None)
@@ -246,6 +255,9 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "ENABLE_EVAL": "1" if args.enable_eval else "0",
         "EVAL_AT_START": "1" if args.eval_at_start else "0",
         "EVAL_FAIL_POLICY": args.eval_fail_policy,
+        "EVAL_VALIDATION_EARLY_STOP": (
+            "1" if getattr(args, "validation_early_stop", False) else "0"
+        ),
         "EVAL_DATA_SPLIT": getattr(
             args,
             "eval_data_split",
@@ -452,6 +464,7 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "EVAL_INTERVAL_STEPS",
         "EVAL_MAX_IMAGES_PER_TASK",
         "EVAL_FAIL_POLICY",
+        "EVAL_VALIDATION_EARLY_STOP",
         "EVAL_DATA_SPLIT",
         "EVAL_FROZEN_GATE_THRESHOLDS",
         "EVAL_INFERENCE_CROP_MODE",
@@ -582,6 +595,7 @@ def main() -> int:
         "EVAL_AT_START",
         "EVAL_INTERVAL_STEPS",
         "EVAL_MAX_IMAGES_PER_TASK",
+        "EVAL_VALIDATION_EARLY_STOP",
         "EVAL_DATA_SPLIT",
         "EVAL_FROZEN_GATE_THRESHOLDS",
         "EVAL_INFERENCE_CROP_MODE",
