@@ -83,6 +83,13 @@ export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 export HF_HUB_DISABLE_TELEMETRY=1
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export NCCL_ASYNC_ERROR_HANDLING=1
+# Preserve enough ProcessGroupNCCL history to identify the first diverging
+# collective if a hardware/network failure occurs after the synchronized-save
+# fix.  These settings do not alter the 10-minute timeout or mask failures.
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export TORCH_NCCL_TRACE_BUFFER_SIZE="${TORCH_NCCL_TRACE_BUFFER_SIZE:-1048576}"
+export TORCH_NCCL_DUMP_ON_TIMEOUT="${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}"
+export TORCH_NCCL_DESYNC_DEBUG="${TORCH_NCCL_DESYNC_DEBUG:-1}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 
@@ -127,7 +134,7 @@ echo "visible_gpus     : ${CUDA_VISIBLE_DEVICES}"
 echo "local_cache      : ${CACHE_ROOT}"
 echo "launcher_log     : ${SHARED_RUNTIME_DIR}/launcher.log"
 echo "integrated_eval  : ${CPT_INTEGRATED_EVAL:-0}"
-echo "eval_at_start    : ${CPT_EVAL_AT_START:-1}"
+echo "eval_at_start    : ${CPT_EVAL_AT_START:-0}"
 git rev-parse --short HEAD 2>/dev/null || true
 bash -n "${PROJECT_ROOT}/shell/run_locany_cpt.sh"
 bash -n "${PROJECT_ROOT}/shell/train_locany_ui_defect.sh"
@@ -239,7 +246,7 @@ if [[ "${CPT_MODE}" == "formal" && "${CPT_INTEGRATED_EVAL:-0}" == "1" ]]; then
   FORMAL_OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_BASE:-${WORKSPACE}/gui_models}/${RUN_NAME}}"
   FORMAL_MAX_STEPS="${MAX_STEPS:-20000}"
   SEGMENT_INDEX=0
-  if [[ "${CPT_EVAL_AT_START:-1}" == "1" ]]; then
+  if [[ "${CPT_EVAL_AT_START:-0}" == "1" ]]; then
     if run_initial_eval_phase "${FORMAL_OUTPUT_DIR}"; then
       :
     else

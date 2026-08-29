@@ -19,8 +19,8 @@ YG smoke recipe
 → YG 全量 recipe 检查
 → HL 全量 recipe
 → H20×2 formal（当前有二卡时使用；x4 YAML 保留）
-→ step 0 Base：从 2% group-heldout 固定抽取的 val_fast + 外部五类完整推理
-→ 每训练约 6 小时自动 checkpoint → 同 job 单卡 held-out generation/CE + 外部五类 → 自动 resume
+→ 单个 torchrun 连续训练；每约 6 小时同步保存 checkpoint
+→ 在 diagnostics/cpt_training_evaluation.xlsx 查看训练中间结果
 ```
 
 H20 排队通常需要一到两天，因此不再把 H20 smoke/eval 作为 formal 启动前门禁。H20
@@ -255,7 +255,7 @@ bash shell/prepare_locany_cpt_v2.sh a100 formal
 `cpt_source_record_id`/manifest `source_record_id`。所有重复项写入
 `diagnostics/duplicate_record_ids.json`，若来源定位符仍冲突则继续非零退出，绝不静默覆盖。
 
-### 0.7 HL：提交 H20×2/H20×4 formal（step 0 先评测）
+### 0.7 HL：提交 H20×2/H20×4 continuous formal
 
 ```bash
 cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
@@ -271,29 +271,20 @@ mlx job submitv2 --path locany_cpt_v4_h20x2_formal_merlin.yaml
 mlx job submitv2 --path locany_cpt_v4_h20x4_formal_merlin.yaml
 ```
 
-这个主流程不再先提交 H20 smoke。formal 使用新的
-`RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x2-formal-eval0` 或
-`...-h20x4-formal-eval0`。这是全新目录，不会续训已经先开训、后补 step-0 评测的旧 formal，
-也不会续训 checkpoint-1549/1860。
+这个主流程不再先提交 H20 smoke，也不运行 step-0 验收门禁。formal 使用新的
+`RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x2-formal-continuous` 或
+`...-h20x4-formal-continuous`，不会碰到旧 `eval0` 目录中被中断的 checkpoint。
 
-该 YAML 固定 `CPT_INTEGRATED_EVAL=1`、`CPT_EVAL_AT_START=1`、
-`SAVE_EVERY_N_HOURS=6`。全新 run 在 optimizer step 1 之前先用 Base 依次执行两套 step-0
-评测：图片 group 零泄漏的 2% held-out `val_fast`（十任务 generation + teacher-forced CE），
-以及 `${WORKSPACE}/data/test_ui_*_no_figma.jsonl` 外部五类完整推理。两套均通过后才启动训练；
-完成标记存在且协议一致时，重提 job 不会重复跑 step-0。
-
-一个 segment 约训练 6 小时后，两卡 torchrun 先保存完整可续训 checkpoint 并正常退出以释放显存；同一个
-Merlin job 随后只暴露 GPU 0，先运行固定 held-out val_fast 的 generation 和
-teacher-forced CE，再运行外部五类完整推理。外部预测只生成一次，统一仅计算与现有
-SFT/Qwen 报告可比的 IoU=0.1。两套评测都成功后才从刚才的 checkpoint 恢复训练。评测时间不计入下一个
-6 小时训练 interval，因此相邻评测结果的实际墙钟间隔是“约 6 小时 + 上一次评测耗时”。
-
-评测失败时 formal job 非零退出，不会绕过测试继续训练；checkpoint 仍可完整 resume。修复
-代码后重新提交同一 YAML，会先重试 queue 中 failed/pending 的评测，再开始下一段训练。
+两个 YAML 都固定 `CPT_INTEGRATED_EVAL=0`、`CPT_EVAL_AT_START=0`、
+`CPT_EXTERNAL_UI5_EVAL=0`、`ENABLE_UI_RELATION=False` 和
+`SAVE_EVERY_N_HOURS=6`。训练不再为了评测自动停止/重启。定时回调只允许 rank 0 判断墙钟，
+并在每个 optimizer step 结束后把保存决定广播给所有 rank；因此 DeepSpeed 所有 rank 会一起
+进入 checkpoint collective，不会再出现一张卡保存、另一张卡继续 backward 的死锁。
+训练 JSONL 和三 sheet 的 `diagnostics/cpt_training_evaluation.xlsx` 仍按原频率更新。
 
 ### 0.8 HL：人工补跑 held-out eval（仅用于故障恢复）
 
-主流程不需要提交独立 eval job。只有集成评测曾失败、或需要人工重算历史 checkpoint 时才提交：
+continuous 主流程不需要提交 eval job。只有需要人工补算历史 checkpoint 时才提交：
 
 ```bash
 cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-CPT
@@ -431,17 +422,17 @@ python scripts/simulate_locany_cpt_sampling.py \
 
 ## 3. 训练和 smoke
 
-第一阶段 formal 保持 `CPT_SAMPLING_MODE=sample_equal`：
+当前 continuous formal 保持 `CPT_SAMPLING_MODE=sample_equal`：
 
 ```bash
 CPT_SAMPLING_MODE=sample_equal \
-RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x2-formal-eval0 \
+RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x2-formal-continuous \
 GPU_COUNT=2 \
 CUDA_VISIBLE_DEVICES=0,1 \
 GRADIENT_ACCUMULATION_STEPS=4 \
-CPT_INTEGRATED_EVAL=1 \
-CPT_EXTERNAL_UI5_EVAL=1 \
-CPT_EXTERNAL_UI5_DATA_DIR=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data \
+CPT_INTEGRATED_EVAL=0 \
+CPT_EVAL_AT_START=0 \
+ENABLE_UI_RELATION=False \
 SAVE_EVERY_N_HOURS=6 \
 bash shell/run_locany_cpt_merlin.sh h20 formal
 ```
@@ -541,16 +532,16 @@ Trainer checkpoint 保存 optimizer、scheduler、random state，以及每 rank 
 行号并以非零状态退出。
 
 每个通过完整性校验的 checkpoint 还会由 rank 0 去重追加
-`diagnostics/cpt_eval_queue.jsonl`，标记待同 job 集成阶段执行的 held-out val_fast 与外部 UI5 评测。完成标记
+`diagnostics/cpt_eval_queue.jsonl`，供以后手工评测 held-out val_fast 与外部 UI5。continuous formal
+不会消费这个 queue，也不会因此停止训练。完成标记
 会先原子落盘、随后才发布 queue row，避免评测器抢到尚未完成的 checkpoint。queue row
 具有 pending/running/completed/failed 状态；失败项只能显式设置 `EVAL_RETRY_FAILED=1` 重试。
 
 ## 6. Held-out 与外部测试集评测
 
 训练池只能显式标记为 `train_pool/domain_absorption`；best checkpoint 只看 held-out。
-H20×2 formal 默认每约 6 小时分段，在同一个 Merlin job 内释放训练进程后用 GPU 0 先跑
-held-out generation + teacher-forced CE，再跑外部五类完整推理；两者完成才 resume。
-下面的直接命令只用于离线调试或重算 held-out：
+continuous formal 只训练和保存，不自动执行 held-out/external 推理；下面命令用于训练外
+离线调试或重算 held-out，不是训练启动门禁：
 
 ```bash
 python scripts/eval_locany_cpt_learning.py \
@@ -572,8 +563,7 @@ python scripts/eval_locany_cpt_learning.py \
   --teacher-forced
 ```
 
-queue consumer 同时供集成评测和人工恢复使用。formal 启动前由 A800 smoke 完成
-checkpoint-10→20 后的 held-out 门禁；在 A800 节点上只暴露 GPU 0：
+queue consumer 供人工评测使用。在 A800 节点上只暴露 GPU 0：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -584,8 +574,8 @@ EVAL_SAMPLES_PER_TASK=10 \
 bash shell/run_locany_cpt_eval_merlin.sh a100
 ```
 
-formal 主流程不需要再提交单卡 job。held-out Base 与外部 UI5 Base 都按各自
-manifest/protocol 缓存，不会为每个 checkpoint 重复跑 Base。下面命令仅作为集成评测失败后的人工恢复入口：
+如果以后需要补 held-out/external 指标，可提交单卡 job。Base 结果按各自
+manifest/protocol 缓存，不会为每个 checkpoint 重复跑 Base：
 
 ```bash
 mlx job submitv2 --path locany_cpt_v4_h20x1_eval_merlin.yaml
@@ -718,7 +708,7 @@ python scripts/run_locany_cpt_ui5_checkpoint_sweep.py \
 一致，autoregressive generation 在临界 token 上可能分叉并影响最终 F1。复现旧结果优先
 Magi；跨模型严谨对比则必须让所有待比较模型使用同一 backend。若另跑 SDPA 对照，请使用
 新的 `--output-root`，不要把两种 backend 的单图结果混在一起。当前 CPT v2 H20 formal 的
-训练和集成评测均由 YAML 固定为 SDPA，与这个旧 CPT sweep 是两个实验协议。
+训练由 YAML 固定为 SDPA，与这个旧 CPT sweep 是两个实验协议。
 
 `0.1` 与仓库现有 `qwen3vl_merge_and_score_fixed_5tasks.py` 的历史默认口径一致，和既有
 Qwen/同事模型报告比较时统一使用该阈值；formal 的 held-out 和 external UI5 都只使用

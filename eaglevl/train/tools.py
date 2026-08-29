@@ -106,11 +106,51 @@ class SaveCheckpointCallback(TrainerCallback):
         self.schedule.start(time.time())
         return control
 
+    @staticmethod
+    def _broadcast_rank0_decision(decision: bool) -> bool:
+        """Return rank 0's checkpoint decision on every distributed rank.
+
+        Wall clocks and callback execution times differ slightly across ranks.
+        Letting each rank call ``is_due`` independently can therefore send one
+        rank into DeepSpeed checkpoint collectives while another rank starts
+        the next backward pass.  Keep the wall-clock policy on rank 0 and make
+        the save request itself a small, ordered collective at every completed
+        optimizer step.
+        """
+
+        if not (dist.is_available() and dist.is_initialized()):
+            return bool(decision)
+
+        backend = str(dist.get_backend()).lower()
+        if backend == "nccl":
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "NCCL checkpoint-decision broadcast requires a CUDA device"
+                )
+            device = torch.device("cuda", torch.cuda.current_device())
+        else:
+            device = torch.device("cpu")
+        value = bool(decision) if dist.get_rank() == 0 else False
+        flag = torch.tensor([int(value)], dtype=torch.int32, device=device)
+        dist.broadcast(flag, src=0)
+        return bool(flag.item())
+
     def on_step_end(self, args, state, control, **kwargs):
-        periodic_due = state.global_step > 0 and self.schedule.is_due(time.time())
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        rank0_due = (
+            rank == 0
+            and state.global_step > 0
+            and self.schedule.is_due(time.time())
+        )
+        periodic_due = self._broadcast_rank0_decision(rank0_due)
         final_step = state.global_step >= int(args.max_steps)
         if periodic_due or (self.stop_after_save and final_step):
             control.should_save = True
+            if periodic_due and rank == 0:
+                logger.info(
+                    "[Checkpoint] synchronized wall-clock save requested at step %s",
+                    state.global_step,
+                )
         if periodic_due and self.stop_after_save:
             # Trainer saves after on_step_end and only then exits its loop. The
             # parent Merlin process can release torchrun, run single-GPU held-

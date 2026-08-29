@@ -63,7 +63,7 @@ jobRunParams:
     CUDA_DEVICES: "0"
     INSTALL_SYSTEM_RUNTIME_DEPS: "1"
     DATA_DIR: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4_split_v2"
-    RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-formal-eval0"
+    RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-formal-continuous"
     EVAL_SAMPLES_PER_TASK: "10"
     # One scarce H20 allocation drains all checkpoints currently waiting in
     # the queue instead of requiring one Merlin submission per checkpoint.

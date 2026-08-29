@@ -22,7 +22,7 @@ case "${MACHINE_TYPE}" in
   h20)
     WORKSPACE="${WORKSPACE:-/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace}"
     FILESYSTEM_ROOT=/mnt/bn/intelligent-service-arnold-hl
-    DEFAULT_RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x2-formal-eval0
+    DEFAULT_RUN_NAME=locany-3b-ui-cpt-v4-v2-h20x2-formal-continuous
     DEFAULT_EXTERNAL_UI5_EVAL=1
     ;;
 esac

@@ -15,7 +15,7 @@ jobDefVersion:
     imageVid: d8ap37f1enlcr23291ug
 
   lazyDownloadCode: true
-  name: 'locany-cpt-v4-v2-h20x2-formal-eval0'
+  name: 'locany-cpt-v4-v2-h20x2-formal-continuous'
 
   resource:
     arnoldConfig:
@@ -64,8 +64,8 @@ jobRunParams:
     GPU_COUNT: "2"
     DATA_DIR: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4_split_v2"
     RECIPE_NAME: "locany_cpt_train.json"
-    # New directory: never resume the formal run that started before step-0 eval.
-    RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-formal-eval0"
+    # New continuous run: do not attach to the interrupted eval0 checkpoint tree.
+    RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x2-formal-continuous"
     ATTN_IMPLEMENTATION: "sdpa"
     MAX_SEQ_LENGTH: "7268"
     MAX_NUM_TOKENS_PER_SAMPLE: "7268"
@@ -75,31 +75,21 @@ jobRunParams:
     MAX_STEPS: "20000"
     WARMUP_STEPS: "500"
     LEARNING_RATE: "5e-6"
+    CPT_SAMPLING_MODE: "sample_equal"
+    # CPT trains and evaluates the same base model path with UI relation disabled.
+    ENABLE_UI_RELATION: "False"
     SAVE_STEPS: "1000000000"
-    # Every six training hours, this same x2 job saves a resumable checkpoint,
-    # releases torchrun, evaluates both held-out and external UI5 on GPU 0,
-    # then resumes x2.
+    # Save in the same uninterrupted torchrun every six hours.  Rank 0
+    # broadcasts the wall-clock decision so all DeepSpeed ranks enter the
+    # checkpoint collectives together.
     SAVE_EVERY_N_HOURS: "6"
     SAVE_TOTAL_LIMIT: "20"
-    CPT_INTEGRATED_EVAL: "1"
-    # Before optimizer step 1, run Base on held-out val_fast and the external
-    # five UI5 JSONLs under WORKSPACE/data.
-    CPT_EVAL_AT_START: "1"
-    CPT_EXTERNAL_UI5_EVAL: "1"
-    CPT_EXTERNAL_UI5_DATA_DIR: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data"
-    # Fixed hash subset sampled only from the image-group held-out pool.
-    EVAL_RECIPE_NAME: "locany_cpt_val_fast.json"
-    EVAL_SAMPLES_PER_TASK: "10"
-    EVAL_MAX_PENDING: "20"
-    EVAL_ATTN_IMPLEMENTATION: "sdpa"
-    EVAL_VISION_ATTN_IMPLEMENTATION: "flash_attention_2"
-    EVAL_DTYPE: "bf16"
-    EVAL_MAX_NEW_TOKENS: "1024"
-    # One threshold for held-out bbox metrics and external UI5 scoring.
+    # No step-0 gate and no six-hour stop/eval/resume loop.  Training metrics
+    # and the three-sheet CPT workbook continue to update in diagnostics/.
+    CPT_INTEGRATED_EVAL: "0"
+    CPT_EVAL_AT_START: "0"
+    CPT_EXTERNAL_UI5_EVAL: "0"
     EVAL_IOU_THRESHOLD: "0.1"
-    EVAL_EXTERNAL_MAX_NEW_TOKENS: "4096"
-    # 0 means the complete external test sets, not a smoke subset.
-    EVAL_EXTERNAL_MAX_IMAGES_PER_TASK: "0"
     REPORT_TO: "tensorboard"
 
 namespace: /user/sicheng.yang

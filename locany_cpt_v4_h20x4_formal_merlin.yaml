@@ -15,7 +15,7 @@ jobDefVersion:
     imageVid: d8ap37f1enlcr23291ug
 
   lazyDownloadCode: true
-  name: 'locany-cpt-v4-v2-h20x4-formal-eval0'
+  name: 'locany-cpt-v4-v2-h20x4-formal-continuous'
 
   resource:
     arnoldConfig:
@@ -64,8 +64,8 @@ jobRunParams:
     INSTALL_SYSTEM_RUNTIME_DEPS: "1"
     DATA_DIR: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data/locany_cpt_v4_split_v2"
     RECIPE_NAME: "locany_cpt_train.json"
-    # New directory: never resume the formal run that started before step-0 eval.
-    RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x4-formal-eval0"
+    # New continuous run: keep its checkpoints separate from eval-gated runs.
+    RUN_NAME: "locany-3b-ui-cpt-v4-v2-h20x4-formal-continuous"
     ATTN_IMPLEMENTATION: "sdpa"
     MAX_SEQ_LENGTH: "7268"
     MAX_NUM_TOKENS_PER_SAMPLE: "7268"
@@ -75,29 +75,17 @@ jobRunParams:
     MAX_STEPS: "20000"
     WARMUP_STEPS: "500"
     LEARNING_RATE: "5e-6"
+    CPT_SAMPLING_MODE: "sample_equal"
+    ENABLE_UI_RELATION: "False"
     SAVE_STEPS: "1000000000"
-    # Every completed wall-clock interval produces a resumable checkpoint;
-    # this same x4 job then releases torchrun and evaluates held-out plus
-    # external UI5 on GPU 0 before resuming x4.
+    # Rank 0 broadcasts the six-hour save decision; all four DeepSpeed ranks
+    # remain in one uninterrupted torchrun and save together.
     SAVE_EVERY_N_HOURS: "6"
     SAVE_TOTAL_LIMIT: "20"
-    CPT_INTEGRATED_EVAL: "1"
-    # Both Base evaluations must pass before optimizer step 1.
-    CPT_EVAL_AT_START: "1"
-    CPT_EXTERNAL_UI5_EVAL: "1"
-    CPT_EXTERNAL_UI5_DATA_DIR: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/data"
-    # Fixed hash subset sampled only from the image-group held-out pool.
-    EVAL_RECIPE_NAME: "locany_cpt_val_fast.json"
-    EVAL_SAMPLES_PER_TASK: "10"
-    EVAL_MAX_PENDING: "20"
-    EVAL_ATTN_IMPLEMENTATION: "sdpa"
-    EVAL_VISION_ATTN_IMPLEMENTATION: "flash_attention_2"
-    EVAL_DTYPE: "bf16"
-    EVAL_MAX_NEW_TOKENS: "1024"
-    # One threshold for held-out bbox metrics and external UI5 scoring.
+    CPT_INTEGRATED_EVAL: "0"
+    CPT_EVAL_AT_START: "0"
+    CPT_EXTERNAL_UI5_EVAL: "0"
     EVAL_IOU_THRESHOLD: "0.1"
-    EVAL_EXTERNAL_MAX_NEW_TOKENS: "4096"
-    EVAL_EXTERNAL_MAX_IMAGES_PER_TASK: "0"
     REPORT_TO: "tensorboard"
 
 namespace: /user/sicheng.yang
