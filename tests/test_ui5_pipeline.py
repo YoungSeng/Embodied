@@ -25,6 +25,23 @@ import submit_locany_ui5
 
 
 class RuntimeConfigTests(unittest.TestCase):
+    def test_single_task_baseline_manifest_has_all_five_comparable_slots(self) -> None:
+        manifest = json.loads(
+            (PROJECT_ROOT / "configs" / "ui5_single_task_baselines.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            set(manifest),
+            {
+                "text_overflow", "text_ellipsis", "element_overlap",
+                "element_cropping", "content_missing",
+            },
+        )
+        self.assertTrue(
+            all(set(value) == {"image_f1", "bbox_f1", "checkpoint"} for value in manifest.values())
+        )
+
     def test_local_debug_starts_same_pipeline_without_evaluation(self) -> None:
         args = run_locany_ui5_local_debug.parse_args(
             [
@@ -75,6 +92,40 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(env["TC_MSED_STAGE"], "m3")
         self.assertEqual(env["GRADIENT_ACCUMULATION_STEPS"], "2")
         self.assertEqual(env["MAX_NUM_TOKENS"], "12800")
+
+    def test_m31_four_gpu_configuration_is_explicit_and_gated(self) -> None:
+        args = run_locany_ui5_local_debug.parse_args(
+            [
+                "--gpus", "4", "--tc-msed-stage", "m31", "--max-steps", "20",
+                "--project-root", str(PROJECT_ROOT),
+            ]
+        )
+        env = run_locany_ui5_local_debug.build_environment(args, base_env={})
+        resolved = locany_ui5_common.resolve_runtime_config(env)
+        self.assertEqual(resolved["MAX_NUM_TOKENS"], 12800)
+        self.assertEqual(resolved["GRADIENT_ACCUMULATION_STEPS"], 2)
+        self.assertEqual(resolved["RELATION_GATE_MODE"], "observe")
+        self.assertEqual(resolved["RELATION_GATE_LOSS_WEIGHT"], 0.0)
+        self.assertEqual(resolved["RELATION_SLOT_OBJECTNESS_LOSS_WEIGHT"], 0.5)
+        self.assertEqual(resolved["RELATION_TASK_HARD_ROUTER"], 1)
+        self.assertEqual(resolved["RELATION_TASK_EXPERT_RANK"], 8)
+        self.assertEqual(resolved["RELATION_SET_DECODER_LAYERS"], 3)
+        with self.assertRaisesRegex(ValueError, "gated at 3000"):
+            locany_ui5_common.resolve_runtime_config(
+                {**env, "MAX_STEPS": "16000"}
+            )
+        for key, invalid in (
+            ("RELATION_TASK_HARD_ROUTER", "0"),
+            ("RELATION_TASK_EXPERT_RANK", "16"),
+            ("RELATION_SET_DECODER_LAYERS", "2"),
+            ("RELATION_NUM_SLOTS", "4"),
+            ("RELATION_GATE_MODE", "hard"),
+            ("RELATION_GATE_LOSS_WEIGHT", "0.2"),
+        ):
+            with self.subTest(key=key), self.assertRaisesRegex(
+                ValueError, "fixed P0/P1 architecture"
+            ):
+                locany_ui5_common.resolve_runtime_config({**env, key: invalid})
 
     def test_a800_defaults_are_gpu_count_specific(self) -> None:
         common = {"MACHINE_TYPE": "a800", "VERSION": "v4"}
@@ -561,6 +612,17 @@ class CheckpointTests(unittest.TestCase):
         )
         self.assertFalse(report["valid"])
         self.assertIn("relation_pbd.coord_prior_lambda", report["missing_groups"])
+
+    def test_m31_checkpoint_cannot_reuse_legacy_relation_structure(self) -> None:
+        base_keys = {
+            f"model.{group}weight"
+            for group in patch_locany_checkpoint.REQUIRED_RELATION_WEIGHT_GROUPS
+        }
+        report = patch_locany_checkpoint.validate_relation_weight_keys(
+            base_keys, {"tc_msed_stage": "m31"}
+        )
+        self.assertFalse(report["valid"])
+        self.assertIn("relation_pyramid.task_set_decoder.", report["missing_groups"])
 
     def test_pbd_checkpoint_config_validation_requires_saved_selector_ids(self) -> None:
         report = patch_locany_checkpoint.validate_pbd_config(

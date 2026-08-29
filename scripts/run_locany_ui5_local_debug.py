@@ -36,7 +36,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument(
         "--tc-msed-stage",
-        choices=("v4", "m1", "m2", "m3", "m4", "m5"),
+        choices=("v4", "m1", "m2", "m3", "m4", "m5", "m31"),
         default="v4",
         help="TC-MSED ablation stage; uses the same stage switch as formal jobs",
     )
@@ -111,6 +111,23 @@ def build_environment(
             "TC_MSED_STAGE": args.tc_msed_stage,
         }
     )
+    if args.tc_msed_stage == "m31":
+        env.update(
+            {
+                "RELATION_GATE_MODE": "observe",
+                "RELATION_GATE_LOSS_WEIGHT": "0.0",
+                "RELATION_SLOT_GATE_LOSS_WEIGHT": "0.5",
+                "RELATION_SLOT_OBJECTNESS_LOSS_WEIGHT": "0.5",
+                "RELATION_ATTENTION_LOSS_WEIGHT": "0.2",
+                "RELATION_BOX_L1_LOSS_WEIGHT": "1.0",
+                "RELATION_BOX_GIOU_LOSS_WEIGHT": "1.0",
+                "RELATION_COVERAGE_LOSS_WEIGHT": "0.05",
+                "RELATION_TASK_HARD_ROUTER": "1",
+                "RELATION_TASK_EXPERT_RANK": "8",
+                "RELATION_SET_DECODER_LAYERS": "3",
+                "RELATION_NUM_SLOTS": "8",
+            }
+        )
     optional_paths = {
         "ENV_DIR": args.env_dir,
         "BASE_MODEL": args.base_model,
@@ -133,6 +150,46 @@ def build_environment(
 def build_command(args: argparse.Namespace) -> list[str]:
     project_root = args.project_root.expanduser().resolve()
     return ["bash", str(project_root / "shell" / "run_locany_ui5_pipeline.sh")]
+
+
+def validate_smoke_checkpoint(
+    args: argparse.Namespace,
+    env: Mapping[str, str],
+) -> None:
+    """Require the final local-smoke checkpoint to be fully resumable."""
+
+    project_root = args.project_root.expanduser().resolve()
+    if args.output_dir is not None:
+        output_dir = args.output_dir.expanduser().resolve()
+    else:
+        output_dir = Path(env["OUTPUT_BASE"]) / env["RUN_NAME"]
+    checkpoint = output_dir / f"checkpoint-{args.max_steps}"
+    validator = project_root / "scripts" / "locany_ui5_checkpoint.py"
+    command = [
+        env["ENV_DIR"] + "/bin/python",
+        str(validator),
+        "validate",
+        "--checkpoint",
+        str(checkpoint),
+        "--mode",
+        "resume",
+        "--expected-ranks",
+        str(args.gpus),
+    ]
+    print("===== local smoke resume checkpoint audit =====")
+    print(f"checkpoint                    : {checkpoint}")
+    completed = subprocess.run(
+        command,
+        cwd=str(project_root),
+        env=dict(env),
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "Training exited successfully, but the final smoke checkpoint is not "
+            f"resumable: {checkpoint}"
+        )
+    print("LOCAL_SMOKE_CHECKPOINT_STATUS : RESUMABLE")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -166,7 +223,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         env=env,
         check=False,
     )
-    return int(completed.returncode)
+    if completed.returncode != 0:
+        return int(completed.returncode)
+    validate_smoke_checkpoint(args, env)
+    return 0
 
 
 if __name__ == "__main__":

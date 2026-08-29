@@ -207,11 +207,17 @@ def resolve_runtime_config(
     )
 
     tc_msed_stage = str(_env_value(env, "TC_MSED_STAGE", "v4")).lower()
-    if tc_msed_stage not in {"v4", "m1", "m2", "m3", "m4", "m5"}:
-        raise ValueError("TC_MSED_STAGE must be v4/m1/m2/m3/m4/m5")
+    if tc_msed_stage not in {"v4", "m1", "m2", "m3", "m4", "m5", "m31"}:
+        raise ValueError("TC_MSED_STAGE must be v4/m1/m2/m3/m4/m5/m31")
     tc_enabled = tc_msed_stage != "v4"
-    set_enabled = tc_msed_stage in {"m2", "m3", "m4", "m5"}
-    dynamic_enabled = tc_msed_stage in {"m3", "m4", "m5"}
+    set_enabled = tc_msed_stage in {"m2", "m3", "m4", "m5", "m31"}
+    dynamic_enabled = tc_msed_stage in {"m3", "m4", "m5", "m31"}
+    m31_enabled = tc_msed_stage == "m31"
+    if m31_enabled and max_steps > 3000:
+        raise ValueError(
+            "m31 Stage A is gated at 3000 steps; review checkpoint-3000 before "
+            "starting any longer run"
+        )
     resolved: dict[str, Any] = {
         "MACHINE_TYPE": machine_type,
         "RESOURCE_GROUP": str(_env_value(env, "RESOURCE_GROUP", "default")),
@@ -275,13 +281,16 @@ def resolve_runtime_config(
             )
         ),
         "RELATION_GATE_LOSS_WEIGHT": float(
-            _env_value(env, "RELATION_GATE_LOSS_WEIGHT", 0.2 if tc_enabled else 1.0)
+            _env_value(env, "RELATION_GATE_LOSS_WEIGHT", 0.0 if m31_enabled else (0.2 if tc_enabled else 1.0))
         ),
         "RELATION_SLOT_GATE_LOSS_WEIGHT": float(
             _env_value(env, "RELATION_SLOT_GATE_LOSS_WEIGHT", 0.5 if tc_enabled else 0.1)
         ),
+        "RELATION_SLOT_OBJECTNESS_LOSS_WEIGHT": float(
+            _env_value(env, "RELATION_SLOT_OBJECTNESS_LOSS_WEIGHT", 0.5 if m31_enabled else (0.5 if tc_enabled else 0.1))
+        ),
         "RELATION_ATTENTION_LOSS_WEIGHT": float(
-            _env_value(env, "RELATION_ATTENTION_LOSS_WEIGHT", 1.0 if tc_enabled else 0.1)
+            _env_value(env, "RELATION_ATTENTION_LOSS_WEIGHT", 0.2 if m31_enabled else (1.0 if tc_enabled else 0.1))
         ),
         "RELATION_GATE_THRESHOLD": float(
             _env_value(env, "RELATION_GATE_THRESHOLD", 0.5)
@@ -300,13 +309,22 @@ def resolve_runtime_config(
         ),
         "TC_MSED_STAGE": tc_msed_stage,
         "RELATION_BOX_L1_LOSS_WEIGHT": float(
-            _env_value(env, "RELATION_BOX_L1_LOSS_WEIGHT", 5.0 if set_enabled else 0.0)
+            _env_value(env, "RELATION_BOX_L1_LOSS_WEIGHT", 1.0 if m31_enabled else (5.0 if set_enabled else 0.0))
         ),
         "RELATION_BOX_GIOU_LOSS_WEIGHT": float(
-            _env_value(env, "RELATION_BOX_GIOU_LOSS_WEIGHT", 2.0 if set_enabled else 0.0)
+            _env_value(env, "RELATION_BOX_GIOU_LOSS_WEIGHT", 1.0 if m31_enabled else (2.0 if set_enabled else 0.0))
         ),
         "RELATION_COVERAGE_LOSS_WEIGHT": float(
-            _env_value(env, "RELATION_COVERAGE_LOSS_WEIGHT", 0.1 if dynamic_enabled else 0.0)
+            _env_value(env, "RELATION_COVERAGE_LOSS_WEIGHT", 0.05 if m31_enabled else (0.1 if dynamic_enabled else 0.0))
+        ),
+        "RELATION_TASK_HARD_ROUTER": int(
+            _env_value(env, "RELATION_TASK_HARD_ROUTER", 1 if m31_enabled else 0)
+        ),
+        "RELATION_TASK_EXPERT_RANK": int(
+            _env_value(env, "RELATION_TASK_EXPERT_RANK", 8)
+        ),
+        "RELATION_SET_DECODER_LAYERS": int(
+            _env_value(env, "RELATION_SET_DECODER_LAYERS", 3)
         ),
         "RELATION_COORD_PRIOR_SIGMA": float(
             _env_value(env, "RELATION_COORD_PRIOR_SIGMA", 0.05)
@@ -348,6 +366,29 @@ def resolve_runtime_config(
         raise ValueError("RELATION_FOCAL_GAMMA cannot be negative")
     if resolved["RELATION_NUM_SLOTS"] < 1:
         raise ValueError("RELATION_NUM_SLOTS must be positive")
+    if m31_enabled:
+        required_m31 = {
+            "RELATION_TASK_HARD_ROUTER": 1,
+            "RELATION_TASK_EXPERT_RANK": 8,
+            "RELATION_SET_DECODER_LAYERS": 3,
+            "RELATION_NUM_SLOTS": 8,
+            "RELATION_GATE_MODE": "observe",
+            "RELATION_GATE_LOSS_WEIGHT": 0.0,
+        }
+        drift = {
+            key: (resolved[key], expected)
+            for key, expected in required_m31.items()
+            if resolved[key] != expected
+        }
+        if drift:
+            details = ", ".join(
+                f"{key}={actual!r} (required {expected!r})"
+                for key, (actual, expected) in sorted(drift.items())
+            )
+            raise ValueError(
+                "m31 has a fixed P0/P1 architecture and Gate policy; "
+                f"refusing configuration drift: {details}"
+            )
     return resolved
 
 

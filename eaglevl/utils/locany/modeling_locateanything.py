@@ -186,6 +186,11 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 task_scale_router=bool(getattr(config, "relation_task_scale_router", False)),
                 set_localizer=bool(getattr(config, "relation_set_localizer", False)),
                 soft_gate=bool(getattr(config, "relation_soft_gate", False)),
+                task_hard_router=bool(getattr(config, "relation_task_hard_router", False)),
+                task_experts=bool(getattr(config, "relation_task_experts", False)),
+                task_expert_rank=int(getattr(config, "relation_task_expert_rank", 8)),
+                set_decoder=bool(getattr(config, "relation_set_decoder", False)),
+                set_decoder_layers=int(getattr(config, "relation_set_decoder_layers", 3)),
             )
             self.relation_pbd = RelationToPBD(
                 detail_hidden_size,
@@ -193,6 +198,9 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 dynamic_slot=bool(getattr(config, "relation_dynamic_slot_pbd", False)),
                 overlap_adapter=bool(getattr(config, "relation_overlap_adapter", False)),
                 coordinate_bridge=bool(getattr(config, "relation_coordinate_bridge", False)),
+                task_experts=bool(getattr(config, "relation_task_experts", False)),
+                task_expert_rank=int(getattr(config, "relation_task_expert_rank", 8)),
+                separate_global_geometry=bool(getattr(config, "relation_set_decoder", False)),
             )
         self._last_ui_defect_interface = None
 
@@ -461,6 +469,12 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         batch_size, seq_len = input_ids.shape
         assert batch_size == 1, 'only batch size = 1 is supported now'
         assert generate_kwargs.get('use_cache', False), "Only use_cache=True is supported."
+        if int(generate_kwargs.get("num_beams", 1)) != 1:
+            raise NotImplementedError(
+                "LocateAnything m31 slot-consumption state currently supports greedy "
+                "or sampled single-beam generation only. Beam search is rejected "
+                "instead of silently reusing stale slot state after beam reorder."
+            )
 
         generated = input_ids.clone()
         total_gen_length = min(tokenizer.model_max_length, seq_len + generate_kwargs.get('max_new_tokens', 2048))
@@ -478,6 +492,14 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             )
             if defect_type is None:
                 defect_type = inferred_defect_type
+            if (
+                str(getattr(self.config, "tc_msed_stage", "v4")).lower() == "m31"
+                and (relation_family is None or defect_type is None)
+            ):
+                raise ValueError(
+                    "m31 requires one of the five fixed UI5 prompts; refusing to "
+                    "silently route an unknown prompt to task 0"
+                )
         if relation_family is not None and not isinstance(relation_family, torch.Tensor):
             relation_family = torch.tensor([relation_family], device=relation_device, dtype=torch.long)
         if defect_type is not None and not isinstance(defect_type, torch.Tensor):
@@ -506,6 +528,10 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             if relation_gate_mode is not None
             else getattr(self.config, "relation_gate_mode", "observe")
         ).lower()
+        if str(getattr(self.config, "tc_msed_stage", "v4")).lower() == "m31":
+            # M3.1 keeps the legacy image head as detached diagnostics only.
+            # A caller-provided hard/soft mode must not change raw generation.
+            gate_mode = "observe"
         if gate_mode not in {"observe", "hard", "soft"}:
             raise ValueError(
                 f"relation_gate_mode must be observe, hard, or soft, got {gate_mode!r}"
@@ -783,7 +809,14 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                         text_mask_token_id=text_mask_token_id,
                         block_size=pbd_block_size,
                         relation_tokens=relation_output.relation_tokens,
-                        slot_gate_logits=relation_output.slot_gate_logits,
+                        slot_gate_logits=(
+                            None if self.relation_pyramid.set_decoder else relation_output.slot_gate_logits
+                        ),
+                        slot_objectness_logits=(
+                            relation_output.slot_objectness_logits
+                            if self.relation_pyramid.set_decoder
+                            else None
+                        ),
                         coarse_boxes=relation_output.coarse_boxes,
                         defect_type=defect_type,
                         initial_slot_usage=slot_usage_state,
@@ -1008,8 +1041,20 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 ),
                 "coarse_boxes": relation_output.coarse_boxes,
                 "slot_gate_probabilities": torch.sigmoid(relation_output.slot_gate_logits),
+                "slot_objectness_probabilities": torch.sigmoid(
+                    relation_output.slot_objectness_logits
+                    if relation_output.slot_objectness_logits is not None
+                    else relation_output.slot_gate_logits
+                ),
+                "defect_type": defect_type,
                 "selected_slot_indices": selected_slot_history,
                 "pbd_enabled": runtime_enable_pbd,
+                "coordinate_bridge_enabled": bool(
+                    runtime_enable_pbd and self.relation_pbd.coordinate_bridge
+                ),
+                "slot_routing_enabled": bool(
+                    runtime_enable_pbd and self.relation_pbd.dynamic_slot
+                ),
                 "unique_slot_count": len(set(selected_slot_history)),
                 "duplicate_slot_rate": (
                     (len(selected_slot_history) - len(set(selected_slot_history)))

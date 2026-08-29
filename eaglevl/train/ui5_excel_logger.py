@@ -27,6 +27,7 @@ TRAIN_BASE_COLUMNS = (
     "learning_rate",
     "gate_loss_weight",
     "slot_gate_loss_weight",
+    "slot_objectness_loss_weight",
     "attention_loss_weight",
     "gate_threshold",
     "focal_beta",
@@ -39,14 +40,20 @@ TRAIN_BASE_COLUMNS = (
     "loss_gate",
     "loss_image_gate",
     "loss_slot_gate",
+    "loss_slot_objectness",
     "loss_attention",
     "weighted_gate_loss",
     "weighted_slot_gate_loss",
+    "weighted_slot_objectness_loss",
     "weighted_attention_loss",
     "loss_lm_contribution",
     "loss_image_gate_contribution",
     "loss_slot_gate_contribution",
     "loss_attention_contribution",
+    "loss_box_l1_contribution",
+    "loss_box_giou_contribution",
+    "loss_coverage_contribution",
+    "loss_coordinate_bridge_contribution",
     "loss_reconstructed",
     "loss_reconstruction_error",
     "attention_active_batch_rate",
@@ -65,6 +72,7 @@ TRAIN_TASK_SUFFIXES = (
     "samples",
     "positive",
     "negative",
+    "lm_loss",
     "gate_loss",
     "attention_loss",
     "p_defect_pos",
@@ -74,6 +82,9 @@ TRAIN_TASK_SUFFIXES = (
     "gate_f1",
     "gate_pr_auc",
     "slot_gate_loss",
+    "slot_objectness_loss",
+    "box_l1_loss",
+    "box_giou_loss",
     "slot_positive",
     "slot_negative",
     "detail_weight_l5",
@@ -88,6 +99,7 @@ TRAIN_TASK_SUFFIXES = (
     "scale_batch_std_l26",
     "coord_prior_lambda",
     "soft_gate_beta",
+    "expert_grad_norm",
 )
 TRAIN_MODULE_COLUMNS = (
     "detail_layer5_norm",
@@ -108,12 +120,18 @@ TRAIN_MODULE_COLUMNS = (
     "coarse_iou_mean",
     "coarse_recall_03",
     "coarse_recall_05",
+    "selected_slot_iou",
+    "oracle_8slot_iou",
+    "route_top1_match_accuracy",
     "matched_slots",
     "unmatched_slots",
     "slot_usage_entropy",
     "box_anchor_count",
     "unique_slot_count",
     "duplicate_slot_rate",
+    "pbd_enabled",
+    "coordinate_bridge_enabled",
+    "slot_routing_enabled",
     "pbd_to_hidden_ratio",
     "pbd_delta_norm_active",
     "relation_grad_norm",
@@ -156,6 +174,7 @@ TRAIN_MODULE_COLUMNS = (
     "update_ratio_relation",
     "update_ratio_pbd",
     "update_ratio_coord_bridge",
+    "cross_task_shared_gradient_cosine",
 )
 TRAIN_COLUMNS = (
     *TRAIN_BASE_COLUMNS,
@@ -165,6 +184,9 @@ TRAIN_COLUMNS = (
         for suffix in TRAIN_TASK_SUFFIXES
     ),
     *TRAIN_MODULE_COLUMNS,
+    "git_commit",
+    "run_name",
+    "config_hash",
 )
 
 EVAL_COLUMNS = (
@@ -208,9 +230,21 @@ EVAL_COLUMNS = (
     "count_mae",
     "coarse_recall_03",
     "coarse_recall_05",
+    "selected_slot_iou",
+    "oracle_8slot_iou",
+    "route_top1_match_accuracy",
     "duplicate_slot_rate",
+    "pbd_enabled",
+    "coordinate_bridge_enabled",
+    "slot_routing_enabled",
     "raw_best_f1_so_far",
     "raw_best_step_so_far",
+    "git_commit",
+    "run_name",
+    "tc_msed_stage",
+    "config_hash",
+    "task_name",
+    "defect_type",
 )
 
 SHEET_TRAIN = "train_100steps"
@@ -490,6 +524,7 @@ def build_eval_rows(
     metrics: Mapping[str, Any],
     gate_metrics: Mapping[str, Mapping[str, Any]] | None = None,
     raw_metrics: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Convert scorer JSON plus gate summaries into the 12 requested rows."""
 
@@ -501,6 +536,7 @@ def build_eval_rows(
         "content_missing": "content_missing",
     }
     gate_metrics = gate_metrics or {}
+    metadata = metadata or {}
     if raw_metrics is None:
         raw_metrics = metrics
     rows: list[dict[str, Any]] = []
@@ -519,8 +555,20 @@ def build_eval_rows(
             rows.append(
                 {
                     "step": step,
+                    "git_commit": metadata.get("git_commit"),
+                    "run_name": metadata.get("run_name"),
+                    "tc_msed_stage": metadata.get("tc_msed_stage"),
+                    "config_hash": metadata.get("config_hash"),
                     "checkpoint": checkpoint,
                     "task": diagnostic_task,
+                    "task_name": diagnostic_task,
+                    "defect_type": {
+                        "text_overflow": 0,
+                        "element_cropping": 1,
+                        "element_overlap": 2,
+                        "text_ellipsis": 3,
+                        "content_missing": 4,
+                    }[diagnostic_task],
                     "granularity": granularity,
                     "precision": values.get("precision"),
                     "recall": values.get("recall"),
@@ -591,7 +639,13 @@ def build_eval_rows(
                     "count_mae": gate.get("count_mae"),
                     "coarse_recall_03": gate.get("coarse_recall_03"),
                     "coarse_recall_05": gate.get("coarse_recall_05"),
+                    "selected_slot_iou": gate.get("selected_slot_iou"),
+                    "oracle_8slot_iou": gate.get("oracle_8slot_iou"),
+                    "route_top1_match_accuracy": gate.get("route_top1_match_accuracy"),
                     "duplicate_slot_rate": gate.get("duplicate_slot_rate"),
+                    "pbd_enabled": gate.get("pbd_enabled"),
+                    "coordinate_bridge_enabled": gate.get("coordinate_bridge_enabled"),
+                    "slot_routing_enabled": gate.get("slot_routing_enabled"),
                 }
             )
 
@@ -636,8 +690,14 @@ def build_eval_rows(
         rows.append(
             {
                 "step": step,
+                "git_commit": metadata.get("git_commit"),
+                "run_name": metadata.get("run_name"),
+                "tc_msed_stage": metadata.get("tc_msed_stage"),
+                "config_hash": metadata.get("config_hash"),
                 "checkpoint": checkpoint,
                 "task": "five_task_macro",
+                "task_name": "five_task_macro",
+                "defect_type": None,
                 "granularity": granularity,
                 "precision": values.get("precision"),
                 "recall": values.get("recall"),
@@ -762,9 +822,31 @@ def build_eval_rows(
                     sum(float(row.get("coarse_recall_05") or 0.0) for row in source_rows)
                     / len(source_rows)
                 ),
+                "selected_slot_iou": (
+                    sum(float(row.get("selected_slot_iou") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "oracle_8slot_iou": (
+                    sum(float(row.get("oracle_8slot_iou") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "route_top1_match_accuracy": (
+                    sum(
+                        float(row.get("route_top1_match_accuracy") or 0.0)
+                        for row in source_rows
+                    )
+                    / len(source_rows)
+                ),
                 "duplicate_slot_rate": (
                     sum(float(row.get("duplicate_slot_rate") or 0.0) for row in source_rows)
                     / len(source_rows)
+                ),
+                "pbd_enabled": source_rows[0].get("pbd_enabled"),
+                "coordinate_bridge_enabled": source_rows[0].get(
+                    "coordinate_bridge_enabled"
+                ),
+                "slot_routing_enabled": source_rows[0].get(
+                    "slot_routing_enabled"
                 ),
             }
         )

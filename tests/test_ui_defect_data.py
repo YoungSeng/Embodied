@@ -66,7 +66,24 @@ class UIDefectDataTest(unittest.TestCase):
             counts[defect_type][int(positive)] += 1
         self.assertTrue(all(value == [8, 4] for value in counts.values()))
 
+    def test_explicit_route_is_validated_against_fixed_table(self):
+        self.assertEqual(
+            identify_ui_defect_task({"defect_type": 2, "relation_family": 1}),
+            ("overlap", 2, 1),
+        )
+        self.assertEqual(
+            identify_ui_defect_task(
+                {"defect_type": "element_cropping", "relation_family": 0}
+            ),
+            ("cropping", 1, 0),
+        )
+        with self.assertRaisesRegex(ValueError, "Unknown explicit"):
+            identify_ui_defect_task({"defect_type": -1, "relation_family": -1})
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            identify_ui_defect_task({"defect_type": 2, "relation_family": 0})
+        with self.assertRaisesRegex(ValueError, "provide both"):
+            identify_ui_defect_task({"defect_type": 2})
+
 
 if __name__ == "__main__":
     unittest.main()
-

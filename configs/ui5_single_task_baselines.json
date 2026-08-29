@@ -1,0 +1,7 @@
+{
+  "text_overflow": {"image_f1": null, "bbox_f1": null, "checkpoint": null},
+  "text_ellipsis": {"image_f1": null, "bbox_f1": null, "checkpoint": null},
+  "element_overlap": {"image_f1": null, "bbox_f1": null, "checkpoint": null},
+  "element_cropping": {"image_f1": null, "bbox_f1": null, "checkpoint": null},
+  "content_missing": {"image_f1": null, "bbox_f1": null, "checkpoint": null}
+}

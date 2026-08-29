@@ -60,7 +60,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument(
         "--tc-msed-stage",
-        choices=("v4", "m1", "m2", "m3", "m4", "m5"),
+        choices=("v4", "m1", "m2", "m3", "m4", "m5", "m31"),
         default="v4",
         help="Architecture ablation stage; v4 is the exact fallback baseline",
     )
@@ -205,6 +205,23 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "TRAINING_DATA_DIR": args.training_data_dir,
     }
     env.update(explicit)
+    if tc_msed_stage == "m31":
+        env.update(
+            {
+                "RELATION_GATE_MODE": "observe",
+                "RELATION_GATE_LOSS_WEIGHT": "0.0",
+                "RELATION_SLOT_GATE_LOSS_WEIGHT": "0.5",
+                "RELATION_SLOT_OBJECTNESS_LOSS_WEIGHT": "0.5",
+                "RELATION_ATTENTION_LOSS_WEIGHT": "0.2",
+                "RELATION_BOX_L1_LOSS_WEIGHT": "1.0",
+                "RELATION_BOX_GIOU_LOSS_WEIGHT": "1.0",
+                "RELATION_COVERAGE_LOSS_WEIGHT": "0.05",
+                "RELATION_TASK_HARD_ROUTER": "1",
+                "RELATION_TASK_EXPERT_RANK": "8",
+                "RELATION_SET_DECODER_LAYERS": "3",
+                "RELATION_NUM_SLOTS": "8",
+            }
+        )
     eval_max_images = optional["EVAL_MAX_IMAGES_PER_TASK"]
     if eval_max_images is not None and int(eval_max_images) < 0:
         raise ValueError("--eval-max-images-per-task cannot be negative")
@@ -285,6 +302,7 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "GRADIENT_ACCUMULATION_STEPS",
         "RELATION_GATE_LOSS_WEIGHT",
         "RELATION_SLOT_GATE_LOSS_WEIGHT",
+        "RELATION_SLOT_OBJECTNESS_LOSS_WEIGHT",
         "RELATION_ATTENTION_LOSS_WEIGHT",
         "RELATION_GATE_THRESHOLD",
         "RELATION_GATE_MODE",
@@ -295,6 +313,9 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "RELATION_BOX_L1_LOSS_WEIGHT",
         "RELATION_BOX_GIOU_LOSS_WEIGHT",
         "RELATION_COVERAGE_LOSS_WEIGHT",
+        "RELATION_TASK_HARD_ROUTER",
+        "RELATION_TASK_EXPERT_RANK",
+        "RELATION_SET_DECODER_LAYERS",
         "RELATION_COORD_PRIOR_SIGMA",
         "MAX_SEQ_LENGTH",
         "MAX_NUM_TOKENS_PER_SAMPLE",

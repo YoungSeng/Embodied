@@ -43,15 +43,48 @@ def identify_ui_defect_task(record: dict) -> Optional[Tuple[str, int, int]]:
     """Return (task_name, defect_type, relation_family), if this is a UI task."""
     explicit_type = record.get("defect_type")
     explicit_family = record.get("relation_family")
-    if explicit_type is not None and explicit_family is not None:
+    if (explicit_type is None) != (explicit_family is None):
+        raise ValueError(
+            "Explicit UI routing metadata must provide both defect_type and "
+            "relation_family"
+        )
+    if explicit_type is not None:
         if isinstance(explicit_type, str) and not explicit_type.isdigit():
-            for task_name, defect_type, _, _ in TASK_SPECS:
-                if explicit_type == task_name:
-                    return task_name, defect_type, int(explicit_family)
+            normalized = explicit_type.strip().lower()
+            defect_type = next(
+                (
+                    spec.defect_type
+                    for spec, train_spec in zip(UI_RELATION_PROMPT_SPECS, TASK_SPECS)
+                    if normalized
+                    in {
+                        spec.task_name.lower(),
+                        spec.diagnostic_name.lower(),
+                        train_spec[0].lower(),
+                    }
+                ),
+                None,
+            )
+            if defect_type is not None:
+                task_name, _, expected_family, _ = TASK_SPECS[defect_type]
+                if int(explicit_family) != expected_family:
+                    raise ValueError(
+                        "Explicit UI relation_family disagrees with the fixed "
+                        f"task table: defect_type={explicit_type!r}, "
+                        f"actual={explicit_family}, expected={expected_family}"
+                    )
+                return task_name, defect_type, expected_family
             raise ValueError(f"Unknown explicit UI defect_type: {explicit_type}")
         defect_type = int(explicit_type)
-        task_name = TASK_SPECS[defect_type][0]
-        return task_name, defect_type, int(explicit_family)
+        if not 0 <= defect_type < len(TASK_SPECS):
+            raise ValueError(f"Unknown explicit UI defect_type: {explicit_type}")
+        task_name, _, expected_family, _ = TASK_SPECS[defect_type]
+        if int(explicit_family) != expected_family:
+            raise ValueError(
+                "Explicit UI relation_family disagrees with the fixed task "
+                f"table: defect_type={defect_type}, actual={explicit_family}, "
+                f"expected={expected_family}"
+            )
+        return task_name, defect_type, expected_family
 
     prompt = _conversation_text(record, "human").lower()
     for task_name, defect_type, relation_family, aliases in TASK_SPECS:

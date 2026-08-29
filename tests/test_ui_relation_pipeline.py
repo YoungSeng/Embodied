@@ -159,6 +159,11 @@ class UIRelationPipelineTest(unittest.TestCase):
             family_name, defect_type = expected[spec.task_name]
             self.assertEqual(RELATION_FAMILIES[matched.relation_family], family_name)
             self.assertEqual(matched.defect_type, defect_type)
+        self.assertIsNone(
+            match_ui_relation_prompt(
+                "Locate every visual anomaly without naming a fixed UI5 task."
+            )
+        )
 
     def test_training_and_patched_inference_relation_shapes_match(self):
         training, features, training_output = self.make_pyramid()

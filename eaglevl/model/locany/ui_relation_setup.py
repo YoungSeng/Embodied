@@ -13,6 +13,60 @@ import torch
 import torch.distributed as dist
 
 
+TC_MSED_STAGE_CONFIGS = {
+    "v4": {
+        "task_scale_router": False, "set_localizer": False,
+        "dynamic_slot_pbd": False, "coordinate_bridge": False,
+        "soft_gate": False, "legacy_overlap_adapter": False,
+        "task_hard_router": False, "task_experts": False, "set_decoder": False,
+        "image_gate_mode": "observe",
+    },
+    "m1": {
+        "task_scale_router": True, "set_localizer": False,
+        "dynamic_slot_pbd": False, "coordinate_bridge": False,
+        "soft_gate": False, "legacy_overlap_adapter": False,
+        "task_hard_router": False, "task_experts": False, "set_decoder": False,
+        "image_gate_mode": "observe",
+    },
+    "m2": {
+        "task_scale_router": True, "set_localizer": True,
+        "dynamic_slot_pbd": False, "coordinate_bridge": False,
+        "soft_gate": False, "legacy_overlap_adapter": False,
+        "task_hard_router": False, "task_experts": False, "set_decoder": False,
+        "image_gate_mode": "observe",
+    },
+    "m3": {
+        "task_scale_router": True, "set_localizer": True,
+        "dynamic_slot_pbd": True, "coordinate_bridge": True,
+        "soft_gate": False, "legacy_overlap_adapter": False,
+        "task_hard_router": False, "task_experts": False, "set_decoder": False,
+        "image_gate_mode": "observe",
+    },
+    "m4": {
+        "task_scale_router": True, "set_localizer": True,
+        "dynamic_slot_pbd": True, "coordinate_bridge": True,
+        "soft_gate": True, "legacy_overlap_adapter": False,
+        "task_hard_router": False, "task_experts": False, "set_decoder": False,
+        "image_gate_mode": "soft",
+    },
+    "m5": {
+        "task_scale_router": True, "set_localizer": True,
+        "dynamic_slot_pbd": True, "coordinate_bridge": True,
+        "soft_gate": True, "legacy_overlap_adapter": True,
+        "task_hard_router": False, "task_experts": False, "set_decoder": False,
+        "image_gate_mode": "soft",
+    },
+    "m31": {
+        "task_scale_router": True, "set_localizer": True,
+        "dynamic_slot_pbd": True, "coordinate_bridge": True,
+        "soft_gate": False, "legacy_overlap_adapter": False,
+        "task_hard_router": True, "task_experts": True, "set_decoder": True,
+        "image_gate_mode": "observe",
+        "image_gate_loss_weight": 0.0,
+    },
+}
+
+
 def ui_relation_collective_device(
     parameter_device: torch.device | str | None = None,
 ) -> torch.device:
@@ -70,6 +124,8 @@ def configure_ui5_model_config(
     relation_box_giou_loss_weight: float = 0.0,
     relation_coverage_loss_weight: float = 0.0,
     relation_coord_prior_sigma: float = 0.05,
+    relation_task_expert_rank: int = 8,
+    relation_set_decoder_layers: int = 3,
 ):
     """Apply the one authoritative UI5 configuration to a model config."""
 
@@ -104,25 +160,35 @@ def configure_ui5_model_config(
         config.relation_detail_layers = layers
     config.relation_gate_loss_weight = float(relation_gate_loss_weight)
     config.relation_slot_gate_loss_weight = float(relation_slot_gate_loss_weight)
+    config.relation_slot_objectness_loss_weight = float(
+        relation_slot_gate_loss_weight
+    )
     config.relation_attention_loss_weight = float(relation_attention_loss_weight)
     config.relation_gate_threshold = float(relation_gate_threshold)
     stage = str(tc_msed_stage).lower()
-    stages = ("v4", "m1", "m2", "m3", "m4", "m5")
-    if stage not in stages:
+    if stage not in TC_MSED_STAGE_CONFIGS:
         raise ValueError(f"unknown TC-MSED stage: {stage!r}")
-    stage_index = stages.index(stage)
+    stage_config = TC_MSED_STAGE_CONFIGS[stage]
     config.tc_msed_stage = stage
-    config.relation_task_scale_router = stage_index >= 1
-    config.relation_set_localizer = stage_index >= 2
-    config.relation_dynamic_slot_pbd = stage_index >= 3
-    config.relation_coordinate_bridge = stage_index >= 3
-    config.relation_soft_gate = stage_index >= 4
-    config.relation_overlap_adapter = stage_index >= 5
+    config.relation_task_scale_router = bool(stage_config["task_scale_router"])
+    config.relation_set_localizer = bool(stage_config["set_localizer"])
+    config.relation_dynamic_slot_pbd = bool(stage_config["dynamic_slot_pbd"])
+    config.relation_coordinate_bridge = bool(stage_config["coordinate_bridge"])
+    config.relation_soft_gate = bool(stage_config["soft_gate"])
+    config.relation_overlap_adapter = bool(stage_config["legacy_overlap_adapter"])
+    config.relation_task_hard_router = bool(stage_config["task_hard_router"])
+    config.relation_task_experts = bool(stage_config["task_experts"])
+    config.relation_set_decoder = bool(stage_config["set_decoder"])
+    config.relation_task_expert_rank = int(relation_task_expert_rank)
+    config.relation_set_decoder_layers = int(relation_set_decoder_layers)
     config.relation_box_l1_loss_weight = float(relation_box_l1_loss_weight)
     config.relation_box_giou_loss_weight = float(relation_box_giou_loss_weight)
     config.relation_coverage_loss_weight = float(relation_coverage_loss_weight)
     config.relation_coord_prior_sigma = float(relation_coord_prior_sigma)
-    config.relation_gate_mode = "soft" if config.relation_soft_gate else "observe"
+    config.relation_gate_mode = str(stage_config["image_gate_mode"])
+    if stage == "m31":
+        # Image Gate is retained as detached diagnostics only.
+        config.relation_gate_loss_weight = 0.0
     if not hasattr(config, "relation_gate_thresholds"):
         config.relation_gate_thresholds = {}
     config.relation_focal_beta = float(relation_focal_beta)

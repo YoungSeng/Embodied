@@ -47,11 +47,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--relation-gate-threshold", type=float, default=0.5)
     parser.add_argument("--relation-focal-beta", type=float, default=0.999)
     parser.add_argument("--relation-focal-gamma", type=float, default=2.0)
-    parser.add_argument("--tc-msed-stage", choices=("v4", "m1", "m2", "m3", "m4", "m5"), default="v4")
+    parser.add_argument("--tc-msed-stage", choices=("v4", "m1", "m2", "m3", "m4", "m5", "m31"), default="v4")
     parser.add_argument("--relation-box-l1-loss-weight", type=float, default=0.0)
     parser.add_argument("--relation-box-giou-loss-weight", type=float, default=0.0)
     parser.add_argument("--relation-coverage-loss-weight", type=float, default=0.0)
     parser.add_argument("--relation-coord-prior-sigma", type=float, default=0.05)
+    parser.add_argument("--relation-task-expert-rank", type=int, default=8)
+    parser.add_argument("--relation-set-decoder-layers", type=int, default=3)
     return parser.parse_args()
 
 
@@ -65,21 +67,26 @@ def main() -> int:
     complete_marker = output / "ui5_checkpoint0_manifest.json"
     if complete_marker.is_file() and (output / "config.json").is_file():
         existing_config = json.loads((output / "config.json").read_text(encoding="utf-8"))
-        stage_index = ("v4", "m1", "m2", "m3", "m4", "m5").index(
-            args.tc_msed_stage
-        )
+        from eaglevl.model.locany.ui_relation_setup import TC_MSED_STAGE_CONFIGS
+        stage_flags = TC_MSED_STAGE_CONFIGS[args.tc_msed_stage]
         expected_signature = {
             "tc_msed_stage": args.tc_msed_stage,
             "relation_detail_hidden_size": args.relation_detail_hidden_size,
             "relation_num_slots": args.relation_num_slots,
+            "relation_slot_objectness_loss_weight": args.relation_slot_gate_loss_weight,
             "relation_adapter_bottleneck": args.relation_adapter_bottleneck,
             "relation_detail_layers": [5, 15, 26],
-            "relation_task_scale_router": stage_index >= 1,
-            "relation_set_localizer": stage_index >= 2,
-            "relation_dynamic_slot_pbd": stage_index >= 3,
-            "relation_coordinate_bridge": stage_index >= 3,
-            "relation_soft_gate": stage_index >= 4,
-            "relation_overlap_adapter": stage_index >= 5,
+            "relation_task_scale_router": stage_flags["task_scale_router"],
+            "relation_set_localizer": stage_flags["set_localizer"],
+            "relation_dynamic_slot_pbd": stage_flags["dynamic_slot_pbd"],
+            "relation_coordinate_bridge": stage_flags["coordinate_bridge"],
+            "relation_soft_gate": stage_flags["soft_gate"],
+            "relation_overlap_adapter": stage_flags["legacy_overlap_adapter"],
+            "relation_task_hard_router": stage_flags["task_hard_router"],
+            "relation_task_experts": stage_flags["task_experts"],
+            "relation_set_decoder": stage_flags["set_decoder"],
+            "relation_task_expert_rank": args.relation_task_expert_rank,
+            "relation_set_decoder_layers": args.relation_set_decoder_layers,
             "relation_box_l1_loss_weight": args.relation_box_l1_loss_weight,
             "relation_box_giou_loss_weight": args.relation_box_giou_loss_weight,
             "relation_coverage_loss_weight": args.relation_coverage_loss_weight,
@@ -141,6 +148,8 @@ def main() -> int:
         relation_box_giou_loss_weight=args.relation_box_giou_loss_weight,
         relation_coverage_loss_weight=args.relation_coverage_loss_weight,
         relation_coord_prior_sigma=args.relation_coord_prior_sigma,
+        relation_task_expert_rank=args.relation_task_expert_rank,
+        relation_set_decoder_layers=args.relation_set_decoder_layers,
     )
     config.relation_gate_thresholds = {}
     config.ui_relation_initialization_seed = args.seed

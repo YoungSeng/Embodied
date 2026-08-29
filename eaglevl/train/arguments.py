@@ -151,7 +151,13 @@ class ModelArguments:
     )
     tc_msed_stage: str = field(
         default="v4",
-        metadata={'help': 'TC-MSED ablation stage: v4, m1, m2, m3, m4, or m5.'},
+        metadata={'help': 'TC-MSED stage: v4, m1, m2, m3, m4, m5, or m31.'},
+    )
+    relation_task_expert_rank: int = field(
+        default=8, metadata={'help': 'Rank of each deterministic m31 task expert.'}
+    )
+    relation_set_decoder_layers: int = field(
+        default=3, metadata={'help': 'Number of shared m31 Set Decoder layers.'}
     )
     relation_box_l1_loss_weight: float = field(
         default=0.0, metadata={'help': 'Hungarian matched coarse-box L1 weight.'}

@@ -201,6 +201,8 @@ class UI5ExcelLoggerTest(unittest.TestCase):
                 values = next(sheet.iter_rows(min_row=2, values_only=True))
                 row = dict(zip(headers, values))
                 for task in TRAIN_TASKS:
+                    self.assertIn(f"{task}_lm_loss", headers)
+                    self.assertIn(f"{task}_slot_objectness_loss", headers)
                     weights = [
                         row[f"{task}_detail_weight_l5"],
                         row[f"{task}_detail_weight_l15"],
@@ -267,6 +269,12 @@ class UI5ExcelLoggerTest(unittest.TestCase):
                 "gated_f1": 0.646,
                 "gated_predicted_positive": 3,
                 "gate_filter_rate": 0.2,
+                "selected_slot_iou": 0.41,
+                "oracle_8slot_iou": 0.58,
+                "route_top1_match_accuracy": 0.7,
+                "pbd_enabled": True,
+                "coordinate_bridge_enabled": True,
+                "slot_routing_enabled": True,
             }
             for task in (
                 "text_overflow",
@@ -295,6 +303,14 @@ class UI5ExcelLoggerTest(unittest.TestCase):
         )
         self.assertEqual(image["raw_f1"], 0.4)
         self.assertEqual(image["soft_f1"], 0.6)
+        self.assertEqual(image["selected_slot_iou"], 0.41)
+        self.assertEqual(image["oracle_8slot_iou"], 0.58)
+        self.assertLessEqual(
+            image["selected_slot_iou"], image["oracle_8slot_iou"]
+        )
+        self.assertTrue(image["pbd_enabled"])
+        self.assertTrue(image["coordinate_bridge_enabled"])
+        self.assertTrue(image["slot_routing_enabled"])
         self.assertEqual(bbox["raw_f1"], 0.4)
         self.assertEqual(bbox["soft_f1"], 0.6)
         self.assertIsNone(bbox["gated_f1"])

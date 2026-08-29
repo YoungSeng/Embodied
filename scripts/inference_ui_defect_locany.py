@@ -78,6 +78,35 @@ import re
 import time
 import traceback
 from collections import defaultdict
+
+
+def _coarse_boxes_norm1000_and_px(value, width: int, height: int):
+    """Canonicalize a single sample's coarse boxes and convert them to pixels."""
+    boxes = value or []
+    while (
+        isinstance(boxes, list)
+        and len(boxes) == 1
+        and isinstance(boxes[0], list)
+        and boxes[0]
+        and isinstance(boxes[0][0], list)
+    ):
+        boxes = boxes[0]
+    normalized = []
+    pixels = []
+    for box in boxes if isinstance(boxes, list) else []:
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        x1, y1, x2, y2 = (float(component) for component in box)
+        normalized.append([x1, y1, x2, y2])
+        pixels.append(
+            [
+                x1 * float(width) / 1000.0,
+                y1 * float(height) / 1000.0,
+                x2 * float(width) / 1000.0,
+                y2 * float(height) / 1000.0,
+            ]
+        )
+    return normalized, pixels
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1199,8 +1228,18 @@ class LocateAnythingInferencer:
             "slot_gate_probabilities": self._scalar(
                 interface.get("slot_gate_probabilities")
             ),
+            "slot_objectness_probabilities": self._scalar(
+                interface.get("slot_objectness_probabilities")
+            ),
+            "defect_type": self._scalar(interface.get("defect_type")),
             "selected_slot_indices": interface.get("selected_slot_indices", []),
             "pbd_enabled": bool(interface.get("pbd_enabled", self.args.enable_pbd)),
+            "coordinate_bridge_enabled": bool(
+                interface.get("coordinate_bridge_enabled", False)
+            ),
+            "slot_routing_enabled": bool(
+                interface.get("slot_routing_enabled", False)
+            ),
             "unique_slot_count": interface.get("unique_slot_count"),
             "duplicate_slot_rate": interface.get("duplicate_slot_rate"),
         }
@@ -1797,6 +1836,14 @@ def run_one_task(
             gate_diagnostics.setdefault("gate_filtered", False)
             gate_diagnostics["final_has_bbox"] = bool(detections)
             gate_diagnostics["image_size"] = {"width": width, "height": height}
+            coarse_norm1000, coarse_px = _coarse_boxes_norm1000_and_px(
+                gate_diagnostics.get("coarse_boxes"), width, height
+            )
+            gate_diagnostics["coordinate_space"] = "norm1000"
+            gate_diagnostics["image_width"] = width
+            gate_diagnostics["image_height"] = height
+            gate_diagnostics["coarse_boxes_norm1000"] = coarse_norm1000
+            gate_diagnostics["coarse_boxes_px"] = coarse_px
             gate_diagnostics["final_boxes_normalized_1000"] = parsed.normalized_boxes
             gate_diagnostics["final_boxes_pixel_xyxy"] = pixel_boxes
             selected_slots = list(gate_diagnostics.get("selected_slot_indices") or [])

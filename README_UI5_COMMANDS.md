@@ -253,3 +253,59 @@ python scripts/submit_locany_ui5.py \
   --save-steps 4000 \
   --run-name locany-ui5-v4-relationfix-h20x4
 ```
+
+## M3.1 Task-MoE + Set Decoder
+
+先运行完整单测：
+
+```bash
+python -m unittest \
+  tests.test_relation_modules \
+  tests.test_ui_defect_data \
+  tests.test_ui_relation_pipeline \
+  tests.test_ui5_excel_logger \
+  tests.test_ui5_pipeline \
+  tests.test_task_routed_experts \
+  tests.test_set_decoder \
+  tests.test_coarse_box_coordinate_space
+```
+
+A800 四卡本地 20-step smoke（跳过评测）：
+
+```bash
+python scripts/run_locany_ui5_local_debug.py \
+  --machine a800 --gpus 4 --cuda-devices 0,1,2,3 \
+  --max-num-tokens 12800 --max-steps 20 --save-steps 20 \
+  --tc-msed-stage m31 \
+  --run-name locany-ui5-m31-taskmoe-setdecoder-a800x4-smoke20
+```
+
+命令返回 0 前会自动以 `resume` 模式校验 `checkpoint-20`，包括四个 rank
+的 DeepSpeed/dataloader 状态；若只是模型权重可读但不能续训，smoke 仍会失败。
+重复 smoke 且代码已变化时请换一个新的 `--run-name`，避免续接旧的 smoke。
+
+旧 M3 sidecar 的 coarse box 可在不重新生成的情况下迁移到明确的 pixel 坐标：
+
+```bash
+python scripts/recompute_ui5_coarse_sidecars.py \
+  work_dirs/locany-ui5-tcmsed-m3-a800x4/inference-checkpoint-2000-full \
+  work_dirs/locany-ui5-tcmsed-m3-a800x4/inference-checkpoint-3000-full \
+  work_dirs/locany-ui5-tcmsed-m3-a800x4/inference-checkpoint-4000-full
+```
+
+迁移后再运行原 metrics record/汇总命令即可重算 `coarse_recall_03/05`；缺少
+`image_size` 的旧记录会直接报错，不会写入伪指标。
+
+只有单测和 smoke 全部通过后，才提交 `aiai_locate` 的 3000-step Stage A：
+
+```bash
+python scripts/submit_locany_ui5.py \
+  --machine a800 --resource-group aiai_locate \
+  --gpus 4 --max-num-tokens 12800 \
+  --tc-msed-stage m31 --enable-eval --eval-at-start \
+  --max-steps 3000 --save-steps 1000 --eval-interval-steps 1000 \
+  --run-name locany-ui5-m31-taskmoe-setdecoder-a800x4-sft
+```
+
+`m31` 会拒绝超过 3000 step 的 Stage A 命令，也不会 resume 旧 v4/M3/M4/M5
+checkpoint。四卡配置固定为 `MAX_NUM_TOKENS=12800`、梯度累积 2。

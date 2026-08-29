@@ -165,7 +165,12 @@ def main() -> int:
             width, height = image.size
             draw = ImageDraw.Draw(image)
             gt_boxes = row["_gt_boxes"]
-            coarse = row.get("coarse_boxes") or []
+            coarse = row.get("coarse_boxes_px") or []
+            if not coarse and row.get("coarse_boxes"):
+                raise RuntimeError(
+                    "legacy coarse_boxes lack pixel coordinate metadata; run "
+                    "scripts/recompute_ui5_coarse_sidecars.py first"
+                )
             if coarse and isinstance(coarse[0], list) and coarse[0] and isinstance(coarse[0][0], list):
                 coarse = coarse[0]
             final_boxes = row.get("final_boxes_normalized_1000") or []

@@ -153,18 +153,27 @@ def validate_relation_weight_keys(
             "relation_pbd.overlap_adapter_down.",
             "relation_pbd.overlap_adapter_up.",
         ),
+        "m31": (
+            "relation_pyramid.task_set_decoder.",
+            "relation_pyramid.relation_semantic_experts.",
+            "relation_pbd.semantic_task_experts.",
+            "relation_pbd.geometry_task_experts.",
+        ),
     }
     stage_order = ("v4", "m1", "m2", "m3", "m4", "m5")
     required = list(REQUIRED_RELATION_WEIGHT_GROUPS)
-    if stage not in stage_order:
+    if stage == "m31":
+        required.extend(stage_groups["m31"])
+    elif stage not in stage_order:
         return {
             "valid": False,
             "missing_groups": [],
             "error": f"unsupported tc_msed_stage={stage!r}",
             "relation_key_count": 0,
         }
-    for enabled_stage in stage_order[1 : stage_order.index(stage) + 1]:
-        required.extend(stage_groups[enabled_stage])
+    else:
+        for enabled_stage in stage_order[1 : stage_order.index(stage) + 1]:
+            required.extend(stage_groups[enabled_stage])
     missing = [
         group
         for group in required

@@ -150,7 +150,19 @@ case "${TC_MSED_STAGE}" in
       export RELATION_COVERAGE_LOSS_WEIGHT="${RELATION_COVERAGE_LOSS_WEIGHT:-0.0}"
     fi
     ;;
-  *) locany_die 22 "Unsupported TC_MSED_STAGE=${TC_MSED_STAGE}; expected v4/m1/m2/m3/m4/m5" ;;
+  m31)
+    export RELATION_GATE_LOSS_WEIGHT="0.0"
+    export RELATION_SLOT_GATE_LOSS_WEIGHT="${RELATION_SLOT_OBJECTNESS_LOSS_WEIGHT:-${RELATION_SLOT_GATE_LOSS_WEIGHT:-0.5}}"
+    export RELATION_SLOT_OBJECTNESS_LOSS_WEIGHT="${RELATION_SLOT_GATE_LOSS_WEIGHT}"
+    export RELATION_ATTENTION_LOSS_WEIGHT="${RELATION_ATTENTION_LOSS_WEIGHT:-0.2}"
+    export RELATION_BOX_L1_LOSS_WEIGHT="${RELATION_BOX_L1_LOSS_WEIGHT:-1.0}"
+    export RELATION_BOX_GIOU_LOSS_WEIGHT="${RELATION_BOX_GIOU_LOSS_WEIGHT:-1.0}"
+    export RELATION_COVERAGE_LOSS_WEIGHT="${RELATION_COVERAGE_LOSS_WEIGHT:-0.05}"
+    export RELATION_TASK_HARD_ROUTER="1"
+    export RELATION_TASK_EXPERT_RANK="${RELATION_TASK_EXPERT_RANK:-8}"
+    export RELATION_SET_DECODER_LAYERS="${RELATION_SET_DECODER_LAYERS:-3}"
+    ;;
+  *) locany_die 22 "Unsupported TC_MSED_STAGE=${TC_MSED_STAGE}; expected v4/m1/m2/m3/m4/m5/m31" ;;
 esac
 export RELATION_COORD_PRIOR_SIGMA="${RELATION_COORD_PRIOR_SIGMA:-0.05}"
 export EVAL_ENABLE_PBD="${EVAL_ENABLE_PBD:-1}"
@@ -158,7 +170,9 @@ if [[ "${EVAL_ENABLE_PBD}" != "0" && "${EVAL_ENABLE_PBD}" != "1" ]]; then
   locany_die 22 "EVAL_ENABLE_PBD must be 0 or 1, got ${EVAL_ENABLE_PBD}"
 fi
 export RELATION_GATE_THRESHOLD="${RELATION_GATE_THRESHOLD:-0.5}"
-if [[ "${TC_MSED_STAGE}" == "m4" || "${TC_MSED_STAGE}" == "m5" ]]; then
+if [[ "${TC_MSED_STAGE}" == "m31" ]]; then
+  export RELATION_GATE_MODE="observe"
+elif [[ "${TC_MSED_STAGE}" == "m4" || "${TC_MSED_STAGE}" == "m5" ]]; then
   export RELATION_GATE_MODE="${RELATION_GATE_MODE:-soft}"
 else
   export RELATION_GATE_MODE="${RELATION_GATE_MODE:-observe}"
@@ -197,6 +211,7 @@ printf '%-28s: %s\n' \
   "GRADIENT_ACCUMULATION_STEPS" "${GRADIENT_ACCUMULATION_STEPS}" \
   "RELATION_GATE_LOSS_WEIGHT" "${RELATION_GATE_LOSS_WEIGHT}" \
   "RELATION_SLOT_GATE_LOSS_WEIGHT" "${RELATION_SLOT_GATE_LOSS_WEIGHT}" \
+  "RELATION_SLOT_OBJECTNESS_LOSS_WEIGHT" "${RELATION_SLOT_OBJECTNESS_LOSS_WEIGHT:-${RELATION_SLOT_GATE_LOSS_WEIGHT}}" \
   "RELATION_ATTENTION_LOSS_WEIGHT" "${RELATION_ATTENTION_LOSS_WEIGHT}" \
   "RELATION_GATE_THRESHOLD" "${RELATION_GATE_THRESHOLD}" \
   "RELATION_GATE_MODE" "${RELATION_GATE_MODE}" \
@@ -208,6 +223,9 @@ printf '%-28s: %s\n' \
   "RELATION_BOX_L1_LOSS_WEIGHT" "${RELATION_BOX_L1_LOSS_WEIGHT}" \
   "RELATION_BOX_GIOU_LOSS_WEIGHT" "${RELATION_BOX_GIOU_LOSS_WEIGHT}" \
   "RELATION_COVERAGE_LOSS_WEIGHT" "${RELATION_COVERAGE_LOSS_WEIGHT}" \
+  "RELATION_TASK_HARD_ROUTER" "${RELATION_TASK_HARD_ROUTER:-0}" \
+  "RELATION_TASK_EXPERT_RANK" "${RELATION_TASK_EXPERT_RANK:-8}" \
+  "RELATION_SET_DECODER_LAYERS" "${RELATION_SET_DECODER_LAYERS:-3}" \
   "RELATION_COORD_PRIOR_SIGMA" "${RELATION_COORD_PRIOR_SIGMA}" \
   "ENABLE_EVAL" "${ENABLE_EVAL}" \
   "EVAL_AT_START" "${EVAL_AT_START}" \
@@ -221,6 +239,8 @@ echo "============================================="
 
 "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/resolve_locany_ui5_config.py" \
   --format json > "${OUTPUT_DIR}/effective_config.json"
+export GIT_COMMIT="${GIT_COMMIT:-$(git -C "${PROJECT_ROOT}" rev-parse HEAD)}"
+export UI5_CONFIG_HASH="${UI5_CONFIG_HASH:-$("${PIPELINE_PYTHON}" -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "${OUTPUT_DIR}/effective_config.json")}"
 
 [[ -d "${PROJECT_ROOT}" ]] || locany_die 21 "Project root missing: ${PROJECT_ROOT}"
 [[ -d "${BASE_MODEL}" ]] || locany_die 22 "Base model missing: ${BASE_MODEL}"
@@ -511,7 +531,9 @@ if [[ "${EVAL_AT_START}" == "1" ]] && ! has_successful_evaluation 0; then
     --relation-box-l1-loss-weight "${RELATION_BOX_L1_LOSS_WEIGHT}" \
     --relation-box-giou-loss-weight "${RELATION_BOX_GIOU_LOSS_WEIGHT}" \
     --relation-coverage-loss-weight "${RELATION_COVERAGE_LOSS_WEIGHT}" \
-    --relation-coord-prior-sigma "${RELATION_COORD_PRIOR_SIGMA}"
+    --relation-coord-prior-sigma "${RELATION_COORD_PRIOR_SIGMA}" \
+    --relation-task-expert-rank "${RELATION_TASK_EXPERT_RANK:-8}" \
+    --relation-set-decoder-layers "${RELATION_SET_DECODER_LAYERS:-3}"
   if run_evaluation 0 "${CHECKPOINT_ZERO}" 0; then
     :
   else

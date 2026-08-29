@@ -16,6 +16,7 @@ import errno
 import copy
 import logging
 import random
+import re
 import sys
 import warnings
 from contextlib import nullcontext
@@ -51,6 +52,7 @@ from eaglevl.patch import (
 from eaglevl.model.locany.modeling_locateanything import LocateAnythingForConditionalGeneration
 from eaglevl.model.locany.configuration_locateanything import LocateAnythingConfig
 from eaglevl.model.locany.ui_relation_setup import (
+    TC_MSED_STAGE_CONFIGS,
     configure_ui5_model_config,
     initialize_or_validate_ui_relation,
 )
@@ -1827,6 +1829,10 @@ class StreamPackingMTPTrainer(Trainer):
         "loss_image_gate_contribution",
         "loss_slot_gate_contribution",
         "loss_attention_contribution",
+        "loss_box_l1_contribution",
+        "loss_box_giou_contribution",
+        "loss_coverage_contribution",
+        "loss_coordinate_bridge_contribution",
         "loss_reconstructed",
         "loss_reconstruction_error",
         "attention_active_batch_rate",
@@ -1890,6 +1896,12 @@ class StreamPackingMTPTrainer(Trainer):
         "coord_bridge_absolute_update_norm",
         "coord_bridge_relative_update_norm",
         "coord_bridge_changed_element_count",
+        "expert_task_0_grad_norm",
+        "expert_task_1_grad_norm",
+        "expert_task_2_grad_norm",
+        "expert_task_3_grad_norm",
+        "expert_task_4_grad_norm",
+        "cross_task_shared_gradient_cosine",
     )
     _DEFECT_TO_DIAGNOSTIC_TASK = {
         0: "text_overflow",
@@ -1963,6 +1975,7 @@ class StreamPackingMTPTrainer(Trainer):
         self._ui5_hook_squares = {}
         self._ui5_hook_seen = set()
         self._ui5_hook_handles = []
+        self._m31_aux_over_budget_streak = defaultdict(int)
         self._ui5_last_grad_seen_global = {}
         self._ui5_parameter_baseline = {}
         self._ui5_real_data_audit_logged = False
@@ -2794,13 +2807,21 @@ class StreamPackingMTPTrainer(Trainer):
     def _ui5_parameter_group(name):
         if "relation_pbd.coord_prior_lambda" in name:
             return "coord_bridge"
-        if "relation_pyramid.coarse_box_head" in name:
+        if (
+            "relation_pyramid.coarse_box_head" in name
+            or "relation_pyramid.task_set_decoder.shared_box_deltas" in name
+            or "relation_pyramid.task_set_decoder.task_box_deltas" in name
+            or "relation_pyramid.task_set_decoder.reference_box_logits" in name
+        ):
             return "coarse_box"
         if "relation_pbd" in name:
             return "pbd"
         if "relation_pyramid.image_gate_heads" in name:
             return "image_gate"
-        if "relation_pyramid.gate_heads" in name:
+        if (
+            "relation_pyramid.gate_heads" in name
+            or "relation_pyramid.task_set_decoder.objectness_heads" in name
+        ):
             return "slot_gate"
         if "relation_pyramid" in name:
             return "relation"
@@ -2811,12 +2832,26 @@ class StreamPackingMTPTrainer(Trainer):
             group = self._ui5_parameter_group(name)
             if group is None or not parameter.requires_grad:
                 continue
+            expert_match = re.search(r"\.experts\.(\d+)\.", name)
+            if expert_match is None:
+                expert_match = re.search(
+                    r"task_box_deltas\.\d+\.heads\.(\d+)\.", name
+                )
+            expert_group = (
+                f"expert_task_{int(expert_match.group(1))}"
+                if expert_match is not None else None
+            )
 
-            def capture(gradient, group=group):
+            def capture(gradient, group=group, expert_group=expert_group):
                 square = gradient.detach().float().square().sum()
                 previous = self._ui5_hook_squares.get(group)
                 self._ui5_hook_squares[group] = square if previous is None else previous + square
                 self._ui5_hook_seen.add(group)
+                if expert_group is not None:
+                    previous = self._ui5_hook_squares.get(expert_group)
+                    self._ui5_hook_squares[expert_group] = (
+                        square if previous is None else previous + square
+                    )
                 return gradient
 
             self._ui5_hook_handles.append(parameter.register_hook(capture))
@@ -2903,6 +2938,11 @@ class StreamPackingMTPTrainer(Trainer):
             trainable = [(name, parameter) for name, parameter in parameters if parameter.requires_grad]
             group_missing = [name for name, parameter in trainable if not in_optimizer(parameter)]
             group_frozen = [name for name, parameter in parameters if not parameter.requires_grad]
+            if (
+                str(getattr(self.model.config, "tc_msed_stage", "v4")).lower() == "m31"
+                and group_name == "image_gate"
+            ):
+                group_frozen = []
             report[group_name] = {
                 "parameter_count": sum(parameter.numel() for _, parameter in parameters),
                 "trainable_parameter_count": sum(parameter.numel() for _, parameter in trainable),
@@ -2956,7 +2996,11 @@ class StreamPackingMTPTrainer(Trainer):
         config = self.model.config
         gate_weight = float(getattr(config, "relation_gate_loss_weight", 1.0))
         slot_gate_weight = float(
-            getattr(config, "relation_slot_gate_loss_weight", 0.1)
+            getattr(
+                config,
+                "relation_slot_objectness_loss_weight",
+                getattr(config, "relation_slot_gate_loss_weight", 0.1),
+            )
         )
         attention_weight = float(
             getattr(config, "relation_attention_loss_weight", 0.1)
@@ -3002,6 +3046,10 @@ class StreamPackingMTPTrainer(Trainer):
             ("loss_image_gate_contribution", "loss_image_gate_contribution"),
             ("loss_slot_gate_contribution", "loss_slot_gate_contribution"),
             ("loss_attention_contribution", "loss_attention_contribution"),
+            ("loss_box_l1_contribution", "loss_box_l1_contribution"),
+            ("loss_box_giou_contribution", "loss_box_giou_contribution"),
+            ("loss_coverage_contribution", "loss_coverage_contribution"),
+            ("loss_coordinate_bridge_contribution", "loss_coordinate_bridge_contribution"),
             ("loss_reconstructed", "loss_reconstructed"),
             ("loss_reconstruction_error", "loss_reconstruction_error"),
             ("attention_active", "attention_active_batch_rate"),
@@ -3249,9 +3297,12 @@ class StreamPackingMTPTrainer(Trainer):
                 values["soft_gate_beta_count"] += 1.0
 
         for output_name, prefix in (
+            ("per_task_lm_loss", "lm_loss"),
             ("per_task_image_gate_loss", "gate_loss"),
             ("per_task_slot_gate_loss", "slot_gate_loss"),
             ("per_task_attention_loss", "attention_loss"),
+            ("per_task_box_l1_loss", "box_l1_loss"),
+            ("per_task_box_giou_loss", "box_giou_loss"),
         ):
             task_losses = getattr(outputs, output_name, None) or {}
             for raw_defect_id, loss_value in task_losses.items():
@@ -3260,6 +3311,50 @@ class StreamPackingMTPTrainer(Trainer):
                 if task is not None and loss_float is not None:
                     self._ui5_tasks[task][f"{prefix}_sum"] += loss_float
                     self._ui5_tasks[task][f"{prefix}_count"] += 1.0
+
+        if (
+            str(getattr(config, "tc_msed_stage", "v4")).lower() == "m31"
+            and (int(self.state.global_step) + 1) % 100 == 0
+        ):
+            shared_parameter = self.model.relation_pyramid.level_projections[0][1].weight
+            per_task_losses = []
+            dictionaries = {
+                "slot": getattr(outputs, "per_task_slot_gate_loss", None) or {},
+                "attention": getattr(outputs, "per_task_attention_loss", None) or {},
+                "l1": getattr(outputs, "per_task_box_l1_loss", None) or {},
+                "giou": getattr(outputs, "per_task_box_giou_loss", None) or {},
+            }
+            present_tasks = sorted(set().union(*(values.keys() for values in dictionaries.values())))
+            for task_id in present_tasks:
+                parts = [
+                    0.5 * dictionaries["slot"].get(task_id, 0.0),
+                    0.2 * dictionaries["attention"].get(task_id, 0.0),
+                    dictionaries["l1"].get(task_id, 0.0),
+                    dictionaries["giou"].get(task_id, 0.0),
+                ]
+                tensor_parts = [value for value in parts if torch.is_tensor(value)]
+                if not tensor_parts:
+                    continue
+                task_loss = sum(tensor_parts)
+                gradient = torch.autograd.grad(
+                    task_loss,
+                    shared_parameter,
+                    retain_graph=True,
+                    allow_unused=True,
+                )[0]
+                if gradient is not None:
+                    per_task_losses.append(gradient.detach().float().flatten())
+            cosines = []
+            for left in range(len(per_task_losses)):
+                for right in range(left + 1, len(per_task_losses)):
+                    cosines.append(F.cosine_similarity(
+                        per_task_losses[left], per_task_losses[right], dim=0
+                    ))
+            if cosines:
+                self._add_ui5_scalar(
+                    "cross_task_shared_gradient_cosine",
+                    torch.stack(cosines).mean(),
+                )
 
     def _capture_ui5_gradient_groups(self, model):
         # Hooks run at gradient creation time, before DeepSpeed/MAGI can clear
@@ -3276,6 +3371,13 @@ class StreamPackingMTPTrainer(Trainer):
                 if self._ui5_last_grad_seen_global.get(group) != global_step:
                     self._add_ui5_scalar(f"{group}_grad_seen_steps", 1.0)
                     self._ui5_last_grad_seen_global[group] = global_step
+        for defect_id in range(5):
+            group = f"expert_task_{defect_id}"
+            square = self._ui5_hook_squares.get(group)
+            if square is not None:
+                self._add_ui5_scalar(
+                    f"{group}_grad_norm", float(square.detach().item())
+                )
         self._ui5_hook_squares = {}
         self._ui5_hook_seen = set()
 
@@ -3366,10 +3468,13 @@ class StreamPackingMTPTrainer(Trainer):
             "p_defect_pos_sum", "p_defect_pos_count",
             "p_defect_neg_sum", "p_defect_neg_count",
             "tp", "fp", "fn",
+            "lm_loss_sum", "lm_loss_count",
             "gate_loss_sum", "gate_loss_count",
             "slot_gate_loss_sum", "slot_gate_loss_count",
             "slot_positive", "slot_negative",
             "attention_loss_sum", "attention_loss_count",
+            "box_l1_loss_sum", "box_l1_loss_count",
+            "box_giou_loss_sum", "box_giou_loss_count",
             "detail_weight_l5_sum", "detail_weight_l15_sum",
             "detail_weight_l26_sum", "detail_weight_count",
             "scale_entropy_sum", "scale_entropy_count",
@@ -3504,6 +3609,9 @@ class StreamPackingMTPTrainer(Trainer):
         )
         metrics = {
             "step": step,
+            "git_commit": os.environ.get("GIT_COMMIT", ""),
+            "run_name": os.environ.get("RUN_NAME", self.args.run_name or ""),
+            "config_hash": os.environ.get("UI5_CONFIG_HASH", ""),
             "task_id": "mixed",
             "tc_msed_stage": str(getattr(config, "tc_msed_stage", "v4")),
             "epoch": self.state.epoch,
@@ -3512,6 +3620,11 @@ class StreamPackingMTPTrainer(Trainer):
             "learning_rate": logs.get("learning_rate"),
             "gate_loss_weight": float(getattr(config, "relation_gate_loss_weight", 1.0)),
             "slot_gate_loss_weight": float(getattr(config, "relation_slot_gate_loss_weight", 0.1)),
+            "slot_objectness_loss_weight": float(getattr(
+                config,
+                "relation_slot_objectness_loss_weight",
+                getattr(config, "relation_slot_gate_loss_weight", 0.1),
+            )),
             "attention_loss_weight": float(getattr(config, "relation_attention_loss_weight", 0.1)),
             "gate_threshold": float(getattr(config, "relation_gate_threshold", 0.5)),
             "focal_beta": float(getattr(config, "relation_focal_beta", 0.999)),
@@ -3524,14 +3637,20 @@ class StreamPackingMTPTrainer(Trainer):
             "loss_gate": self._average(scalars["loss_gate"]),
             "loss_image_gate": self._average(scalars["loss_image_gate"]),
             "loss_slot_gate": self._average(scalars["loss_slot_gate"]),
+            "loss_slot_objectness": self._average(scalars["loss_slot_gate"]),
             "loss_attention": self._average(scalars["loss_attention"]),
             "weighted_gate_loss": self._average(scalars["weighted_gate_loss"]),
             "weighted_slot_gate_loss": self._average(scalars["weighted_slot_gate_loss"]),
+            "weighted_slot_objectness_loss": self._average(scalars["weighted_slot_gate_loss"]),
             "weighted_attention_loss": self._average(scalars["weighted_attention_loss"]),
             "loss_lm_contribution": self._average(scalars["loss_lm_contribution"]),
             "loss_image_gate_contribution": self._average(scalars["loss_image_gate_contribution"]),
             "loss_slot_gate_contribution": self._average(scalars["loss_slot_gate_contribution"]),
             "loss_attention_contribution": self._average(scalars["loss_attention_contribution"]),
+            "loss_box_l1_contribution": self._average(scalars["loss_box_l1_contribution"]),
+            "loss_box_giou_contribution": self._average(scalars["loss_box_giou_contribution"]),
+            "loss_coverage_contribution": self._average(scalars["loss_coverage_contribution"]),
+            "loss_coordinate_bridge_contribution": self._average(scalars["loss_coordinate_bridge_contribution"]),
             "loss_reconstructed": self._average(scalars["loss_reconstructed"]),
             "loss_reconstruction_error": self._average(scalars["loss_reconstruction_error"]),
             "attention_active_batch_rate": self._average(scalars["attention_active_batch_rate"]),
@@ -3591,8 +3710,64 @@ class StreamPackingMTPTrainer(Trainer):
             "update_ratio_coord_bridge": self._average(
                 scalars["coord_bridge_relative_update_norm"]
             ),
+            "cross_task_shared_gradient_cosine": self._average(
+                scalars["cross_task_shared_gradient_cosine"]
+            ),
             "tasks": {},
         }
+        if (
+            str(getattr(config, "tc_msed_stage", "v4")).lower() == "m31"
+            and 100 <= int(step) <= 500
+        ):
+            contribution_names = (
+                "loss_slot_gate_contribution",
+                "loss_attention_contribution",
+                "loss_box_l1_contribution",
+                "loss_box_giou_contribution",
+                "loss_coverage_contribution",
+                "loss_coordinate_bridge_contribution",
+            )
+            lm_contribution = abs(
+                float(metrics.get("loss_lm_contribution") or 0.0)
+            )
+            contributions = {
+                name: abs(float(metrics.get(name) or 0.0))
+                for name in contribution_names
+            }
+            image_gate_contribution = abs(
+                float(metrics.get("loss_image_gate_contribution") or 0.0)
+            )
+            budget_total = (
+                lm_contribution
+                + sum(contributions.values())
+                + image_gate_contribution
+            )
+            if budget_total <= 0.0:
+                raise RuntimeError("m31 loss budget audit has zero total contribution")
+            lm_share = lm_contribution / budget_total
+            auxiliary_share = sum(contributions.values()) / budget_total
+            if (
+                image_gate_contribution > 1.0e-8
+                or lm_share < 0.50
+                or auxiliary_share > 0.40
+            ):
+                raise RuntimeError(
+                    "m31 loss budget guard failed: "
+                    f"lm_share={lm_share:.6f}, auxiliary_share={auxiliary_share:.6f}, "
+                    f"image_gate_contribution={image_gate_contribution:.6g}, "
+                    f"contributions={contributions}"
+                )
+            for name, value in contributions.items():
+                share = value / budget_total
+                self._m31_aux_over_budget_streak[name] = (
+                    self._m31_aux_over_budget_streak[name] + 1
+                    if share > 0.30
+                    else 0
+                )
+                if self._m31_aux_over_budget_streak[name] >= 3:
+                    raise RuntimeError(
+                        f"m31 auxiliary contribution {name} exceeded 30% for three logs"
+                    )
         for group in ("relation", "image_gate", "slot_gate", "pbd", "coarse_box", "coord_bridge"):
             metrics[f"{group}_grad_seen_steps"] = scalars[f"{group}_grad_seen_steps"]["sum"]
             for suffix in (
@@ -3612,6 +3787,10 @@ class StreamPackingMTPTrainer(Trainer):
                 "samples": values["samples"],
                 "positive": values["positive"],
                 "negative": values["negative"],
+                "lm_loss": (
+                    values["lm_loss_sum"] / values["lm_loss_count"]
+                    if values["lm_loss_count"] else None
+                ),
                 "gate_loss": (
                     values["gate_loss_sum"] / values["gate_loss_count"]
                     if values["gate_loss_count"] else None
@@ -3635,6 +3814,21 @@ class StreamPackingMTPTrainer(Trainer):
                 "slot_gate_loss": (
                     values["slot_gate_loss_sum"] / values["slot_gate_loss_count"]
                     if values["slot_gate_loss_count"] else None
+                ),
+                "slot_objectness_loss": (
+                    values["slot_gate_loss_sum"] / values["slot_gate_loss_count"]
+                    if values["slot_gate_loss_count"] else None
+                ),
+                "box_l1_loss": (
+                    values["box_l1_loss_sum"] / values["box_l1_loss_count"]
+                    if values["box_l1_loss_count"] else None
+                ),
+                "box_giou_loss": (
+                    values["box_giou_loss_sum"] / values["box_giou_loss_count"]
+                    if values["box_giou_loss_count"] else None
+                ),
+                "expert_grad_norm": global_grad_rms(
+                    f"expert_task_{next(key for key, value in self._DEFECT_TO_DIAGNOSTIC_TASK.items() if value == task)}"
                 ),
                 "slot_positive": values["slot_positive"],
                 "slot_negative": values["slot_negative"],
@@ -3722,13 +3916,54 @@ class StreamPackingMTPTrainer(Trainer):
         ):
             self._capture_ui5_parameter_updates()
             if step == 20:
-                required_groups = {"relation", "image_gate", "slot_gate"}
-                if self._ui5_scalar["pbd_active_positions"]["sum"] > 0:
-                    required_groups.add("pbd")
+                required_groups = {"relation", "slot_gate"}
                 stage = str(getattr(self.model.config, "tc_msed_stage", "v4"))
-                if stage in {"m2", "m3", "m4", "m5"}:
+                if stage == "m31":
+                    if self._ui5_scalar["pbd_active_positions"]["sum"] <= 0:
+                        raise RuntimeError(
+                            "m31 smoke saw no PBD-active prediction positions"
+                        )
+                    if self._ui5_scalar["matched_slots"]["sum"] <= 0:
+                        raise RuntimeError("m31 smoke saw no Hungarian-matched slots")
+                    if self._ui5_scalar["unique_slot_count"]["max"] <= 1.0:
+                        raise RuntimeError(
+                            "m31 smoke did not route any multi-box sample to multiple slots"
+                        )
+                    missing_expert_gradients = [
+                        defect_id
+                        for defect_id in range(5)
+                        if self._ui5_scalar[
+                            f"expert_task_{defect_id}_grad_norm"
+                        ]["count"] <= 0
+                    ]
+                    if missing_expert_gradients:
+                        raise RuntimeError(
+                            "m31 smoke did not activate all five task experts; "
+                            f"missing={missing_expert_gradients}"
+                        )
+                    missing_losses = [
+                        name
+                        for name in (
+                            "loss_lm",
+                            "loss_slot_gate",
+                            "loss_box_l1",
+                            "loss_box_giou",
+                        )
+                        if self._ui5_scalar[name]["count"] <= 0
+                    ]
+                    if missing_losses:
+                        raise RuntimeError(
+                            "m31 smoke did not observe all required finite losses: "
+                            f"{missing_losses}"
+                        )
+                    required_groups.add("pbd")
+                elif self._ui5_scalar["pbd_active_positions"]["sum"] > 0:
+                    required_groups.add("pbd")
+                if stage != "m31":
+                    required_groups.add("image_gate")
+                if stage in {"m2", "m3", "m4", "m5", "m31"}:
                     required_groups.add("coarse_box")
-                if stage in {"m3", "m4", "m5"}:
+                if stage in {"m3", "m4", "m5", "m31"}:
                     required_groups.add("coord_bridge")
                 failed_groups = [
                     group
@@ -3742,12 +3977,14 @@ class StreamPackingMTPTrainer(Trainer):
                     )
             if step >= 500 and step % 100 == 0:
                 stage = str(getattr(self.model.config, "tc_msed_stage", "v4"))
-                required_groups = {"relation", "image_gate", "slot_gate"}
+                required_groups = {"relation", "slot_gate"}
                 if self._ui5_scalar["pbd_active_positions"]["sum"] > 0:
                     required_groups.add("pbd")
-                if stage in {"m2", "m3", "m4", "m5"}:
+                if stage != "m31":
+                    required_groups.add("image_gate")
+                if stage in {"m2", "m3", "m4", "m5", "m31"}:
                     required_groups.add("coarse_box")
-                if stage in {"m3", "m4", "m5"}:
+                if stage in {"m3", "m4", "m5", "m31"}:
                     required_groups.add("coord_bridge")
                 inactive = []
                 for group in sorted(required_groups):
@@ -4061,6 +4298,8 @@ def main():
             relation_box_giou_loss_weight=model_args.relation_box_giou_loss_weight,
             relation_coverage_loss_weight=model_args.relation_coverage_loss_weight,
             relation_coord_prior_sigma=model_args.relation_coord_prior_sigma,
+            relation_task_expert_rank=model_args.relation_task_expert_rank,
+            relation_set_decoder_layers=model_args.relation_set_decoder_layers,
         )
         logger.info(f'Text attn: {model_args.attn_implementation}, Vision attn: flash_attention_2')
 
@@ -4115,6 +4354,7 @@ def main():
             model_args.llm_path, torch_dtype=torch.bfloat16,
             config=text_config, trust_remote_code=True)
         
+        stage_flags = TC_MSED_STAGE_CONFIGS[str(model_args.tc_msed_stage).lower()]
         locateanything_config = LocateAnythingConfig(
             vision_config.to_dict(), text_config.to_dict(), 
             image_token_index=image_token_index, 
@@ -4131,7 +4371,7 @@ def main():
             relation_num_slots=model_args.relation_num_slots,
             relation_adapter_bottleneck=model_args.relation_adapter_bottleneck,
             relation_detail_layers=relation_detail_layers,
-            relation_gate_loss_weight=model_args.relation_gate_loss_weight,
+            relation_gate_loss_weight=(0.0 if model_args.tc_msed_stage == "m31" else model_args.relation_gate_loss_weight),
             relation_slot_gate_loss_weight=model_args.relation_slot_gate_loss_weight,
             relation_attention_loss_weight=model_args.relation_attention_loss_weight,
             relation_gate_threshold=model_args.relation_gate_threshold,
@@ -4139,12 +4379,17 @@ def main():
             relation_focal_beta=model_args.relation_focal_beta,
             relation_focal_gamma=model_args.relation_focal_gamma,
             tc_msed_stage=model_args.tc_msed_stage,
-            relation_task_scale_router=model_args.tc_msed_stage in {"m1", "m2", "m3", "m4", "m5"},
-            relation_set_localizer=model_args.tc_msed_stage in {"m2", "m3", "m4", "m5"},
-            relation_dynamic_slot_pbd=model_args.tc_msed_stage in {"m3", "m4", "m5"},
-            relation_coordinate_bridge=model_args.tc_msed_stage in {"m3", "m4", "m5"},
-            relation_soft_gate=model_args.tc_msed_stage in {"m4", "m5"},
-            relation_overlap_adapter=model_args.tc_msed_stage == "m5",
+            relation_task_scale_router=stage_flags["task_scale_router"],
+            relation_set_localizer=stage_flags["set_localizer"],
+            relation_dynamic_slot_pbd=stage_flags["dynamic_slot_pbd"],
+            relation_coordinate_bridge=stage_flags["coordinate_bridge"],
+            relation_soft_gate=stage_flags["soft_gate"],
+            relation_overlap_adapter=stage_flags["legacy_overlap_adapter"],
+            relation_task_hard_router=stage_flags["task_hard_router"],
+            relation_task_experts=stage_flags["task_experts"],
+            relation_task_expert_rank=model_args.relation_task_expert_rank,
+            relation_set_decoder=stage_flags["set_decoder"],
+            relation_set_decoder_layers=model_args.relation_set_decoder_layers,
             relation_box_l1_loss_weight=model_args.relation_box_l1_loss_weight,
             relation_box_giou_loss_weight=model_args.relation_box_giou_loss_weight,
             relation_coverage_loss_weight=model_args.relation_coverage_loss_weight,

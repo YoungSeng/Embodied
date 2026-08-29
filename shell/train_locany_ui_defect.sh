@@ -378,6 +378,8 @@ if torchrun \
   --relation_focal_beta "${RELATION_FOCAL_BETA:-0.999}" \
   --relation_focal_gamma "${RELATION_FOCAL_GAMMA:-2.0}" \
   --tc_msed_stage "${TC_MSED_STAGE:-v4}" \
+  --relation_task_expert_rank "${RELATION_TASK_EXPERT_RANK:-8}" \
+  --relation_set_decoder_layers "${RELATION_SET_DECODER_LAYERS:-3}" \
   --relation_box_l1_loss_weight "${RELATION_BOX_L1_LOSS_WEIGHT:-0.0}" \
   --relation_box_giou_loss_weight "${RELATION_BOX_GIOU_LOSS_WEIGHT:-0.0}" \
   --relation_coverage_loss_weight "${RELATION_COVERAGE_LOSS_WEIGHT:-0.0}" \

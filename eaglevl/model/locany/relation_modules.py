@@ -122,6 +122,8 @@ class RelationPyramidOutput:
     relation_summary: torch.Tensor
     best_relation_token: torch.Tensor
     scale_weights: torch.Tensor
+    global_task_token: Optional[torch.Tensor] = None
+    slot_objectness_logits: Optional[torch.Tensor] = None
     gate_targets: Optional[torch.Tensor] = None
     image_gate_targets: Optional[torch.Tensor] = None
     projected_level_norms: Optional[torch.Tensor] = None
@@ -132,6 +134,8 @@ class RelationPyramidOutput:
     relation_context_norm: Optional[torch.Tensor] = None
     per_task_gate_loss: Optional[Dict[int, torch.Tensor]] = None
     per_task_attention_loss: Optional[Dict[int, torch.Tensor]] = None
+    per_task_box_l1_loss: Optional[Dict[int, torch.Tensor]] = None
+    per_task_box_giou_loss: Optional[Dict[int, torch.Tensor]] = None
     gate_loss: Optional[torch.Tensor] = None
     image_gate_loss: Optional[torch.Tensor] = None
     slot_gate_loss: Optional[torch.Tensor] = None
@@ -280,6 +284,334 @@ class ResidualAdapter(nn.Module):
         return hidden_states + self.scale.tanh() * residual
 
 
+class TaskRoutedExpertBank(nn.Module):
+    """Exactly one residual expert is activated by each known defect type.
+
+    This is deterministic sparse adapter-MoE routing: no learned router, soft
+    mixture, top-k selection, or load-balancing loss is involved.  Grouped
+    execution is important here; evaluating all experts and masking afterwards
+    would still build autograd graphs (and gradients) for inactive experts.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        rank: int = 8,
+        num_defect_types: int = 5,
+        initial_alpha: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if hidden_size <= 0 or rank <= 0 or num_defect_types <= 0:
+            raise ValueError("hidden_size, rank and num_defect_types must be positive")
+        self.hidden_size = int(hidden_size)
+        self.rank = int(rank)
+        self.num_defect_types = int(num_defect_types)
+        self.experts = nn.ModuleList(
+            [
+                nn.ModuleDict(
+                    {
+                        "norm": nn.LayerNorm(hidden_size),
+                        "down": nn.Linear(hidden_size, rank, bias=False),
+                        "up": nn.Linear(rank, hidden_size, bias=False),
+                    }
+                )
+                for _ in range(num_defect_types)
+            ]
+        )
+        self.alpha = nn.Parameter(
+            torch.full((num_defect_types,), float(initial_alpha))
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        for expert in self.experts:
+            nn.init.zeros_(expert["up"].weight)
+
+    def _validate_tasks(self, defect_type: torch.Tensor, batch: int) -> torch.Tensor:
+        tasks = defect_type.reshape(-1).long()
+        if tasks.numel() != batch:
+            raise ValueError(
+                f"defect_type has {tasks.numel()} values for expert batch {batch}"
+            )
+        invalid = (tasks < 0) | (tasks >= self.num_defect_types)
+        if bool(invalid.any()):
+            raise ValueError(
+                "TaskRoutedExpertBank requires a known UI5 defect_type; "
+                f"got {tasks[invalid].detach().cpu().tolist()}"
+            )
+        return tasks
+
+    def forward(
+        self, hidden_states: torch.Tensor, defect_type: torch.Tensor
+    ) -> torch.Tensor:
+        if hidden_states.ndim < 2 or hidden_states.shape[-1] != self.hidden_size:
+            raise ValueError(
+                "expert input must be [B,...,H] with "
+                f"H={self.hidden_size}, got {tuple(hidden_states.shape)}"
+            )
+        tasks = self._validate_tasks(defect_type, hidden_states.shape[0])
+        output = hidden_states
+        # Sorting the tiny set makes route execution/checkpoint tests stable.
+        for task_tensor in torch.unique(tasks, sorted=True):
+            task = int(task_tensor.item())
+            indices = (tasks == task).nonzero(as_tuple=False).flatten()
+            selected = hidden_states.index_select(0, indices)
+            expert = self.experts[task]
+            residual = expert["up"](
+                F.gelu(expert["down"](expert["norm"](selected)))
+            )
+            selected_output = selected + self.alpha[task].to(
+                dtype=selected.dtype
+            ) * residual
+            output = output.index_copy(0, indices, selected_output)
+        return output
+
+
+class _TaskRoutedLinearBank(nn.Module):
+    """Task-private delta heads with the same strict grouped routing policy."""
+
+    def __init__(
+        self, hidden_size: int, output_size: int, num_defect_types: int = 5
+    ) -> None:
+        super().__init__()
+        self.num_defect_types = int(num_defect_types)
+        self.heads = nn.ModuleList(
+            [nn.Linear(hidden_size, output_size) for _ in range(num_defect_types)]
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        for head in self.heads:
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
+
+    def forward(self, hidden_states: torch.Tensor, defect_type: torch.Tensor) -> torch.Tensor:
+        tasks = defect_type.reshape(-1).long()
+        if tasks.numel() != hidden_states.shape[0]:
+            raise ValueError("task delta head batch mismatch")
+        if bool(((tasks < 0) | (tasks >= self.num_defect_types)).any()):
+            raise ValueError("task delta head received unknown defect_type")
+        output = hidden_states.new_zeros((*hidden_states.shape[:-1], self.heads[0].out_features))
+        for task_tensor in torch.unique(tasks, sorted=True):
+            task = int(task_tensor.item())
+            indices = (tasks == task).nonzero(as_tuple=False).flatten()
+            selected = self.heads[task](hidden_states.index_select(0, indices))
+            output = output.index_copy(0, indices, selected)
+        return output
+
+
+def inverse_sigmoid(values: torch.Tensor, eps: float = 1.0e-5) -> torch.Tensor:
+    values = values.float().clamp(min=eps, max=1.0 - eps)
+    return torch.log(values) - torch.log1p(-values)
+
+
+def cxcywh_to_xyxy_unit(boxes: torch.Tensor) -> torch.Tensor:
+    center = boxes[..., :2]
+    half_size = boxes[..., 2:].clamp_min(0.0) * 0.5
+    first = (center - half_size).clamp(0.0, 1.0)
+    second = (center + half_size).clamp(0.0, 1.0)
+    return torch.cat((torch.minimum(first, second), torch.maximum(first, second)), dim=-1)
+
+
+@dataclass
+class TaskConditionedSetDecoderOutput:
+    global_task_token: torch.Tensor
+    slot_tokens: torch.Tensor
+    slot_objectness_logits: torch.Tensor
+    slot_boxes_norm: torch.Tensor
+    slot_boxes_norm1000: torch.Tensor
+    slot_attention: torch.Tensor
+    auxiliary_boxes_norm: Tuple[torch.Tensor, ...]
+    auxiliary_objectness_logits: Tuple[torch.Tensor, ...]
+
+
+class _TaskConditionedSetDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        expert_rank: int,
+        num_defect_types: int,
+    ) -> None:
+        super().__init__()
+        self.self_norm = nn.LayerNorm(hidden_size)
+        self.self_attention = nn.MultiheadAttention(
+            hidden_size, num_heads, batch_first=True
+        )
+        self.cross_norm = nn.LayerNorm(hidden_size)
+        self.cross_attention = nn.MultiheadAttention(
+            hidden_size, num_heads, batch_first=True
+        )
+        self.ffn_norm = nn.LayerNorm(hidden_size)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, 4 * hidden_size),
+            nn.GELU(),
+            nn.Linear(4 * hidden_size, hidden_size),
+        )
+        self.task_expert = TaskRoutedExpertBank(
+            hidden_size,
+            rank=expert_rank,
+            num_defect_types=num_defect_types,
+        )
+
+    def forward(
+        self,
+        queries: torch.Tensor,
+        memory: torch.Tensor,
+        defect_type: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        normalized = self.self_norm(queries)
+        update, _ = self.self_attention(
+            normalized, normalized, normalized, need_weights=False
+        )
+        queries = queries + update
+        normalized = self.cross_norm(queries)
+        update, attention = self.cross_attention(
+            normalized,
+            memory,
+            memory,
+            need_weights=True,
+            average_attn_weights=True,
+        )
+        queries = queries + update
+        queries = queries + self.ffn(self.ffn_norm(queries))
+        queries = self.task_expert(queries, defect_type)
+        return queries, attention
+
+
+class TaskConditionedSetDecoder(nn.Module):
+    """One global query plus K task-conditioned direct object queries."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_object_queries: int = 8,
+        num_decoder_layers: int = 3,
+        num_attention_heads: Optional[int] = None,
+        num_defect_types: int = 5,
+        expert_rank: int = 8,
+    ) -> None:
+        super().__init__()
+        if num_object_queries <= 0 or num_decoder_layers <= 0:
+            raise ValueError("set decoder queries/layers must be positive")
+        if num_attention_heads is None:
+            num_attention_heads = next(
+                heads for heads in (8, 4, 2, 1) if hidden_size % heads == 0
+            )
+        if hidden_size % int(num_attention_heads) != 0:
+            raise ValueError("set decoder hidden size must divide attention heads")
+        self.hidden_size = int(hidden_size)
+        self.num_object_queries = int(num_object_queries)
+        self.num_defect_types = int(num_defect_types)
+        self.global_query = nn.Parameter(torch.empty(1, hidden_size))
+        self.object_queries = nn.Parameter(torch.empty(num_object_queries, hidden_size))
+        self.task_embedding = nn.Embedding(num_defect_types, hidden_size)
+        self.reference_box_logits = nn.Parameter(
+            torch.empty(num_object_queries, 4)
+        )
+        self.layers = nn.ModuleList(
+            [
+                _TaskConditionedSetDecoderLayer(
+                    hidden_size,
+                    int(num_attention_heads),
+                    expert_rank,
+                    num_defect_types,
+                )
+                for _ in range(num_decoder_layers)
+            ]
+        )
+        self.shared_box_deltas = nn.ModuleList(
+            [nn.Linear(hidden_size, 4) for _ in range(num_decoder_layers)]
+        )
+        self.task_box_deltas = nn.ModuleList(
+            [
+                _TaskRoutedLinearBank(hidden_size, 4, num_defect_types)
+                for _ in range(num_decoder_layers)
+            ]
+        )
+        self.objectness_heads = nn.ModuleList(
+            [nn.Linear(hidden_size, 1) for _ in range(num_decoder_layers)]
+        )
+        self.output_norm = nn.LayerNorm(hidden_size)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.global_query, std=0.02)
+        nn.init.normal_(self.object_queries, std=0.02)
+        # Deterministic spread across the image; refinement is unconstrained in
+        # inverse-sigmoid space and can move arbitrarily far from these points.
+        side = int(math.ceil(math.sqrt(self.num_object_queries)))
+        references = []
+        for index in range(self.num_object_queries):
+            row, column = divmod(index, side)
+            references.append(
+                ((column + 0.5) / side, (row + 0.5) / side, 0.25, 0.25)
+            )
+        with torch.no_grad():
+            self.reference_box_logits.copy_(
+                inverse_sigmoid(torch.tensor(references, dtype=torch.float32))
+            )
+        for shared in self.shared_box_deltas:
+            nn.init.zeros_(shared.weight)
+            nn.init.zeros_(shared.bias)
+        for objectness in self.objectness_heads:
+            nn.init.zeros_(objectness.weight)
+            nn.init.constant_(objectness.bias, -2.0)
+        for layer in self.layers:
+            layer.self_attention._reset_parameters()
+            layer.cross_attention._reset_parameters()
+            layer.task_expert.reset_parameters()
+        for task_delta in self.task_box_deltas:
+            task_delta.reset_parameters()
+
+    def forward(
+        self, memory: torch.Tensor, defect_type: torch.Tensor
+    ) -> TaskConditionedSetDecoderOutput:
+        if memory.ndim != 3 or memory.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"set decoder memory must be [B,P,{self.hidden_size}]"
+            )
+        tasks = defect_type.reshape(-1).long()
+        if tasks.numel() != memory.shape[0]:
+            raise ValueError("set decoder defect_type batch mismatch")
+        if bool(((tasks < 0) | (tasks >= self.num_defect_types)).any()):
+            raise ValueError("set decoder requires one of the five known defect types")
+        batch = memory.shape[0]
+        task_condition = self.task_embedding(tasks).unsqueeze(1)
+        base_queries = torch.cat((self.global_query, self.object_queries), dim=0)
+        queries = base_queries.unsqueeze(0).expand(batch, -1, -1) + task_condition
+        reference = torch.sigmoid(self.reference_box_logits.float()).unsqueeze(0).expand(
+            batch, -1, -1
+        )
+        auxiliary_boxes: List[torch.Tensor] = []
+        auxiliary_objectness: List[torch.Tensor] = []
+        final_attention = memory.new_zeros(
+            (batch, self.num_object_queries, memory.shape[1]), dtype=torch.float32
+        )
+        for index, layer in enumerate(self.layers):
+            queries, attention = layer(queries, memory, tasks)
+            slots = queries[:, 1:]
+            delta = self.shared_box_deltas[index](slots).float()
+            delta = delta + self.task_box_deltas[index](slots, tasks).float()
+            reference = torch.sigmoid(inverse_sigmoid(reference) + delta)
+            objectness = self.objectness_heads[index](slots).squeeze(-1)
+            auxiliary_boxes.append(cxcywh_to_xyxy_unit(reference))
+            auxiliary_objectness.append(objectness)
+            final_attention = attention[:, 1:].float()
+        queries = self.output_norm(queries)
+        boxes_norm = auxiliary_boxes[-1]
+        return TaskConditionedSetDecoderOutput(
+            global_task_token=queries[:, 0],
+            slot_tokens=queries[:, 1:],
+            slot_objectness_logits=auxiliary_objectness[-1],
+            slot_boxes_norm=boxes_norm,
+            slot_boxes_norm1000=boxes_norm * 1000.0,
+            slot_attention=final_attention,
+            auxiliary_boxes_norm=tuple(auxiliary_boxes),
+            auxiliary_objectness_logits=tuple(auxiliary_objectness),
+        )
+
+
 class RelationConditionedDetailPyramid(nn.Module):
     """Relation-specific scale selection and implicit UI relation queries."""
 
@@ -296,6 +628,11 @@ class RelationConditionedDetailPyramid(nn.Module):
         task_scale_router: bool = False,
         set_localizer: bool = False,
         soft_gate: bool = False,
+        task_hard_router: bool = False,
+        task_experts: bool = False,
+        task_expert_rank: int = 8,
+        set_decoder: bool = False,
+        set_decoder_layers: int = 3,
     ) -> None:
         super().__init__()
         self.detail_hidden_size = detail_hidden_size
@@ -307,6 +644,15 @@ class RelationConditionedDetailPyramid(nn.Module):
         self.task_scale_router = bool(task_scale_router)
         self.set_localizer = bool(set_localizer)
         self.soft_gate = bool(soft_gate)
+        self.task_hard_router = bool(task_hard_router)
+        self.task_experts = bool(task_experts)
+        self.task_expert_rank = int(task_expert_rank)
+        self.set_decoder = bool(set_decoder)
+        self.set_decoder_layers = int(set_decoder_layers)
+        if self.set_decoder and not (self.task_hard_router and self.task_experts):
+            raise ValueError(
+                "m31 set decoder requires deterministic task routing and experts"
+            )
 
         self.level_projections = nn.ModuleList(
             [
@@ -383,9 +729,26 @@ class RelationConditionedDetailPyramid(nn.Module):
                 nn.GELU(),
                 nn.Linear(adapter_bottleneck, 4),
             )
+        if self.set_decoder:
+            self.task_set_decoder = TaskConditionedSetDecoder(
+                detail_hidden_size,
+                num_object_queries=num_slots,
+                num_decoder_layers=set_decoder_layers,
+                num_defect_types=num_defect_types,
+                expert_rank=task_expert_rank,
+            )
+            self.relation_semantic_experts = TaskRoutedExpertBank(
+                detail_hidden_size,
+                rank=task_expert_rank,
+                num_defect_types=num_defect_types,
+            )
         if self.soft_gate:
             self.soft_gate_beta = nn.Parameter(torch.zeros(num_defect_types))
         self.reset_parameters()
+        if self.set_decoder:
+            # M3.1 retains these weights solely for checkpoint compatibility
+            # and detached diagnostics; they must not enter optimization.
+            self.image_gate_heads.requires_grad_(False)
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.evidence_queries, std=0.02)
@@ -612,6 +975,15 @@ class RelationConditionedDetailPyramid(nn.Module):
         relation_family = relation_family.reshape(-1).long()
         defect_type = defect_type.reshape(-1).long()
         num_samples = relation_family.numel()
+        if self.set_decoder:
+            invalid_tasks = (defect_type < 0) | (
+                defect_type >= self.num_defect_types
+            )
+            if bool(invalid_tasks.any()):
+                raise ValueError(
+                    "m31 requires a known defect_type for every packed sample; "
+                    f"got {defect_type[invalid_tasks].detach().cpu().tolist()}"
+                )
         if image_flags is None:
             image_flags = torch.ones(num_samples, device=relation_family.device, dtype=torch.long)
         else:
@@ -645,6 +1017,7 @@ class RelationConditionedDetailPyramid(nn.Module):
         scale_weights_all = self.scale_logits.float().softmax(dim=-1)
 
         relation_tokens_list: List[torch.Tensor] = []
+        global_task_tokens_list: List[torch.Tensor] = []
         gate_logits_list: List[torch.Tensor] = []
         image_gate_logits_list: List[torch.Tensor] = []
         coarse_boxes_list: List[torch.Tensor] = []
@@ -653,6 +1026,12 @@ class RelationConditionedDetailPyramid(nn.Module):
         gate_targets_list: List[torch.Tensor] = []
         evidence_losses: List[torch.Tensor] = []
         attention_losses_by_task: Dict[int, List[torch.Tensor]] = {
+            task: [] for task in range(self.num_defect_types)
+        }
+        box_l1_losses_by_task: Dict[int, List[torch.Tensor]] = {
+            task: [] for task in range(self.num_defect_types)
+        }
+        box_giou_losses_by_task: Dict[int, List[torch.Tensor]] = {
             task: [] for task in range(self.num_defect_types)
         }
         fused_norms: List[torch.Tensor] = []
@@ -686,6 +1065,7 @@ class RelationConditionedDetailPyramid(nn.Module):
                     dtype=pyramid_features[0].dtype,
                 ) + parameter_zero
                 relation_tokens_list.append(empty_tokens)
+                global_task_tokens_list.append(empty_tokens.mean(dim=0))
                 gate_logits_list.append(torch.full((self.num_slots,), -20.0, device=empty_tokens.device, dtype=empty_tokens.dtype))
                 image_gate_logits_list.append(
                     torch.full((), -20.0, device=empty_tokens.device, dtype=empty_tokens.dtype)
@@ -744,71 +1124,99 @@ class RelationConditionedDetailPyramid(nn.Module):
             keys = self._sanitize(self.key_projection(fused))
             values = self._sanitize(self.value_projection(fused))
 
-            conditioning = self._sanitize(
-                self.family_embedding.weight[family] + self.defect_embedding.weight[task],
-                limit=32.0,
-            )
-            evidence_query = self._sanitize(
-                self.query_norm(self._sanitize(self.evidence_queries[family] + conditioning)),
-                limit=32.0,
-            )
-            context_query = self._sanitize(
-                self.query_norm(self._sanitize(self.context_queries[family] + conditioning)),
-                limit=32.0,
-            )
-            scale = math.sqrt(self.detail_hidden_size)
-            evidence_logits = self._sanitize(
-                evidence_query @ keys.transpose(0, 1) / scale, limit=30.0
-            )
-            context_logits = self._sanitize(
-                context_query @ keys.transpose(0, 1) / scale, limit=30.0
-            )
-            evidence_attention = evidence_logits.float().softmax(dim=-1).to(dtype=fused.dtype)
-            context_attention = context_logits.float().softmax(dim=-1).to(dtype=fused.dtype)
-            evidence_state = evidence_attention @ values
-            context_state = context_attention @ values
+            if self.set_decoder:
+                task_tensor = defect_type[sample_index : sample_index + 1]
+                decoded = self.task_set_decoder(fused.unsqueeze(0), task_tensor)
+                adapted_relation = self.relation_semantic_experts(
+                    decoded.slot_tokens, task_tensor
+                )[0]
+                global_task_token = self.relation_semantic_experts(
+                    decoded.global_task_token.unsqueeze(1), task_tensor
+                )[0, 0]
+                gate_logits = self._sanitize(
+                    decoded.slot_objectness_logits[0], limit=30.0
+                )
+                sample_coarse_boxes = canonicalize_xyxy(
+                    decoded.slot_boxes_norm1000[0].float()
+                )
+                evidence_attention = decoded.slot_attention[0].to(dtype=fused.dtype)
+                context_attention = (1.0 - evidence_attention.float()).clamp_min(0.0)
+                context_attention = (
+                    context_attention
+                    / context_attention.sum(dim=-1, keepdim=True).clamp_min(1.0e-7)
+                ).to(dtype=fused.dtype)
+                # Image Gate is diagnostics-only in m31.  Detaching both input
+                # and output prevents it from affecting hidden states/loss.
+                image_gate_logit = self.image_gate_heads[task](
+                    global_task_token.detach()
+                ).squeeze(-1).detach()
+                relation_tokens_for_sample = adapted_relation
+            else:
+                conditioning = self._sanitize(
+                    self.family_embedding.weight[family] + self.defect_embedding.weight[task],
+                    limit=32.0,
+                )
+                evidence_query = self._sanitize(
+                    self.query_norm(self._sanitize(self.evidence_queries[family] + conditioning)),
+                    limit=32.0,
+                )
+                context_query = self._sanitize(
+                    self.query_norm(self._sanitize(self.context_queries[family] + conditioning)),
+                    limit=32.0,
+                )
+                scale = math.sqrt(self.detail_hidden_size)
+                evidence_logits = self._sanitize(
+                    evidence_query @ keys.transpose(0, 1) / scale, limit=30.0
+                )
+                context_logits = self._sanitize(
+                    context_query @ keys.transpose(0, 1) / scale, limit=30.0
+                )
+                evidence_attention = evidence_logits.float().softmax(dim=-1).to(dtype=fused.dtype)
+                context_attention = context_logits.float().softmax(dim=-1).to(dtype=fused.dtype)
+                evidence_state = evidence_attention @ values
+                context_state = context_attention @ values
+                relation_input = self._sanitize(torch.cat(
+                    (
+                        evidence_state,
+                        context_state,
+                        evidence_state - context_state,
+                        evidence_state * context_state,
+                    ),
+                    dim=-1,
+                ))
+                base_relation = self._sanitize(self.relation_mlp(relation_input), limit=32.0)
+                adapted_all = torch.stack(
+                    [self._sanitize(adapter(base_relation), limit=32.0) for adapter in self.family_adapters], dim=0
+                )
+                adapted_relation = adapted_all[family]
+                logits_all = torch.stack(
+                    [head(adapted_relation).squeeze(-1) for head in self.gate_heads], dim=0
+                )
+                gate_logits = self._sanitize(logits_all[family], limit=30.0)
+                global_task_token = adapted_relation.mean(dim=0)
+                image_gate_logit = self._sanitize(
+                    self.image_gate_heads[task](global_task_token).squeeze(-1),
+                    limit=30.0,
+                )
+                relation_tokens_for_sample = self._sanitize(
+                    torch.sigmoid(gate_logits).unsqueeze(-1) * adapted_relation,
+                    limit=32.0,
+                )
+                attention_boxes = self._coarse_boxes(evidence_attention, height, width)
+                if self.set_localizer:
+                    residual = 100.0 * torch.tanh(self.coarse_box_head(adapted_relation).float())
+                    sample_coarse_boxes = canonicalize_xyxy(attention_boxes.float() + residual)
+                else:
+                    sample_coarse_boxes = attention_boxes
 
-            relation_input = self._sanitize(torch.cat(
-                (
-                    evidence_state,
-                    context_state,
-                    evidence_state - context_state,
-                    evidence_state * context_state,
-                ),
-                dim=-1,
-            ))
-            base_relation = self._sanitize(self.relation_mlp(relation_input), limit=32.0)
-            adapted_all = torch.stack(
-                [self._sanitize(adapter(base_relation), limit=32.0) for adapter in self.family_adapters], dim=0
-            )
-            adapted_relation = adapted_all[family]
             relation_context_norms.append(
                 adapted_relation.detach().float().norm(dim=-1).mean()
             )
-            logits_all = torch.stack(
-                [head(adapted_relation).squeeze(-1) for head in self.gate_heads], dim=0
-            )
-            gate_logits = self._sanitize(logits_all[family], limit=30.0)
-            pooled_relation = adapted_relation.mean(dim=0)
-            image_gate_logit = self._sanitize(
-                self.image_gate_heads[task](pooled_relation).squeeze(-1),
-                limit=30.0,
-            )
-            gated_relation = self._sanitize(
-                torch.sigmoid(gate_logits).unsqueeze(-1) * adapted_relation,
-                limit=32.0,
-            )
-
-            relation_tokens_list.append(gated_relation)
+            relation_tokens_list.append(relation_tokens_for_sample)
+            global_task_tokens_list.append(global_task_token)
             gate_logits_list.append(gate_logits)
             image_gate_logits_list.append(image_gate_logit)
-            attention_boxes = self._coarse_boxes(evidence_attention, height, width)
-            if self.set_localizer:
-                residual = 100.0 * torch.tanh(self.coarse_box_head(adapted_relation).float())
-                sample_coarse_boxes = canonicalize_xyxy(attention_boxes.float() + residual)
-            else:
-                sample_coarse_boxes = attention_boxes
-            coarse_boxes_list.append(sample_coarse_boxes.to(dtype=gated_relation.dtype))
+            coarse_boxes_list.append(sample_coarse_boxes.to(dtype=relation_tokens_for_sample.dtype))
             attention_list.append(torch.stack((evidence_attention, context_attention), dim=0))
             scale_weights_list.append(weights)
 
@@ -861,10 +1269,10 @@ class RelationConditionedDetailPyramid(nn.Module):
                         * (target_log[None] - evidence_log[:, None])
                     ).sum(dim=-1)
                     cost = (
-                        positive_focal_cost
+                        (2.0 if self.set_decoder else 1.0) * positive_focal_cost
                         + 5.0 * l1_cost
                         + 2.0 * giou_cost
-                        + attention_kl_cost
+                        + (0.0 if self.set_decoder else 1.0) * attention_kl_cost
                     )
                     matched_slots, matched_targets = hungarian_assignment(cost)
                     matched_for_sample[
@@ -881,6 +1289,8 @@ class RelationConditionedDetailPyramid(nn.Module):
                     ).mean()
                     box_l1_losses.append(sample_l1)
                     box_giou_losses.append(sample_giou)
+                    box_l1_losses_by_task[task].append(sample_l1)
+                    box_giou_losses_by_task[task].append(sample_giou)
                     matched_evidence = evidence_attention[matched_slots].float().clamp_min(1.0e-7)
                     matched_context = context_attention[matched_slots].float().clamp_min(1.0e-7)
                     target_evidence = box_evidence[matched_targets].float()
@@ -948,6 +1358,7 @@ class RelationConditionedDetailPyramid(nn.Module):
             matched_indices_list.append(matched_for_sample)
 
         relation_tokens = torch.stack(relation_tokens_list, dim=0)
+        global_task_tokens = torch.stack(global_task_tokens_list, dim=0)
         slot_gate_logits = torch.stack(gate_logits_list, dim=0)
         image_gate_logits = torch.stack(image_gate_logits_list, dim=0)
         coarse_boxes = torch.stack(coarse_boxes_list, dim=0)
@@ -956,7 +1367,9 @@ class RelationConditionedDetailPyramid(nn.Module):
         p_defect = torch.sigmoid(image_gate_logits)
         # Do not divide by the summed gate probability: that would cancel the
         # gate on negative samples.  A mean preserves defectness attenuation.
-        relation_summary = relation_tokens.mean(dim=1)
+        relation_summary = (
+            global_task_tokens if self.set_decoder else relation_tokens.mean(dim=1)
+        )
         best_indices = gate_probability.argmax(dim=-1)
         best_relation = relation_tokens[
             torch.arange(num_samples, device=relation_tokens.device), best_indices
@@ -1020,6 +1433,14 @@ class RelationConditionedDetailPyramid(nn.Module):
             for task, values in attention_losses_by_task.items()
             if values
         }
+        per_task_box_l1_loss = {
+            task: torch.stack(values).mean()
+            for task, values in box_l1_losses_by_task.items() if values
+        }
+        per_task_box_giou_loss = {
+            task: torch.stack(values).mean()
+            for task, values in box_giou_losses_by_task.items() if values
+        }
         projected_level_norms = torch.stack(
             [level.detach().float().norm(dim=-1).mean() for level in projected_levels]
         )
@@ -1075,6 +1496,8 @@ class RelationConditionedDetailPyramid(nn.Module):
             relation_summary=relation_summary,
             best_relation_token=best_relation,
             scale_weights=scale_weights,
+            global_task_token=global_task_tokens,
+            slot_objectness_logits=slot_gate_logits,
             gate_targets=gate_targets,
             image_gate_targets=image_gate_targets,
             projected_level_norms=projected_level_norms,
@@ -1087,6 +1510,8 @@ class RelationConditionedDetailPyramid(nn.Module):
             per_task_image_gate_loss=per_task_image_gate_loss,
             per_task_slot_gate_loss=per_task_slot_gate_loss,
             per_task_attention_loss=per_task_attention_loss,
+            per_task_box_l1_loss=per_task_box_l1_loss,
+            per_task_box_giou_loss=per_task_box_giou_loss,
             gate_loss=image_gate_loss,
             image_gate_loss=image_gate_loss,
             slot_gate_loss=slot_gate_loss,
@@ -1549,6 +1974,9 @@ class RelationToPBD(nn.Module):
         coordinate_bridge: bool = False,
         num_defect_types: int = 5,
         adapter_rank: int = 8,
+        task_experts: bool = False,
+        task_expert_rank: int = 8,
+        separate_global_geometry: bool = False,
     ) -> None:
         super().__init__()
         self.semantic_projection = nn.Sequential(
@@ -1566,6 +1994,19 @@ class RelationToPBD(nn.Module):
         self.dynamic_slot = bool(dynamic_slot)
         self.overlap_adapter = bool(overlap_adapter)
         self.coordinate_bridge = bool(coordinate_bridge)
+        self.task_experts = bool(task_experts)
+        self.separate_global_geometry = bool(separate_global_geometry)
+        if self.task_experts:
+            self.semantic_task_experts = TaskRoutedExpertBank(
+                relation_hidden_size,
+                rank=task_expert_rank,
+                num_defect_types=num_defect_types,
+            )
+            self.geometry_task_experts = TaskRoutedExpertBank(
+                relation_hidden_size,
+                rank=task_expert_rank,
+                num_defect_types=num_defect_types,
+            )
         if self.dynamic_slot:
             self.router_query = nn.Linear(language_hidden_size, relation_hidden_size, bias=False)
             self.router_key = nn.Linear(relation_hidden_size, relation_hidden_size, bias=False)
@@ -1605,6 +2046,32 @@ class RelationToPBD(nn.Module):
             + torch.nan_to_num(self.box_scale.tanh(), nan=0.0) * box_delta
         )
 
+    def enhance_routed_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        relation_summary: torch.Tensor,
+        selected_relation_token: torch.Tensor,
+        active_offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        """M3.1 global semantics at anchors, slot geometry across the box span."""
+
+        if not self.separate_global_geometry:
+            return self.enhance_prediction_hidden(
+                hidden_states, relation_summary, selected_relation_token
+            )
+        semantic_delta = self.semantic_projection(relation_summary)
+        box_delta = self.box_projection(selected_relation_token)
+        anchor = (active_offsets == 0).to(
+            device=hidden_states.device, dtype=hidden_states.dtype
+        ).unsqueeze(-1)
+        return (
+            hidden_states
+            + anchor
+            * torch.nan_to_num(self.semantic_scale.tanh(), nan=0.0)
+            * semantic_delta
+            + torch.nan_to_num(self.box_scale.tanh(), nan=0.0) * box_delta
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1617,6 +2084,7 @@ class RelationToPBD(nn.Module):
         block_size: int,
         relation_tokens: Optional[torch.Tensor] = None,
         slot_gate_logits: Optional[torch.Tensor] = None,
+        slot_objectness_logits: Optional[torch.Tensor] = None,
         coarse_boxes: Optional[torch.Tensor] = None,
         matched_slot_indices: Optional[torch.Tensor] = None,
         defect_type: Optional[torch.Tensor] = None,
@@ -1660,6 +2128,17 @@ class RelationToPBD(nn.Module):
             safe_best_tokens = torch.nan_to_num(
                 best_relation_token[active_samples], nan=0.0, posinf=32.0, neginf=-32.0
             ).clamp(-32.0, 32.0)
+            if slot_objectness_logits is not None:
+                if slot_gate_logits is not None and slot_gate_logits is not slot_objectness_logits:
+                    raise ValueError("provide slot objectness through only one argument")
+                slot_gate_logits = slot_objectness_logits
+            if self.task_experts:
+                if defect_type is None:
+                    raise ValueError("m31 PBD task experts require defect_type")
+                active_tasks = defect_type.reshape(-1)[active_samples].long()
+                safe_summaries = self.semantic_task_experts(
+                    safe_summaries, active_tasks
+                )
             if self.dynamic_slot:
                 if relation_tokens is None or slot_gate_logits is None:
                     raise ValueError("dynamic slot PBD requires relation_tokens and slot_gate_logits")
@@ -1689,6 +2168,10 @@ class RelationToPBD(nn.Module):
                             + F.logsigmoid(slot_gate_logits[sample].float())
                             - self.coverage_gamma.float().abs() * final_slot_usage[sample]
                         )
+                        if self.task_experts:
+                            available = final_slot_usage[sample] <= 0
+                            if bool(available.any()):
+                                route_logits = route_logits.masked_fill(~available, -1.0e4)
                         soft_weights = route_logits.softmax(dim=-1)
                         chosen = int(soft_weights.argmax().item())
                         if matched_slot_indices is not None and ordinal < matched_slot_indices.shape[1]:
@@ -1707,7 +2190,9 @@ class RelationToPBD(nn.Module):
                         # used only for coverage state, coarse geometry and
                         # diagnostics.  This lets LM loss train q/k/v routing;
                         # straight-through top-1 remains a separate ablation.
-                        seen_route_weights[group] = soft_weights
+                        seen_route_weights[group] = (
+                            selected if self.task_experts else soft_weights
+                        )
                         seen_selected_slots[group] = chosen
                         soft_anchor_weights.append(soft_weights)
                         # ``final_slot_usage[sample]`` participates in the
@@ -1724,7 +2209,11 @@ class RelationToPBD(nn.Module):
                     selected_slot_indices[active_index] = selected_index
                     # K=1 is a strict degeneration to the legacy selected token;
                     # do not add an otherwise unidentifiable value projection.
-                    if num_slots == 1:
+                    if self.task_experts:
+                        token = self.router_value(
+                            relation_tokens[sample, selected_index]
+                        )
+                    elif num_slots == 1:
                         token = relation_tokens[sample, 0]
                     else:
                         projected_tokens = self.router_value(relation_tokens[sample])
@@ -1751,6 +2240,11 @@ class RelationToPBD(nn.Module):
                         coverage_loss = coverage_loss + torch.stack(overlap_terms).mean()
                 routing_weights = all_weights
                 safe_best_tokens = routed_tokens
+                if self.task_experts:
+                    active_tasks = defect_type.reshape(-1)[active_samples].long()
+                    safe_best_tokens = self.geometry_task_experts(
+                        safe_best_tokens, active_tasks
+                    )
                 anchor_selected = []
                 for group, selected_index in seen_selected_slots.items():
                     anchor_selected.append((group[0], int(selected_index)))
@@ -1766,8 +2260,11 @@ class RelationToPBD(nn.Module):
                     duplicate_slot_rate = hidden_states.new_tensor(float(duplicates / max(total, 1)))
                     coverage_loss = coverage_loss / max(total, 1)
             active_hidden = flat_hidden.index_select(0, active_positions)
-            enhanced_active_hidden = self.enhance_prediction_hidden(
-                active_hidden, safe_summaries, safe_best_tokens
+            enhanced_active_hidden = self.enhance_routed_hidden(
+                active_hidden,
+                safe_summaries,
+                safe_best_tokens,
+                active_offsets,
             )
             # The replacement is computed from ``flat_hidden`` itself.  An
             # indexed in-place write into that storage invalidates the views

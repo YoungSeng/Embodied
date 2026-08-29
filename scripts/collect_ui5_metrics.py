@@ -52,6 +52,54 @@ TASK_COLUMNS = [
 CSV_COLUMNS = BASE_COLUMNS + TASK_COLUMNS
 
 
+def norm1000_box_to_pixel(
+    box: list[float] | tuple[float, float, float, float],
+    image_width: float,
+    image_height: float,
+) -> list[float]:
+    if len(box) != 4 or image_width <= 0 or image_height <= 0:
+        raise ValueError("norm1000 box conversion requires four coordinates and positive image size")
+    x1, y1, x2, y2 = (float(value) for value in box)
+    return [
+        x1 * image_width / 1000.0,
+        y1 * image_height / 1000.0,
+        x2 * image_width / 1000.0,
+        y2 * image_height / 1000.0,
+    ]
+
+
+def coarse_boxes_px_from_sidecar(record: dict[str, Any]) -> list[list[float]]:
+    """Return coarse boxes in pixel space, rejecting ambiguous legacy records."""
+    normalized = record.get("coarse_boxes_norm1000")
+    pixel = record.get("coarse_boxes_px")
+    if not normalized and not pixel:
+        if record.get("coarse_boxes"):
+            raise RuntimeError(
+                "legacy coarse_boxes are ambiguous; migrate them with "
+                "scripts/recompute_ui5_coarse_sidecars.py first"
+            )
+        return []
+    if record.get("coordinate_space") != "norm1000":
+        raise RuntimeError("coarse boxes require coordinate_space='norm1000'")
+    if not isinstance(normalized, list) or not isinstance(pixel, list):
+        raise RuntimeError(
+            "coarse boxes require both coarse_boxes_norm1000 and "
+            "coarse_boxes_px lists"
+        )
+    size = record.get("image_size") or {}
+    width = record.get("image_width", size.get("width") if isinstance(size, dict) else None)
+    height = record.get("image_height", size.get("height") if isinstance(size, dict) else None)
+    if not isinstance(width, (int, float)) or not isinstance(height, (int, float)):
+        raise RuntimeError("coarse boxes require image_width/image_height")
+    expected = [norm1000_box_to_pixel(box, float(width), float(height)) for box in normalized]
+    if len(expected) != len(pixel):
+        raise RuntimeError("coarse norm1000/pixel box counts differ")
+    for left, right in zip(expected, pixel):
+        if len(right) != 4 or any(abs(a - float(b)) > 1.0e-4 for a, b in zip(left, right)):
+            raise RuntimeError("coarse_boxes_px does not match norm1000 conversion")
+    return [[float(value) for value in box] for box in pixel]
+
+
 def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
@@ -117,6 +165,10 @@ def ui_model_signature(checkpoint: Path) -> str:
         "relation_slot_gate_loss_weight": config.get(
             "relation_slot_gate_loss_weight"
         ),
+        "relation_slot_objectness_loss_weight": config.get(
+            "relation_slot_objectness_loss_weight",
+            config.get("relation_slot_gate_loss_weight"),
+        ),
         "tc_msed_stage": config.get("tc_msed_stage", "v4"),
         "relation_task_scale_router": config.get("relation_task_scale_router", False),
         "relation_set_localizer": config.get("relation_set_localizer", False),
@@ -124,6 +176,11 @@ def ui_model_signature(checkpoint: Path) -> str:
         "relation_coordinate_bridge": config.get("relation_coordinate_bridge", False),
         "relation_soft_gate": config.get("relation_soft_gate", False),
         "relation_overlap_adapter": config.get("relation_overlap_adapter", False),
+        "relation_task_hard_router": config.get("relation_task_hard_router", False),
+        "relation_task_experts": config.get("relation_task_experts", False),
+        "relation_task_expert_rank": config.get("relation_task_expert_rank", 8),
+        "relation_set_decoder": config.get("relation_set_decoder", False),
+        "relation_set_decoder_layers": config.get("relation_set_decoder_layers", 3),
         "relation_box_l1_loss_weight": config.get("relation_box_l1_loss_weight", 0.0),
         "relation_box_giou_loss_weight": config.get("relation_box_giou_loss_weight", 0.0),
         "relation_coverage_loss_weight": config.get("relation_coverage_loss_weight", 0.0),
@@ -233,6 +290,8 @@ def collect_gate_metrics(
         gt_box_sum = pred_box_sum = 0
         count_absolute_error = 0.0
         coarse_iou_values: list[float] = []
+        selected_iou_values: list[float] = []
+        route_match_values: list[float] = []
         duplicate_slot_values: list[float] = []
         labels = ground_truth.get(task, {})
         task_boxes = ground_truth_boxes.get(task, {})
@@ -281,12 +340,19 @@ def collect_gate_metrics(
             gt_box_sum += len(gt_boxes)
             pred_box_sum += predicted_count
             count_absolute_error += abs(predicted_count - len(gt_boxes))
-            raw_coarse = record.get("coarse_boxes") or []
-            if raw_coarse and isinstance(raw_coarse[0], list) and raw_coarse[0] and isinstance(raw_coarse[0][0], list):
-                raw_coarse = raw_coarse[0]
+            raw_coarse = coarse_boxes_px_from_sidecar(record)
             coarse = [parsed for value in raw_coarse if (parsed := xyxy(value)) is not None]
+            selected_indices = [
+                int(value) for value in (record.get("selected_slot_indices") or [])
+                if isinstance(value, (int, float)) and 0 <= int(value) < len(coarse)
+            ]
+            selected = [coarse[index] for index in dict.fromkeys(selected_indices)]
             for target in gt_boxes:
-                coarse_iou_values.append(max((iou(target, candidate) for candidate in coarse), default=0.0))
+                oracle_iou = max((iou(target, candidate) for candidate in coarse), default=0.0)
+                selected_iou = max((iou(target, candidate) for candidate in selected), default=0.0)
+                coarse_iou_values.append(oracle_iou)
+                selected_iou_values.append(selected_iou)
+                route_match_values.append(float(selected_iou + 1.0e-9 >= oracle_iou))
             duplicate = record.get("duplicate_slot_rate")
             if isinstance(duplicate, (int, float)):
                 duplicate_slot_values.append(float(duplicate))
@@ -338,9 +404,30 @@ def collect_gate_metrics(
                 sum(value >= 0.5 for value in coarse_iou_values) / len(coarse_iou_values)
                 if coarse_iou_values else None
             ),
+            "selected_slot_iou": (
+                sum(selected_iou_values) / len(selected_iou_values)
+                if selected_iou_values else None
+            ),
+            "oracle_8slot_iou": (
+                sum(coarse_iou_values) / len(coarse_iou_values)
+                if coarse_iou_values else None
+            ),
+            "route_top1_match_accuracy": (
+                sum(route_match_values) / len(route_match_values)
+                if route_match_values else None
+            ),
             "duplicate_slot_rate": (
                 sum(duplicate_slot_values) / len(duplicate_slot_values)
                 if duplicate_slot_values else None
+            ),
+            "pbd_enabled": (
+                bool(records[0].get("pbd_enabled")) if records else None
+            ),
+            "coordinate_bridge_enabled": (
+                bool(records[0].get("coordinate_bridge_enabled")) if records else None
+            ),
+            "slot_routing_enabled": (
+                bool(records[0].get("slot_routing_enabled")) if records else None
             ),
         }
     return result
@@ -611,6 +698,14 @@ def append_excel_evaluation(
         metrics=metrics,
         gate_metrics=gate_metrics,
         raw_metrics=raw_metrics,
+        metadata={
+            "git_commit": os.environ.get("GIT_COMMIT", ""),
+            "run_name": os.environ.get("RUN_NAME", ""),
+            "tc_msed_stage": json.loads(
+                (args.checkpoint / "config.json").read_text(encoding="utf-8")
+            ).get("tc_msed_stage", "v4") if (args.checkpoint / "config.json").is_file() else "",
+            "config_hash": os.environ.get("UI5_CONFIG_HASH", ""),
+        },
     )
     UI5ExcelLogger(diagnostics_path).append_eval(args.step, rows)
     return diagnostics_path
