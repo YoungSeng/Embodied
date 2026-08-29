@@ -95,12 +95,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--scan-name", default="horizontal_scan_v5_raw_detector_edge_aligned"
     )
     parser.add_argument(
-        "--cache-scope", choices=("auto", "preview", "full_test"), default="auto"
+        "--cache-scope", choices=("auto", "preview", "validation", "full_test"), default="auto"
     )
     parser.add_argument(
         "--expected-full-test-unique-images",
         type=int,
         default=DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
+    )
+    parser.add_argument(
+        "--expected-unique-images",
+        type=int,
+        default=None,
+        help="Explicit expected count for validation/full-test caches.",
     )
     parser.add_argument("--scan-max-crops", type=int, default=10)
     parser.add_argument("--scan-target-height", type=int, default=960)
@@ -849,20 +855,21 @@ def _resolve_cache_scope(
     inferred = "preview" if max_images_per_task > 0 else "full_test"
     requested = str(getattr(args, "cache_scope", "auto"))
     cache_scope = inferred if requested == "auto" else requested
-    if cache_scope != inferred:
+    if cache_scope != inferred and not (
+        cache_scope == "validation" and inferred == "full_test"
+    ):
         raise RuntimeError(
             f"cache scope contradicts prepared manifest: requested={cache_scope}, "
             f"max_images_per_task={max_images_per_task}"
         )
-    expected = (
-        unique_count
-        if cache_scope == "preview"
-        else int(
-            getattr(
-                args,
-                "expected_full_test_unique_images",
-                DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
-            )
+    explicit_expected = getattr(args, "expected_unique_images", None)
+    expected = unique_count if cache_scope == "preview" else int(
+        explicit_expected
+        if explicit_expected is not None
+        else getattr(
+            args,
+            "expected_full_test_unique_images",
+            DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
         )
     )
     if unique_count != expected:

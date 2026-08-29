@@ -54,6 +54,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Smoke evaluation limit per UI5 task; omitted/0 keeps the full set",
     )
+    parser.add_argument("--eval-input-dir", default=None)
+    parser.add_argument(
+        "--eval-data-split", choices=("validation", "test"), default="validation"
+    )
+    parser.add_argument("--frozen-gate-thresholds", default=None)
     parser.add_argument(
         "--eval-inference-crop-mode",
         choices=("full_image", "lossless_tiling", "detector_scan"),
@@ -69,8 +74,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--require-cache-scope",
-        choices=("preview", "full_test"),
-        default="full_test",
+        choices=("preview", "validation", "full_test"),
+        default="validation",
     )
     parser.add_argument(
         "--require-strict-nonoverlap",
@@ -158,10 +163,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--crop-audit-dir", default=None)
     parser.add_argument(
         "--crop-train-mode",
-        choices=("full_only", "full_plus_crop"),
+        choices=("full_only", "full_plus_crop", "crop_only"),
         default=None,
     )
     parser.add_argument("--crop-meta-path", default=None)
+    parser.add_argument(
+        "--ui-sampling-mode",
+        choices=("fixed_ratio", "task_balanced_all_records"),
+        default=None,
+    )
     runtime_deps_group = parser.add_mutually_exclusive_group()
     runtime_deps_group.add_argument(
         "--install-system-runtime-deps",
@@ -236,6 +246,13 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "ENABLE_EVAL": "1" if args.enable_eval else "0",
         "EVAL_AT_START": "1" if args.eval_at_start else "0",
         "EVAL_FAIL_POLICY": args.eval_fail_policy,
+        "EVAL_DATA_SPLIT": getattr(
+            args,
+            "eval_data_split",
+            "test"
+            if getattr(args, "require_cache_scope", "validation") == "full_test"
+            else "validation",
+        ),
         "EVAL_INFERENCE_CROP_MODE": getattr(
             args, "eval_inference_crop_mode", "detector_scan"
         ),
@@ -253,7 +270,7 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
             )
         ),
         "EVAL_REQUIRE_CACHE_SCOPE": str(
-            getattr(args, "require_cache_scope", "full_test")
+            getattr(args, "require_cache_scope", "validation")
         ),
         "EVAL_REQUIRE_STRICT_NONOVERLAP": (
             "1" if getattr(args, "require_strict_nonoverlap", True) else "0"
@@ -314,6 +331,8 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         ),
         "UI5_USE_DETECTION_CROPS": "1" if use_detection_crops else "0",
         "UI5_CROP_TRAIN_MODE": crop_train_mode,
+        "UI5_UI_SAMPLING_MODE": getattr(args, "ui_sampling_mode", None)
+        or ("task_balanced_all_records" if crop_train_mode == "crop_only" else "fixed_ratio"),
     }
     optional = {
         "MAX_NUM_TOKENS": args.max_num_tokens,
@@ -330,6 +349,8 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "UI5_CROP_AUDIT_DIR": getattr(args, "crop_audit_dir", None),
         "UI5_CROP_META_PATH": getattr(args, "crop_meta_path", None),
         "EVAL_PARSER_ROOT": getattr(args, "eval_parser_root", None),
+        "EVAL_INPUT_DIR": getattr(args, "eval_input_dir", None),
+        "EVAL_FROZEN_GATE_THRESHOLDS": getattr(args, "frozen_gate_thresholds", None),
         "EVAL_DETECTOR_CACHE": getattr(args, "eval_detector_cache", None),
         "EVAL_TEXT_PYTHON": getattr(args, "eval_text_python", None),
         "EVAL_ICON_PYTHON": getattr(args, "eval_icon_python", None),
@@ -431,7 +452,10 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "EVAL_INTERVAL_STEPS",
         "EVAL_MAX_IMAGES_PER_TASK",
         "EVAL_FAIL_POLICY",
+        "EVAL_DATA_SPLIT",
+        "EVAL_FROZEN_GATE_THRESHOLDS",
         "EVAL_INFERENCE_CROP_MODE",
+        "EVAL_INPUT_DIR",
         "EVAL_PARSER_ROOT",
         "EVAL_DETECTOR_CACHE",
         "EVAL_DETECTOR_CACHE_MODE",
@@ -464,6 +488,7 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "UI5_CROP_AUDIT_DIR",
         "UI5_CROP_TRAIN_MODE",
         "UI5_CROP_META_PATH",
+        "UI5_UI_SAMPLING_MODE",
         "RUN_NAME",
         "PIPELINE_MODE",
     )
@@ -557,7 +582,10 @@ def main() -> int:
         "EVAL_AT_START",
         "EVAL_INTERVAL_STEPS",
         "EVAL_MAX_IMAGES_PER_TASK",
+        "EVAL_DATA_SPLIT",
+        "EVAL_FROZEN_GATE_THRESHOLDS",
         "EVAL_INFERENCE_CROP_MODE",
+        "EVAL_INPUT_DIR",
         "EVAL_PARSER_ROOT",
         "EVAL_DETECTOR_CACHE",
         "EVAL_DETECTOR_CACHE_MODE",
@@ -588,6 +616,7 @@ def main() -> int:
         "UI5_CROP_AUDIT_DIR",
         "UI5_CROP_TRAIN_MODE",
         "UI5_CROP_META_PATH",
+        "UI5_UI_SAMPLING_MODE",
         "META_PATH",
     ):
         print(f"{key:28s}: {runtime[key]}")

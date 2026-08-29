@@ -56,8 +56,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--require-cache-scope",
-        choices=("preview", "full_test"),
-        default="full_test",
+        choices=("preview", "validation", "full_test"),
+        default="validation",
     )
     parser.add_argument(
         "--require-strict-nonoverlap",
@@ -96,6 +96,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--relation-gate-mode", choices=("observe", "hard"), default="observe"
     )
+    parser.add_argument(
+        "--evaluation-split", choices=("validation", "test"), default="validation"
+    )
+    parser.add_argument("--frozen-gate-thresholds", type=Path, default=None)
     parser.add_argument("--relation-gate-threshold", type=float, default=None)
     parser.add_argument("--skip-patch", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -138,6 +142,7 @@ def record_history(
     status: str,
     prediction_dir: Path,
     evaluation_run_dir: Path | None,
+    gated_metrics_json: Path | None,
     error: str,
 ) -> None:
     command = [
@@ -158,6 +163,8 @@ def record_history(
         "per_rank_packed_batch",
         "--relation-gate-mode",
         args.relation_gate_mode,
+        "--evaluation-split",
+        args.evaluation_split,
         "--checkpoint",
         str(args.checkpoint),
         "--start-time",
@@ -177,8 +184,14 @@ def record_history(
     ]
     if metrics_json is not None and metrics_json.is_file():
         command.extend(["--metrics-json", str(metrics_json)])
+    if gated_metrics_json is not None and gated_metrics_json.is_file():
+        command.extend(["--gated-metrics-json", str(gated_metrics_json)])
     if evaluation_run_dir is not None:
         command.extend(["--evaluation-run-dir", str(evaluation_run_dir)])
+    if args.frozen_gate_thresholds is not None:
+        command.extend(
+            ["--frozen-gate-thresholds", str(args.frozen_gate_thresholds)]
+        )
     run_checked(command, cwd=args.project_root, stage="history")
 
 
@@ -198,6 +211,12 @@ def main() -> int:
         args.scan_target_guard_max_pixels,
     ) != (0.0, 0, 0):
         raise ValueError("raw detector-edge evaluation requires target guard 0/0/0")
+    expected_scope = "validation" if args.evaluation_split == "validation" else "full_test"
+    if args.require_cache_scope != expected_scope:
+        raise ValueError(
+            "evaluation split/cache scope mismatch: "
+            f"split={args.evaluation_split}, scope={args.require_cache_scope}"
+        )
     if min(
         args.scan_vertical_link_ratio,
         args.scan_context_ratio,
@@ -247,6 +266,7 @@ def main() -> int:
     current_stage = "preflight"
     current_command: list[str] = []
     metrics_json: Path | None = None
+    gated_metrics_json: Path | None = None
 
     metadata: dict[str, Any] = {
         "schema_version": 1,
@@ -256,6 +276,11 @@ def main() -> int:
         "max_num_tokens": args.max_num_tokens,
         "max_num_tokens_scope": "per_rank_packed_batch",
         "relation_gate_mode": args.relation_gate_mode,
+        "evaluation_split": args.evaluation_split,
+        "frozen_gate_thresholds": (
+            str(args.frozen_gate_thresholds)
+            if args.frozen_gate_thresholds is not None else None
+        ),
         "inference_crop_mode": args.inference_crop_mode,
         "gt_repair_used_for_inference": False,
         "detector_crop_cache": (
@@ -329,7 +354,7 @@ def main() -> int:
                     "--seam-candidates", "safe-raw-detector-edges-only",
                     "--strict-vertical-partition",
                     "--cache-scope", args.require_cache_scope,
-                    "--expected-full-test-unique-images",
+                    "--expected-unique-images",
                     str(args.eval_expected_unique_images),
                     "--visualization-samples", str(args.scan_visualization_samples),
                     "--resume",
@@ -530,6 +555,53 @@ def main() -> int:
             raise FileNotFoundError(
                 f"Scorer succeeded but metric JSON was not generated: {metrics_json}"
             )
+        if args.inference_crop_mode == "detector_scan":
+            current_stage = "tile_diagnostics"
+            current_command = [
+                sys.executable,
+                str(args.project_root / "scripts" / "analyze_ui5_tiled_evaluation.py"),
+                "--prediction-dir",
+                str(prediction_dir),
+                "--gt-dir",
+                str(args.input_dir),
+                "--scorer-root",
+                str(args.scorer_root),
+                "--output-dir",
+                str(evaluation_run_dir / "tile_diagnostics"),
+            ]
+            run_checked(current_command, cwd=args.project_root, stage=current_stage)
+        if args.evaluation_split == "validation" or args.frozen_gate_thresholds is not None:
+            current_stage = "frozen_gate_rescore"
+            frozen_gate_dir = evaluation_run_dir / "frozen_gate"
+            current_command = [
+                sys.executable,
+                str(args.project_root / "scripts" / "score_ui5_frozen_gate.py"),
+                "--prediction-dir",
+                str(prediction_dir),
+                "--gt-dir",
+                str(args.input_dir),
+                "--scorer-root",
+                str(args.scorer_root),
+                "--output-dir",
+                str(frozen_gate_dir),
+                "--evaluation-split",
+                args.evaluation_split,
+            ]
+            if args.frozen_gate_thresholds is not None:
+                current_command.extend(
+                    ["--frozen-gate-thresholds", str(args.frozen_gate_thresholds)]
+                )
+            run_checked(current_command, cwd=args.project_root, stage=current_stage)
+            gated_metrics_json = (
+                frozen_gate_dir
+                / "score"
+                / "frozen-gated"
+                / "all_tasks_evaluation.json"
+            )
+            if not gated_metrics_json.is_file():
+                raise FileNotFoundError(
+                    f"frozen Gate scorer did not write metrics: {gated_metrics_json}"
+                )
         end_time = utc_now()
         current_stage = "history"
         record_history(
@@ -541,6 +613,7 @@ def main() -> int:
             status="success",
             prediction_dir=prediction_dir,
             evaluation_run_dir=evaluation_run_dir,
+            gated_metrics_json=gated_metrics_json,
             error="",
         )
         metadata.update(
@@ -577,6 +650,7 @@ def main() -> int:
                 status="failed",
                 prediction_dir=prediction_dir,
                 evaluation_run_dir=evaluation_run_dir,
+                gated_metrics_json=gated_metrics_json,
                 error=f"stage={current_stage}; exit_code={exit_code}; {error_text}",
             )
         except Exception as history_exc:

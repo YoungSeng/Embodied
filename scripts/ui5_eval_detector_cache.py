@@ -102,9 +102,9 @@ def validate_eval_detector_cache(
     """Fail closed unless every dataset/detector/geometry digest still matches."""
 
     cache_dir = cache_dir.expanduser().resolve(strict=False)
-    if required_cache_scope == "full_test" and int(expected_unique_images) <= 0:
+    if required_cache_scope in {"validation", "full_test"} and int(expected_unique_images) <= 0:
         raise ValueError(
-            "full_test cache validation requires an explicit positive expected_unique_images"
+            f"{required_cache_scope} cache validation requires an explicit positive expected_unique_images"
         )
     ready_path = marker_path(cache_dir, scan_name)
     if not ready_path.is_file():
@@ -134,7 +134,7 @@ def validate_eval_detector_cache(
             "schema-v5 marker must declare detector_bbox_unique_containment=true"
         )
     cache_scope = str(marker.get("cache_scope", ""))
-    if cache_scope not in {"preview", "full_test"}:
+    if cache_scope not in {"preview", "validation", "full_test"}:
         raise RuntimeError("detector cache marker has no valid cache_scope")
     if required_cache_scope and cache_scope != required_cache_scope:
         raise RuntimeError(
@@ -143,8 +143,8 @@ def validate_eval_detector_cache(
     max_images_per_task = int(marker.get("max_images_per_task", -1))
     if cache_scope == "preview" and max_images_per_task <= 0:
         raise RuntimeError("preview detector cache must have max_images_per_task > 0")
-    if cache_scope == "full_test" and max_images_per_task != 0:
-        raise RuntimeError("full_test detector cache requires max_images_per_task=0")
+    if cache_scope in {"validation", "full_test"} and max_images_per_task != 0:
+        raise RuntimeError(f"{cache_scope} detector cache requires max_images_per_task=0")
 
     dataset = marker.get("dataset") or {}
     unique_count = int(dataset.get("content_unique_images", -1))

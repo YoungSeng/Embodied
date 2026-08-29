@@ -19,16 +19,51 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import collect_ui5_metrics
 import check_locany_environment
+import check_ui5_train_eval_content_overlap
+import check_ui5_validation_early_stop
 import locany_ui5_checkpoint
 import locany_ui5_common
 import patch_locany_checkpoint
 import preflight_locany_runtime
+import prepare_ui5_validation_eval_input
 import run_locany_ui5_local_debug
+import score_ui5_frozen_gate
 import submit_locany_ui5
+from eaglevl.train.ui5_excel_logger import build_eval_rows
 from eaglevl.train.ui5_checkpoint_utils import atomic_save_with_fsync
 
 
 class RuntimeConfigTests(unittest.TestCase):
+    def test_content_leak_gate_rejects_validation_test_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            validation = root / "validation"
+            test = root / "test"
+            validation.mkdir()
+            test.mkdir()
+            for task in locany_ui5_common.TASKS:
+                (validation / f"ui_{task}_val.jsonl").write_text("{}\n", encoding="utf-8")
+                (test / locany_ui5_common.TASK_JSONL[task]).write_text("{}\n", encoding="utf-8")
+            train = root / "unique_images.jsonl"
+            train.write_text(json.dumps({"content_id": "train-only"}) + "\n", encoding="utf-8")
+            output = root / "overlap.json"
+            args = Namespace(
+                train_unique_manifest=train,
+                validation_data_dir=validation,
+                test_data_dir=test,
+                output=output,
+            )
+            with mock.patch.object(
+                check_ui5_train_eval_content_overlap,
+                "_content_ids",
+                side_effect=[({"eval-shared"}, 5), ({"eval-shared"}, 5)],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "validation-test=1"):
+                    check_ui5_train_eval_content_overlap.build(args)
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertFalse(report["passes"])
+            self.assertEqual(report["validation_test_content_overlap_count"], 1)
+
     def test_local_debug_starts_same_pipeline_without_evaluation(self) -> None:
         args = run_locany_ui5_local_debug.parse_args(
             [
@@ -660,6 +695,40 @@ class CheckpointTests(unittest.TestCase):
 
 
 class HistoryTests(unittest.TestCase):
+    def test_validation_early_stop_requires_two_points_without_either_macro_improving(self):
+        rows = [
+            {
+                "step": 1000,
+                "evaluation_status": "success",
+                "evaluation_split": "validation",
+                "image_macro_f1": 0.40,
+                "bbox_macro_f1": 0.30,
+            },
+            {
+                "step": 2000,
+                "evaluation_status": "success",
+                "evaluation_split": "validation",
+                "image_macro_f1": 0.39,
+                "bbox_macro_f1": 0.29,
+            },
+            {
+                "step": 3000,
+                "evaluation_status": "success",
+                "evaluation_split": "validation",
+                "image_macro_f1": 0.38,
+                "bbox_macro_f1": 0.28,
+            },
+        ]
+        result = check_ui5_validation_early_stop.evaluate(
+            rows, patience=2, min_delta=0.0
+        )
+        self.assertTrue(result["should_stop"])
+        rows[-1]["bbox_macro_f1"] = 0.31
+        result = check_ui5_validation_early_stop.evaluate(
+            rows, patience=2, min_delta=0.0
+        )
+        self.assertFalse(result["should_stop"])
+
     def test_collect_metrics_direct_script_uses_checkout_eaglevl(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             completed = subprocess.run(
@@ -776,6 +845,99 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(raw["fp"], 1)
         self.assertGreaterEqual(selected["f1"], raw["f1"])
         self.assertEqual(len(sweep["tasks"]["occlusion"]["sweep"]), 61)
+
+    def test_frozen_gate_publishes_filtered_prediction_tree_without_mutating_raw(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            predictions = root / "raw"
+            gated = root / "gated"
+            for index, task in enumerate(locany_ui5_common.TASKS):
+                task_dir = predictions / task
+                gate_dir = task_dir / "gate"
+                gate_dir.mkdir(parents=True)
+                payload = [{"bbox_2d": [1, 2, 3, 4], "label": "x"}]
+                (task_dir / "sample.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                (gate_dir / "sample.json").write_text(
+                    json.dumps({"p_defect": 0.2 + 0.1 * index}), encoding="utf-8"
+                )
+            thresholds = {task: 0.5 for task in locany_ui5_common.TASKS}
+            counts = score_ui5_frozen_gate._publish_gated_predictions(
+                predictions, gated, thresholds
+            )
+            self.assertEqual(
+                json.loads((predictions / "occlusion" / "sample.json").read_text()),
+                [{"bbox_2d": [1, 2, 3, 4], "label": "x"}],
+            )
+            self.assertEqual(
+                json.loads((gated / "occlusion" / "sample.json").read_text()), []
+            )
+            self.assertEqual(counts["content_missing"]["kept_by_frozen_gate"], 1)
+
+    def test_bbox_gated_metrics_are_taken_from_genuine_rescore(self) -> None:
+        metrics = {
+            "tasks": {
+                task: {
+                    "image": {"precision": 0.4, "recall": 0.5, "f1": 0.44, "tp": 4, "fp": 6, "fn": 4, "tn": 2},
+                    "bbox": {"precision": 0.3, "recall": 0.6, "f1": 0.4, "tp": 3, "fp": 7, "fn": 2},
+                }
+                for task in locany_ui5_common.TASKS
+            },
+            "macro": {
+                "image": {"precision": 0.4, "recall": 0.5, "f1": 0.44},
+                "bbox": {"precision": 0.3, "recall": 0.6, "f1": 0.4},
+            },
+        }
+        gates = {
+            task: {
+                "selected_gate_threshold": 0.5,
+                "gated_precision": 0.9,
+                "gated_recall": 0.8,
+                "gated_f1": 0.85,
+                "gated_predicted_positive": 9,
+                "gated_metrics_by_granularity": {
+                    "image": {"precision": 0.7, "recall": 0.5, "f1": 0.58, "tp": 4, "fp": 2},
+                    "bbox": {"precision": 0.25, "recall": 0.4, "f1": 0.31, "tp": 2, "fp": 6},
+                },
+            }
+            for task in locany_ui5_common.TASKS
+        }
+        rows = build_eval_rows(step=1000, checkpoint="ckpt", metrics=metrics, gate_metrics=gates)
+        bbox = next(
+            row
+            for row in rows
+            if row["task"] == "element_overlap" and row["granularity"] == "bbox"
+        )
+        image = next(
+            row
+            for row in rows
+            if row["task"] == "element_overlap" and row["granularity"] == "image"
+        )
+        self.assertEqual(bbox["gated_f1"], 0.31)
+        self.assertEqual(image["gated_f1"], 0.58)
+        self.assertNotEqual(bbox["gated_f1"], image["gated_f1"])
+
+    def test_validation_staging_reports_content_unique_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            output = root / "staged"
+            source.mkdir()
+            image = root / "same.png"
+            image.write_bytes(b"same-image-content")
+            for task in locany_ui5_common.TASKS:
+                (source / f"ui_{task}_val.jsonl").write_text(
+                    json.dumps({"images": [str(image)]}) + "\n", encoding="utf-8"
+                )
+            summary = prepare_ui5_validation_eval_input.build(
+                Namespace(source_dir=source, output_dir=output)
+            )
+            self.assertEqual(summary["total_records"], 5)
+            self.assertEqual(summary["content_unique_images"], 1)
+            self.assertEqual(summary["expected_unique_images"], 1)
+            for filename in locany_ui5_common.TASK_JSONL.values():
+                self.assertTrue((output / filename).is_file())
 
     def test_legacy_markdown_report_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

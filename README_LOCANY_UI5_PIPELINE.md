@@ -2,6 +2,30 @@
 
 本分支同时保证 UI5 v4 的 Detail Pyramid、Relation Query、Defectness Gate、PBD 与训练/推理基础设施使用同一条可诊断链路；不引入新的多任务算法，也不改变五类任务定义。
 
+## v5 crop-only 数据与评测口径
+
+当前正式数据模式为 `UI5_CROP_TRAIN_MODE=crop_only`，采样模式为
+`UI5_UI_SAMPLING_MODE=task_balanced_all_records`。四个局部任务先使用测试侧同款 schema-v5
+raw detector edge 生成 full-width 严格分区，再在训练侧仅删除穿过 GT 的 seam；因此 repair
+后的结果仍无 overlap/gap。GT 只决定训练 crop 边界和局部标签，不会被绘制或传给模型。
+`ui_content_missing` 继续使用原图 global view。所有纯负 strips 均保留，正样本原图中的无 GT
+strips 也作为 negative record；partial strip 不会作为负样本。
+
+`task_balanced_all_records` 为五个任务建立独立确定性 stream。较小 stream 只有在完整遍历后
+才重复，较大 stream 不被下采样；自然正负分布不改写，manual repair fail-closed 保留。
+训练启动及每 1000 step 写 `diagnostics/sampling_coverage_step_<N>.json`，其中合法但未进入
+active pool 的记录数必须为 0。
+
+评测拆成两个不可混用的集合：训练期间只使用 held-out validation cache，根据 raw Image/BBox
+macro 选择 checkpoint，并仅在 validation 上冻结每任务 Gate 阈值；正式 1,555 张 test 只在
+checkpoint 选定后运行一次。两者都使用 GT-free、strict non-overlap、raw-detector-edge-aligned
+只读 cache，训练任务不会启动 PaddleOCR/icon worker。冻结 Gate 后会生成独立预测目录并重新
+调用五任务 scorer，所以 gated BBox 指标不是 Image Gate 指标的复制。
+
+从旧任务归档、生成 crop-only recipe、建立 validation cache、20+5 step resume smoke、正式
+5000-step 训练和一次性 test 的完整无省略命令见 `README_UI5_COMMANDS.md` 的
+“v5 crop-only F1 修复”章节。
+
 统一入口为：
 
 ```bash

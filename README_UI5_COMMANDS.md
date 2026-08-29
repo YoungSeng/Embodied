@@ -1,5 +1,315 @@
 # LocateAnything UI5 常用命令
 
+## v5 crop-only F1 修复：从归档到一次性正式 test
+
+这一轮只改训练数据形态和采样，不改模型、optimizer、BF16、Relation/PBD 或 prompt。四个局部
+任务使用与测试 schema-v5 相同的 full-width raw-detector-edge 基础 strips；训练 GT 只能删除
+穿过 GT 的 seam，从而合并相邻 strips。`ui_content_missing` 继续直接引用原图。所有合法正、
+负 strips 都进入 recipe；`task_balanced_all_records` 在任一任务开始重复前遍历该任务全部唯一
+记录，不再固定抽成 88,020 条，也不再强制 1:2 正负比。
+
+### 0. 安全停止并归档旧的 full+crop 任务
+
+先在调度器页面确认精确 job/trial ID。若状态仍是 RUNNING，使用调度器页面对该 ID 执行停止；
+不要在机器上执行 `pkill -f`。若正在写 checkpoint，等 `checkpoint_complete.json` 出现并且
+`checkpoint_save_trace.jsonl` 对本次保存没有未闭合阶段后再停止。以下命令不会停止、移动、
+删除或覆盖任何文件；它只在旧 run 根目录原子写入一份归档 JSON：
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+
+PROJECT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+LA_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python
+OLD_RUN=${PROJECT}/work_dirs/locany-ui5-v4-gtcrop-a800x4
+OLD_AUDIT=${PROJECT}/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
+OLD_META=${OLD_AUDIT}/training_recipes/ui_defect_5class_train_full_plus_crop.json
+
+read -r -p '请输入调度器中显示的精确旧任务 ID: ' OLD_JOB_ID
+read -r -p '请输入调度器最终状态（STOPPED/CANCELLED/COMPLETED/FAILED）: ' OLD_JOB_STATE
+BEST_METRICS=$(find "${OLD_RUN}/evaluation/raw" -mindepth 2 -maxdepth 2 \
+  -path '*/checkpoint-4000-*/all_tasks_evaluation.json' -type f -size +0c \
+  | sort | tail -n 1)
+
+test -n "${OLD_JOB_ID}"
+test -n "${BEST_METRICS}"
+case "${OLD_JOB_STATE}" in STOPPED|CANCELLED|COMPLETED|FAILED) ;; *) exit 2 ;; esac
+
+"${LA_PY}" scripts/archive_ui5_current_run.py \
+  --run-dir "${OLD_RUN}" \
+  --job-id "${OLD_JOB_ID}" \
+  --scheduler-state "${OLD_JOB_STATE}" \
+  --meta-path "${OLD_META}" \
+  --crop-audit-dir "${OLD_AUDIT}" \
+  --best-metrics-json "${BEST_METRICS}" \
+  --best-step 4000 \
+  --expected-ranks 4
+```
+
+输出为 `${OLD_RUN}/current_run_archive_summary.json`。脚本会逐个验证 checkpoint resume 完整性，
+并记录代码 SHA、最佳 raw 指标、实际 META_PATH、full/crop/repair 数量、正负分布、采样参数、
+Excel、预测与评测文件树摘要。旧目录保持原样。
+
+### 1. 复用 detector 结果，生成并验证 crop-only recipe
+
+该命令只读取 v4 audit 已有的 `detections/merged/detections.jsonl`，不启动 PP-OCR 或 icon
+detector。它生成 schema-v5 基础 strips、train-only seam repair、全部负 strips、数据泄漏报告、
+crop-only recipe，最后才原子刷新 `training_ready.json`：
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+
+PROJECT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+LA_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python
+AUDIT=${PROJECT}/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
+BASE_META=${PROJECT}/data/ui_defect_locany_v3/recipe/ui_defect_5class_train.json
+TRAIN_DATA=${PROJECT}/data/ui_defect_locany_v3
+TEST_DATA=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data
+
+PYTHON_BIN="${LA_PY}" bash shell/run_ui5_croponly_recipe.sh \
+  --audit-dir "${AUDIT}" \
+  --base-meta "${BASE_META}" \
+  --validation-data-dir "${TRAIN_DATA}" \
+  --test-data-dir "${TEST_DATA}" \
+  --output-name crop_only_horizontal_v5_train_repair \
+  --max-crops 10 \
+  --target-height 960 \
+  --resume
+```
+
+成功时必须打印 `active crop retention=100%`，并存在：
+
+```bash
+test -s "${AUDIT}/crop_only_horizontal_v5_train_repair/task_aware_manifest.jsonl"
+test -s "${AUDIT}/training_recipes/ui_defect_5class_train_crop_only.json"
+test -s "${AUDIT}/training_recipes/ui_defect_5class_train_crop_only.jsonl"
+test -s "${AUDIT}/training_recipes/crop_only_recipe_summary.json"
+test -s "${AUDIT}/training_ready.json"
+
+"${LA_PY}" scripts/validate_ui5_crop_training_ready.py \
+  --audit-dir "${AUDIT}" \
+  --recipe "${AUDIT}/training_recipes/ui_defect_5class_train_crop_only.json"
+```
+
+数据门禁包括：清洗后 GT materialization recall=100%、106 个 repair GT 全部映射、
+partial-negative=0、四局部任务 full-image=0、所有负 strips 保留、train/validation/test 内容
+两两重叠均为 0、异常样本只从 `ui_text_overflow` 排除。
+
+### 2. 建立独立 validation 输入与只读 detector cache
+
+训练期间禁止使用正式 test 选 checkpoint。先把五个 `ui_*_val.jsonl` 原子 staging 成 scorer
+兼容文件名，然后对 validation 内容唯一图片离线检测一次。之后 step-0/1000/... 只读该 cache：
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+
+PROJECT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+LA_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python
+TEXT_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/UI5PaddleOCR/bin/python
+TRAIN_DATA=${PROJECT}/data/ui_defect_locany_v3
+VAL_INPUT=${PROJECT}/work_dirs/ui5_validation_eval_input_v1
+VAL_CACHE=${PROJECT}/work_dirs/ui5_validation_detector_cache_horizontal_v5
+PARSER_ROOT=${PROJECT}/../ui-region-parser
+
+"${LA_PY}" scripts/prepare_ui5_validation_eval_input.py \
+  --source-dir "${TRAIN_DATA}" \
+  --output-dir "${VAL_INPUT}"
+
+VAL_UNIQUE=$("${LA_PY}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["expected_unique_images"])' \
+  "${VAL_INPUT}/validation_staging_summary.json")
+test "${VAL_UNIQUE}" -gt 0
+
+"${LA_PY}" scripts/prepare_ui5_eval_detector_crops.py \
+  --stage all \
+  --input-dir "${VAL_INPUT}" \
+  --parser-root "${PARSER_ROOT}" \
+  --output-dir "${VAL_CACHE}" \
+  --gpus 0,1,2,3 \
+  --workers-per-gpu 1 \
+  --text-python "${TEXT_PY}" \
+  --icon-python "${LA_PY}" \
+  --icon-model "${PARSER_ROOT}/weights/icon_detect_v3/model.pt" \
+  --scan-name horizontal_scan_v5_raw_detector_edge_aligned \
+  --scan-max-crops 10 \
+  --scan-target-height 960 \
+  --scan-context-pixels 0 \
+  --target-guard-ratio 0 \
+  --target-guard-min-pixels 0 \
+  --target-guard-max-pixels 0 \
+  --seam-edge-reference raw-detector-bbox \
+  --seam-candidates safe-raw-detector-edges-only \
+  --strict-vertical-partition \
+  --cache-scope validation \
+  --expected-unique-images "${VAL_UNIQUE}" \
+  --visualization-samples 60 \
+  --resume
+
+"${LA_PY}" scripts/validate_ui5_eval_detector_cache.py \
+  --cache-dir "${VAL_CACHE}" \
+  --scan-name horizontal_scan_v5_raw_detector_edge_aligned \
+  --cache-scope validation \
+  --expected-unique-images "${VAL_UNIQUE}" \
+  --require-strict-nonoverlap \
+  --require-raw-detector-edge-alignment \
+  --require-detector-unique-containment \
+  --require-ready
+```
+
+### 3. 四卡 20-step smoke，并从 checkpoint-20 恢复 5 step
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+
+PROJECT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+LA_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python
+AUDIT=${PROJECT}/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
+SMOKE_RUN=${PROJECT}/work_dirs/locany-ui5-v5-croponly-f1fix-a800x4-smoke
+
+"${LA_PY}" scripts/run_locany_ui5_local_debug.py \
+  --machine a800 \
+  --gpus 4 \
+  --cuda-devices 0,1,2,3 \
+  --max-num-tokens 12800 \
+  --max-steps 20 \
+  --save-steps 20 \
+  --use-detection-crops \
+  --crop-audit-dir "${AUDIT}" \
+  --crop-train-mode crop_only \
+  --ui-sampling-mode task_balanced_all_records \
+  --output-dir "${SMOKE_RUN}" \
+  --run-name locany-ui5-v5-croponly-f1fix-a800x4-smoke
+
+"${LA_PY}" scripts/locany_ui5_checkpoint.py validate \
+  --checkpoint "${SMOKE_RUN}/checkpoint-20" \
+  --mode resume \
+  --expected-ranks 4
+
+"${LA_PY}" scripts/run_locany_ui5_local_debug.py \
+  --machine a800 \
+  --gpus 4 \
+  --cuda-devices 0,1,2,3 \
+  --max-num-tokens 12800 \
+  --max-steps 25 \
+  --save-steps 5 \
+  --use-detection-crops \
+  --crop-audit-dir "${AUDIT}" \
+  --crop-train-mode crop_only \
+  --ui-sampling-mode task_balanced_all_records \
+  --output-dir "${SMOKE_RUN}" \
+  --run-name locany-ui5-v5-croponly-f1fix-a800x4-smoke
+
+"${LA_PY}" scripts/locany_ui5_checkpoint.py validate \
+  --checkpoint "${SMOKE_RUN}/checkpoint-25" \
+  --mode resume \
+  --expected-ranks 4
+```
+
+除 checkpoint 完整外，还要检查 `${SMOKE_RUN}/diagnostics/sampling_coverage_step_0.json`：
+`never_active_legal_records=0`、`active_crop_retention=1.0`、manual repair retention=100%，日志同时出现四类局部 crop、
+`content_missing_global`、positive 和 negative；loss、relation/PBD grad 为有限值，环境 pre/post
+指纹一致。
+
+### 4. A800 四卡正式训练：最多 5000 step，只按 validation 选模型
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+
+PROJECT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+LA_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python
+AUDIT=${PROJECT}/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
+VAL_INPUT=${PROJECT}/work_dirs/ui5_validation_eval_input_v1
+VAL_CACHE=${PROJECT}/work_dirs/ui5_validation_detector_cache_horizontal_v5
+VAL_UNIQUE=$("${LA_PY}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["expected_unique_images"])' \
+  "${VAL_INPUT}/validation_staging_summary.json")
+
+"${LA_PY}" scripts/submit_locany_ui5.py \
+  --machine a800 \
+  --resource-group aiai_locate \
+  --gpus 4 \
+  --max-num-tokens 12800 \
+  --install-system-runtime-deps \
+  --use-detection-crops \
+  --crop-audit-dir "${AUDIT}" \
+  --crop-train-mode crop_only \
+  --ui-sampling-mode task_balanced_all_records \
+  --enable-eval \
+  --eval-at-start \
+  --eval-interval-steps 1000 \
+  --eval-input-dir "${VAL_INPUT}" \
+  --eval-data-split validation \
+  --eval-inference-crop-mode detector_scan \
+  --eval-detector-cache "${VAL_CACHE}" \
+  --eval-detector-cache-mode readonly \
+  --eval-scan-name horizontal_scan_v5_raw_detector_edge_aligned \
+  --require-cache-scope validation \
+  --eval-expected-unique-images "${VAL_UNIQUE}" \
+  --max-steps 5000 \
+  --save-steps 500 \
+  --run-name locany-ui5-v5-croponly-f1fix-a800x4
+```
+
+四卡固定 `MAX_NUM_TOKENS=12800`、梯度累积 2。每 1000 step 写一次
+`sampling_coverage_step_<N>.json` 并完整 validation；连续两个 validation 点的 raw Image 与 BBox
+macro 均未改善时 pipeline 停止。Gate 主结果是 `observe` raw 指标；validation 同时生成冻结
+阈值并用独立 prediction tree 重新调用 scorer，因此 gated Image/BBox 是两套真实重评分指标。
+
+### 5. 选定 checkpoint 后，只运行一次正式 test
+
+正式 test cache 必须是现有 1,555 张内容唯一图片的 `full_test` marker。以下命令先验证 cache，
+再从所选 checkpoint 对应的 validation 结果中读取已冻结阈值。`SELECTED_STEP` 只能根据
+validation history 决定：
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+
+PROJECT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
+LA_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python
+TEST_DATA=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data
+TEST_CACHE=${PROJECT}/work_dirs/ui5_eval_detector_cache_horizontal_v5
+FORMAL_RUN=${PROJECT}/work_dirs/locany-ui5-v5-croponly-f1fix-a800x4
+
+read -r -p '输入仅根据 validation 选出的 checkpoint step: ' SELECTED_STEP
+SELECTED_CHECKPOINT=${FORMAL_RUN}/checkpoint-${SELECTED_STEP}
+FROZEN_THRESHOLDS=$(find "${FORMAL_RUN}/evaluation/raw" -mindepth 3 -maxdepth 3 \
+  -path "*/checkpoint-${SELECTED_STEP}-*/frozen_gate/frozen_gate_thresholds.json" \
+  -type f -size +0c | sort | tail -n 1)
+
+test -d "${SELECTED_CHECKPOINT}"
+test -s "${FROZEN_THRESHOLDS}"
+
+"${LA_PY}" scripts/validate_ui5_eval_detector_cache.py \
+  --cache-dir "${TEST_CACHE}" \
+  --scan-name horizontal_scan_v5_raw_detector_edge_aligned \
+  --cache-scope full_test \
+  --expected-unique-images 1555 \
+  --require-strict-nonoverlap \
+  --require-raw-detector-edge-alignment \
+  --require-detector-unique-containment \
+  --require-ready
+
+"${LA_PY}" scripts/submit_locany_ui5.py \
+  --machine a800 \
+  --resource-group aiai_locate \
+  --gpus 4 \
+  --eval-checkpoint "${SELECTED_CHECKPOINT}" \
+  --eval-step "${SELECTED_STEP}" \
+  --eval-input-dir "${TEST_DATA}" \
+  --eval-data-split test \
+  --frozen-gate-thresholds "${FROZEN_THRESHOLDS}" \
+  --eval-inference-crop-mode detector_scan \
+  --eval-detector-cache "${TEST_CACHE}" \
+  --eval-detector-cache-mode readonly \
+  --eval-scan-name horizontal_scan_v5_raw_detector_edge_aligned \
+  --require-cache-scope full_test \
+  --eval-expected-unique-images 1555 \
+  --run-name locany-ui5-v5-croponly-f1fix-a800x4-final-test
+```
+
+正式 test 不做 threshold sweep，也不选 checkpoint。报告分别保存 raw 与 validation-frozen gated
+指标；`tile_diagnostics/` 额外包含每任务 tile TP/FP/FN、负原图误报 tile 数、NMS 前后框数、
+source-image FP amplification、tile_count 分组指标、text ellipsis FP gallery 和 cropping FN
+gallery。训练/评测日志若出现 detector worker 启动、preview marker、非 1555 full-test marker、
+GT repair 或 cache digest 不匹配，会在模型 worker 启动前失败。
+
 ## 测试集水平 detector scan：先离线缓存，再只读评测
 
 四个区域任务共享同一套 GT-free 水平切图，`ui_content_missing` 单独使用完整原图。区域切图
@@ -141,12 +451,12 @@ boundary cut、balanced fallback、full-in-multi、duplicate 和 nested 均为 0
 属于全局安全 raw bbox edge 集合、到最近原始 detector edge 的距离严格为 0。非零 guard 和
 schema-v4 marker 会被拒绝；preview marker 也不能用于正式训练评测。
 
-marker 中的 `cache_scope` 明确区分 `preview` 与 `full_test`。preview 必须记录正数
+marker 中的 `cache_scope` 明确区分 `preview`、`validation` 与 `full_test`。preview 必须记录正数
 `max_images_per_task`；full-test 必须为 0，并绑定显式的 1,555 张预期内容唯一图片。五个任务
 各有 1,555 条记录并共享同一内容池，因此 task manifest 共 7,775 条、content-unique union 为
-1,555；不要把训练池的 17,281 张误用作测试集门禁。训练/周期
-评测默认要求 `full_test`，所以 20/200 张预览即使几何全部通过也会在 LocateAnything worker
-启动前 fail closed。
+1,555；不要把训练池的 17,281 张误用作测试集门禁。正式训练的周期评测要求独立
+`validation` marker；只有最终一次 test 才接受 `full_test`。20/200 张预览即使几何全部通过，
+也会在 LocateAnything worker 启动前 fail closed。
 
 全量 validator 通过后，用同一 cache 做只读评测 smoke：
 
@@ -157,6 +467,8 @@ marker 中的 `cache_scope` 明确区分 `preview` 与 `full_test`。preview 必
   --gpus 4 \
   --eval-checkpoint /path/to/checkpoint \
   --eval-step 1000 \
+  --eval-input-dir /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data \
+  --eval-data-split test \
   --eval-inference-crop-mode detector_scan \
   --eval-detector-cache "${EVAL_CACHE}" \
   --eval-detector-cache-mode readonly \
@@ -172,7 +484,10 @@ marker 中的 `cache_scope` 明确区分 `preview` 与 `full_test`。preview 必
 
 日志必须包含 `detector cache: readonly validated`，且不能出现 PaddleOCR/icon worker 启动日志。
 
-## v4.1 当前执行顺序
+## 历史 v4.1 full+crop 命令（仅复现，不用于本轮选模）
+
+下面的 v4.1 命令保留作历史复现。当前 crop-only F1 修复必须使用本文顶部的新流程，不得用
+下面的 full-test 周期评测选择 checkpoint。
 
 先完成 [README_UI5_CROP_AUDIT.md](README_UI5_CROP_AUDIT.md) 顶部的唯一一条
 `shell/run_ui5_gt_repair.sh` 命令。只有新目录
@@ -261,6 +576,8 @@ python scripts/submit_locany_ui5.py \
   --enable-eval \
   --eval-at-start \
   --eval-interval-steps 1000 \
+  --eval-input-dir /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data \
+  --eval-data-split test \
   --eval-inference-crop-mode detector_scan \
   --eval-detector-cache "${EVAL_CACHE}" \
   --eval-detector-cache-mode readonly \

@@ -507,6 +507,75 @@ class RecipeBuilderTests(unittest.TestCase):
             )
             self.assertEqual(validated_counts, (1, 1))
 
+    def test_crop_only_recipe_has_no_local_full_image_and_keeps_content_global(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self._make_fixture(root)
+            content_annotation = root / "ui_content_missing_train.jsonl"
+            content_image = root / "content.png"
+            Image.new("RGB", (100, 80), "green").save(content_image)
+            content_record = {
+                "image": str(content_image),
+                "conversations": [
+                    {"from": "human", "value": "locate content missing"},
+                    {"from": "gpt", "value": "<box>none</box>"},
+                ],
+            }
+            atomic_write_jsonl(content_annotation, [content_record])
+            base = json.loads(args.base_meta.read_text(encoding="utf-8"))
+            base["ui_content_missing"] = {
+                "annotation": [str(content_annotation)],
+                "root": "",
+            }
+            atomic_write_json(args.base_meta, base)
+            parent = args.audit_dir.parent / "manifest" / "task_samples.jsonl"
+            parent_rows = gt_repair.read_jsonl(parent)
+            parent_rows.append(
+                {
+                    "sample_id": "sample_content",
+                    "image_id": "content_image",
+                    "task": "ui_content_missing",
+                    "split": "train",
+                    "source_records": [
+                        {"source_file": str(content_annotation), "line_no": 1}
+                    ],
+                }
+            )
+            atomic_write_jsonl(parent, parent_rows)
+            manifest_rows = gt_repair.read_jsonl(args.task_aware_manifest)
+            manifest_rows.append(
+                {
+                    "sample_id": "sample_content",
+                    "image_id": "content_image",
+                    "task": "ui_content_missing",
+                    "training_records": [],
+                    "content_missing_global_view": True,
+                }
+            )
+            atomic_write_jsonl(args.task_aware_manifest, manifest_rows)
+            atomic_write_json(
+                args.task_aware_manifest.parent / "data_split_overlap.json",
+                {
+                    "train_validation_content_overlap_count": 0,
+                    "train_test_content_overlap_count": 0,
+                    "validation_test_content_overlap_count": 0,
+                },
+            )
+            args.mode = "crop_only"
+            result = recipe_builder.build(args)
+            rows = gt_repair.read_jsonl(
+                args.output_dir / "ui_defect_5class_train_crop_only.jsonl"
+            )
+            self.assertEqual(result["crop_only_local_task_full_image_records"], 0)
+            self.assertEqual(result["crop_only_content_missing_global_records"], 1)
+            self.assertEqual(sum(row["_ui5_record_kind"] == "crop" for row in rows), 2)
+            self.assertEqual(
+                sum(row["_ui5_record_kind"] == "global_view" for row in rows), 1
+            )
+            self.assertTrue(
+                json.loads((args.audit_dir / "training_ready.json").read_text())["training_ready"]
+            )
+
     def test_missing_report_fails_closed_and_leaves_no_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             args = self._make_fixture(Path(temporary), include_excel=False)
@@ -571,6 +640,42 @@ class RecipeBuilderTests(unittest.TestCase):
 
 
 class CropTrainingWiringTests(unittest.TestCase):
+    def test_crop_only_defaults_to_all_record_sampling_across_local_and_submit(self) -> None:
+        audit = PROJECT_ROOT / "work_dirs" / "test_v5_croponly_audit"
+        local_args = run_locany_ui5_local_debug.parse_args(
+            [
+                "--machine", "a800", "--gpus", "4", "--max-steps", "20",
+                "--use-detection-crops", "--crop-audit-dir", str(audit),
+                "--crop-train-mode", "crop_only", "--project-root", str(PROJECT_ROOT),
+            ]
+        )
+        local_env = run_locany_ui5_local_debug.build_environment(local_args, base_env={})
+        self.assertEqual(local_env["UI5_CROP_TRAIN_MODE"], "crop_only")
+        self.assertEqual(
+            local_env["UI5_UI_SAMPLING_MODE"], "task_balanced_all_records"
+        )
+
+        submit_args = submit_locany_ui5.parse_args(
+            [
+                "--machine", "a800", "--resource-group", "aiai_locate", "--gpus", "4",
+                "--use-detection-crops", "--crop-audit-dir", "/mnt/audit/v5",
+                "--crop-train-mode", "crop_only",
+                "--eval-input-dir", "/mnt/validation",
+                "--eval-data-split", "validation",
+                "--require-cache-scope", "validation",
+                "--render-only",
+            ]
+        )
+        rendered, runtime = submit_locany_ui5.render_job(submit_args)
+        self.assertEqual(runtime["UI5_CROP_TRAIN_MODE"], "crop_only")
+        self.assertEqual(
+            runtime["UI5_UI_SAMPLING_MODE"], "task_balanced_all_records"
+        )
+        self.assertEqual(runtime["EVAL_DATA_SPLIT"], "validation")
+        self.assertEqual(runtime["EVAL_INPUT_DIR"], "/mnt/validation")
+        self.assertIn("UI5_UI_SAMPLING_MODE", rendered)
+        self.assertIn("EVAL_DATA_SPLIT", rendered)
+
     def test_local_debug_resolves_all_four_crop_parameters(self) -> None:
         audit = PROJECT_ROOT / "work_dirs" / "test_v4_audit"
         args = run_locany_ui5_local_debug.parse_args(

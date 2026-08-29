@@ -15,7 +15,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cache-dir", type=Path, required=True)
     parser.add_argument("--scan-name", required=True)
     parser.add_argument("--expected-unique-images", type=int, default=0)
-    parser.add_argument("--cache-scope", choices=("preview", "full_test"), default=None)
+    parser.add_argument(
+        "--cache-scope", choices=("preview", "validation", "full_test"), default=None
+    )
     parser.add_argument("--require-strict-nonoverlap", action="store_true")
     parser.add_argument("--require-raw-detector-edge-alignment", action="store_true")
     parser.add_argument(

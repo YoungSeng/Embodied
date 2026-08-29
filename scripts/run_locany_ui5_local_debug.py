@@ -42,10 +42,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--crop-audit-dir", type=Path, default=None)
     parser.add_argument(
         "--crop-train-mode",
-        choices=("full_only", "full_plus_crop"),
+        choices=("full_only", "full_plus_crop", "crop_only"),
         default=None,
     )
     parser.add_argument("--crop-meta-path", type=Path, default=None)
+    parser.add_argument(
+        "--ui-sampling-mode",
+        choices=("fixed_ratio", "task_balanced_all_records"),
+        default=None,
+    )
     parser.add_argument("--training-data-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--output-base", type=Path, default=None)
@@ -113,6 +118,12 @@ def build_environment(
             "UI5_USE_DETECTION_CROPS": "1" if args.use_detection_crops else "0",
             "UI5_CROP_TRAIN_MODE": args.crop_train_mode
             or ("full_plus_crop" if args.use_detection_crops else "full_only"),
+            "UI5_UI_SAMPLING_MODE": args.ui_sampling_mode
+            or (
+                "task_balanced_all_records"
+                if args.crop_train_mode == "crop_only"
+                else "fixed_ratio"
+            ),
             "UI5_CROP_AUDIT_DIR": "",
             "UI5_CROP_META_PATH": "",
         }
@@ -166,6 +177,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "UI5_CROP_AUDIT_DIR",
         "UI5_CROP_TRAIN_MODE",
         "UI5_CROP_META_PATH",
+        "UI5_UI_SAMPLING_MODE",
         "RUN_NAME",
         "OUTPUT_BASE",
     ):

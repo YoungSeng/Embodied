@@ -2750,6 +2750,11 @@ def validate_training_ready_marker(
                 str(recipe_state.get("full_plus_crop_recipe_digest", "")),
             ),
         }
+        if recipe_state.get("crop_only_meta"):
+            approved["crop_only"] = (
+                Path(str(recipe_state["crop_only_meta"])).resolve(strict=True),
+                str(recipe_state.get("crop_only_recipe_digest", "")),
+            )
         matched_modes = [
             mode for mode, (path, _) in approved.items() if path == bound_recipe
         ]
@@ -2765,12 +2770,62 @@ def validate_training_ready_marker(
         combined_jsonl = Path(
             str(recipe_state.get("full_plus_crop_jsonl", ""))
         ).resolve(strict=True)
+        crop_only_jsonl = (
+            Path(str(recipe_state["crop_only_jsonl"])).resolve(strict=True)
+            if recipe_state.get("crop_only_jsonl")
+            else None
+        )
         if marker.get("full_only_recipe_digest") != content_fingerprint(approved["full_only"][0]):
             raise RuntimeError("v4 full-only recipe digest mismatch")
         if marker.get("full_only_recipe_jsonl_digest") != content_fingerprint(full_only_jsonl):
             raise RuntimeError("v4 full-only recipe JSONL digest mismatch")
-        if marker.get("training_recipe_jsonl_digest") != content_fingerprint(combined_jsonl):
-            raise RuntimeError("v4 full+crop recipe JSONL digest mismatch")
+        selected_jsonl = {
+            "full_only": full_only_jsonl,
+            "full_plus_crop": combined_jsonl,
+            "crop_only": crop_only_jsonl,
+        }[train_mode]
+        if selected_jsonl is None:
+            raise RuntimeError("selected crop-only recipe JSONL is missing")
+        if marker.get("training_recipe_jsonl_digest") != content_fingerprint(selected_jsonl):
+            raise RuntimeError("v4 selected training recipe JSONL digest mismatch")
+        if "crop_only" in approved:
+            if marker.get("crop_only_recipe_digest") != content_fingerprint(approved["crop_only"][0]):
+                raise RuntimeError("v5 crop-only recipe digest mismatch")
+            if marker.get("crop_only_recipe_jsonl_digest") != content_fingerprint(crop_only_jsonl):
+                raise RuntimeError("v5 crop-only recipe JSONL digest mismatch")
+            if train_mode == "crop_only":
+                crop_only_gate = summary.get("crop_only_gate", {})
+                if crop_only_gate.get("required") is not True or crop_only_gate.get("passes") is not True:
+                    raise RuntimeError(
+                        "crop-only training gate did not pass: "
+                        f"{crop_only_gate.get('failed_conditions', [])}"
+                    )
+                recorded_manifest_digest = str(marker.get("crop_only_manifest_digest", ""))
+                if not recorded_manifest_digest:
+                    raise RuntimeError("crop-only marker does not bind the training manifest")
+                # Custom output names are supported: locate the bound digest
+                # inside the audit tree instead of trusting a conventional path.
+                matching_manifests = [
+                    path for path in audit_dir.glob("*/task_aware_manifest.jsonl")
+                    if content_fingerprint(path) == recorded_manifest_digest
+                ]
+                if len(matching_manifests) != 1:
+                    raise RuntimeError(
+                        "crop-only bound task manifest is missing or ambiguous"
+                    )
+                manifest_summary_path = matching_manifests[0].parent / "summary.json"
+                if not manifest_summary_path.is_file() or marker.get(
+                    "crop_only_manifest_summary_digest"
+                ) != content_fingerprint(manifest_summary_path):
+                    raise RuntimeError("crop-only manifest summary digest mismatch")
+                split_overlap_path = matching_manifests[0].parent / "data_split_overlap.json"
+                if not split_overlap_path.is_file() or marker.get(
+                    "crop_only_data_split_overlap_digest"
+                ) != content_fingerprint(split_overlap_path):
+                    raise RuntimeError("crop-only data split overlap digest mismatch")
+                split_overlap = json.loads(split_overlap_path.read_text(encoding="utf-8"))
+                if split_overlap.get("passes") is not True:
+                    raise RuntimeError("crop-only train/validation/test leakage gate failed")
         recipe_summary = Path(
             str(recipe_state.get("recipe_summary", ""))
         ).resolve(strict=True)
@@ -2790,6 +2845,34 @@ def validate_training_ready_marker(
                 "training_recipe_digest": expected_recipe_digest,
                 "full_image_records": int(recipe_payload["full_image_records"]),
                 "crop_records": int(recipe_payload["crop_records"]),
+                "crop_only_records": int(recipe_payload.get("crop_only_records", 0)),
+                "crop_only_region_records": int(
+                    recipe_payload.get("crop_only_region_records", 0)
+                ),
+                "crop_only_content_missing_global_records": int(
+                    recipe_payload.get("crop_only_content_missing_global_records", 0)
+                ),
+                "crop_only_local_task_full_image_records": int(
+                    recipe_payload.get("crop_only_local_task_full_image_records", -1)
+                ),
+                "crop_only_negative_records": sum(
+                    int(values.get("negative", 0))
+                    for values in recipe_payload.get(
+                        "crop_only_positive_negative_by_task", {}
+                    ).values()
+                ),
+                "crop_only_positive_negative_by_task": recipe_payload.get(
+                    "crop_only_positive_negative_by_task", {}
+                ),
+                "crop_only_records_by_task": recipe_payload.get(
+                    "crop_only_records_by_task", {}
+                ),
+                "active_crop_retention_policy": (
+                    "100%"
+                    if recipe_payload.get("crop_only_sampling_mode")
+                    == "task_balanced_all_records"
+                    else "legacy_fixed_ratio"
+                ),
                 "gt_repair_crop_records": int(
                     recipe_payload["gt_repair_crop_records"]
                 ),

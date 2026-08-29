@@ -447,6 +447,9 @@ def build_eval_rows(
         gate = gate_metrics.get(scorer_task, {})
         for granularity in ("image", "bbox"):
             values = task_values.get(granularity, {})
+            rescored = gate.get("gated_metrics_by_granularity", {}).get(
+                granularity, {}
+            )
             tp = values.get("tp")
             fp = values.get("fp")
             rows.append(
@@ -475,16 +478,32 @@ def build_eval_rows(
                     "p_defect_pos": gate.get("p_defect_pos"),
                     "p_defect_neg": gate.get("p_defect_neg"),
                     "parse_error": gate.get("parse_error"),
-                    "raw_precision": gate.get("raw_precision"),
-                    "raw_recall": gate.get("raw_recall"),
-                    "raw_f1": gate.get("raw_f1"),
-                    "raw_predicted_positive": gate.get("raw_predicted_positive"),
+                    "raw_precision": values.get("precision"),
+                    "raw_recall": values.get("recall"),
+                    "raw_f1": values.get("f1"),
+                    "raw_predicted_positive": (
+                        int(tp) + int(fp)
+                        if tp is not None and fp is not None
+                        else None
+                    ),
                     "selected_gate_threshold": gate.get("selected_gate_threshold"),
-                    "gated_precision": gate.get("gated_precision"),
-                    "gated_recall": gate.get("gated_recall"),
-                    "gated_f1": gate.get("gated_f1"),
-                    "gated_predicted_positive": gate.get("gated_predicted_positive"),
-                    "gate_filter_rate": gate.get("gate_filter_rate"),
+                    "gated_precision": rescored.get(
+                        "precision", gate.get("gated_precision")
+                    ),
+                    "gated_recall": rescored.get("recall", gate.get("gated_recall")),
+                    "gated_f1": rescored.get("f1", gate.get("gated_f1")),
+                    "gated_predicted_positive": (
+                        int(rescored.get("tp", 0)) + int(rescored.get("fp", 0))
+                        if rescored
+                        else gate.get("gated_predicted_positive")
+                    ),
+                    "gate_filter_rate": (
+                        1.0
+                        - (int(rescored.get("tp", 0)) + int(rescored.get("fp", 0)))
+                        / max(1, int(tp or 0) + int(fp or 0))
+                        if rescored
+                        else gate.get("gate_filter_rate")
+                    ),
                 }
             )
 

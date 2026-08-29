@@ -32,7 +32,7 @@ export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
 export GPUS="${GPU_COUNT}"
 export MODEL_PATH BASE_MODEL META_PATH OUTPUT_BASE OUTPUT_DIR RUN_NAME
-export UI5_USE_DETECTION_CROPS UI5_CROP_AUDIT_DIR UI5_CROP_TRAIN_MODE UI5_CROP_META_PATH
+export UI5_USE_DETECTION_CROPS UI5_CROP_AUDIT_DIR UI5_CROP_TRAIN_MODE UI5_CROP_META_PATH UI5_UI_SAMPLING_MODE
 export EVAL_INFERENCE_CROP_MODE EVAL_TILE_MAX_COUNT EVAL_TILE_TARGET_LONG_SIDE
 export EVAL_TILE_OVERLAP_RATIO EVAL_TILE_NMS_IOU
 export EVAL_PARSER_ROOT EVAL_DETECTOR_CACHE EVAL_TEXT_PYTHON EVAL_ICON_PYTHON
@@ -45,6 +45,7 @@ export EVAL_SCAN_TARGET_GUARD_RATIO EVAL_SCAN_TARGET_GUARD_MIN_PIXELS
 export EVAL_SCAN_TARGET_GUARD_MAX_PIXELS
 export EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO EVAL_SCAN_DENSE_BAND_RATIO
 export EVAL_SCAN_VISUALIZATION_SAMPLES
+export EVAL_DATA_SPLIT EVAL_FROZEN_GATE_THRESHOLDS
 export ATTN_IMPLEMENTATION MAX_SEQ_LENGTH MAX_NUM_TOKENS_PER_SAMPLE MAX_NUM_TOKENS
 export MAX_STEPS WARMUP_STEPS LEARNING_RATE SAVE_STEPS
 
@@ -132,6 +133,13 @@ export FREEZE_MLP="${FREEZE_MLP:-False}"
 export BALANCE_UI_DEFECTS="${BALANCE_UI_DEFECTS:-True}"
 export UI_RECORDS_PER_CLASS="${UI_RECORDS_PER_CLASS:-17604}"
 export UI_NEGATIVE_TO_POSITIVE_RATIO="${UI_NEGATIVE_TO_POSITIVE_RATIO:-2.0}"
+if [[ -z "${UI5_UI_SAMPLING_MODE:-}" ]]; then
+  if [[ "${UI5_CROP_TRAIN_MODE}" == "crop_only" ]]; then
+    export UI5_UI_SAMPLING_MODE="task_balanced_all_records"
+  else
+    export UI5_UI_SAMPLING_MODE="fixed_ratio"
+  fi
+fi
 export ENABLE_UI_RELATION="${ENABLE_UI_RELATION:-True}"
 export RELATION_DETAIL_HIDDEN_SIZE="${RELATION_DETAIL_HIDDEN_SIZE:-256}"
 export RELATION_NUM_SLOTS="${RELATION_NUM_SLOTS:-8}"
@@ -165,8 +173,10 @@ printf '%-28s: %s\n' \
   "UI5_USE_DETECTION_CROPS" "${UI5_USE_DETECTION_CROPS}" \
   "UI5_CROP_AUDIT_DIR" "${UI5_CROP_AUDIT_DIR:-<none>}" \
   "UI5_CROP_TRAIN_MODE" "${UI5_CROP_TRAIN_MODE}" \
+  "UI5_UI_SAMPLING_MODE" "${UI5_UI_SAMPLING_MODE}" \
   "UI5_CROP_META_PATH" "${UI5_CROP_META_PATH:-<none>}" \
   "EVAL_INPUT_DIR" "${EVAL_INPUT_DIR}" \
+  "EVAL_DATA_SPLIT" "${EVAL_DATA_SPLIT}" \
   "OUTPUT_DIR" "${OUTPUT_DIR}" \
   "SCORER_ROOT" "${SCORER_ROOT}" \
   "CPU_COUNT (nproc)" "$(nproc)" \
@@ -330,6 +340,7 @@ run_evaluation() {
     --project-root "${PROJECT_ROOT}"
     --relation-gate-mode "${RELATION_GATE_MODE}"
     --relation-gate-threshold "${RELATION_GATE_THRESHOLD}"
+    --evaluation-split "${EVAL_DATA_SPLIT}"
     --inference-crop-mode "${EVAL_INFERENCE_CROP_MODE}"
     --eval-parser-root "${EVAL_PARSER_ROOT}"
     --eval-detector-cache "${EVAL_DETECTOR_CACHE}"
@@ -353,6 +364,9 @@ run_evaluation() {
     --scan-dense-band-ratio "${EVAL_SCAN_DENSE_BAND_RATIO}"
     --scan-visualization-samples "${EVAL_SCAN_VISUALIZATION_SAMPLES}"
   )
+  if [[ -n "${EVAL_FROZEN_GATE_THRESHOLDS:-}" ]]; then
+    command+=(--frozen-gate-thresholds "${EVAL_FROZEN_GATE_THRESHOLDS}")
+  fi
   if [[ "${EVAL_REQUIRE_STRICT_NONOVERLAP}" == "1" ]]; then
     command+=(--require-strict-nonoverlap)
   else
@@ -620,6 +634,21 @@ while (( current_step < MAX_STEPS )); do
     "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/locany_ui5_checkpoint.py" cleanup \
       --output-dir "${OUTPUT_DIR}" --formal-interval "${SAVE_STEPS}" \
       --latest-step "${next_step}" --expected-ranks "${GPU_COUNT}"
+    if [[ "${EVAL_DATA_SPLIT}" == "validation" ]]; then
+      if "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/check_ui5_validation_early_stop.py" \
+          --history "${OUTPUT_DIR}/evaluation/evaluation_history.json" \
+          --patience 2; then
+        :
+      else
+        early_stop_code=$?
+        if (( early_stop_code == 10 )); then
+          echo "[PIPELINE EARLY STOP] two validation points improved neither raw Image nor BBox macro F1"
+          current_step="${next_step}"
+          break
+        fi
+        locany_die "${early_stop_code}" "Validation early-stop audit failed"
+      fi
+    fi
   else
     echo "[WARN] Evaluation failed under warn policy; temporary checkpoints were retained" >&2
   fi

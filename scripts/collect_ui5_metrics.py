@@ -33,6 +33,7 @@ BASE_COLUMNS = [
     "max_num_tokens",
     "max_num_tokens_scope",
     "relation_gate_mode",
+    "evaluation_split",
     "ui_model_signature",
     "checkpoint",
     "macro_precision",
@@ -349,6 +350,53 @@ def build_gate_threshold_sweep(
     return output
 
 
+def score_gate_samples(samples: list[dict[str, Any]], threshold: float) -> dict[str, Any]:
+    tp = fp = fn = tn = predicted_positive = 0
+    for sample in samples:
+        predicted = bool(sample["raw_positive"]) and (
+            threshold <= 0.0 or float(sample["p_defect"]) >= threshold
+        )
+        label = bool(sample["label"])
+        tp += int(label and predicted)
+        fp += int(not label and predicted)
+        fn += int(label and not predicted)
+        tn += int(not label and not predicted)
+        predicted_positive += int(predicted)
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    return {
+        "threshold": threshold,
+        "precision": precision,
+        "recall": recall,
+        "f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
+        "predicted_positive": predicted_positive,
+    }
+
+
+def apply_frozen_gate_thresholds(
+    gate_metrics: dict[str, dict[str, Any]], thresholds: dict[str, float]
+) -> dict[str, Any]:
+    if set(thresholds) != set(TASKS):
+        raise ValueError(
+            f"frozen gate thresholds must contain exactly five tasks: {sorted(thresholds)}"
+        )
+    output = {"schema_version": 1, "selection": "frozen_validation", "tasks": {}}
+    for task in TASKS:
+        samples = list(gate_metrics.get(task, {}).get("_sweep_samples", []))
+        threshold = float(thresholds[task])
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError(f"invalid frozen gate threshold for {task}: {threshold}")
+        output["tasks"][task] = {
+            "raw": score_gate_samples(samples, 0.0),
+            "selected": score_gate_samples(samples, threshold),
+        }
+    return output
+
+
 def write_gate_threshold_sweep(prediction_dir: Path, sweep: dict[str, Any]) -> None:
     atomic_write_text(
         prediction_dir / "gate_threshold_sweep.json",
@@ -442,6 +490,7 @@ def build_row(args: argparse.Namespace) -> dict[str, Any]:
         "max_num_tokens": args.max_num_tokens,
         "max_num_tokens_scope": args.max_num_tokens_scope,
         "relation_gate_mode": getattr(args, "relation_gate_mode", "observe"),
+        "evaluation_split": getattr(args, "evaluation_split", "validation"),
         "ui_model_signature": ui_model_signature(args.checkpoint),
         "checkpoint": str(args.checkpoint),
         "macro_precision": image_macro.get("precision"),
@@ -484,11 +533,52 @@ def append_excel_evaluation(
     gate_metrics = collect_gate_metrics(
         args.prediction_dir, args.gt_dir, args.scorer_root
     )
-    sweep = build_gate_threshold_sweep(gate_metrics)
-    if args.prediction_dir is not None:
-        write_gate_threshold_sweep(args.prediction_dir, sweep)
-    if args.evaluation_run_dir is not None:
-        write_gate_threshold_sweep(args.evaluation_run_dir, sweep)
+    genuinely_rescored_metrics = (
+        load_metrics(args.gated_metrics_json)
+        if getattr(args, "gated_metrics_json", None) is not None
+        else None
+    )
+    evaluation_split = getattr(args, "evaluation_split", "validation")
+    if evaluation_split == "validation":
+        sweep = build_gate_threshold_sweep(gate_metrics)
+        frozen_payload = {
+            "schema_version": 1,
+            "selected_on": "validation",
+            "thresholds": {
+                task: float(sweep["tasks"][task]["selected"]["threshold"])
+                for task in TASKS
+            },
+        }
+        for root in (args.prediction_dir, args.evaluation_run_dir):
+            if root is not None:
+                write_gate_threshold_sweep(root, sweep)
+                atomic_write_text(
+                    root / "frozen_gate_thresholds.json",
+                    json.dumps(frozen_payload, ensure_ascii=False, indent=2, sort_keys=True)
+                    + "\n",
+                )
+    elif args.frozen_gate_thresholds is not None:
+        frozen_path = args.frozen_gate_thresholds.expanduser().resolve(strict=True)
+        frozen_value = json.loads(frozen_path.read_text(encoding="utf-8"))
+        thresholds = frozen_value.get("thresholds", frozen_value)
+        sweep = apply_frozen_gate_thresholds(gate_metrics, thresholds)
+    else:
+        # Test metrics remain raw unless a validation-frozen threshold file is supplied.
+        sweep = {
+            "schema_version": 1,
+            "selection": "raw_only_no_validation_thresholds",
+            "tasks": {
+                task: {
+                    "raw": score_gate_samples(
+                        list(gate_metrics.get(task, {}).get("_sweep_samples", [])), 0.0
+                    ),
+                    "selected": score_gate_samples(
+                        list(gate_metrics.get(task, {}).get("_sweep_samples", [])), 0.0
+                    ),
+                }
+                for task in TASKS
+            },
+        }
     for task in TASKS:
         task_sweep = sweep.get("tasks", {}).get(task, {})
         raw = task_sweep.get("raw", {})
@@ -511,6 +601,13 @@ def append_excel_evaluation(
                     - float(selected.get("predicted_positive", 0))
                     / max(1, int(raw.get("predicted_positive", 0)))
                 ),
+                "gated_metrics_by_granularity": (
+                    genuinely_rescored_metrics.get("tasks", {}).get(task, {})
+                    if genuinely_rescored_metrics is not None
+                    else {}
+                ),
+                "bbox_metrics_genuinely_rescored": genuinely_rescored_metrics
+                is not None,
             }
         )
         gate_metrics[task].pop("_sweep_samples", None)
@@ -594,8 +691,13 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument(
         "--relation-gate-mode", choices=("observe", "hard"), default="observe"
     )
+    record.add_argument(
+        "--evaluation-split", choices=("validation", "test"), default="validation"
+    )
+    record.add_argument("--frozen-gate-thresholds", type=Path, default=None)
     record.add_argument("--checkpoint", type=Path, required=True)
     record.add_argument("--metrics-json", type=Path, default=None)
+    record.add_argument("--gated-metrics-json", type=Path, default=None)
     record.add_argument("--start-time", required=True)
     record.add_argument("--end-time", required=True)
     record.add_argument("--status", choices=("success", "failed"), required=True)

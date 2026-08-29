@@ -16,6 +16,7 @@ UI5_USE_DETECTION_CROPS="${UI5_USE_DETECTION_CROPS:-0}"
 UI5_CROP_AUDIT_DIR="${UI5_CROP_AUDIT_DIR:-}"
 UI5_CROP_TRAIN_MODE="${UI5_CROP_TRAIN_MODE:-}"
 UI5_CROP_META_PATH="${UI5_CROP_META_PATH:-}"
+UI5_UI_SAMPLING_MODE="${UI5_UI_SAMPLING_MODE:-}"
 
 OUTPUT_BASE="${OUTPUT_BASE:-${PROJECT_ROOT}/work_dirs}"
 RUN_NAME="${RUN_NAME:-locateanything-3b-ui-defect-5class-full}"
@@ -62,12 +63,27 @@ if [[ -z "${UI5_CROP_TRAIN_MODE}" ]]; then
     UI5_CROP_TRAIN_MODE="full_only"
   fi
 fi
-if [[ "${UI5_CROP_TRAIN_MODE}" != "full_only" && "${UI5_CROP_TRAIN_MODE}" != "full_plus_crop" ]]; then
-  echo "[ERROR] UI5_CROP_TRAIN_MODE must be full_only or full_plus_crop." >&2
+if [[ "${UI5_CROP_TRAIN_MODE}" != "full_only" && "${UI5_CROP_TRAIN_MODE}" != "full_plus_crop" && "${UI5_CROP_TRAIN_MODE}" != "crop_only" ]]; then
+  echo "[ERROR] UI5_CROP_TRAIN_MODE must be full_only, full_plus_crop, or crop_only." >&2
   exit 1
 fi
-if [[ "${UI5_USE_DETECTION_CROPS}" == "1" && "${UI5_CROP_TRAIN_MODE}" != "full_plus_crop" ]]; then
-  echo "[ERROR] UI5_USE_DETECTION_CROPS=1 requires UI5_CROP_TRAIN_MODE=full_plus_crop." >&2
+if [[ "${UI5_USE_DETECTION_CROPS}" == "1" && "${UI5_CROP_TRAIN_MODE}" == "full_only" ]]; then
+  echo "[ERROR] UI5_USE_DETECTION_CROPS=1 requires a crop-bearing train mode." >&2
+  exit 1
+fi
+if [[ -z "${UI5_UI_SAMPLING_MODE}" ]]; then
+  if [[ "${UI5_CROP_TRAIN_MODE}" == "crop_only" ]]; then
+    UI5_UI_SAMPLING_MODE="task_balanced_all_records"
+  else
+    UI5_UI_SAMPLING_MODE="fixed_ratio"
+  fi
+fi
+if [[ "${UI5_UI_SAMPLING_MODE}" != "fixed_ratio" && "${UI5_UI_SAMPLING_MODE}" != "task_balanced_all_records" ]]; then
+  echo "[ERROR] UI5_UI_SAMPLING_MODE must be fixed_ratio or task_balanced_all_records." >&2
+  exit 1
+fi
+if [[ "${UI5_CROP_TRAIN_MODE}" == "crop_only" && "${UI5_UI_SAMPLING_MODE}" != "task_balanced_all_records" ]]; then
+  echo "[ERROR] crop_only requires UI5_UI_SAMPLING_MODE=task_balanced_all_records." >&2
   exit 1
 fi
 if [[ "${UI5_USE_DETECTION_CROPS}" == "1" || -n "${UI5_CROP_AUDIT_DIR}" ]]; then
@@ -105,7 +121,7 @@ if [[ ! -s "${META_PATH}" ]]; then
   echo "[ERROR] Final META_PATH does not exist or is empty: ${META_PATH}" >&2
   exit 1
 fi
-export UI5_USE_DETECTION_CROPS UI5_CROP_AUDIT_DIR UI5_CROP_TRAIN_MODE
+export UI5_USE_DETECTION_CROPS UI5_CROP_AUDIT_DIR UI5_CROP_TRAIN_MODE UI5_UI_SAMPLING_MODE
 export UI5_CROP_META_PATH META_PATH
 
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-deepspeed_configs/zero_stage2_config.json}"
@@ -358,6 +374,7 @@ echo "META_PATH                     : ${META_PATH}"
 echo "UI5_USE_DETECTION_CROPS       : ${UI5_USE_DETECTION_CROPS}"
 echo "UI5_CROP_AUDIT_DIR            : ${UI5_CROP_AUDIT_DIR:-<none>}"
 echo "UI5_CROP_TRAIN_MODE           : ${UI5_CROP_TRAIN_MODE}"
+echo "UI5_UI_SAMPLING_MODE          : ${UI5_UI_SAMPLING_MODE}"
 echo "UI5_CROP_META_PATH            : ${UI5_CROP_META_PATH:-<none>}"
 echo "OUTPUT_DIR                    : ${OUTPUT_DIR}"
 echo "GPU_NAME                      : ${GPU_NAME}"
@@ -368,8 +385,13 @@ echo "MAX_SEQ_LENGTH                : ${MAX_SEQ_LENGTH}"
 echo "MAX_NUM_TOKENS_PER_SAMPLE     : ${MAX_NUM_TOKENS_PER_SAMPLE}"
 echo "MAX_NUM_TOKENS                : ${MAX_NUM_TOKENS}"
 echo "BALANCE_UI_DEFECTS             : ${BALANCE_UI_DEFECTS:-True}"
-echo "UI_RECORDS_PER_CLASS           : ${UI_RECORDS_PER_CLASS:-17604}"
-echo "UI_NEGATIVE:POSITIVE           : ${UI_NEGATIVE_TO_POSITIVE_RATIO:-2.0}:1"
+if [[ "${UI5_UI_SAMPLING_MODE}" == "task_balanced_all_records" ]]; then
+  echo "UI_RECORDS_PER_CLASS           : inactive (all legal records retained)"
+  echo "UI_NEGATIVE:POSITIVE           : natural recipe distribution"
+else
+  echo "UI_RECORDS_PER_CLASS           : ${UI_RECORDS_PER_CLASS:-17604}"
+  echo "UI_NEGATIVE:POSITIVE           : ${UI_NEGATIVE_TO_POSITIVE_RATIO:-2.0}:1"
+fi
 echo "PACKING_BUFFER_SIZE           : ${PACKING_BUFFER_SIZE}"
 echo "GRADIENT_ACCUMULATION_STEPS   : ${GRADIENT_ACCUMULATION_STEPS}"
 echo "RELATION_GATE_LOSS_WEIGHT     : ${RELATION_GATE_LOSS_WEIGHT:-1.0}"
@@ -438,6 +460,7 @@ if torchrun \
   --balance_ui_defects "${BALANCE_UI_DEFECTS:-True}" \
   --ui_records_per_class "${UI_RECORDS_PER_CLASS:-17604}" \
   --ui_negative_to_positive_ratio "${UI_NEGATIVE_TO_POSITIVE_RATIO:-2.0}" \
+  --ui_sampling_mode "${UI5_UI_SAMPLING_MODE}" \
   --bf16 "${BF16}" \
   --max_steps "${MAX_STEPS}" \
   --per_device_train_batch_size 1 \

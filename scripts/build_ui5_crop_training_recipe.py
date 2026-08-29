@@ -38,7 +38,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--base-meta", type=Path, required=True)
     parser.add_argument("--task-aware-manifest", type=Path, required=True)
     parser.add_argument("--excluded-samples", type=Path, required=True)
-    parser.add_argument("--mode", choices=("full_only", "full_plus_crop"), default="full_plus_crop")
+    parser.add_argument(
+        "--mode",
+        choices=("full_only", "full_plus_crop", "crop_only"),
+        default="full_plus_crop",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--require-valid-gt-recall", type=float, default=1.0)
     parser.add_argument("--progress-interval-seconds", type=float, default=10.0)
@@ -208,6 +212,7 @@ def _recipe_entry(
     excluded_manifest_relative: str,
     crop_recipe: bool,
     recipe_summary_name: str,
+    ui_sampling_mode: str = "fixed_ratio",
 ) -> dict[str, Any]:
     return {
         "annotation": [annotation_name],
@@ -218,6 +223,7 @@ def _recipe_entry(
         "ui5_crop_recipe": bool(crop_recipe),
         "excluded_samples": excluded_manifest_relative,
         "recipe_summary": recipe_summary_name,
+        "ui_sampling_mode": ui_sampling_mode,
     }
 
 
@@ -348,7 +354,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("full_plus_crop recipe would contain zero crop records")
     if not any(row.get("_ui5_crop_source") == "manual_gt_repair" for row in crop_records):
         raise ValueError("crop recipe contains no manual_gt_repair record")
-    if not any(row.get("_ui5_crop_source") == "raw_detector" for row in crop_records):
+    if not any(
+        row.get("_ui5_crop_source") in {"raw_detector", "raw_detector_strip"}
+        for row in crop_records
+    ):
         raise ValueError("crop recipe contains no ordinary detector crop record")
 
     repair_actions_path = audit_dir / "gt_repair_actions.jsonl"
@@ -391,11 +400,37 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     full_jsonl = output_dir / "ui_defect_5class_train_full_only.jsonl"
     combined_jsonl = output_dir / "ui_defect_5class_train_full_plus_crop.jsonl"
+    crop_only_jsonl = output_dir / "ui_defect_5class_train_crop_only.jsonl"
     full_meta = output_dir / "ui_defect_5class_train_full_only.json"
     combined_meta = output_dir / "ui_defect_5class_train_full_plus_crop.json"
+    crop_only_meta = output_dir / "ui_defect_5class_train_crop_only.json"
     recipe_summary_path = output_dir / "recipe_summary.json"
+    crop_only_summary_path = output_dir / "crop_only_recipe_summary.json"
+    content_missing_global = []
+    for row in full_records:
+        if str(row.get("_ui5_task")) != "ui_content_missing":
+            continue
+        global_record = dict(row)
+        global_record.update(
+            {
+                "_ui5_record_kind": "global_view",
+                "_ui5_crop_source": "content_missing_global",
+                "_ui5_training_eligible": True,
+                "_ui5_positive": _positive(global_record),
+            }
+        )
+        content_missing_global.append(global_record)
+    crop_only_records = [*crop_records, *content_missing_global]
+    local_full_records = sum(
+        row.get("_ui5_record_kind") == "full_image"
+        and str(row.get("_ui5_task")) != "ui_content_missing"
+        for row in crop_only_records
+    )
+    if local_full_records:
+        raise RuntimeError("crop-only recipe contains local-task full-image records")
     atomic_write_jsonl(full_jsonl, full_records)
     atomic_write_jsonl(combined_jsonl, [*full_records, *crop_records])
+    atomic_write_jsonl(crop_only_jsonl, crop_only_records)
     excluded_relative = Path(os.path.relpath(excluded_path, output_dir)).as_posix()
     _atomic_write_json(
         full_meta,
@@ -419,6 +454,18 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             )
         },
     )
+    _atomic_write_json(
+        crop_only_meta,
+        {
+            "ui_defect_5class_train_crop_only": _recipe_entry(
+                crop_only_jsonl.name,
+                excluded_manifest_relative=excluded_relative,
+                crop_recipe=True,
+                recipe_summary_name=crop_only_summary_path.name,
+                ui_sampling_mode="task_balanced_all_records",
+            )
+        },
+    )
 
     counts_by_task = Counter(str(row["_ui5_task"]) for row in (*full_records, *crop_records))
     positive_by_kind = Counter(
@@ -432,7 +479,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "full_image_records": len(full_records),
         "crop_records": len(crop_records),
         "ordinary_detector_crop_records": sum(
-            row.get("_ui5_crop_source") == "raw_detector" for row in crop_records
+            row.get("_ui5_crop_source") in {"raw_detector", "raw_detector_strip"}
+            for row in crop_records
         ),
         "gt_repair_crop_records": sum(
             row.get("_ui5_crop_source") == "manual_gt_repair" for row in crop_records
@@ -456,15 +504,57 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "full_only_jsonl": str(full_jsonl.resolve()),
         "full_plus_crop_meta": str(combined_meta.resolve()),
         "full_plus_crop_jsonl": str(combined_jsonl.resolve()),
+        "crop_only_meta": str(crop_only_meta.resolve()),
+        "crop_only_jsonl": str(crop_only_jsonl.resolve()),
         "full_only_recipe_digest": content_fingerprint(full_meta),
         "full_only_jsonl_digest": content_fingerprint(full_jsonl),
         "full_plus_crop_recipe_digest": content_fingerprint(combined_meta),
         "full_plus_crop_jsonl_digest": content_fingerprint(combined_jsonl),
+        "crop_only_recipe_digest": content_fingerprint(crop_only_meta),
+        "crop_only_jsonl_digest": content_fingerprint(crop_only_jsonl),
+        "crop_only_records": len(crop_only_records),
+        "crop_only_region_records": len(crop_records),
+        "crop_only_content_missing_global_records": len(content_missing_global),
+        "crop_only_local_task_full_image_records": local_full_records,
+        "crop_only_partial_negative_count": sum(
+            bool(row.get("_ui5_partial_gt_indices")) and not _positive(row)
+            for row in crop_records
+        ),
+        "crop_only_all_legal_strips_retained": all(
+            row.get("_ui5_training_eligible") is True for row in crop_records
+        ),
+        "crop_only_sampling_mode": "task_balanced_all_records",
+        "crop_only_records_by_task": dict(
+            sorted(Counter(str(row["_ui5_task"]) for row in crop_only_records).items())
+        ),
+        "crop_only_positive_negative_by_task": {
+            task: {
+                "positive": sum(
+                    str(row["_ui5_task"]) == task and _positive(row)
+                    for row in crop_only_records
+                ),
+                "negative": sum(
+                    str(row["_ui5_task"]) == task and not _positive(row)
+                    for row in crop_only_records
+                ),
+            }
+            for task in sorted({str(row["_ui5_task"]) for row in crop_only_records})
+        },
         "excluded_samples_digest": content_fingerprint(excluded_path),
     }
     atomic_write_json(recipe_summary_path, recipe_summary)
+    atomic_write_json(crop_only_summary_path, recipe_summary)
 
-    selected_meta = combined_meta if args.mode == "full_plus_crop" else full_meta
+    selected_meta = {
+        "full_only": full_meta,
+        "full_plus_crop": combined_meta,
+        "crop_only": crop_only_meta,
+    }[args.mode]
+    selected_jsonl = {
+        "full_only": full_jsonl,
+        "full_plus_crop": combined_jsonl,
+        "crop_only": crop_only_jsonl,
+    }[args.mode]
     conditions = dict(summary["next_stage_gate"]["conditions"])
     final_report_files = (
         audit_dir / "summary.json",
@@ -487,7 +577,15 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "crop_training_recipe_written_successfully": all(
                 path.is_file() and path.stat().st_size > 0
-                for path in (full_meta, combined_meta, combined_jsonl, recipe_summary_path)
+                for path in (
+                    full_meta,
+                    combined_meta,
+                    crop_only_meta,
+                    combined_jsonl,
+                    crop_only_jsonl,
+                    recipe_summary_path,
+                    crop_only_summary_path,
+                )
             ),
             "crop_training_recipe_contains_crop_records": len(crop_records) > 0,
             "all_reports_written_successfully": all(
@@ -505,7 +603,45 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             f"v4 training gate schema differs: missing={sorted(V4_GATE_CONDITIONS - set(conditions))}, "
             f"extra={sorted(set(conditions) - V4_GATE_CONDITIONS)}"
         )
-    passes = all(bool(value) for value in conditions.values())
+    manifest_summary_path = task_manifest_path.parent / "summary.json"
+    manifest_summary = (
+        json.loads(manifest_summary_path.read_text(encoding="utf-8"))
+        if manifest_summary_path.is_file()
+        else {}
+    )
+    split_overlap_path = task_manifest_path.parent / "data_split_overlap.json"
+    split_overlap = (
+        json.loads(split_overlap_path.read_text(encoding="utf-8"))
+        if split_overlap_path.is_file() else {}
+    )
+    crop_only_conditions = {
+        "crop_only_recipe_written": crop_only_meta.is_file() and crop_only_meta.stat().st_size > 0,
+        "crop_only_contains_region_crops": len(crop_records) > 0,
+        "crop_only_local_task_full_image_count_zero": local_full_records == 0,
+        "crop_only_content_missing_global_view_present": len(content_missing_global) > 0,
+        "crop_only_partial_negative_count_zero": recipe_summary["crop_only_partial_negative_count"] == 0,
+        "crop_only_all_legal_strips_retained": bool(
+            recipe_summary["crop_only_all_legal_strips_retained"]
+        ) and bool(manifest_summary.get("all_legal_strips_retained", True)),
+        "crop_only_all_repair_gt_mapped": bool(recipe_summary["all_gt_repair_actions_mapped"]),
+        "crop_only_sampling_mode_all_records": (
+            recipe_summary["crop_only_sampling_mode"] == "task_balanced_all_records"
+        ),
+        "crop_only_all_images_exist": not missing_images,
+        "crop_only_train_validation_content_overlap_zero": (
+            int(split_overlap.get("train_validation_content_overlap_count", -1)) == 0
+        ),
+        "crop_only_train_test_content_overlap_zero": (
+            int(split_overlap.get("train_test_content_overlap_count", -1)) == 0
+        ),
+        "crop_only_validation_test_content_overlap_zero": (
+            int(split_overlap.get("validation_test_content_overlap_count", -1)) == 0
+        ),
+    }
+    crop_only_gate_required = args.mode == "crop_only"
+    passes = all(bool(value) for value in conditions.values()) and (
+        all(crop_only_conditions.values()) if crop_only_gate_required else True
+    )
     summary["next_stage_gate"] = {
         "conditions": conditions,
         "passes": passes,
@@ -515,13 +651,21 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     }
     summary["training_ready"] = passes
     summary["training_started"] = False
+    summary["crop_only_gate"] = {
+        "required": crop_only_gate_required,
+        "conditions": crop_only_conditions,
+        "passes": all(crop_only_conditions.values()),
+        "failed_conditions": [
+            name for name, value in crop_only_conditions.items() if not value
+        ],
+    }
     summary["recipe_state"] = {
         "written": True,
         "mode": args.mode,
         "selected_meta": str(selected_meta.resolve()),
         "recipe_summary": str(recipe_summary_path.resolve()),
         "recipe_digest": content_fingerprint(selected_meta),
-        "recipe_jsonl_digest": content_fingerprint(combined_jsonl),
+        "recipe_jsonl_digest": content_fingerprint(selected_jsonl),
         "recipe_summary_digest": content_fingerprint(recipe_summary_path),
         "excluded_samples_digest": content_fingerprint(excluded_path),
         **recipe_summary,
@@ -534,7 +678,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     marker = {
-        "schema_version": 2,
+        "schema_version": 3,
         "training_ready": True,
         "recommended_config": summary["recommended_config"],
         "training_started": False,
@@ -543,10 +687,23 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "summary_file_digest": content_fingerprint(summary_path),
         "excluded_samples_digest": content_fingerprint(excluded_path),
         "training_recipe_digest": content_fingerprint(selected_meta),
-        "training_recipe_jsonl_digest": content_fingerprint(combined_jsonl),
+        "training_recipe_jsonl_digest": content_fingerprint(selected_jsonl),
         "full_only_recipe_digest": content_fingerprint(full_meta),
         "full_only_recipe_jsonl_digest": content_fingerprint(full_jsonl),
+        "full_plus_crop_recipe_digest": content_fingerprint(combined_meta),
+        "full_plus_crop_recipe_jsonl_digest": content_fingerprint(combined_jsonl),
+        "crop_only_recipe_digest": content_fingerprint(crop_only_meta),
+        "crop_only_recipe_jsonl_digest": content_fingerprint(crop_only_jsonl),
         "recipe_summary_digest": content_fingerprint(recipe_summary_path),
+        "crop_only_manifest_digest": content_fingerprint(task_manifest_path),
+        "crop_only_manifest_summary_digest": (
+            content_fingerprint(manifest_summary_path)
+            if manifest_summary_path.is_file() else ""
+        ),
+        "crop_only_data_split_overlap_digest": (
+            content_fingerprint(split_overlap_path)
+            if split_overlap_path.is_file() else ""
+        ),
         "training_recipe": str(selected_meta.resolve()),
         "created_after_all_checks": True,
     }

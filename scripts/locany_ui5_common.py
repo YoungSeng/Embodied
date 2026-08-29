@@ -253,11 +253,24 @@ def resolve_runtime_config(
             "full_plus_crop" if use_detection_crops else "full_only",
         )
     )
-    if crop_train_mode not in {"full_only", "full_plus_crop"}:
-        raise ValueError("UI5_CROP_TRAIN_MODE must be full_only or full_plus_crop")
-    if use_detection_crops and crop_train_mode != "full_plus_crop":
+    if crop_train_mode not in {"full_only", "full_plus_crop", "crop_only"}:
         raise ValueError(
-            "UI5_USE_DETECTION_CROPS=1 requires UI5_CROP_TRAIN_MODE=full_plus_crop"
+            "UI5_CROP_TRAIN_MODE must be full_only, full_plus_crop, or crop_only"
+        )
+    if use_detection_crops and crop_train_mode not in {"full_plus_crop", "crop_only"}:
+        raise ValueError(
+            "UI5_USE_DETECTION_CROPS=1 requires a crop-bearing train mode"
+        )
+    ui_sampling_mode = str(
+        _env_value(
+            env,
+            "UI5_UI_SAMPLING_MODE",
+            "task_balanced_all_records" if crop_train_mode == "crop_only" else "fixed_ratio",
+        )
+    )
+    if ui_sampling_mode not in {"fixed_ratio", "task_balanced_all_records"}:
+        raise ValueError(
+            "UI5_UI_SAMPLING_MODE must be fixed_ratio or task_balanced_all_records"
         )
     if use_detection_crops and not crop_audit_dir:
         raise ValueError("UI5_USE_DETECTION_CROPS=1 requires UI5_CROP_AUDIT_DIR")
@@ -293,6 +306,11 @@ def resolve_runtime_config(
     eval_fail_policy = str(_env_value(env, "EVAL_FAIL_POLICY", "stop")).lower()
     if eval_fail_policy not in {"stop", "warn"}:
         raise ValueError("EVAL_FAIL_POLICY must be 'stop' or 'warn'")
+    eval_data_split = str(
+        _env_value(env, "EVAL_DATA_SPLIT", "validation")
+    ).lower()
+    if eval_data_split not in {"validation", "test"}:
+        raise ValueError("EVAL_DATA_SPLIT must be validation or test")
     eval_inference_crop_mode = str(
         _env_value(env, "EVAL_INFERENCE_CROP_MODE", "detector_scan")
     ).lower()
@@ -350,6 +368,7 @@ def resolve_runtime_config(
         "UI5_CROP_AUDIT_DIR": crop_audit_dir,
         "UI5_CROP_TRAIN_MODE": crop_train_mode,
         "UI5_CROP_META_PATH": crop_meta_path,
+        "UI5_UI_SAMPLING_MODE": ui_sampling_mode,
         "EVAL_INPUT_DIR": eval_input_dir,
         "OUTPUT_BASE": output_base,
         "RUN_NAME": run_name,
@@ -410,6 +429,10 @@ def resolve_runtime_config(
         "EVAL_AT_START": int(eval_at_start),
         "EVAL_INTERVAL_STEPS": eval_interval,
         "EVAL_FAIL_POLICY": eval_fail_policy,
+        "EVAL_DATA_SPLIT": eval_data_split,
+        "EVAL_FROZEN_GATE_THRESHOLDS": str(
+            _env_value(env, "EVAL_FROZEN_GATE_THRESHOLDS", "")
+        ),
         "EVAL_INFERENCE_CROP_MODE": eval_inference_crop_mode,
         "EVAL_PARSER_ROOT": str(
             _env_value(
@@ -438,7 +461,11 @@ def resolve_runtime_config(
             )
         ),
         "EVAL_REQUIRE_CACHE_SCOPE": str(
-            _env_value(env, "EVAL_REQUIRE_CACHE_SCOPE", "full_test")
+            _env_value(
+                env,
+                "EVAL_REQUIRE_CACHE_SCOPE",
+                "validation" if eval_data_split == "validation" else "full_test",
+            )
         ).lower(),
         "EVAL_REQUIRE_STRICT_NONOVERLAP": int(
             parse_bool(
@@ -556,8 +583,16 @@ def resolve_runtime_config(
         raise ValueError("EVAL_DETECTOR_WORKERS_PER_GPU must be 1 or 2")
     if resolved["EVAL_DETECTOR_CACHE_MODE"] not in {"build", "readonly"}:
         raise ValueError("EVAL_DETECTOR_CACHE_MODE must be build or readonly")
-    if resolved["EVAL_REQUIRE_CACHE_SCOPE"] not in {"preview", "full_test"}:
-        raise ValueError("EVAL_REQUIRE_CACHE_SCOPE must be preview or full_test")
+    if resolved["EVAL_REQUIRE_CACHE_SCOPE"] not in {"preview", "validation", "full_test"}:
+        raise ValueError(
+            "EVAL_REQUIRE_CACHE_SCOPE must be preview, validation, or full_test"
+        )
+    expected_scope = "validation" if eval_data_split == "validation" else "full_test"
+    if resolved["EVAL_REQUIRE_CACHE_SCOPE"] != expected_scope:
+        raise ValueError(
+            "evaluation split/cache scope mismatch: "
+            f"split={eval_data_split}, scope={resolved['EVAL_REQUIRE_CACHE_SCOPE']}"
+        )
     if resolved["EVAL_EXPECTED_UNIQUE_IMAGES"] < 0:
         raise ValueError("EVAL_EXPECTED_UNIQUE_IMAGES cannot be negative")
     if resolved["EVAL_SCAN_TARGET_HEIGHT"] <= 0:

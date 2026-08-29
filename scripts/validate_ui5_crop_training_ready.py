@@ -26,6 +26,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     result = validate_training_ready_marker(args.audit_dir, recipe_path=args.recipe)
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if result.get("crop_train_mode") == "crop_only":
+        print(f"crop records={result['crop_only_region_records']}")
+        print(f"active crop retention={result['active_crop_retention_policy']}")
+        print(f"negative crop records={result['crop_only_negative_records']}")
+        print(
+            "full image records by local task="
+            f"{result['crop_only_local_task_full_image_records']}"
+        )
+        print(
+            "content_missing global records="
+            f"{result['crop_only_content_missing_global_records']}"
+        )
+        print(
+            "five-task positive/negative="
+            + json.dumps(
+                result["crop_only_positive_negative_by_task"],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
     return 0
 
 

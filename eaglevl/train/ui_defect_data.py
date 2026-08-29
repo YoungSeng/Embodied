@@ -189,3 +189,77 @@ def build_balanced_ui_indices(
             f"{sorted(missing_required)[:20]}"
         )
     return result
+
+
+def build_task_balanced_all_records_indices(
+    records: Sequence[dict],
+    seed: int = 202603,
+) -> List[int]:
+    """Return one deterministic macro-balanced epoch without dropping records.
+
+    Every task is shuffled independently.  The five task streams are then
+    round-robin interleaved.  A shorter stream is repeated only after every
+    unique record in that stream has appeared once; the longest stream appears
+    exactly once.  Positive/negative labels are deliberately not rebalanced so
+    the recipe's natural crop distribution is preserved.
+    """
+    buckets: Dict[int, List[int]] = defaultdict(list)
+    passthrough: List[int] = []
+    for index, record in enumerate(records):
+        task = identify_ui_defect_task(record)
+        if task is None:
+            passthrough.append(index)
+        else:
+            buckets[task[1]].append(index)
+
+    if not buckets:
+        return list(range(len(records)))
+    if passthrough:
+        raise ValueError(
+            "task_balanced_all_records was enabled for a mixed dataset; "
+            "move non-UI records to a separate recipe entry"
+        )
+    expected_types = set(range(len(TASK_SPECS)))
+    if set(buckets) != expected_types:
+        missing = sorted(expected_types - set(buckets))
+        raise ValueError(
+            "task_balanced_all_records requires all five tasks; "
+            f"missing defect types: {missing}"
+        )
+    if any(not values for values in buckets.values()):
+        raise ValueError("task_balanced_all_records cannot use an empty task stream")
+
+    rng = random.Random(seed)
+    streams: Dict[int, List[int]] = {}
+    for defect_type, values in sorted(buckets.items()):
+        stream = list(values)
+        rng.shuffle(stream)
+        streams[defect_type] = stream
+
+    task_order = sorted(streams)
+    rng.shuffle(task_order)
+    longest = max(len(stream) for stream in streams.values())
+    result: List[int] = []
+    for position in range(longest):
+        rotated = task_order[position % len(task_order):] + task_order[:position % len(task_order)]
+        for defect_type in rotated:
+            stream = streams[defect_type]
+            result.append(stream[position % len(stream)])
+
+    if set(result) != set(range(len(records))):
+        missing = sorted(set(range(len(records))) - set(result))
+        raise RuntimeError(
+            "task_balanced_all_records dropped legal records: "
+            f"count={len(missing)}, first={missing[:20]}"
+        )
+    required = {
+        index
+        for index, record in enumerate(records)
+        if record.get("_ui5_crop_source") == "manual_gt_repair"
+    }
+    if not required.issubset(result):
+        raise RuntimeError(
+            "task_balanced_all_records dropped manual_gt_repair records: "
+            f"{sorted(required - set(result))[:20]}"
+        )
+    return result
