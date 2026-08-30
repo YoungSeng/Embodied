@@ -268,10 +268,20 @@ def resolve_runtime_config(
             "task_balanced_all_records" if crop_train_mode == "crop_only" else "fixed_ratio",
         )
     )
-    if ui_sampling_mode not in {"fixed_ratio", "task_balanced_all_records"}:
+    if ui_sampling_mode not in {
+        "fixed_ratio",
+        "task_balanced_all_records",
+        "task_source_balanced_rotating",
+    }:
         raise ValueError(
-            "UI5_UI_SAMPLING_MODE must be fixed_ratio or task_balanced_all_records"
+            "UI5_UI_SAMPLING_MODE must be fixed_ratio, task_balanced_all_records, "
+            "or task_source_balanced_rotating"
         )
+    ui_negative_to_positive_ratio = float(
+        _env_value(env, "UI_NEGATIVE_TO_POSITIVE_RATIO", 2.0)
+    )
+    if ui_negative_to_positive_ratio <= 0:
+        raise ValueError("UI_NEGATIVE_TO_POSITIVE_RATIO must be positive")
     if use_detection_crops and not crop_audit_dir:
         raise ValueError("UI5_USE_DETECTION_CROPS=1 requires UI5_CROP_AUDIT_DIR")
     crop_meta_path = str(_env_value(env, "UI5_CROP_META_PATH", ""))
@@ -373,6 +383,7 @@ def resolve_runtime_config(
         "UI5_CROP_TRAIN_MODE": crop_train_mode,
         "UI5_CROP_META_PATH": crop_meta_path,
         "UI5_UI_SAMPLING_MODE": ui_sampling_mode,
+        "UI_NEGATIVE_TO_POSITIVE_RATIO": ui_negative_to_positive_ratio,
         "EVAL_INPUT_DIR": eval_input_dir,
         "OUTPUT_BASE": output_base,
         "RUN_NAME": run_name,

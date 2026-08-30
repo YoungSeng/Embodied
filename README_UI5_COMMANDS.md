@@ -5,8 +5,10 @@
 这一轮只改训练数据形态和采样，不改模型、optimizer、BF16、Relation/PBD 或 prompt。四个局部
 任务使用与测试 schema-v5 相同的 full-width raw-detector-edge 基础 strips；训练 GT 只能删除
 穿过 GT 的 seam，从而合并相邻 strips。`ui_content_missing` 继续直接引用原图。所有合法正、
-负 strips 都进入 recipe；`task_balanced_all_records` 在任一任务开始重复前遍历该任务全部唯一
-记录，不再固定抽成 88,020 条，也不再强制 1:2 正负比。
+负 strips 都进入 recipe。正式训练使用 `task_source_balanced_rotating`：五任务等概率、任务内
+正:负约为 1:2，先均匀选择“原图×任务”source group，再轮换该 source 的 crop。完整 recipe
+仍保留在 active pool 中，普通 crop 不会被固定子集丢弃；同一原图不会因为切出更多横条而获得
+更大权重。已经生成的 crop-only recipe 可直接复用，不需要重跑 detector、图片或标签。
 
 ### 0. 安全停止并归档旧的 full+crop 任务
 
@@ -172,7 +174,10 @@ cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5
 PROJECT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
 LA_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python
 AUDIT=${PROJECT}/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
+CROP_META=${AUDIT}/training_recipes/ui_defect_5class_train_crop_only.json
 SMOKE_RUN=${PROJECT}/work_dirs/locany-ui5-v5-croponly-f1fix-a800x4-smoke
+
+test -s "${CROP_META}"
 
 "${LA_PY}" scripts/run_locany_ui5_local_debug.py \
   --machine a800 \
@@ -184,7 +189,9 @@ SMOKE_RUN=${PROJECT}/work_dirs/locany-ui5-v5-croponly-f1fix-a800x4-smoke
   --use-detection-crops \
   --crop-audit-dir "${AUDIT}" \
   --crop-train-mode crop_only \
-  --ui-sampling-mode task_balanced_all_records \
+  --crop-meta-path "${CROP_META}" \
+  --ui-sampling-mode task_source_balanced_rotating \
+  --ui-negative-to-positive-ratio 2.0 \
   --output-dir "${SMOKE_RUN}" \
   --run-name locany-ui5-v5-croponly-f1fix-a800x4-smoke
 
@@ -203,7 +210,9 @@ SMOKE_RUN=${PROJECT}/work_dirs/locany-ui5-v5-croponly-f1fix-a800x4-smoke
   --use-detection-crops \
   --crop-audit-dir "${AUDIT}" \
   --crop-train-mode crop_only \
-  --ui-sampling-mode task_balanced_all_records \
+  --crop-meta-path "${CROP_META}" \
+  --ui-sampling-mode task_source_balanced_rotating \
+  --ui-negative-to-positive-ratio 2.0 \
   --output-dir "${SMOKE_RUN}" \
   --run-name locany-ui5-v5-croponly-f1fix-a800x4-smoke
 
@@ -218,7 +227,7 @@ SMOKE_RUN=${PROJECT}/work_dirs/locany-ui5-v5-croponly-f1fix-a800x4-smoke
 `content_missing_global`、positive 和 negative；loss、relation/PBD grad 为有限值，环境 pre/post
 指纹一致。
 
-### 4. A800 四卡正式训练：最多 5000 step，只按 validation 选模型
+### 4. A800 四卡正式训练：16,000 step，关闭 validation 自动早停
 
 ```bash
 cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
@@ -226,10 +235,14 @@ cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5
 PROJECT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop
 LA_PY=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python
 AUDIT=${PROJECT}/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair
+CROP_META=${AUDIT}/training_recipes/ui_defect_5class_train_crop_only.json
 VAL_INPUT=${PROJECT}/work_dirs/ui5_validation_eval_input_v1
 VAL_CACHE=${PROJECT}/work_dirs/ui5_validation_detector_cache_horizontal_v5
 VAL_UNIQUE=$("${LA_PY}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["expected_unique_images"])' \
   "${VAL_INPUT}/validation_staging_summary.json")
+
+test -s "${CROP_META}"
+test -s "${VAL_CACHE}/horizontal_scan_v5_raw_detector_edge_aligned/eval_detector_cache_ready.json"
 
 "${LA_PY}" scripts/submit_locany_ui5.py \
   --machine a800 \
@@ -240,10 +253,13 @@ VAL_UNIQUE=$("${LA_PY}" -c 'import json,sys; print(json.load(open(sys.argv[1]))[
   --use-detection-crops \
   --crop-audit-dir "${AUDIT}" \
   --crop-train-mode crop_only \
-  --ui-sampling-mode task_balanced_all_records \
+  --crop-meta-path "${CROP_META}" \
+  --ui-sampling-mode task_source_balanced_rotating \
+  --ui-negative-to-positive-ratio 2.0 \
   --enable-eval \
   --eval-at-start \
   --eval-interval-steps 1000 \
+  --eval-fail-policy warn \
   --eval-input-dir "${VAL_INPUT}" \
   --eval-data-split validation \
   --no-validation-early-stop \
@@ -253,12 +269,14 @@ VAL_UNIQUE=$("${LA_PY}" -c 'import json,sys; print(json.load(open(sys.argv[1]))[
   --eval-scan-name horizontal_scan_v5_raw_detector_edge_aligned \
   --require-cache-scope validation \
   --eval-expected-unique-images "${VAL_UNIQUE}" \
-  --max-steps 5000 \
-  --save-steps 500 \
-  --run-name locany-ui5-v5-croponly-f1fix-a800x4
+  --max-steps 16000 \
+  --save-steps 4000 \
+  --run-name locany-ui5-v5-croponly-sourcebalanced-a800x4-20260830
 ```
 
-四卡固定 `MAX_NUM_TOKENS=12800`、梯度累积 2。每 1000 step 写一次
+四卡固定 `MAX_NUM_TOKENS=12800`、梯度累积 2。完整的 206,937 条 recipe 仍在 active pool；
+effective epoch 使用五任务等量、每任务正:负约 1:2 的 source-balanced rotating draws。
+每 1000 step 写一次
 `sampling_coverage_step_<N>.json` 并完整 validation。正式命令显式使用
 `--no-validation-early-stop`，因此 pipeline 不会依据中间指标自动停止，可直接查看 Excel；如确实
 需要恢复原来的连续两次未改善自动停止，显式改为 `--validation-early-stop`。Gate 主结果是

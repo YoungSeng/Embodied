@@ -640,6 +640,49 @@ class RecipeBuilderTests(unittest.TestCase):
 
 
 class CropTrainingWiringTests(unittest.TestCase):
+    def test_source_balanced_rotating_mode_reaches_local_and_submit_runtime(self) -> None:
+        audit = PROJECT_ROOT / "work_dirs" / "test_v5_source_balanced_audit"
+        local_args = run_locany_ui5_local_debug.parse_args(
+            [
+                "--machine", "a800", "--gpus", "4", "--max-steps", "20",
+                "--use-detection-crops", "--crop-audit-dir", str(audit),
+                "--crop-train-mode", "crop_only",
+                "--ui-sampling-mode", "task_source_balanced_rotating",
+                "--ui-negative-to-positive-ratio", "2.0",
+                "--project-root", str(PROJECT_ROOT),
+            ]
+        )
+        local_env = run_locany_ui5_local_debug.build_environment(
+            local_args, base_env={}
+        )
+        self.assertEqual(
+            local_env["UI5_UI_SAMPLING_MODE"],
+            "task_source_balanced_rotating",
+        )
+        self.assertEqual(local_env["UI_NEGATIVE_TO_POSITIVE_RATIO"], "2.0")
+
+        submit_args = submit_locany_ui5.parse_args(
+            [
+                "--machine", "a800", "--resource-group", "aiai_locate",
+                "--gpus", "4", "--use-detection-crops",
+                "--crop-audit-dir", "/mnt/audit/v5",
+                "--crop-train-mode", "crop_only",
+                "--ui-sampling-mode", "task_source_balanced_rotating",
+                "--ui-negative-to-positive-ratio", "2.0",
+                "--eval-input-dir", "/mnt/validation",
+                "--eval-data-split", "validation",
+                "--require-cache-scope", "validation",
+                "--render-only",
+            ]
+        )
+        rendered, runtime = submit_locany_ui5.render_job(submit_args)
+        self.assertEqual(
+            runtime["UI5_UI_SAMPLING_MODE"],
+            "task_source_balanced_rotating",
+        )
+        self.assertEqual(runtime["UI_NEGATIVE_TO_POSITIVE_RATIO"], 2.0)
+        self.assertIn("task_source_balanced_rotating", rendered)
+
     def test_crop_only_defaults_to_all_record_sampling_across_local_and_submit(self) -> None:
         audit = PROJECT_ROOT / "work_dirs" / "test_v5_croponly_audit"
         local_args = run_locany_ui5_local_debug.parse_args(

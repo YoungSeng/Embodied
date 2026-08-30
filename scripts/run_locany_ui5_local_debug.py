@@ -48,9 +48,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--crop-meta-path", type=Path, default=None)
     parser.add_argument(
         "--ui-sampling-mode",
-        choices=("fixed_ratio", "task_balanced_all_records"),
+        choices=(
+            "fixed_ratio",
+            "task_balanced_all_records",
+            "task_source_balanced_rotating",
+        ),
         default=None,
     )
+    parser.add_argument("--ui-negative-to-positive-ratio", type=float, default=2.0)
     parser.add_argument("--training-data-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--output-base", type=Path, default=None)
@@ -66,6 +71,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--save-steps must be positive")
     if args.max_num_tokens is not None and args.max_num_tokens <= 0:
         parser.error("--max-num-tokens must be positive")
+    if args.ui_negative_to_positive_ratio <= 0:
+        parser.error("--ui-negative-to-positive-ratio must be positive")
     return args
 
 
@@ -124,6 +131,9 @@ def build_environment(
                 if args.crop_train_mode == "crop_only"
                 else "fixed_ratio"
             ),
+            "UI_NEGATIVE_TO_POSITIVE_RATIO": str(
+                args.ui_negative_to_positive_ratio
+            ),
             "UI5_CROP_AUDIT_DIR": "",
             "UI5_CROP_META_PATH": "",
         }
@@ -178,6 +188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "UI5_CROP_TRAIN_MODE",
         "UI5_CROP_META_PATH",
         "UI5_UI_SAMPLING_MODE",
+        "UI_NEGATIVE_TO_POSITIVE_RATIO",
         "RUN_NAME",
         "OUTPUT_BASE",
     ):

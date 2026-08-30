@@ -82,9 +82,11 @@ from eaglevl.train.augmentation import apply_resize_augmentation
 from eaglevl.train.ui_defect_data import (
     build_balanced_ui_indices,
     build_task_balanced_all_records_indices,
+    build_task_source_balanced_rotating_plan,
     extract_ui_defect_targets,
     identify_ui_defect_task,
     is_positive_ui_defect,
+    materialize_task_source_balanced_rotating_indices,
 )
 from eaglevl.train.ui5_excel_logger import UI5ExcelLogger, TRAIN_TASKS
 from eaglevl.train.ui5_checkpoint_utils import atomic_save_with_fsync, validate_checkpoint
@@ -315,8 +317,23 @@ class LazySupervisedDatasetMTP(Dataset):
         self.visual_prompt = bool(meta.get("visual_prompt", False))
         self.ui5_crop_recipe = bool(meta.get("ui5_crop_recipe", False))
         self.balance_ui_defects = bool(meta.get("balance_ui_defects", balance_ui_defects))
-        self.ui_sampling_mode = str(meta.get("ui_sampling_mode", ui_sampling_mode))
-        if self.ui_sampling_mode not in {"fixed_ratio", "task_balanced_all_records"}:
+        # An explicitly exported runtime mode must override the recipe's
+        # historical default.  This lets a new sampler reuse an already audited
+        # immutable crop recipe without rewriting its digest-bound marker.
+        runtime_sampling_mode = os.environ.get("UI5_UI_SAMPLING_MODE")
+        self.ui_sampling_mode = str(
+            runtime_sampling_mode
+            or (
+                ui_sampling_mode
+                if ui_sampling_mode != "fixed_ratio"
+                else meta.get("ui_sampling_mode", ui_sampling_mode)
+            )
+        )
+        if self.ui_sampling_mode not in {
+            "fixed_ratio",
+            "task_balanced_all_records",
+            "task_source_balanced_rotating",
+        }:
             raise ValueError(
                 f"[{self.ds_name}] unsupported ui_sampling_mode={self.ui_sampling_mode!r}"
             )
@@ -345,6 +362,7 @@ class LazySupervisedDatasetMTP(Dataset):
         self.active_indices = list(range(original_num_rows))
         self._balanced_logical_buckets = None
         self._all_records_task_buckets = None
+        self._source_balanced_plan = None
 
         exclusion_path = str(meta.get("excluded_samples", ""))
         excluded_pairs = set()
@@ -429,7 +447,72 @@ class LazySupervisedDatasetMTP(Dataset):
                 dict(examples),
             )
 
-        if self.ui_sampling_mode == "task_balanced_all_records":
+        if self.ui_sampling_mode == "task_source_balanced_rotating":
+            candidate_indices = list(self.active_indices)
+            index_records = [self.lazy_loader[index] for index in candidate_indices]
+            plan = build_task_source_balanced_rotating_plan(
+                index_records,
+                negative_to_positive_ratio=ui_negative_to_positive_ratio,
+            )
+            first_epoch = materialize_task_source_balanced_rotating_indices(
+                plan, seed=202603, epoch_index=0
+            )
+            required_manual = {
+                index
+                for index, record in enumerate(index_records)
+                if record.get("_ui5_crop_source") == "manual_gt_repair"
+            }
+            planned_indices = {
+                index
+                for polarities in plan["buckets"].values()
+                for source_groups in polarities.values()
+                for values in source_groups.values()
+                for index in values
+            }
+            missing_manual = required_manual - planned_indices
+            if missing_manual:
+                raise RuntimeError(
+                    f"[{self.ds_name}] source-balanced sampler dropped manual repairs: "
+                    f"{sorted(missing_manual)[:20]}"
+                )
+            if planned_indices != set(range(len(index_records))):
+                missing = sorted(set(range(len(index_records))) - planned_indices)
+                raise RuntimeError(
+                    f"[{self.ds_name}] source-balanced active plan dropped legal records: "
+                    f"count={len(missing)}, first={missing[:20]}"
+                )
+            if len(first_epoch) != int(plan["epoch_length"]):
+                raise RuntimeError(
+                    f"[{self.ds_name}] source-balanced first epoch is incomplete"
+                )
+            self._source_balanced_plan = plan
+            self._active_pool_length = len(self.active_indices)
+            self._length = int(plan["epoch_length"])
+            logger.info(
+                "[Dataset] %s task_source_balanced_rotating: raw_recipe=%s "
+                "active_pool=%s effective_epoch=%s positive_slots_per_task=%s "
+                "negative_slots_per_task=%s effective_negative:positive=%.6f "
+                "source_groups=%s records=%s never_active=%s "
+                "manual_repair_retention=%s/%s",
+                self.ds_name,
+                original_num_rows,
+                self._active_pool_length,
+                self._length,
+                plan["positive_slots_per_task"],
+                plan["negative_slots_per_task"],
+                plan["negative_to_positive_ratio"],
+                plan["source_groups_by_task"],
+                plan["records_by_task"],
+                max(
+                    0,
+                    original_num_rows
+                    - self._excluded_record_count
+                    - self._active_pool_length,
+                ),
+                len(required_manual),
+                len(required_manual),
+            )
+        elif self.ui_sampling_mode == "task_balanced_all_records":
             candidate_indices = list(self.active_indices)
             index_records = [self.lazy_loader[index] for index in candidate_indices]
             # Validation and the first deterministic epoch are intentionally
@@ -576,7 +659,10 @@ class LazySupervisedDatasetMTP(Dataset):
                 else:
                     self.active_indices = []
         
-        if self.ui_sampling_mode != "task_balanced_all_records":
+        if self.ui_sampling_mode not in {
+            "task_balanced_all_records",
+            "task_source_balanced_rotating",
+        }:
             self._active_pool_length = len(self.active_indices)
             self._length = self._active_pool_length
 
@@ -600,8 +686,15 @@ class LazySupervisedDatasetMTP(Dataset):
                 negative_index += 1
         return output
 
-    def get_epoch_indices(self, shuffle_seed: int) -> List[int]:
+    def get_epoch_indices(self, shuffle_seed: int, epoch_index: int = 0) -> List[int]:
         rng = random.Random(shuffle_seed)
+        if self._source_balanced_plan is not None:
+            base_seed = int(shuffle_seed) - int(epoch_index) * 999983
+            return materialize_task_source_balanced_rotating_indices(
+                self._source_balanced_plan,
+                seed=base_seed,
+                epoch_index=epoch_index,
+            )
         if self._all_records_task_buckets is not None:
             streams = {}
             for defect_type, values in self._all_records_task_buckets.items():
@@ -657,7 +750,9 @@ class LazySupervisedDatasetMTP(Dataset):
         remaining = max(0, int(global_idx))
         epoch = 0
         while remaining:
-            indices = self.get_epoch_indices(seed + epoch * 999983)
+            indices = self.get_epoch_indices(
+                seed + epoch * 999983, epoch_index=epoch
+            )
             take = min(remaining, len(indices))
             seen.update(self.active_indices[index] for index in indices[:take])
             remaining -= take
@@ -762,6 +857,30 @@ class LazySupervisedDatasetMTP(Dataset):
                 len(manual_active) / len(self._raw_manual_repair_indices)
                 if self._raw_manual_repair_indices
                 else 1.0
+            ),
+            "source_balanced_rotation": (
+                {
+                    "positive_slots_per_task": self._source_balanced_plan[
+                        "positive_slots_per_task"
+                    ],
+                    "negative_slots_per_task": self._source_balanced_plan[
+                        "negative_slots_per_task"
+                    ],
+                    "effective_negative_to_positive_ratio": self._source_balanced_plan[
+                        "negative_to_positive_ratio"
+                    ],
+                    "source_groups_by_task": self._source_balanced_plan[
+                        "source_groups_by_task"
+                    ],
+                    "records_by_task": self._source_balanced_plan[
+                        "records_by_task"
+                    ],
+                    "source_group_repeat_draws_per_epoch_by_task": self._source_balanced_plan[
+                        "source_group_repeat_draws_per_epoch_by_task"
+                    ],
+                }
+                if self._source_balanced_plan is not None
+                else None
             ),
         }
 
@@ -1107,7 +1226,7 @@ class LazySupervisedDatasetMTP(Dataset):
         pos = global_idx % ds_len
         
         shuffle_seed = seed + epoch * 999983
-        indices = self.get_epoch_indices(shuffle_seed)
+        indices = self.get_epoch_indices(shuffle_seed, epoch_index=epoch)
         
         real_idx = indices[pos]
         return self[real_idx]
@@ -1145,7 +1264,7 @@ class DeterministicIterator:
             return self._cached_indices
         
         shuffle_seed = self.seed + epoch * 999983
-        indices = self.dataset.get_epoch_indices(shuffle_seed)
+        indices = self.dataset.get_epoch_indices(shuffle_seed, epoch_index=epoch)
         
         self._cached_epoch = epoch
         self._cached_indices = indices

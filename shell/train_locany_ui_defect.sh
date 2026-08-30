@@ -78,12 +78,16 @@ if [[ -z "${UI5_UI_SAMPLING_MODE}" ]]; then
     UI5_UI_SAMPLING_MODE="fixed_ratio"
   fi
 fi
-if [[ "${UI5_UI_SAMPLING_MODE}" != "fixed_ratio" && "${UI5_UI_SAMPLING_MODE}" != "task_balanced_all_records" ]]; then
-  echo "[ERROR] UI5_UI_SAMPLING_MODE must be fixed_ratio or task_balanced_all_records." >&2
+if [[ "${UI5_UI_SAMPLING_MODE}" != "fixed_ratio" && \
+      "${UI5_UI_SAMPLING_MODE}" != "task_balanced_all_records" && \
+      "${UI5_UI_SAMPLING_MODE}" != "task_source_balanced_rotating" ]]; then
+  echo "[ERROR] UI5_UI_SAMPLING_MODE must be fixed_ratio, task_balanced_all_records, or task_source_balanced_rotating." >&2
   exit 1
 fi
-if [[ "${UI5_CROP_TRAIN_MODE}" == "crop_only" && "${UI5_UI_SAMPLING_MODE}" != "task_balanced_all_records" ]]; then
-  echo "[ERROR] crop_only requires UI5_UI_SAMPLING_MODE=task_balanced_all_records." >&2
+if [[ "${UI5_CROP_TRAIN_MODE}" == "crop_only" && \
+      "${UI5_UI_SAMPLING_MODE}" != "task_balanced_all_records" && \
+      "${UI5_UI_SAMPLING_MODE}" != "task_source_balanced_rotating" ]]; then
+  echo "[ERROR] crop_only requires an all-record sampling mode." >&2
   exit 1
 fi
 if [[ "${UI5_USE_DETECTION_CROPS}" == "1" || -n "${UI5_CROP_AUDIT_DIR}" ]]; then
@@ -388,6 +392,10 @@ echo "BALANCE_UI_DEFECTS             : ${BALANCE_UI_DEFECTS:-True}"
 if [[ "${UI5_UI_SAMPLING_MODE}" == "task_balanced_all_records" ]]; then
   echo "UI_RECORDS_PER_CLASS           : inactive (all legal records retained)"
   echo "UI_NEGATIVE:POSITIVE           : natural recipe distribution"
+elif [[ "${UI5_UI_SAMPLING_MODE}" == "task_source_balanced_rotating" ]]; then
+  echo "UI_RECORDS_PER_CLASS           : inactive (all legal records retained in active pool)"
+  echo "UI_NEGATIVE:POSITIVE           : ${UI_NEGATIVE_TO_POSITIVE_RATIO:-2.0}:1 effective rotating draws"
+  echo "UI_SOURCE_GROUP_WEIGHTING      : uniform within task/polarity; crops rotate before repeat"
 else
   echo "UI_RECORDS_PER_CLASS           : ${UI_RECORDS_PER_CLASS:-17604}"
   echo "UI_NEGATIVE:POSITIVE           : ${UI_NEGATIVE_TO_POSITIVE_RATIO:-2.0}:1"

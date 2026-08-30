@@ -178,8 +178,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--crop-meta-path", default=None)
     parser.add_argument(
         "--ui-sampling-mode",
-        choices=("fixed_ratio", "task_balanced_all_records"),
+        choices=(
+            "fixed_ratio",
+            "task_balanced_all_records",
+            "task_source_balanced_rotating",
+        ),
         default=None,
+    )
+    parser.add_argument(
+        "--ui-negative-to-positive-ratio",
+        type=float,
+        default=2.0,
+        help="Effective negative:positive draws inside each UI task",
     )
     runtime_deps_group = parser.add_mutually_exclusive_group()
     runtime_deps_group.add_argument(
@@ -345,6 +355,9 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "UI5_CROP_TRAIN_MODE": crop_train_mode,
         "UI5_UI_SAMPLING_MODE": getattr(args, "ui_sampling_mode", None)
         or ("task_balanced_all_records" if crop_train_mode == "crop_only" else "fixed_ratio"),
+        "UI_NEGATIVE_TO_POSITIVE_RATIO": str(
+            getattr(args, "ui_negative_to_positive_ratio", 2.0)
+        ),
     }
     optional = {
         "MAX_NUM_TOKENS": args.max_num_tokens,
@@ -502,6 +515,7 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "UI5_CROP_TRAIN_MODE",
         "UI5_CROP_META_PATH",
         "UI5_UI_SAMPLING_MODE",
+        "UI_NEGATIVE_TO_POSITIVE_RATIO",
         "RUN_NAME",
         "PIPELINE_MODE",
     )
@@ -631,6 +645,7 @@ def main() -> int:
         "UI5_CROP_TRAIN_MODE",
         "UI5_CROP_META_PATH",
         "UI5_UI_SAMPLING_MODE",
+        "UI_NEGATIVE_TO_POSITIVE_RATIO",
         "META_PATH",
     ):
         print(f"{key:28s}: {runtime[key]}")

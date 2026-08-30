@@ -354,6 +354,36 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(default["EVAL_VALIDATION_EARLY_STOP"], 0)
         self.assertEqual(enabled["EVAL_VALIDATION_EARLY_STOP"], 1)
 
+    def test_runtime_config_accepts_source_balanced_rotating_sampling(self) -> None:
+        config = locany_ui5_common.resolve_runtime_config(
+            {
+                "MACHINE_TYPE": "a800",
+                "GPU_COUNT": "4",
+                "CUDA_DEVICES": "0,1,2,3",
+                "UI5_CROP_TRAIN_MODE": "crop_only",
+                "UI5_UI_SAMPLING_MODE": "task_source_balanced_rotating",
+                "UI_NEGATIVE_TO_POSITIVE_RATIO": "2.0",
+            }
+        )
+        self.assertEqual(
+            config["UI5_UI_SAMPLING_MODE"],
+            "task_source_balanced_rotating",
+        )
+        self.assertEqual(config["UI_NEGATIVE_TO_POSITIVE_RATIO"], 2.0)
+
+    def test_runtime_config_rejects_nonpositive_source_balanced_ratio(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            locany_ui5_common.resolve_runtime_config(
+                {
+                    "MACHINE_TYPE": "a800",
+                    "GPU_COUNT": "4",
+                    "CUDA_DEVICES": "0,1,2,3",
+                    "UI5_CROP_TRAIN_MODE": "crop_only",
+                    "UI5_UI_SAMPLING_MODE": "task_source_balanced_rotating",
+                    "UI_NEGATIVE_TO_POSITIVE_RATIO": "0",
+                }
+            )
+
     def test_gpu_parity_rejects_validation_early_stop_drift(self) -> None:
         four = locany_ui5_common.resolve_runtime_config(
             {

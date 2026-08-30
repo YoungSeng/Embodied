@@ -4,6 +4,8 @@ from eaglevl.train.ui_defect_data import (
     TASK_SPECS,
     build_balanced_ui_indices,
     build_task_balanced_all_records_indices,
+    build_task_source_balanced_rotating_indices,
+    build_task_source_balanced_rotating_plan,
     extract_ui_defect_targets,
     identify_ui_defect_task,
 )
@@ -212,6 +214,129 @@ class UIDefectDataTest(unittest.TestCase):
         resumed = build_task_balanced_all_records_indices(records, seed=101)
         self.assertEqual(first, resumed)
         self.assertEqual(first[13:], resumed[13:])
+
+    def test_task_source_balanced_rotating_is_task_and_polarity_balanced(self):
+        records = []
+        expected_sources = {}
+        for task_index, (_, _, _, aliases) in enumerate(TASK_SPECS):
+            task_sources = {"positive": set(), "negative": set()}
+            for polarity, source_count in (("positive", 2), ("negative", 4)):
+                for source_index in range(source_count):
+                    source_id = f"task{task_index}_{polarity}_{source_index}"
+                    task_sources[polarity].add(source_id)
+                    # Deliberately give source zero many more crops.  It must
+                    # still receive one source-level draw, not more weight.
+                    crop_count = 5 if source_index == 0 else 1
+                    for crop_index in range(crop_count):
+                        record = make_record(
+                            aliases[0], positive=polarity == "positive"
+                        )
+                        record.update(
+                            {
+                                "_ui5_image_id": source_id,
+                                "_ui5_sample_id": f"{source_id}_{crop_index}",
+                                "_ui5_crop_source": "raw_detector_strip",
+                            }
+                        )
+                        records.append(record)
+            expected_sources[task_index] = task_sources
+
+        plan = build_task_source_balanced_rotating_plan(
+            records, negative_to_positive_ratio=2.0
+        )
+        indices = build_task_source_balanced_rotating_indices(
+            records, negative_to_positive_ratio=2.0, seed=91, epoch_index=0
+        )
+        self.assertEqual(plan["positive_slots_per_task"], 2)
+        self.assertEqual(plan["negative_slots_per_task"], 4)
+        self.assertEqual(len(indices), 5 * 6)
+        counts = {task: {"positive": 0, "negative": 0} for task in range(5)}
+        selected_sources = {
+            task: {"positive": set(), "negative": set()} for task in range(5)
+        }
+        for index in indices:
+            record = records[index]
+            task = identify_ui_defect_task(record)[1]
+            polarity = "positive" if extract_ui_defect_targets(record)[
+                "target_box_mask"
+            ].any() else "negative"
+            counts[task][polarity] += 1
+            selected_sources[task][polarity].add(record["_ui5_image_id"])
+        self.assertTrue(
+            all(value == {"positive": 2, "negative": 4} for value in counts.values())
+        )
+        self.assertEqual(selected_sources, expected_sources)
+
+    def test_task_source_balanced_rotates_all_source_crops_before_repeat(self):
+        records = []
+        task_zero_positive = []
+        task_zero_manual = None
+        for task_index, (_, _, _, aliases) in enumerate(TASK_SPECS):
+            positive_source = f"task{task_index}_positive"
+            for crop_index in range(3):
+                record = make_record(aliases[0], positive=True)
+                record.update(
+                    {
+                        "_ui5_image_id": positive_source,
+                        "_ui5_sample_id": f"p{task_index}_{crop_index}",
+                        "_ui5_crop_source": (
+                            "manual_gt_repair"
+                            if crop_index == 0
+                            else "raw_detector_strip"
+                        ),
+                        "_ui5_manual_repair_gt_indices": (
+                            [0] if crop_index == 0 else []
+                        ),
+                    }
+                )
+                records.append(record)
+                if task_index == 0:
+                    task_zero_positive.append(len(records) - 1)
+                    if crop_index == 0:
+                        task_zero_manual = len(records) - 1
+            for source_index in range(2):
+                record = make_record(aliases[0], positive=False)
+                record.update(
+                    {
+                        "_ui5_image_id": f"task{task_index}_negative_{source_index}",
+                        "_ui5_sample_id": f"n{task_index}_{source_index}",
+                        "_ui5_crop_source": "raw_detector_strip",
+                    }
+                )
+                records.append(record)
+
+        selected = []
+        for epoch in range(3):
+            indices = build_task_source_balanced_rotating_indices(
+                records,
+                negative_to_positive_ratio=2.0,
+                seed=123,
+                epoch_index=epoch,
+            )
+            positives = [
+                index
+                for index in indices
+                if identify_ui_defect_task(records[index])[1] == 0
+                and extract_ui_defect_targets(records[index])["target_box_mask"].any()
+            ]
+            self.assertEqual(len(positives), 1)
+            selected.append(positives[0])
+        self.assertEqual(selected[0], task_zero_manual)
+        self.assertEqual(set(selected), set(task_zero_positive))
+
+        resumed = build_task_source_balanced_rotating_indices(
+            records,
+            negative_to_positive_ratio=2.0,
+            seed=123,
+            epoch_index=2,
+        )
+        original = build_task_source_balanced_rotating_indices(
+            records,
+            negative_to_positive_ratio=2.0,
+            seed=123,
+            epoch_index=2,
+        )
+        self.assertEqual(resumed, original)
 
 
 if __name__ == "__main__":
