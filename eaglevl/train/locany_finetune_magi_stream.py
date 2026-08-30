@@ -3355,7 +3355,7 @@ class StreamPackingMTPTrainer(Trainer):
             cosines = []
             for left in range(len(per_task_losses)):
                 for right in range(left + 1, len(per_task_losses)):
-                    cosines.append(F.cosine_similarity(
+                    cosines.append(torch.nn.functional.cosine_similarity(
                         per_task_losses[left], per_task_losses[right], dim=0
                     ))
             if cosines:

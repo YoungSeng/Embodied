@@ -25,6 +25,16 @@ import submit_locany_ui5
 
 
 class RuntimeConfigTests(unittest.TestCase):
+    def test_m31_gradient_cosine_diagnostic_uses_available_torch_namespace(self) -> None:
+        trainer_source = (
+            PROJECT_ROOT / "eaglevl" / "train" / "locany_finetune_magi_stream.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "torch.nn.functional.cosine_similarity(",
+            trainer_source,
+        )
+        self.assertNotIn("F.cosine_similarity(", trainer_source)
+
     def test_single_task_baseline_manifest_has_all_five_comparable_slots(self) -> None:
         manifest = json.loads(
             (PROJECT_ROOT / "configs" / "ui5_single_task_baselines.json").read_text(
