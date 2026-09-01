@@ -603,6 +603,7 @@ class DetectorScanPipelineTest(unittest.TestCase):
             tile_overlap_ratio=0.12,
             tile_nms_iou=0.5,
             detector_crop_manifest=Path("detector_scan_crops.jsonl"),
+            save_raw_answer=True,
             relation_gate_threshold=None,
             overwrite=False,
             max_images_per_task=0,
@@ -613,6 +614,15 @@ class DetectorScanPipelineTest(unittest.TestCase):
         self.assertIn("detector_scan", command)
         self.assertIn("--detector-crop-manifest", command)
         self.assertIn("detector_scan_crops.jsonl", command)
+        self.assertIn("--save-raw-answer", command)
+
+    def test_detector_scan_without_raw_sidecars_fails_before_workers(self) -> None:
+        source = (SCRIPTS / "run_ui5_eval.py").read_text(encoding="utf-8")
+        self.assertIn('current_command.append("--save-raw-answer")', source)
+        source = (SCRIPTS / "run_ui5_parallel_inference.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("detector_scan requires --save-raw-answer", source)
 
     def test_runtime_defaults_to_detector_scan_and_exposes_detector_settings(self) -> None:
         config = common.resolve_runtime_config(
@@ -630,7 +640,17 @@ class DetectorScanPipelineTest(unittest.TestCase):
         self.assertEqual(config["EVAL_REQUIRE_STRICT_NONOVERLAP"], 1)
         self.assertEqual(config["EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT"], 1)
         self.assertEqual(config["EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT"], 1)
-        self.assertEqual(config["EVAL_EXPECTED_UNIQUE_IMAGES"], 1555)
+        self.assertEqual(config["EVAL_EXPECTED_UNIQUE_IMAGES"], 0)
+        self.assertTrue(
+            config["EVAL_INPUT_DIR"].endswith(
+                "work_dirs/ui5_validation_eval_input_v1"
+            )
+        )
+        self.assertTrue(
+            config["EVAL_DETECTOR_CACHE"].endswith(
+                "work_dirs/ui5_validation_detector_cache_horizontal_v5"
+            )
+        )
         self.assertEqual(config["EVAL_SCAN_TARGET_GUARD_RATIO"], 0.0)
         self.assertEqual(config["EVAL_SCAN_TARGET_GUARD_MIN_PIXELS"], 0)
         self.assertEqual(config["EVAL_SCAN_TARGET_GUARD_MAX_PIXELS"], 0)

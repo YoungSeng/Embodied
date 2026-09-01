@@ -90,6 +90,10 @@ from eaglevl.train.ui_defect_data import (
 )
 from eaglevl.train.ui5_excel_logger import UI5ExcelLogger, TRAIN_TASKS
 from eaglevl.train.ui5_checkpoint_utils import atomic_save_with_fsync, validate_checkpoint
+from eaglevl.train.ui5_sampling_coverage import (
+    is_monotonic_coverage,
+    write_sampling_coverage_atomic,
+)
 from dotenv import load_dotenv
 load_dotenv()
 from transformers.trainer_pt_utils import LabelSmoother
@@ -1794,9 +1798,14 @@ class SamplingCoverageCallback(TrainerCallback):
             for index, values in enumerate(seen)
         ]
 
-    def _write(self, args, state) -> None:
+    @staticmethod
+    def _is_monotonic(previous: dict, current: dict) -> bool:
+        return is_monotonic_coverage(previous, current)
+
+    def _write(self, args, state, *, resume_start: bool = False) -> None:
         step = int(state.global_step)
-        if step in self._written_steps:
+        write_key = (step, "resume_start" if resume_start else "periodic")
+        if write_key in self._written_steps:
             return
         local = self._local_seen()
         gathered = None
@@ -1807,7 +1816,7 @@ class SamplingCoverageCallback(TrainerCallback):
         else:
             gathered = [local]
         if get_rank() != 0:
-            self._written_steps.add(step)
+            self._written_steps.add(write_key)
             return
         datasets = []
         for ds_index, dataset in enumerate(self.train_dataset.datasets):
@@ -1826,24 +1835,29 @@ class SamplingCoverageCallback(TrainerCallback):
         payload = {
             "schema_version": 1,
             "global_step": step,
+            "event": "resume_start" if resume_start else "periodic_coverage",
             "world_size": dist.get_world_size() if dist.is_initialized() else 1,
             "datasets": datasets,
         }
         output_dir = Path(args.output_dir) / "diagnostics"
         output_dir.mkdir(parents=True, exist_ok=True)
-        destination = output_dir / f"sampling_coverage_step_{step}.json"
-        temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
+        destination = output_dir / (
+            f"sampling_coverage_resume_start_step_{step}.json"
+            if resume_start
+            else f"sampling_coverage_step_{step}.json"
+        )
+        if not write_sampling_coverage_atomic(destination, payload):
+            logger.warning(
+                "[UI5 sampling] refusing non-monotonic overwrite: %s",
+                destination,
+            )
+            self._written_steps.add(write_key)
+            return
         logger.info("[UI5 sampling] wrote %s: %s", destination, datasets)
-        self._written_steps.add(step)
+        self._written_steps.add(write_key)
 
     def on_train_begin(self, args, state, control, **kwargs):
-        self._write(args, state)
+        self._write(args, state, resume_start=int(state.global_step) > 0)
         return control
 
     def on_step_end(self, args, state, control, **kwargs):
@@ -2035,6 +2049,8 @@ class StreamPackingMTPTrainer(Trainer):
                 "ui5_training_evaluation.xlsx",
             )
         )
+        self._ui5_global_epoch_offset = self._ui5_excel.latest_train_global_epoch()
+        self._ui5_segment_start_epoch = None
         self._ui5_last_flushed_step = 0
         self._reset_ui5_window()
         self._ui5_window_path = osp.join(
@@ -2801,6 +2817,8 @@ class StreamPackingMTPTrainer(Trainer):
         # 记录开始的step（用于resume时正确计算平均值）
         if self._start_step is None:
             self._start_step = self.state.global_step
+        if self._ui5_segment_start_epoch is None:
+            self._ui5_segment_start_epoch = float(self.state.epoch or 0.0)
         
         # Count samples in current batch (通过 sub_sample_lengths 获取样本数)
         if 'sub_sample_lengths' in inputs:
@@ -2969,9 +2987,14 @@ class StreamPackingMTPTrainer(Trainer):
             if image_gate_grad_norm is not None or slot_gate_grad_norm is not None
             else None
         )
+        current_epoch = float(self.state.epoch or 0.0)
+        segment_start_epoch = float(self._ui5_segment_start_epoch or 0.0)
+        segment_epoch = max(0.0, current_epoch - segment_start_epoch)
+        global_epoch = self._ui5_global_epoch_offset + segment_epoch
         metrics = {
             "step": step,
-            "epoch": self.state.epoch,
+            "segment_epoch": segment_epoch,
+            "global_epoch": global_epoch,
             "gpu_num": self.args.world_size,
             "max_num_tokens": self._max_num_tokens,
             "learning_rate": logs.get("learning_rate"),

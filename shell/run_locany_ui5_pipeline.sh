@@ -27,6 +27,26 @@ trap cleanup_resolved_config EXIT
 # shellcheck disable=SC1090
 source "${RESOLVED_SHELL}"
 
+# Validation is the only default periodic-evaluation split.  Its staged image
+# count is data-dependent, so derive it from the immutable staging summary when
+# the submitter did not supply an explicit value.  Never guess 1,555 (the test
+# count) for validation.
+if [[ "${ENABLE_EVAL}" == "1" \
+      && "${EVAL_DATA_SPLIT}" == "validation" \
+      && "${EVAL_EXPECTED_UNIQUE_IMAGES}" == "0" ]]; then
+  VALIDATION_STAGING_SUMMARY="${EVAL_INPUT_DIR}/validation_staging_summary.json"
+  if [[ ! -s "${VALIDATION_STAGING_SUMMARY}" ]]; then
+    locany_die 20 \
+      "Validation staging summary is missing: ${VALIDATION_STAGING_SUMMARY}; build the fixed validation input/cache before training"
+  fi
+  read -r EVAL_EXPECTED_UNIQUE_IMAGES < <(
+    "${PIPELINE_PYTHON}" -c \
+      'import json,sys; value=int(json.load(open(sys.argv[1], encoding="utf-8"))["expected_unique_images"]); assert value > 0; print(value)' \
+      "${VALIDATION_STAGING_SUMMARY}"
+  )
+  echo "[EVAL] derived validation unique images=${EVAL_EXPECTED_UNIQUE_IMAGES} from ${VALIDATION_STAGING_SUMMARY}"
+fi
+
 export PATH="${ENV_DIR}/bin:${PATH}"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
@@ -342,6 +362,7 @@ run_evaluation() {
     --relation-gate-mode "${RELATION_GATE_MODE}"
     --relation-gate-threshold "${RELATION_GATE_THRESHOLD}"
     --evaluation-split "${EVAL_DATA_SPLIT}"
+    --recipe-path "${META_PATH}"
     --inference-crop-mode "${EVAL_INFERENCE_CROP_MODE}"
     --eval-parser-root "${EVAL_PARSER_ROOT}"
     --eval-detector-cache "${EVAL_DETECTOR_CACHE}"
@@ -365,6 +386,12 @@ run_evaluation() {
     --scan-dense-band-ratio "${EVAL_SCAN_DENSE_BAND_RATIO}"
     --scan-visualization-samples "${EVAL_SCAN_VISUALIZATION_SAMPLES}"
   )
+  if [[ "${PIPELINE_MODE}" != "eval" \
+        && "${EVAL_DATA_SPLIT}" == "test" \
+        && "${EVAL_REQUIRE_CACHE_SCOPE}" == "full_test" ]]; then
+    command+=(--development-test-reuse)
+    echo "[EVAL WARNING] development_test_reuse=true: periodic training evaluation is using full_test" >&2
+  fi
   if [[ -n "${EVAL_FROZEN_GATE_THRESHOLDS:-}" ]]; then
     command+=(--frozen-gate-thresholds "${EVAL_FROZEN_GATE_THRESHOLDS}")
   fi

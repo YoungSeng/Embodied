@@ -282,6 +282,10 @@ effective epoch 使用五任务等量、每任务正:负约 1:2 的 source-balan
 需要恢复原来的连续两次未改善自动停止，显式改为 `--validation-early-stop`。Gate 主结果是
 `observe` raw 指标；validation 同时生成冻结
 阈值并用独立 prediction tree 重新调用 scorer，因此 gated Image/BBox 是两套真实重评分指标。
+断点恢复会单独写 `sampling_coverage_resume_start_step_<N>.json`，不会用恢复瞬间的零计数覆盖
+已有周期覆盖率；Excel 将片段 epoch 与累计 epoch 分别写为 `segment_epoch`、`global_epoch`。
+周期评测默认路径就是上述 `VAL_INPUT`/`VAL_CACHE`；未显式给出 validation 图片数时，pipeline
+从 `validation_staging_summary.json` 读取，绝不会套用正式 test 的 1,555。
 
 ### 5. 选定 checkpoint 后，只运行一次正式 test
 
@@ -340,6 +344,9 @@ test -s "${FROZEN_THRESHOLDS}"
 source-image FP amplification、tile_count 分组指标、text ellipsis FP gallery 和 cropping FN
 gallery。训练/评测日志若出现 detector worker 启动、preview marker、非 1555 full-test marker、
 GT repair 或 cache digest 不匹配，会在模型 worker 启动前失败。
+detector-scan 推理固定传递 `--save-raw-answer`；若 `raw/` sidecar 为 0，诊断状态为
+`missing_raw_sidecars` 且该次评测失败，不再生成 amplification=0 的成功口径。Excel 对每种粒度
+分别写 `five_task_macro` 与 `five_task_micro`，并记录 split/scope、Git 状态以及 recipe/cache digest。
 
 ## 测试集水平 detector scan：先离线缓存，再只读评测
 

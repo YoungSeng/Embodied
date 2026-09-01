@@ -14,13 +14,18 @@ strips 也作为 negative record；partial strip 不会作为负样本。
 `task_balanced_all_records` 为五个任务建立独立确定性 stream。较小 stream 只有在完整遍历后
 才重复，较大 stream 不被下采样；自然正负分布不改写，manual repair fail-closed 保留。
 训练启动及每 1000 step 写 `diagnostics/sampling_coverage_step_<N>.json`，其中合法但未进入
-active pool 的记录数必须为 0。
+active pool 的记录数必须为 0。断点恢复时另写
+`sampling_coverage_resume_start_step_<N>.json`；恢复瞬间的 `seen=0` 不会覆盖同 step 已有覆盖率，
+周期文件只允许 seen 数量单调增加。Excel 中 `segment_epoch` 表示本次 torchrun 片段内 epoch，
+`global_epoch` 表示跨恢复片段的累计 epoch。
 
 评测拆成两个不可混用的集合：训练期间只使用 held-out validation cache，根据 raw Image/BBox
 macro 选择 checkpoint，并仅在 validation 上冻结每任务 Gate 阈值；正式 1,555 张 test 只在
 checkpoint 选定后运行一次。两者都使用 GT-free、strict non-overlap、raw-detector-edge-aligned
 只读 cache，训练任务不会启动 PaddleOCR/icon worker。冻结 Gate 后会生成独立预测目录并重新
 调用五任务 scorer，所以 gated BBox 指标不是 Image Gate 指标的复制。
+detector-scan worker 强制保存 `raw/` sidecar；缺少全部 sidecar 时 tile 诊断写
+`status=missing_raw_sidecars` 并令评测失败，不能再以 amplification=0 冒充成功。
 
 从旧任务归档、生成 crop-only recipe、建立 validation cache、20+5 step resume smoke、正式
 5000-step 训练和一次性 test 的完整无省略命令见 `README_UI5_COMMANDS.md` 的
@@ -370,6 +375,17 @@ ${OUTPUT_DIR}/evaluation/evaluation_history.csv
 ```
 
 history 包含：step、机器类型、训练 GPU 数、`MAX_NUM_TOKENS`、checkpoint、五类 image/bbox 指标、image/bbox macro precision/recall/F1、起止时间和状态。`macro_precision/recall/F1` 列默认对应主要的 Image Macro 指标，同时保留明确的 `image_macro_*` 与 `bbox_macro_*` 列。
+
+Excel 的 `eval_1000steps` 对 Image/BBox 分别写 `five_task_macro`（五任务指标等权平均、TP/FP/FN
+留空）和 `five_task_micro`（先汇总 TP/FP/FN 后重算指标）。评测行同时绑定
+`evaluation_split`、`cache_scope`、Git SHA/dirty、recipe digest 与 cache digest。BBox Gate 只有真实
+scorer 重评分后才写 gated 指标：threshold=0 时等于 raw BBox；threshold>0 但没有 genuine rescore
+时字段留空，`gate_metric_status=not_rescored`。
+
+训练周期评测默认使用固定的 `work_dirs/ui5_validation_eval_input_v1` 与
+`work_dirs/ui5_validation_detector_cache_horizontal_v5`，且自动早停默认关闭。`full_test` 正常只由
+`PIPELINE_MODE=eval` 的最终离线任务使用；若训练 pipeline 显式复用 full-test cache，日志和 Excel
+会标记 `development_test_reuse=true`。
 
 ## 两-sheet 训练/评测诊断
 

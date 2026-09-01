@@ -47,6 +47,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tile-overlap-ratio", type=float, default=0.10)
     parser.add_argument("--tile-nms-iou", type=float, default=0.50)
     parser.add_argument(
+        "--save-raw-answer",
+        action="store_true",
+        help="Persist per-image raw/tile sidecars required by detector-scan diagnostics",
+    )
+    parser.add_argument(
         "--relation-gate-mode", choices=("observe", "hard"), default="observe"
     )
     parser.add_argument("--relation-gate-threshold", type=float, default=None)
@@ -159,6 +164,8 @@ def build_command(
         command.extend(
             ["--relation-gate-threshold", str(args.relation_gate_threshold)]
         )
+    if getattr(args, "save_raw_answer", False):
+        command.append("--save-raw-answer")
     if args.overwrite:
         command.append("--overwrite")
     if load_only:
@@ -215,6 +222,11 @@ def main() -> int:
     args.output_dir = args.output_dir.expanduser().resolve()
     args.inference_script = args.inference_script.expanduser().resolve()
     if args.inference_crop_mode == "detector_scan":
+        if not getattr(args, "save_raw_answer", False):
+            raise ValueError(
+                "detector_scan requires --save-raw-answer so tile diagnostics cannot "
+                "silently report zero raw records"
+            )
         if args.detector_crop_manifest is None:
             raise ValueError("detector_scan requires --detector-crop-manifest")
         args.detector_crop_manifest = args.detector_crop_manifest.expanduser().resolve(

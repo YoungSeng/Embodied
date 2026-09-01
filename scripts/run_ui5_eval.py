@@ -99,6 +99,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--evaluation-split", choices=("validation", "test"), default="validation"
     )
+    parser.add_argument(
+        "--development-test-reuse",
+        action="store_true",
+        help="Mark periodic full-test evaluation as development-time test reuse",
+    )
+    parser.add_argument("--recipe-path", type=Path, default=None)
     parser.add_argument("--frozen-gate-thresholds", type=Path, default=None)
     parser.add_argument("--relation-gate-threshold", type=float, default=None)
     parser.add_argument("--skip-patch", action="store_true")
@@ -121,6 +127,29 @@ def atomic_write_json(path: Path, value: Any) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def file_digest(path: Path | None) -> str | None:
+    if path is None or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_state(project_root: Path) -> tuple[str, bool]:
+    def output(*arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(project_root), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return completed.stdout.strip()
+
+    return output("rev-parse", "HEAD"), bool(output("status", "--porcelain"))
 
 
 def run_checked(command: list[str], *, cwd: Path | None, stage: str) -> None:
@@ -165,6 +194,12 @@ def record_history(
         args.relation_gate_mode,
         "--evaluation-split",
         args.evaluation_split,
+        "--cache-scope",
+        args.require_cache_scope,
+        "--git-sha",
+        args.git_sha,
+        "--git-dirty",
+        "1" if args.git_dirty else "0",
         "--checkpoint",
         str(args.checkpoint),
         "--start-time",
@@ -182,6 +217,12 @@ def record_history(
         "--error",
         error,
     ]
+    if args.development_test_reuse:
+        command.append("--development-test-reuse")
+    if args.recipe_digest is not None:
+        command.extend(["--recipe-digest", args.recipe_digest])
+    if args.cache_digest is not None:
+        command.extend(["--cache-digest", args.cache_digest])
     if metrics_json is not None and metrics_json.is_file():
         command.extend(["--metrics-json", str(metrics_json)])
     if gated_metrics_json is not None and gated_metrics_json.is_file():
@@ -217,6 +258,8 @@ def main() -> int:
             "evaluation split/cache scope mismatch: "
             f"split={args.evaluation_split}, scope={args.require_cache_scope}"
         )
+    if args.development_test_reuse and args.evaluation_split != "test":
+        raise ValueError("--development-test-reuse is only valid for test evaluation")
     if min(
         args.scan_vertical_link_ratio,
         args.scan_context_ratio,
@@ -237,6 +280,14 @@ def main() -> int:
     args.input_dir = args.input_dir.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
     args.scorer_root = args.scorer_root.expanduser().resolve()
+    args.recipe_path = (
+        args.recipe_path.expanduser().resolve(strict=True)
+        if args.recipe_path is not None
+        else None
+    )
+    args.recipe_digest = file_digest(args.recipe_path)
+    args.cache_digest = None
+    args.git_sha, args.git_dirty = git_state(args.project_root)
     args.eval_parser_root = (
         args.eval_parser_root.expanduser().resolve(strict=False)
         if args.eval_parser_root is not None
@@ -277,6 +328,11 @@ def main() -> int:
         "max_num_tokens_scope": "per_rank_packed_batch",
         "relation_gate_mode": args.relation_gate_mode,
         "evaluation_split": args.evaluation_split,
+        "cache_scope": args.require_cache_scope,
+        "development_test_reuse": args.development_test_reuse,
+        "git_sha": args.git_sha,
+        "git_dirty": args.git_dirty,
+        "recipe_digest": args.recipe_digest,
         "frozen_gate_thresholds": (
             str(args.frozen_gate_thresholds)
             if args.frozen_gate_thresholds is not None else None
@@ -305,6 +361,14 @@ def main() -> int:
         "status": "running",
     }
     atomic_write_json(metadata_path, metadata)
+
+    if args.development_test_reuse:
+        print(
+            "[EVAL WARNING] development_test_reuse=true: full_test is being used "
+            "periodically for development monitoring; do not treat checkpoint "
+            "selection as an unbiased final-test result",
+            flush=True,
+        )
 
     try:
         for path, label in (
@@ -394,6 +458,14 @@ def main() -> int:
                 detector_crop_manifest_digest = hashlib.sha256(
                     detector_crop_manifest.read_bytes()
                 ).hexdigest()
+                ready_marker = (
+                    args.eval_detector_cache
+                    / args.eval_scan_name
+                    / "eval_detector_cache_ready.json"
+                )
+                args.cache_digest = file_digest(ready_marker)
+                metadata["cache_digest"] = args.cache_digest
+                atomic_write_json(metadata_path, metadata)
                 print(
                     "detector cache: readonly validated | "
                     f"scan={args.eval_scan_name} | scope={marker['cache_scope']} | "
@@ -458,12 +530,14 @@ def main() -> int:
             "--tile-nms-iou",
             str(args.tile_nms_iou),
         ]
+        if args.inference_crop_mode == "detector_scan":
+            current_command.append("--save-raw-answer")
         if detector_crop_manifest is not None:
             current_command.extend(
                 ["--detector-crop-manifest", str(detector_crop_manifest)]
             )
         existing_manifest = prediction_dir / "_run_manifest.json"
-        overwrite_for_gate_mode_change = False
+        overwrite_for_inference_identity_change = False
         if existing_manifest.is_file():
             try:
                 previous_manifest = json.loads(existing_manifest.read_text(encoding="utf-8"))
@@ -471,6 +545,7 @@ def main() -> int:
                     "relation_gate_mode"
                 )
                 previous_crop = previous_manifest.get("inference_crop", {})
+                previous_output = previous_manifest.get("output", {})
                 expected_crop = {
                     "mode": args.inference_crop_mode,
                     "max_tiles": args.tile_max_count,
@@ -485,13 +560,17 @@ def main() -> int:
                     "detector_crop_manifest_digest": detector_crop_manifest_digest,
                     "gt_repair_allowed": False,
                 }
-                overwrite_for_gate_mode_change = (
+                overwrite_for_inference_identity_change = (
                     previous_mode != args.relation_gate_mode
                     or previous_crop != expected_crop
+                    or (
+                        args.inference_crop_mode == "detector_scan"
+                        and previous_output.get("save_raw_answer") is not True
+                    )
                 )
             except (OSError, json.JSONDecodeError):
-                overwrite_for_gate_mode_change = True
-        if overwrite_for_gate_mode_change:
+                overwrite_for_inference_identity_change = True
+        if overwrite_for_inference_identity_change:
             current_command.append("--overwrite")
         if args.relation_gate_threshold is not None:
             current_command.extend(

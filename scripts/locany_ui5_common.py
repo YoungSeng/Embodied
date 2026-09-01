@@ -295,11 +295,19 @@ def resolve_runtime_config(
         meta_path = crop_meta_path
     elif crop_meta_path:
         raise ValueError("UI5_CROP_META_PATH requires UI5_CROP_AUDIT_DIR")
+    eval_data_split_hint = str(
+        _env_value(env, "EVAL_DATA_SPLIT", "validation")
+    ).lower()
+    eval_input_default = (
+        join_runtime_path(project_root, "work_dirs", "ui5_validation_eval_input_v1")
+        if eval_data_split_hint == "validation"
+        else join_runtime_path(workspace, shared["eval_data_relative_path"])
+    )
     eval_input_dir = str(
         _env_value(
             env,
             "EVAL_INPUT_DIR",
-            join_runtime_path(workspace, shared["eval_data_relative_path"]),
+            eval_input_default,
         )
     )
 
@@ -320,9 +328,7 @@ def resolve_runtime_config(
         _env_value(env, "EVAL_VALIDATION_EARLY_STOP", "0"),
         name="EVAL_VALIDATION_EARLY_STOP",
     )
-    eval_data_split = str(
-        _env_value(env, "EVAL_DATA_SPLIT", "validation")
-    ).lower()
+    eval_data_split = eval_data_split_hint
     if eval_data_split not in {"validation", "test"}:
         raise ValueError("EVAL_DATA_SPLIT must be validation or test")
     eval_inference_crop_mode = str(
@@ -463,7 +469,19 @@ def resolve_runtime_config(
             _env_value(
                 env,
                 "EVAL_DETECTOR_CACHE",
-                join_runtime_path(output_dir, "evaluation", "detector_scan_cache"),
+                (
+                    join_runtime_path(
+                        project_root,
+                        "work_dirs",
+                        "ui5_validation_detector_cache_horizontal_v5",
+                    )
+                    if eval_data_split == "validation"
+                    else join_runtime_path(
+                        project_root,
+                        "work_dirs",
+                        "ui5_eval_detector_cache_horizontal_v5",
+                    )
+                ),
             )
         ),
         "EVAL_DETECTOR_CACHE_MODE": str(
@@ -507,7 +525,9 @@ def resolve_runtime_config(
             _env_value(
                 env,
                 "EVAL_EXPECTED_UNIQUE_IMAGES",
-                DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
+                0
+                if eval_data_split == "validation"
+                else DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
             )
         ),
         "EVAL_TEXT_PYTHON": str(_env_value(env, "EVAL_TEXT_PYTHON", "")),

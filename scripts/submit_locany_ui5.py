@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 from locany_ui5_common import (
-    DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
     DEFAULT_CONFIG_PATH,
     PROJECT_ROOT,
     assert_gpu_mode_consistency,
@@ -95,7 +94,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--eval-expected-unique-images",
         type=int,
-        default=DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
+        default=None,
+        help=(
+            "Expected content-unique evaluation images. Validation may omit this "
+            "and derive it from validation_staging_summary.json inside the job."
+        ),
     )
     parser.add_argument("--eval-text-python", default=None)
     parser.add_argument("--eval-icon-python", default=None)
@@ -307,13 +310,6 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
             if getattr(args, "require_detector_unique_containment", True)
             else "0"
         ),
-        "EVAL_EXPECTED_UNIQUE_IMAGES": str(
-            getattr(
-                args,
-                "eval_expected_unique_images",
-                DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
-            )
-        ),
         "EVAL_TILE_MAX_COUNT": str(getattr(args, "eval_tile_max_count", 10)),
         "EVAL_TILE_TARGET_LONG_SIDE": str(
             getattr(args, "eval_tile_target_long_side", 1600)
@@ -377,6 +373,9 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "EVAL_INPUT_DIR": getattr(args, "eval_input_dir", None),
         "EVAL_FROZEN_GATE_THRESHOLDS": getattr(args, "frozen_gate_thresholds", None),
         "EVAL_DETECTOR_CACHE": getattr(args, "eval_detector_cache", None),
+        "EVAL_EXPECTED_UNIQUE_IMAGES": getattr(
+            args, "eval_expected_unique_images", None
+        ),
         "EVAL_TEXT_PYTHON": getattr(args, "eval_text_python", None),
         "EVAL_ICON_PYTHON": getattr(args, "eval_icon_python", None),
         "EVAL_TEXT_MODEL_DIR": getattr(args, "eval_text_model_dir", None),

@@ -354,6 +354,14 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(default["EVAL_VALIDATION_EARLY_STOP"], 0)
         self.assertEqual(enabled["EVAL_VALIDATION_EARLY_STOP"], 1)
 
+    def test_periodic_full_test_reuse_is_explicitly_marked(self) -> None:
+        pipeline = (PROJECT_ROOT / "shell" / "run_locany_ui5_pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"${PIPELINE_MODE}" != "eval"', pipeline)
+        self.assertIn("command+=(--development-test-reuse)", pipeline)
+        self.assertIn("development_test_reuse=true", pipeline)
+
     def test_runtime_config_accepts_source_balanced_rotating_sampling(self) -> None:
         config = locany_ui5_common.resolve_runtime_config(
             {
@@ -1031,6 +1039,145 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(bbox["gated_f1"], 0.31)
         self.assertEqual(image["gated_f1"], 0.58)
         self.assertNotEqual(bbox["gated_f1"], image["gated_f1"])
+        self.assertTrue(bbox["bbox_metrics_genuinely_rescored"])
+        self.assertEqual(bbox["gate_metric_status"], "genuinely_rescored")
+
+    def test_bbox_gate_threshold_zero_uses_raw_bbox_not_image_gate(self) -> None:
+        metrics = {
+            "tasks": {
+                task: {
+                    "image": {
+                        "precision": 0.9,
+                        "recall": 0.8,
+                        "f1": 0.85,
+                        "tp": 9,
+                        "fp": 1,
+                        "fn": 2,
+                        "tn": 8,
+                    },
+                    "bbox": {
+                        "precision": 0.25,
+                        "recall": 0.5,
+                        "f1": 1 / 3,
+                        "tp": 2,
+                        "fp": 6,
+                        "fn": 2,
+                    },
+                }
+                for task in locany_ui5_common.TASKS
+            },
+            "macro": {
+                "image": {"precision": 0.9, "recall": 0.8, "f1": 0.85},
+                "bbox": {"precision": 0.25, "recall": 0.5, "f1": 1 / 3},
+            },
+        }
+        gates = {
+            task: {
+                "selected_gate_threshold": 0.0,
+                "gated_precision": 0.99,
+                "gated_recall": 0.99,
+                "gated_f1": 0.99,
+            }
+            for task in locany_ui5_common.TASKS
+        }
+        rows = build_eval_rows(
+            step=1000, checkpoint="ckpt", metrics=metrics, gate_metrics=gates
+        )
+        bbox = next(
+            row
+            for row in rows
+            if row["task"] == "element_overlap" and row["granularity"] == "bbox"
+        )
+        self.assertEqual(bbox["gated_f1"], bbox["raw_f1"])
+        self.assertEqual(bbox["gated_precision"], bbox["raw_precision"])
+        self.assertFalse(bbox["bbox_metrics_genuinely_rescored"])
+        self.assertEqual(bbox["gate_metric_status"], "raw_equivalent_threshold_zero")
+
+    def test_positive_gate_threshold_without_bbox_rescore_leaves_bbox_blank(self) -> None:
+        metrics = {
+            "tasks": {
+                task: {
+                    "image": {
+                        "precision": 0.4,
+                        "recall": 0.5,
+                        "f1": 0.44,
+                        "tp": 4,
+                        "fp": 6,
+                        "fn": 4,
+                        "tn": 2,
+                    },
+                    "bbox": {
+                        "precision": 0.3,
+                        "recall": 0.6,
+                        "f1": 0.4,
+                        "tp": 3,
+                        "fp": 7,
+                        "fn": 2,
+                    },
+                }
+                for task in locany_ui5_common.TASKS
+            },
+            "macro": {
+                "image": {"precision": 0.4, "recall": 0.5, "f1": 0.44},
+                "bbox": {"precision": 0.3, "recall": 0.6, "f1": 0.4},
+            },
+        }
+        gates = {
+            task: {
+                "selected_gate_threshold": 0.5,
+                "gated_precision": 0.9,
+                "gated_recall": 0.8,
+                "gated_f1": 0.85,
+                "gated_tp": 9,
+                "gated_fp": 1,
+                "gated_fn": 2,
+            }
+            for task in locany_ui5_common.TASKS
+        }
+        rows = build_eval_rows(
+            step=1000,
+            checkpoint="ckpt",
+            metrics=metrics,
+            gate_metrics=gates,
+            audit_context={
+                "evaluation_split": "test",
+                "cache_scope": "full_test",
+                "development_test_reuse": True,
+                "git_sha": "abc123",
+                "git_dirty": True,
+                "recipe_digest": "recipe",
+                "cache_digest": "cache",
+            },
+        )
+        bbox = next(
+            row
+            for row in rows
+            if row["task"] == "element_overlap" and row["granularity"] == "bbox"
+        )
+        self.assertIsNone(bbox["gated_precision"])
+        self.assertIsNone(bbox["gated_recall"])
+        self.assertIsNone(bbox["gated_f1"])
+        self.assertFalse(bbox["bbox_metrics_genuinely_rescored"])
+        self.assertEqual(bbox["gate_metric_status"], "not_rescored")
+        self.assertEqual(bbox["evaluation_split"], "test")
+        self.assertEqual(bbox["cache_scope"], "full_test")
+        self.assertTrue(bbox["development_test_reuse"])
+        self.assertEqual(bbox["git_sha"], "abc123")
+        self.assertTrue(bbox["git_dirty"])
+        self.assertEqual(bbox["recipe_digest"], "recipe")
+        self.assertEqual(bbox["cache_digest"], "cache")
+        macro = next(
+            row
+            for row in rows
+            if row["task"] == "five_task_macro" and row["granularity"] == "bbox"
+        )
+        micro = next(
+            row
+            for row in rows
+            if row["task"] == "five_task_micro" and row["granularity"] == "bbox"
+        )
+        self.assertIsNone(macro["tp"])
+        self.assertEqual(micro["tp"], 15)
 
     def test_validation_staging_reports_content_unique_images(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -19,7 +19,8 @@ TRAIN_TASKS = (
 
 TRAIN_BASE_COLUMNS = (
     "step",
-    "epoch",
+    "segment_epoch",
+    "global_epoch",
     "gpu_num",
     "max_num_tokens",
     "learning_rate",
@@ -129,6 +130,13 @@ TRAIN_COLUMNS = (
 EVAL_COLUMNS = (
     "step",
     "checkpoint",
+    "evaluation_split",
+    "cache_scope",
+    "development_test_reuse",
+    "git_sha",
+    "git_dirty",
+    "recipe_digest",
+    "cache_digest",
     "task",
     "granularity",
     "precision",
@@ -158,6 +166,8 @@ EVAL_COLUMNS = (
     "gated_f1",
     "gated_predicted_positive",
     "gate_filter_rate",
+    "bbox_metrics_genuinely_rescored",
+    "gate_metric_status",
 )
 
 SHEET_TRAIN = "train_100steps"
@@ -264,7 +274,8 @@ class UI5ExcelLogger:
             sheet = workbook[sheet_name]
             current = tuple(cell.value for cell in sheet[1])
             if current != expected:
-                if not set(current).issubset(set(expected)):
+                legacy_columns = {"epoch"} if sheet_name == SHEET_TRAIN else set()
+                if not set(current).issubset(set(expected) | legacy_columns):
                     workbook.close()
                     raise ValueError(
                         f"Cannot migrate {sheet_name} header: current={current}"
@@ -273,6 +284,11 @@ class UI5ExcelLogger:
                     dict(zip(current, values))
                     for values in sheet.iter_rows(min_row=2, values_only=True)
                 ]
+                if sheet_name == SHEET_TRAIN and "epoch" in current:
+                    for row in rows:
+                        legacy_epoch = row.get("epoch")
+                        row.setdefault("segment_epoch", legacy_epoch)
+                        row.setdefault("global_epoch", legacy_epoch)
                 sheet.delete_rows(1, sheet.max_row)
                 sheet.append(list(expected))
                 for row in rows:
@@ -342,7 +358,31 @@ class UI5ExcelLogger:
                 )
                 if row[0] is not None and int(row[0]) == int(step)
             ]
-            return len(rows) == 12
+            return len(rows) == 14
+        finally:
+            workbook.close()
+
+    def latest_train_global_epoch(self) -> float:
+        """Return the last cumulative epoch recorded before a new segment starts."""
+        if not self.path.is_file():
+            return 0.0
+        workbook = self._load_or_create()
+        try:
+            sheet = workbook[SHEET_TRAIN]
+            headers = [cell.value for cell in sheet[1]]
+            rows = [
+                dict(zip(headers, values))
+                for values in sheet.iter_rows(min_row=2, values_only=True)
+            ]
+            valid = [
+                row
+                for row in rows
+                if row.get("step") is not None and row.get("global_epoch") is not None
+            ]
+            if not valid:
+                return 0.0
+            latest = max(valid, key=lambda row: int(row["step"]))
+            return float(latest["global_epoch"])
         finally:
             workbook.close()
 
@@ -392,13 +432,13 @@ class UI5ExcelLogger:
             row["step"] = step
         expected_pairs = {
             (task, granularity)
-            for task in (*TRAIN_TASKS, "five_task_macro")
+            for task in (*TRAIN_TASKS, "five_task_macro", "five_task_micro")
             for granularity in ("image", "bbox")
         }
         actual_pairs = {(row.get("task"), row.get("granularity")) for row in rows}
-        if len(rows) != 12 or actual_pairs != expected_pairs:
+        if len(rows) != 14 or actual_pairs != expected_pairs:
             raise ValueError(
-                "eval_1000steps requires exactly five tasks plus macro, each at image/bbox; "
+                "eval_1000steps requires exactly five tasks plus macro/micro, each at image/bbox; "
                 f"found={sorted(actual_pairs)}"
             )
 
@@ -406,7 +446,7 @@ class UI5ExcelLogger:
         sheet = workbook[SHEET_EVAL]
         headers = [cell.value for cell in sheet[1]]
         existing = [dict(zip(headers, values)) for values in sheet.iter_rows(min_row=2, values_only=True)]
-        if sum(int(row.get("step", -1)) == step for row in existing) == 12:
+        if sum(int(row.get("step", -1)) == step for row in existing) == 14:
             workbook.close()
             return False
 
@@ -430,8 +470,14 @@ def build_eval_rows(
     checkpoint: str,
     metrics: Mapping[str, Any],
     gate_metrics: Mapping[str, Mapping[str, Any]] | None = None,
+    audit_context: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Convert scorer JSON plus gate summaries into the 12 requested rows."""
+    """Convert scorer and Gate summaries into task, macro, and micro rows.
+
+    Macro rows contain only task-averaged metrics.  Micro rows contain summed
+    confusion counts and metrics recomputed from those counts.  BBox Gate
+    metrics never fall back to image-Gate metrics.
+    """
 
     scorer_to_diagnostic = {
         "text_overflow": "text_overflow",
@@ -441,6 +487,65 @@ def build_eval_rows(
         "content_missing": "content_missing",
     }
     gate_metrics = gate_metrics or {}
+    audit_context = dict(audit_context or {})
+    context_columns = {
+        key: audit_context.get(key)
+        for key in (
+            "evaluation_split",
+            "cache_scope",
+            "development_test_reuse",
+            "git_sha",
+            "git_dirty",
+            "recipe_digest",
+            "cache_digest",
+        )
+    }
+
+    def mean(values: Sequence[Any]) -> float | None:
+        numeric = [float(value) for value in values if value is not None]
+        return sum(numeric) / len(numeric) if numeric else None
+
+    def sum_present(source_rows: Sequence[Mapping[str, Any]], name: str) -> int | None:
+        values = [row.get(name) for row in source_rows]
+        present = [int(value) for value in values if value is not None]
+        return sum(present) if present else None
+
+    def metrics_from_counts(
+        *,
+        tp: int,
+        fp: int,
+        fn: int,
+        tn: int | None,
+        granularity: str,
+    ) -> dict[str, Any]:
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = (
+            2.0 * precision * recall / (precision + recall)
+            if precision + recall
+            else 0.0
+        )
+        if granularity == "image":
+            denominator = tp + fp + fn + int(tn or 0)
+            accuracy = (tp + int(tn or 0)) / denominator if denominator else 0.0
+        else:
+            denominator = tp + fp + fn
+            accuracy = tp / denominator if denominator else 0.0
+        return {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "accuracy": accuracy,
+        }
+
+    def aggregate_gate_status(source_rows: Sequence[Mapping[str, Any]]) -> str:
+        statuses = {str(row.get("gate_metric_status")) for row in source_rows}
+        if "not_rescored" in statuses:
+            return "not_rescored"
+        if len(statuses) == 1:
+            return next(iter(statuses))
+        return "mixed"
+
     rows: list[dict[str, Any]] = []
     for scorer_task, diagnostic_task in scorer_to_diagnostic.items():
         task_values = metrics.get("tasks", {}).get(scorer_task, {})
@@ -450,10 +555,56 @@ def build_eval_rows(
             rescored = gate.get("gated_metrics_by_granularity", {}).get(
                 granularity, {}
             )
+            threshold_value = gate.get("selected_gate_threshold")
+            threshold = (
+                float(threshold_value) if threshold_value is not None else 0.0
+            )
+            bbox_genuinely_rescored = bool(
+                gate.get("gated_metrics_by_granularity", {}).get("bbox", {})
+            )
+            if rescored:
+                gated = dict(rescored)
+                gate_metric_status = "genuinely_rescored"
+            elif threshold <= 0.0:
+                # A disabled Gate is exactly the raw scorer result.  This is
+                # especially important for BBox, where image Gate metrics must
+                # never be copied into the BBox row.
+                gated = dict(values)
+                gate_metric_status = "raw_equivalent_threshold_zero"
+            elif granularity == "bbox":
+                gated = {}
+                gate_metric_status = "not_rescored"
+            else:
+                gated = {
+                    "precision": gate.get("gated_precision"),
+                    "recall": gate.get("gated_recall"),
+                    "f1": gate.get("gated_f1"),
+                    "tp": gate.get("gated_tp"),
+                    "fp": gate.get("gated_fp"),
+                    "fn": gate.get("gated_fn"),
+                    "tn": gate.get("gated_tn"),
+                    "predicted_positive": gate.get("gated_predicted_positive"),
+                }
+                gate_metric_status = "image_gate_sidecar_rescored"
             tp = values.get("tp")
             fp = values.get("fp")
+            gated_tp = gated.get("tp")
+            gated_fp = gated.get("fp")
+            gated_fn = gated.get("fn")
+            gated_tn = gated.get("tn") if granularity == "image" else None
+            gated_predicted_positive = (
+                int(gated_tp) + int(gated_fp)
+                if gated_tp is not None and gated_fp is not None
+                else gated.get("predicted_positive")
+            )
+            raw_predicted_positive = (
+                int(tp) + int(fp)
+                if tp is not None and fp is not None
+                else None
+            )
             rows.append(
                 {
+                    **context_columns,
                     "step": step,
                     "checkpoint": checkpoint,
                     "task": diagnostic_task,
@@ -469,9 +620,7 @@ def build_eval_rows(
                         "accuracy" if granularity == "image" else "count_accuracy"
                     ),
                     "predicted_positive": (
-                        int(tp) + int(fp)
-                        if tp is not None and fp is not None
-                        else None
+                        raw_predicted_positive
                     ),
                     "gate_positive": gate.get("gate_positive"),
                     "gate_filtered": gate.get("gate_filtered"),
@@ -482,28 +631,27 @@ def build_eval_rows(
                     "raw_recall": values.get("recall"),
                     "raw_f1": values.get("f1"),
                     "raw_predicted_positive": (
-                        int(tp) + int(fp)
-                        if tp is not None and fp is not None
+                        raw_predicted_positive
+                    ),
+                    "selected_gate_threshold": threshold,
+                    "gated_precision": gated.get("precision"),
+                    "gated_recall": gated.get("recall"),
+                    "gated_f1": gated.get("f1"),
+                    "gated_predicted_positive": gated_predicted_positive,
+                    "gate_filter_rate": (
+                        1.0 - int(gated_predicted_positive) / max(1, int(raw_predicted_positive))
+                        if gated_predicted_positive is not None
+                        and raw_predicted_positive is not None
                         else None
                     ),
-                    "selected_gate_threshold": gate.get("selected_gate_threshold"),
-                    "gated_precision": rescored.get(
-                        "precision", gate.get("gated_precision")
+                    "bbox_metrics_genuinely_rescored": (
+                        bbox_genuinely_rescored if granularity == "bbox" else None
                     ),
-                    "gated_recall": rescored.get("recall", gate.get("gated_recall")),
-                    "gated_f1": rescored.get("f1", gate.get("gated_f1")),
-                    "gated_predicted_positive": (
-                        int(rescored.get("tp", 0)) + int(rescored.get("fp", 0))
-                        if rescored
-                        else gate.get("gated_predicted_positive")
-                    ),
-                    "gate_filter_rate": (
-                        1.0
-                        - (int(rescored.get("tp", 0)) + int(rescored.get("fp", 0)))
-                        / max(1, int(tp or 0) + int(fp or 0))
-                        if rescored
-                        else gate.get("gate_filter_rate")
-                    ),
+                    "gate_metric_status": gate_metric_status,
+                    "_gated_tp": gated_tp,
+                    "_gated_fp": gated_fp,
+                    "_gated_fn": gated_fn,
+                    "_gated_tn": gated_tn,
                 }
             )
 
@@ -514,9 +662,6 @@ def build_eval_rows(
             for row in rows
             if row["granularity"] == granularity
         ]
-        summed = lambda name: sum(
-            int(row[name]) for row in source_rows if row.get(name) is not None
-        )
         positive_count = sum(
             int(gate_metrics.get(task, {}).get("positive_count", 0))
             for task in scorer_to_diagnostic
@@ -545,28 +690,95 @@ def build_eval_rows(
             if negative_count
             else None
         )
+        all_gated = all(row.get("gated_f1") is not None for row in source_rows)
+        macro_row = {
+            **context_columns,
+            "step": step,
+            "checkpoint": checkpoint,
+            "task": "five_task_macro",
+            "granularity": granularity,
+            "precision": values.get("precision", mean([row.get("precision") for row in source_rows])),
+            "recall": values.get("recall", mean([row.get("recall") for row in source_rows])),
+            "f1": values.get("f1", mean([row.get("f1") for row in source_rows])),
+            # Macro is a mean-of-tasks row.  Counts intentionally remain empty.
+            "tp": None,
+            "fp": None,
+            "fn": None,
+            "tn": None,
+            "accuracy": mean([row.get("accuracy") for row in source_rows]),
+            "predicted_positive": None,
+            "gate_positive": None,
+            "gate_filtered": None,
+            "p_defect_pos": mean([row.get("p_defect_pos") for row in source_rows]),
+            "p_defect_neg": mean([row.get("p_defect_neg") for row in source_rows]),
+            "parse_error": None,
+            "raw_precision": mean([row.get("raw_precision") for row in source_rows]),
+            "raw_recall": mean([row.get("raw_recall") for row in source_rows]),
+            "raw_f1": mean([row.get("raw_f1") for row in source_rows]),
+            "raw_predicted_positive": None,
+            "selected_gate_threshold": mean([row.get("selected_gate_threshold") for row in source_rows]),
+            "gated_precision": mean([row.get("gated_precision") for row in source_rows]) if all_gated else None,
+            "gated_recall": mean([row.get("gated_recall") for row in source_rows]) if all_gated else None,
+            "gated_f1": mean([row.get("gated_f1") for row in source_rows]) if all_gated else None,
+            "gated_predicted_positive": None,
+            "gate_filter_rate": mean([row.get("gate_filter_rate") for row in source_rows]) if all_gated else None,
+            "bbox_metrics_genuinely_rescored": (
+                all(bool(row.get("bbox_metrics_genuinely_rescored")) for row in source_rows)
+                if granularity == "bbox"
+                else None
+            ),
+            "gate_metric_status": aggregate_gate_status(source_rows),
+        }
+        rows.append(macro_row)
+
+        raw_tp = int(sum_present(source_rows, "tp") or 0)
+        raw_fp = int(sum_present(source_rows, "fp") or 0)
+        raw_fn = int(sum_present(source_rows, "fn") or 0)
+        raw_tn = (
+            int(sum_present(source_rows, "tn") or 0)
+            if granularity == "image"
+            else None
+        )
+        raw_micro = metrics_from_counts(
+            tp=raw_tp, fp=raw_fp, fn=raw_fn, tn=raw_tn, granularity=granularity
+        )
+        all_gated_counts = all(
+            row.get("_gated_tp") is not None
+            and row.get("_gated_fp") is not None
+            and row.get("_gated_fn") is not None
+            for row in source_rows
+        )
+        gated_micro: dict[str, Any] | None = None
+        gated_tp = gated_fp = gated_fn = gated_tn = None
+        if all_gated_counts:
+            gated_tp = int(sum_present(source_rows, "_gated_tp") or 0)
+            gated_fp = int(sum_present(source_rows, "_gated_fp") or 0)
+            gated_fn = int(sum_present(source_rows, "_gated_fn") or 0)
+            gated_tn = (
+                int(sum_present(source_rows, "_gated_tn") or 0)
+                if granularity == "image"
+                else None
+            )
+            gated_micro = metrics_from_counts(
+                tp=gated_tp,
+                fp=gated_fp,
+                fn=gated_fn,
+                tn=gated_tn,
+                granularity=granularity,
+            )
         rows.append(
             {
+                **context_columns,
                 "step": step,
                 "checkpoint": checkpoint,
-                "task": "five_task_macro",
+                "task": "five_task_micro",
                 "granularity": granularity,
-                "precision": values.get("precision"),
-                "recall": values.get("recall"),
-                "f1": values.get("f1"),
-                "tp": summed("tp"),
-                "fp": summed("fp"),
-                "fn": summed("fn"),
-                "tn": summed("tn") if granularity == "image" else None,
-                "accuracy": (
-                    sum(
-                        float(row["accuracy"])
-                        for row in source_rows
-                        if row.get("accuracy") is not None
-                    )
-                    / max(1, sum(row.get("accuracy") is not None for row in source_rows))
-                ),
-                "predicted_positive": summed("predicted_positive"),
+                **raw_micro,
+                "tp": raw_tp,
+                "fp": raw_fp,
+                "fn": raw_fn,
+                "tn": raw_tn,
+                "predicted_positive": raw_tp + raw_fp,
                 "gate_positive": sum(
                     int(gate_metrics.get(task, {}).get("gate_positive", 0))
                     for task in scorer_to_diagnostic
@@ -581,41 +793,28 @@ def build_eval_rows(
                     int(gate_metrics.get(task, {}).get("parse_error", 0))
                     for task in scorer_to_diagnostic
                 ),
-                "raw_precision": (
-                    sum(float(row.get("raw_precision") or 0.0) for row in source_rows)
-                    / len(source_rows)
+                "raw_precision": raw_micro["precision"],
+                "raw_recall": raw_micro["recall"],
+                "raw_f1": raw_micro["f1"],
+                "raw_predicted_positive": raw_tp + raw_fp,
+                "selected_gate_threshold": mean([row.get("selected_gate_threshold") for row in source_rows]),
+                "gated_precision": gated_micro["precision"] if gated_micro else None,
+                "gated_recall": gated_micro["recall"] if gated_micro else None,
+                "gated_f1": gated_micro["f1"] if gated_micro else None,
+                "gated_predicted_positive": (
+                    int(gated_tp) + int(gated_fp) if gated_micro else None
                 ),
-                "raw_recall": (
-                    sum(float(row.get("raw_recall") or 0.0) for row in source_rows)
-                    / len(source_rows)
-                ),
-                "raw_f1": (
-                    sum(float(row.get("raw_f1") or 0.0) for row in source_rows)
-                    / len(source_rows)
-                ),
-                "raw_predicted_positive": summed("raw_predicted_positive"),
-                "selected_gate_threshold": (
-                    sum(float(row.get("selected_gate_threshold") or 0.0) for row in source_rows)
-                    / len(source_rows)
-                ),
-                "gated_precision": (
-                    sum(float(row.get("gated_precision") or 0.0) for row in source_rows)
-                    / len(source_rows)
-                ),
-                "gated_recall": (
-                    sum(float(row.get("gated_recall") or 0.0) for row in source_rows)
-                    / len(source_rows)
-                ),
-                "gated_f1": (
-                    sum(float(row.get("gated_f1") or 0.0) for row in source_rows)
-                    / len(source_rows)
-                ),
-                "gated_predicted_positive": summed("gated_predicted_positive"),
                 "gate_filter_rate": (
-                    1.0
-                    - summed("gated_predicted_positive")
-                    / max(1, summed("raw_predicted_positive"))
+                    1.0 - (int(gated_tp) + int(gated_fp)) / max(1, raw_tp + raw_fp)
+                    if gated_micro
+                    else None
                 ),
+                "bbox_metrics_genuinely_rescored": (
+                    all(bool(row.get("bbox_metrics_genuinely_rescored")) for row in source_rows)
+                    if granularity == "bbox"
+                    else None
+                ),
+                "gate_metric_status": aggregate_gate_status(source_rows),
             }
         )
     return rows

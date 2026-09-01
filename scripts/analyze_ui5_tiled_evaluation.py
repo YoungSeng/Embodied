@@ -7,7 +7,7 @@ import csv
 import importlib.util
 import json
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -145,6 +145,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     )
     detail_rows = []
     task_totals = {}
+    raw_sidecar_records_by_task: dict[str, int] = {}
+    missing_raw_sidecar_tasks: list[str] = []
     grouped = defaultdict(lambda: {"image": {"tp": 0, "fp": 0, "fn": 0, "tn": 0}, "bbox": {"tp": 0, "fp": 0, "fn": 0}})
     for task in TASKS:
         source = gt_dir / TASK_JSONL[task]
@@ -159,6 +161,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                     scorer.get_gt_payload(sample), TASK_ISSUE_NAMES[task]
                 )
         raw_dir = prediction_dir / task / "raw"
+        raw_paths = sorted(raw_dir.glob("*.json"))
+        raw_sidecar_records_by_task[task] = len(raw_paths)
+        if not raw_paths:
+            missing_raw_sidecar_tasks.append(task)
         task_counts = {
             "tile": {"tp": 0, "fp": 0, "fn": 0},
             "final_bbox": {"tp": 0, "fp": 0, "fn": 0},
@@ -166,8 +172,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "false_positive_tiles_on_negative_images": 0,
             "boxes_before_global_nms": 0,
             "boxes_after_global_nms": 0,
+            "tile_count_distribution": {},
         }
-        for raw_path in sorted(raw_dir.glob("*.json")):
+        tile_count_distribution: Counter[str] = Counter()
+        for raw_path in raw_paths:
             raw = json.loads(raw_path.read_text(encoding="utf-8"))
             image_path = str(Path(raw["image_path"]).resolve(strict=False))
             width = int(raw["image_size"]["width"])
@@ -175,6 +183,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             gt_boxes = [_pixel_box(box, width, height) for box in gt_by_image.get(image_path, [])]
             tile_rows = raw.get("inference_crop", {}).get("tiles", [])
             tile_count = len(tile_rows) or 1
+            tile_count_distribution[str(tile_count)] += 1
             tile_tp = tile_fp = tile_fn = 0
             before = 0
             false_positive_tiles = 0
@@ -244,10 +253,38 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             )
         task_counts["tile"] = _metrics(task_counts["tile"])
         task_counts["final_bbox"] = _metrics(task_counts["final_bbox"])
-        task_counts["source_image_fp_amplification"] = (
-            task_counts["false_positive_tiles_on_negative_images"]
-            / max(1, sum(row["final_bbox_fp"] > 0 for row in detail_rows if row["task"] == task and row["gt_count"] == 0))
+        task_counts["tile_count_distribution"] = dict(
+            sorted(tile_count_distribution.items(), key=lambda item: int(item[0]))
         )
+        source_image_fp_count = sum(
+            row["final_bbox_fp"] > 0
+            for row in detail_rows
+            if row["task"] == task and row["gt_count"] == 0
+        )
+        task_counts["source_image_false_positive_count"] = source_image_fp_count
+        if not raw_paths:
+            task_counts["status"] = "missing_raw_sidecars"
+            task_counts["source_image_fp_amplification"] = None
+            task_counts["source_image_fp_amplification_status"] = (
+                "missing_raw_sidecars"
+            )
+        elif source_image_fp_count:
+            task_counts["status"] = "ok"
+            task_counts["source_image_fp_amplification"] = (
+                task_counts["false_positive_tiles_on_negative_images"]
+                / source_image_fp_count
+            )
+            task_counts["source_image_fp_amplification_status"] = "ok"
+        elif task_counts["false_positive_tiles_on_negative_images"]:
+            task_counts["status"] = "ok"
+            task_counts["source_image_fp_amplification"] = None
+            task_counts["source_image_fp_amplification_status"] = (
+                "undefined_zero_source_image_fp_denominator"
+            )
+        else:
+            task_counts["status"] = "ok"
+            task_counts["source_image_fp_amplification"] = 0.0
+            task_counts["source_image_fp_amplification_status"] = "no_false_positives"
         task_totals[task] = task_counts
     grouped_output = {
         f"{task}|tiles={bucket}": {
@@ -256,9 +293,21 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         }
         for (task, bucket), values in sorted(grouped.items())
     }
+    raw_sidecar_record_count = sum(raw_sidecar_records_by_task.values())
+    status = (
+        "missing_raw_sidecars"
+        if raw_sidecar_record_count == 0
+        else "incomplete_raw_sidecars"
+        if missing_raw_sidecar_tasks
+        else "ok"
+    )
     summary = {
         "schema_version": 1,
+        "status": status,
         "iou_threshold": args.iou_threshold,
+        "raw_sidecar_record_count": raw_sidecar_record_count,
+        "raw_sidecar_records_by_task": raw_sidecar_records_by_task,
+        "missing_raw_sidecar_tasks": missing_raw_sidecar_tasks,
         "tasks": task_totals,
         "by_tile_count": grouped_output,
         "detail_rows": len(detail_rows),
@@ -290,8 +339,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    print(json.dumps(build(parse_args(argv)), ensure_ascii=False, indent=2))
-    return 0
+    summary = build(parse_args(argv))
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0 if summary.get("status") == "ok" else 2
 
 
 if __name__ == "__main__":

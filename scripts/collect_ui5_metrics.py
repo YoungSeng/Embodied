@@ -34,6 +34,12 @@ BASE_COLUMNS = [
     "max_num_tokens_scope",
     "relation_gate_mode",
     "evaluation_split",
+    "cache_scope",
+    "development_test_reuse",
+    "git_sha",
+    "git_dirty",
+    "recipe_digest",
+    "cache_digest",
     "ui_model_signature",
     "checkpoint",
     "macro_precision",
@@ -491,6 +497,14 @@ def build_row(args: argparse.Namespace) -> dict[str, Any]:
         "max_num_tokens_scope": args.max_num_tokens_scope,
         "relation_gate_mode": getattr(args, "relation_gate_mode", "observe"),
         "evaluation_split": getattr(args, "evaluation_split", "validation"),
+        "cache_scope": getattr(args, "cache_scope", "validation"),
+        "development_test_reuse": bool(
+            getattr(args, "development_test_reuse", False)
+        ),
+        "git_sha": getattr(args, "git_sha", ""),
+        "git_dirty": str(getattr(args, "git_dirty", "0")) == "1",
+        "recipe_digest": getattr(args, "recipe_digest", ""),
+        "cache_digest": getattr(args, "cache_digest", ""),
         "ui_model_signature": ui_model_signature(args.checkpoint),
         "checkpoint": str(args.checkpoint),
         "macro_precision": image_macro.get("precision"),
@@ -583,6 +597,11 @@ def append_excel_evaluation(
         task_sweep = sweep.get("tasks", {}).get(task, {})
         raw = task_sweep.get("raw", {})
         selected = task_sweep.get("selected", {})
+        genuine_task_metrics = (
+            genuinely_rescored_metrics.get("tasks", {}).get(task, {})
+            if genuinely_rescored_metrics is not None
+            else {}
+        )
         gate_metrics.setdefault(task, {}).update(
             {
                 "raw_precision": raw.get("precision"),
@@ -595,19 +614,19 @@ def append_excel_evaluation(
                 "gated_recall": selected.get("recall"),
                 "gated_f1": selected.get("f1"),
                 "gated_predicted_positive": selected.get("predicted_positive"),
+                "gated_tp": selected.get("tp"),
                 "gated_fp": selected.get("fp"),
+                "gated_fn": selected.get("fn"),
+                "gated_tn": selected.get("tn"),
                 "gate_filter_rate": (
                     1.0
                     - float(selected.get("predicted_positive", 0))
                     / max(1, int(raw.get("predicted_positive", 0)))
                 ),
-                "gated_metrics_by_granularity": (
-                    genuinely_rescored_metrics.get("tasks", {}).get(task, {})
-                    if genuinely_rescored_metrics is not None
-                    else {}
+                "gated_metrics_by_granularity": genuine_task_metrics,
+                "bbox_metrics_genuinely_rescored": bool(
+                    genuine_task_metrics.get("bbox")
                 ),
-                "bbox_metrics_genuinely_rescored": genuinely_rescored_metrics
-                is not None,
             }
         )
         gate_metrics[task].pop("_sweep_samples", None)
@@ -643,6 +662,17 @@ def append_excel_evaluation(
         checkpoint=str(args.checkpoint),
         metrics=metrics,
         gate_metrics=gate_metrics,
+        audit_context={
+            "evaluation_split": getattr(args, "evaluation_split", "validation"),
+            "cache_scope": getattr(args, "cache_scope", "validation"),
+            "development_test_reuse": bool(
+                getattr(args, "development_test_reuse", False)
+            ),
+            "git_sha": getattr(args, "git_sha", ""),
+            "git_dirty": str(getattr(args, "git_dirty", "0")) == "1",
+            "recipe_digest": getattr(args, "recipe_digest", ""),
+            "cache_digest": getattr(args, "cache_digest", ""),
+        },
     )
     UI5ExcelLogger(diagnostics_path).append_eval(args.step, rows)
     return diagnostics_path
@@ -694,6 +724,16 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument(
         "--evaluation-split", choices=("validation", "test"), default="validation"
     )
+    record.add_argument(
+        "--cache-scope",
+        choices=("preview", "validation", "full_test"),
+        default="validation",
+    )
+    record.add_argument("--development-test-reuse", action="store_true")
+    record.add_argument("--git-sha", default="")
+    record.add_argument("--git-dirty", choices=("0", "1"), default="0")
+    record.add_argument("--recipe-digest", default="")
+    record.add_argument("--cache-digest", default="")
     record.add_argument("--frozen-gate-thresholds", type=Path, default=None)
     record.add_argument("--checkpoint", type=Path, required=True)
     record.add_argument("--metrics-json", type=Path, default=None)
