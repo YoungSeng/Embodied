@@ -120,6 +120,7 @@ class UIDefectModelOutput(CausalLMOutputWithPast):
     per_task_lm_loss: Optional[Dict[int, torch.Tensor]] = None
     per_task_image_gate_loss: Optional[Dict[int, torch.Tensor]] = None
     per_task_slot_gate_loss: Optional[Dict[int, torch.Tensor]] = None
+    per_task_slot_objectness_loss: Optional[Dict[int, torch.Tensor]] = None
     per_task_attention_loss: Optional[Dict[int, torch.Tensor]] = None
     per_task_box_l1_loss: Optional[Dict[int, torch.Tensor]] = None
     per_task_box_giou_loss: Optional[Dict[int, torch.Tensor]] = None
@@ -168,6 +169,14 @@ class UIDefectModelOutput(CausalLMOutputWithPast):
     slot_usage_entropy: Optional[torch.Tensor] = None
     unique_slot_count: Optional[torch.Tensor] = None
     duplicate_slot_rate: Optional[torch.Tensor] = None
+    predicted_center_diversity: Optional[torch.Tensor] = None
+    attention_diversity: Optional[torch.Tensor] = None
+    route_top1_match_accuracy: Optional[torch.Tensor] = None
+    pre_mask_route_top1_match_accuracy: Optional[torch.Tensor] = None
+    slot_usage_histogram: Optional[torch.Tensor] = None
+    relation_aux_budget_scale: Optional[torch.Tensor] = None
+    relation_aux_raw_contribution: Optional[torch.Tensor] = None
+    relation_aux_scaled_contribution: Optional[torch.Tensor] = None
     coord_prior_lambdas: Optional[torch.Tensor] = None
     soft_gate_betas: Optional[torch.Tensor] = None
     cpt_token_losses: Optional[torch.Tensor] = None
@@ -240,6 +249,15 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 task_expert_rank=int(getattr(config, "relation_task_expert_rank", 8)),
                 set_decoder=bool(getattr(config, "relation_set_decoder", False)),
                 set_decoder_layers=int(getattr(config, "relation_set_decoder_layers", 3)),
+                set_decoder_deep_supervision=bool(
+                    getattr(config, "relation_set_decoder_deep_supervision", False)
+                ),
+                reference_position_encoding=bool(
+                    getattr(config, "relation_reference_position_encoding", False)
+                ),
+                per_level_scale_router=bool(
+                    getattr(config, "relation_per_level_scale_router", False)
+                ),
             )
             self.relation_pbd = RelationToPBD(
                 detail_hidden_size,
@@ -250,7 +268,20 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 task_experts=bool(getattr(config, "relation_task_experts", False)),
                 task_expert_rank=int(getattr(config, "relation_task_expert_rank", 8)),
                 separate_global_geometry=bool(getattr(config, "relation_set_decoder", False)),
+                straight_through_hard_routing=bool(
+                    getattr(config, "relation_straight_through_slot_router", False)
+                ),
             )
+            if str(getattr(config, "tc_msed_stage", "v4")).lower() == "m32":
+                self.register_buffer(
+                    "relation_aux_lm_ema", torch.zeros((), dtype=torch.float32)
+                )
+                self.register_buffer(
+                    "relation_aux_loss_ema", torch.zeros((), dtype=torch.float32)
+                )
+                self.register_buffer(
+                    "relation_aux_ema_initialized", torch.zeros((), dtype=torch.bool)
+                )
 
         if config.use_backbone_lora:
             self.wrap_backbone_lora(r=config.use_backbone_lora, lora_alpha=2 * config.use_backbone_lora)
@@ -318,6 +349,10 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                     if self.relation_pyramid.task_scale_router:
                         nn.init.zeros_(self.relation_pyramid.task_scale_projection.weight)
                         nn.init.zeros_(self.relation_pyramid.image_scale_projection.weight)
+                        if self.relation_pyramid.per_level_scale_router:
+                            nn.init.zeros_(
+                                self.relation_pyramid.per_level_scale_scorer[-1].weight
+                            )
                     if self.relation_pyramid.set_localizer:
                         nn.init.zeros_(self.relation_pyramid.coarse_box_head[-1].weight)
                         nn.init.zeros_(self.relation_pyramid.coarse_box_head[-1].bias)
@@ -777,6 +812,9 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         soft_gate_contribution = None
         loss_reconstructed = None
         loss_reconstruction_error = None
+        relation_aux_budget_scale = None
+        relation_aux_raw_contribution = None
+        relation_aux_scaled_contribution = None
         cpt_token_losses = None
         per_task_lm_loss = None
         logits = None
@@ -803,7 +841,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             liger_loss_fn = LigerFusedLinearCrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction='mean')
             collect_token_losses = bool(
                 getattr(self, "_cpt_observability_enabled", False)
-            ) or str(getattr(self.config, "tc_msed_stage", "v4")).lower() == "m31"
+            ) or str(getattr(self.config, "tc_msed_stage", "v4")).lower() in {"m31", "m32"}
             if collect_token_losses:
                 lm_loss, cpt_token_losses = liger_loss_fn.forward_with_token_losses(
                     lm_head_weight, shift_hidden_states, shift_labels
@@ -811,7 +849,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             else:
                 lm_loss = liger_loss_fn(lm_head_weight, shift_hidden_states, shift_labels)
             if (
-                str(getattr(self.config, "tc_msed_stage", "v4")).lower() == "m31"
+                str(getattr(self.config, "tc_msed_stage", "v4")).lower() in {"m31", "m32"}
                 and cpt_token_losses is not None
             ):
                 sample_ids = torch.repeat_interleave(
@@ -848,6 +886,9 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                             selected
                         ].float().mean()
             loss = lm_loss
+            m32_stage = (
+                str(getattr(self.config, "tc_msed_stage", "v4")).lower() == "m32"
+            )
             if relation_output is not None:
                 if relation_output.image_gate_loss is not None:
                     image_gate_contribution = (
@@ -864,31 +905,106 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                         ))
                         * relation_output.slot_gate_loss
                     )
-                    loss = loss + slot_gate_contribution
+                    if not m32_stage:
+                        loss = loss + slot_gate_contribution
                 if relation_output.attention_loss is not None:
                     attention_contribution = (
                         float(self.config.relation_attention_loss_weight)
                         * relation_output.attention_loss
                     )
-                    loss = loss + attention_contribution
+                    if not m32_stage:
+                        loss = loss + attention_contribution
                 if relation_output.box_l1_loss is not None:
                     box_l1_contribution = (
                         float(getattr(self.config, "relation_box_l1_loss_weight", 0.0))
                         * relation_output.box_l1_loss
                     )
-                    loss = loss + box_l1_contribution
+                    if not m32_stage:
+                        loss = loss + box_l1_contribution
                 if relation_output.box_giou_loss is not None:
                     box_giou_contribution = (
                         float(getattr(self.config, "relation_box_giou_loss_weight", 0.0))
                         * relation_output.box_giou_loss
                     )
-                    loss = loss + box_giou_contribution
+                    if not m32_stage:
+                        loss = loss + box_giou_contribution
                 if coverage_loss is not None:
                     coverage_contribution = (
                         float(getattr(self.config, "relation_coverage_loss_weight", 0.0))
                         * coverage_loss
                     )
-                    loss = loss + coverage_contribution
+                    if not m32_stage:
+                        loss = loss + coverage_contribution
+                if m32_stage:
+                    zero_aux = lm_loss.new_zeros(())
+                    raw_parts = (
+                        slot_gate_contribution,
+                        attention_contribution,
+                        box_l1_contribution,
+                        box_giou_contribution,
+                        coverage_contribution,
+                    )
+                    relation_aux_raw_contribution = sum(
+                        (part if part is not None else zero_aux)
+                        for part in raw_parts
+                    )
+                    with torch.no_grad():
+                        current_lm = lm_loss.detach().float().abs()
+                        current_aux = relation_aux_raw_contribution.detach().float().abs()
+                        if not bool(self.relation_aux_ema_initialized.item()):
+                            self.relation_aux_lm_ema.copy_(current_lm)
+                            self.relation_aux_loss_ema.copy_(current_aux)
+                            self.relation_aux_ema_initialized.fill_(True)
+                        else:
+                            decay = 0.95
+                            self.relation_aux_lm_ema.mul_(decay).add_(
+                                current_lm, alpha=1.0 - decay
+                            )
+                            self.relation_aux_loss_ema.mul_(decay).add_(
+                                current_aux, alpha=1.0 - decay
+                            )
+                        budget = float(
+                            getattr(self.config, "relation_aux_budget_ratio", 1.0)
+                        ) * self.relation_aux_lm_ema
+                        current_budget = float(
+                            getattr(self.config, "relation_aux_budget_ratio", 1.0)
+                        ) * current_lm
+                        relation_aux_budget_scale = torch.minimum(
+                            torch.minimum(
+                                torch.ones_like(budget),
+                                budget
+                                / self.relation_aux_loss_ema.clamp_min(1.0e-12),
+                            ),
+                            current_budget / current_aux.clamp_min(1.0e-12),
+                        ).detach()
+                    slot_gate_contribution = (
+                        zero_aux if slot_gate_contribution is None
+                        else relation_aux_budget_scale * slot_gate_contribution
+                    )
+                    attention_contribution = (
+                        zero_aux if attention_contribution is None
+                        else relation_aux_budget_scale * attention_contribution
+                    )
+                    box_l1_contribution = (
+                        zero_aux if box_l1_contribution is None
+                        else relation_aux_budget_scale * box_l1_contribution
+                    )
+                    box_giou_contribution = (
+                        zero_aux if box_giou_contribution is None
+                        else relation_aux_budget_scale * box_giou_contribution
+                    )
+                    coverage_contribution = (
+                        zero_aux if coverage_contribution is None
+                        else relation_aux_budget_scale * coverage_contribution
+                    )
+                    relation_aux_scaled_contribution = (
+                        slot_gate_contribution
+                        + attention_contribution
+                        + box_l1_contribution
+                        + box_giou_contribution
+                        + coverage_contribution
+                    )
+                    loss = loss + relation_aux_scaled_contribution
                 if coordinate_bridge_loss is not None:
                     coordinate_bridge_contribution = coordinate_bridge_loss
                     loss = loss + coordinate_bridge_contribution
@@ -1067,6 +1183,27 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             slot_usage_entropy=relation_output.slot_usage_entropy if relation_output is not None else None,
             unique_slot_count=pbd_output.unique_slot_count if pbd_output is not None else None,
             duplicate_slot_rate=pbd_output.duplicate_slot_rate if pbd_output is not None else None,
+            predicted_center_diversity=(
+                relation_output.predicted_center_diversity
+                if relation_output is not None else None
+            ),
+            attention_diversity=(
+                relation_output.attention_diversity
+                if relation_output is not None else None
+            ),
+            route_top1_match_accuracy=(
+                pbd_output.route_top1_match_accuracy if pbd_output is not None else None
+            ),
+            pre_mask_route_top1_match_accuracy=(
+                pbd_output.pre_mask_route_top1_match_accuracy
+                if pbd_output is not None else None
+            ),
+            slot_usage_histogram=(
+                pbd_output.slot_usage_histogram if pbd_output is not None else None
+            ),
+            relation_aux_budget_scale=relation_aux_budget_scale,
+            relation_aux_raw_contribution=relation_aux_raw_contribution,
+            relation_aux_scaled_contribution=relation_aux_scaled_contribution,
             coord_prior_lambdas=(self.relation_pbd.coord_prior_lambda if self.enable_ui_relation and self.relation_pbd.coordinate_bridge else None),
             soft_gate_betas=(self.relation_pyramid.soft_gate_beta if self.enable_ui_relation and self.relation_pyramid.soft_gate else None),
             per_task_gate_loss=(
@@ -1078,6 +1215,11 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             ),
             per_task_slot_gate_loss=(
                 relation_output.per_task_slot_gate_loss if relation_output is not None else None
+            ),
+            per_task_slot_objectness_loss=(
+                relation_output.per_task_slot_objectness_loss
+                if relation_output is not None
+                else None
             ),
             per_task_attention_loss=(
                 relation_output.per_task_attention_loss if relation_output is not None else None

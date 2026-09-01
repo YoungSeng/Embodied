@@ -259,6 +259,48 @@ class UI5ExcelLoggerTest(unittest.TestCase):
             finally:
                 workbook.close()
 
+    def test_eval_replaces_same_step_when_cache_identity_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "ui5_training_evaluation.xlsx"
+            logger = UI5ExcelLogger(path)
+            first = build_eval_rows(
+                step=0,
+                checkpoint="checkpoint-0",
+                metrics=scorer_metrics(0.4),
+                metadata={
+                    "git_commit": "old",
+                    "config_hash": "old-config",
+                    "model_signature": "old-model",
+                },
+            )
+            second = build_eval_rows(
+                step=0,
+                checkpoint="checkpoint-0",
+                metrics=scorer_metrics(0.5),
+                metadata={
+                    "git_commit": "new",
+                    "config_hash": "new-config",
+                    "model_signature": "new-model",
+                },
+            )
+            self.assertTrue(logger.append_eval(0, first))
+            self.assertTrue(logger.append_eval(0, second))
+            workbook = load_workbook(path, read_only=True)
+            try:
+                sheet = workbook["eval_1000steps"]
+                header = [cell.value for cell in sheet[1]]
+                rows = [
+                    dict(zip(header, values))
+                    for values in sheet.iter_rows(min_row=2, values_only=True)
+                ]
+                self.assertEqual(len(rows), 12)
+                self.assertEqual({row["git_commit"] for row in rows}, {"new"})
+                self.assertEqual(
+                    {row["model_signature"] for row in rows}, {"new-model"}
+                )
+            finally:
+                workbook.close()
+
     def test_soft_eval_keeps_separate_observe_raw_metrics(self):
         gate_metrics = {
             task: {

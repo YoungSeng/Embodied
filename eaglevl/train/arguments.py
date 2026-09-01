@@ -151,10 +151,10 @@ class ModelArguments:
     )
     tc_msed_stage: str = field(
         default="v4",
-        metadata={'help': 'TC-MSED stage: v4, m1, m2, m3, m4, m5, or m31.'},
+        metadata={'help': 'TC-MSED stage: v4, m1, m2, m3, m4, m5, m31, or m32.'},
     )
     relation_task_expert_rank: int = field(
-        default=8, metadata={'help': 'Rank of each deterministic m31 task expert.'}
+        default=8, metadata={'help': 'Rank of each deterministic m31/m32 task expert.'}
     )
     relation_set_decoder_layers: int = field(
         default=3, metadata={'help': 'Number of shared m31 Set Decoder layers.'}
@@ -170,6 +170,10 @@ class ModelArguments:
     )
     relation_coord_prior_sigma: float = field(
         default=0.05, metadata={'help': 'Coordinate prior sigma as coordinate-range fraction.'}
+    )
+    relation_aux_budget_ratio: float = field(
+        default=1.0,
+        metadata={'help': 'M3.2 EMA cap for auxiliary contribution relative to LM.'},
     )
     relation_gate_threshold: float = field(
         default=0.5,

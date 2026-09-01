@@ -47,13 +47,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--relation-gate-threshold", type=float, default=0.5)
     parser.add_argument("--relation-focal-beta", type=float, default=0.999)
     parser.add_argument("--relation-focal-gamma", type=float, default=2.0)
-    parser.add_argument("--tc-msed-stage", choices=("v4", "m1", "m2", "m3", "m4", "m5", "m31"), default="v4")
+    parser.add_argument("--tc-msed-stage", choices=("v4", "m1", "m2", "m3", "m4", "m5", "m31", "m32"), default="v4")
     parser.add_argument("--relation-box-l1-loss-weight", type=float, default=0.0)
     parser.add_argument("--relation-box-giou-loss-weight", type=float, default=0.0)
     parser.add_argument("--relation-coverage-loss-weight", type=float, default=0.0)
     parser.add_argument("--relation-coord-prior-sigma", type=float, default=0.05)
     parser.add_argument("--relation-task-expert-rank", type=int, default=8)
     parser.add_argument("--relation-set-decoder-layers", type=int, default=3)
+    parser.add_argument("--relation-aux-budget-ratio", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -91,6 +92,12 @@ def main() -> int:
             "relation_box_giou_loss_weight": args.relation_box_giou_loss_weight,
             "relation_coverage_loss_weight": args.relation_coverage_loss_weight,
             "relation_coord_prior_sigma": args.relation_coord_prior_sigma,
+            "relation_aux_budget_ratio": args.relation_aux_budget_ratio,
+            "relation_straight_through_slot_router": stage_flags.get("straight_through_slot_router", False),
+            "relation_set_decoder_deep_supervision": stage_flags.get("set_decoder_deep_supervision", False),
+            "relation_reference_position_encoding": stage_flags.get("reference_position_encoding", False),
+            "relation_per_level_scale_router": stage_flags.get("per_level_scale_router", False),
+            "relation_constrained_bbox_decoding": stage_flags.get("constrained_bbox_decoding", False),
         }
         mismatches = {
             key: {"existing": existing_config.get(key), "requested": expected}
@@ -150,6 +157,7 @@ def main() -> int:
         relation_coord_prior_sigma=args.relation_coord_prior_sigma,
         relation_task_expert_rank=args.relation_task_expert_rank,
         relation_set_decoder_layers=args.relation_set_decoder_layers,
+        relation_aux_budget_ratio=args.relation_aux_budget_ratio,
     )
     config.relation_gate_thresholds = {}
     config.ui_relation_initialization_seed = args.seed

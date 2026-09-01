@@ -139,6 +139,61 @@ class RuntimeConfigTests(unittest.TestCase):
             ):
                 locany_ui5_common.resolve_runtime_config({**env, key: invalid})
 
+    def test_m32_four_gpu_configuration_allows_16000_without_gate_or_auto_stop(self) -> None:
+        args = run_locany_ui5_local_debug.parse_args(
+            [
+                "--gpus", "4",
+                "--tc-msed-stage", "m32",
+                "--max-steps", "16000",
+                "--save-steps", "1000",
+                "--project-root", str(PROJECT_ROOT),
+            ]
+        )
+        env = run_locany_ui5_local_debug.build_environment(args, base_env={})
+        resolved = locany_ui5_common.resolve_runtime_config(env)
+        self.assertEqual(resolved["MAX_STEPS"], 16000)
+        self.assertEqual(resolved["SAVE_STEPS"], 1000)
+        self.assertEqual(resolved["EVAL_INTERVAL_STEPS"], 1000)
+        self.assertEqual(resolved["MAX_NUM_TOKENS"], 12800)
+        self.assertEqual(resolved["GRADIENT_ACCUMULATION_STEPS"], 2)
+        self.assertEqual(resolved["RELATION_GATE_MODE"], "observe")
+        self.assertEqual(resolved["RELATION_GATE_LOSS_WEIGHT"], 0.0)
+        self.assertEqual(resolved["RELATION_AUX_BUDGET_RATIO"], 1.0)
+
+        trainer_source = (
+            PROJECT_ROOT / "eaglevl" / "train" / "locany_finetune_magi_stream.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('stage in {"m31", "m32"}', trainer_source)
+        self.assertNotIn('tc_msed_stage == "m32" and max_steps', trainer_source)
+
+    def test_m32_is_available_in_local_and_formal_entrypoints(self) -> None:
+        local = run_locany_ui5_local_debug.parse_args(
+            ["--tc-msed-stage", "m32", "--project-root", str(PROJECT_ROOT)]
+        )
+        formal = submit_locany_ui5.parse_args(
+            [
+                "--machine", "a800", "--gpus", "4",
+                "--tc-msed-stage", "m32", "--render-only",
+            ]
+        )
+        self.assertEqual(local.tc_msed_stage, "m32")
+        self.assertEqual(formal.tc_msed_stage, "m32")
+
+        zero_budget = submit_locany_ui5.parse_args(
+            [
+                "--machine", "a800", "--gpus", "4",
+                "--tc-msed-stage", "m32",
+                "--relation-aux-budget-ratio", "0",
+                "--render-only",
+            ]
+        )
+        self.assertEqual(
+            submit_locany_ui5.build_submission_environment(zero_budget)[
+                "RELATION_AUX_BUDGET_RATIO"
+            ],
+            "0.0",
+        )
+
     def test_a800_defaults_are_gpu_count_specific(self) -> None:
         common = {"MACHINE_TYPE": "a800", "VERSION": "v4"}
         four = locany_ui5_common.resolve_runtime_config(
@@ -758,6 +813,64 @@ class HistoryTests(unittest.TestCase):
             self.assertEqual(history[0]["macro_f1"], 0.65)
             self.assertEqual(history[0]["occlusion_bbox_f1"], 0.34)
             self.assertTrue((root / "evaluation_history.csv").is_file())
+
+    def test_zero_iou_tie_is_not_counted_as_a_correct_slot_route(self) -> None:
+        diagnostic = collect_ui5_metrics.route_slot_diagnostic(
+            [0.0, 0.0, 10.0, 10.0],
+            coarse=[[100.0, 100.0, 120.0, 120.0]],
+            selected=[[100.0, 100.0, 120.0, 120.0]],
+            pre_mask_selected=[[100.0, 100.0, 120.0, 120.0]],
+        )
+        self.assertEqual(diagnostic["oracle_iou"], 0.0)
+        self.assertEqual(diagnostic["route_match"], 0.0)
+        self.assertEqual(diagnostic["pre_mask_route_match"], 0.0)
+        self.assertEqual(diagnostic["oracle_slot_hit"], 0.0)
+        self.assertIsNone(diagnostic["selected_oracle_iou_ratio"])
+
+    def test_route_diagnostic_reports_oracle_hit_and_selected_ratio(self) -> None:
+        diagnostic = collect_ui5_metrics.route_slot_diagnostic(
+            [0.0, 0.0, 10.0, 10.0],
+            coarse=[[0.0, 0.0, 10.0, 10.0]],
+            selected=[[0.0, 0.0, 5.0, 10.0]],
+            pre_mask_selected=[[0.0, 0.0, 10.0, 10.0]],
+        )
+        self.assertEqual(diagnostic["oracle_slot_hit"], 1.0)
+        self.assertAlmostEqual(diagnostic["selected_oracle_iou_ratio"], 0.5)
+        self.assertEqual(diagnostic["route_match"], 0.0)
+        self.assertEqual(diagnostic["pre_mask_route_match"], 1.0)
+
+    def test_checkpoint_zero_cache_requires_commit_config_and_model_signature(self) -> None:
+        signature = '{"has_image_gate":true,"tc_msed_stage":"m32"}'
+        row = {
+            "step": 0,
+            "evaluation_status": "success",
+            "relation_gate_mode": "observe",
+            "git_commit": "commit-a",
+            "config_hash": "config-a",
+            "ui_model_signature": signature,
+            "checkpoint": "/tmp/run/checkpoint-0",
+        }
+        common = {
+            "step": 0,
+            "relation_gate_mode": "observe",
+            "git_commit": "commit-a",
+            "config_hash": "config-a",
+            "model_signature": signature,
+        }
+        self.assertTrue(
+            collect_ui5_metrics.evaluation_cache_row_matches(row, **common)
+        )
+        for key, changed in (
+            ("git_commit", "commit-b"),
+            ("config_hash", "config-b"),
+            ("model_signature", '{"has_image_gate":true,"tc_msed_stage":"m31"}'),
+        ):
+            with self.subTest(key=key):
+                self.assertFalse(
+                    collect_ui5_metrics.evaluation_cache_row_matches(
+                        row, **{**common, key: changed}
+                    )
+                )
 
 
 class ParallelInferenceTests(unittest.TestCase):

@@ -34,9 +34,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--learning-rate", default="2e-5")
     parser.add_argument("--run-name", default=None)
+    parser.add_argument("--relation-aux-budget-ratio", type=float, default=1.0)
     parser.add_argument(
         "--tc-msed-stage",
-        choices=("v4", "m1", "m2", "m3", "m4", "m5", "m31"),
+        choices=("v4", "m1", "m2", "m3", "m4", "m5", "m31", "m32"),
         default="v4",
         help="TC-MSED ablation stage; uses the same stage switch as formal jobs",
     )
@@ -111,7 +112,7 @@ def build_environment(
             "TC_MSED_STAGE": args.tc_msed_stage,
         }
     )
-    if args.tc_msed_stage == "m31":
+    if args.tc_msed_stage in {"m31", "m32"}:
         env.update(
             {
                 "RELATION_GATE_MODE": "observe",
@@ -126,6 +127,7 @@ def build_environment(
                 "RELATION_TASK_EXPERT_RANK": "8",
                 "RELATION_SET_DECODER_LAYERS": "3",
                 "RELATION_NUM_SLOTS": "8",
+                "RELATION_AUX_BUDGET_RATIO": str(args.relation_aux_budget_ratio),
             }
         )
     optional_paths = {

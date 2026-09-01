@@ -6,11 +6,13 @@ from eaglevl.model.locany.relation_modules import (
     FAMILY_SCALE_PRIOR,
     RelationConditionedDetailPyramid,
     RelationToPBD,
+    TaskConditionedSetDecoder,
     apply_coordinate_logit_prior,
     apply_soft_gate_logit_prior,
     coordinate_bridge_prediction_groups,
     coordinate_gaussian_prior,
 )
+from eaglevl.utils.locany.generate_utils import constrain_ui5_bbox_logits
 
 
 class RelationModulesTest(unittest.TestCase):
@@ -241,6 +243,215 @@ class RelationModulesTest(unittest.TestCase):
         anchors = output.selected_slot_indices[output.active_offsets == 0]
         self.assertEqual(anchors.tolist(), [0, 1])
         self.assertEqual(float(output.duplicate_slot_rate), 0.0)
+
+    def test_m32_straight_through_uses_predicted_slots_not_teacher_slots(self):
+        torch.manual_seed(32)
+        module = RelationToPBD(
+            8,
+            10,
+            dynamic_slot=True,
+            task_experts=True,
+            straight_through_hard_routing=True,
+        )
+        with torch.no_grad():
+            module.router_query.weight.zero_()
+            module.router_query.weight[:, :8].copy_(torch.eye(8))
+            module.router_key.weight.copy_(torch.eye(8))
+            module.router_value.weight.copy_(torch.eye(8))
+        ids = torch.tensor([[5, *([99] * 5), 7, 5, *([99] * 5)]])
+        hidden = torch.zeros(1, ids.numel(), 10)
+        hidden[0, 0, 0] = 1.0
+        hidden[0, 7, 0] = 1.0
+        relation_tokens = torch.tensor(
+            [[[3.0, 0, 0, 0, 0, 0, 0, 0],
+              [2.0, 1, 0, 0, 0, 0, 0, 0],
+              [1.0, 0, 1, 0, 0, 0, 0, 0]]],
+            requires_grad=True,
+        )
+        output = module(
+            hidden,
+            ids,
+            torch.tensor([ids.numel()]),
+            torch.zeros(1, 8),
+            torch.zeros(1, 8),
+            5,
+            99,
+            6,
+            relation_tokens=relation_tokens,
+            slot_objectness_logits=torch.zeros(1, 3),
+            coarse_boxes=torch.zeros(1, 3, 4),
+            # Teacher deliberately disagrees with predicted top-1.
+            matched_slot_indices=torch.tensor([[2, 2, -1]]),
+            defect_type=torch.tensor([1]),
+        )
+        anchors = output.selected_slot_indices[output.active_offsets == 0]
+        self.assertEqual(anchors.tolist(), [0, 1])
+        self.assertNotEqual(anchors[0].item(), 2)
+        anchor_weights = output.routing_weights[output.active_offsets == 0]
+        torch.testing.assert_close(
+            anchor_weights,
+            torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+        )
+        output.hidden_states.sum().backward()
+        for parameter in (module.router_query.weight, module.router_key.weight):
+            self.assertIsNotNone(parameter.grad)
+            self.assertGreater(float(parameter.grad.detach().norm()), 0.0)
+
+    def test_m32_never_reuses_a_slot_after_all_slots_are_consumed(self):
+        module = RelationToPBD(
+            8,
+            10,
+            dynamic_slot=True,
+            task_experts=True,
+            straight_through_hard_routing=True,
+        )
+        ids = torch.tensor([[5, *([99] * 5), 5, *([99] * 5), 5, *([99] * 5)]])
+        output = module(
+            torch.randn(1, ids.numel(), 10),
+            ids,
+            torch.tensor([ids.numel()]),
+            torch.randn(1, 8),
+            torch.randn(1, 8),
+            5,
+            99,
+            6,
+            relation_tokens=torch.randn(1, 2, 8),
+            slot_objectness_logits=torch.zeros(1, 2),
+            coarse_boxes=torch.zeros(1, 2, 4),
+            defect_type=torch.tensor([0]),
+        )
+        anchors = output.selected_slot_indices[output.active_offsets == 0]
+        self.assertEqual(len(set(anchors[:2].tolist())), 2)
+        self.assertEqual(int(anchors[2].item()), -1)
+        self.assertEqual(float(output.duplicate_slot_rate), 0.0)
+
+    def test_m32_set_decoder_deep_supervises_every_layer(self):
+        torch.manual_seed(41)
+        module = RelationConditionedDetailPyramid(
+            12,
+            8,
+            3,
+            4,
+            task_scale_router=True,
+            set_localizer=True,
+            task_hard_router=True,
+            task_experts=True,
+            set_decoder=True,
+            set_decoder_layers=3,
+            set_decoder_deep_supervision=True,
+            reference_position_encoding=True,
+            per_level_scale_router=True,
+        )
+        features = tuple(torch.randn(16, 12) for _ in range(3))
+        boxes = torch.tensor([[[80.0, 90.0, 320.0, 410.0], [610.0, 520.0, 930.0, 910.0]]])
+        output = module(
+            features,
+            torch.tensor([[4, 4]]),
+            torch.tensor([0]),
+            torch.tensor([0]),
+            image_flags=torch.tensor([1]),
+            target_boxes=boxes,
+            target_box_mask=torch.tensor([[True, True]]),
+        )
+        total = output.slot_objectness_loss + output.box_l1_loss + output.box_giou_loss
+        total.backward()
+        for layer in range(3):
+            self.assertIsNotNone(
+                module.task_set_decoder.objectness_heads[layer].weight.grad
+            )
+            self.assertIsNotNone(
+                module.task_set_decoder.shared_box_deltas[layer].weight.grad
+            )
+        self.assertTrue(torch.isfinite(output.predicted_center_diversity))
+        self.assertTrue(torch.isfinite(output.attention_diversity))
+
+    def test_reference_position_encoding_changes_decoder_queries(self):
+        torch.manual_seed(51)
+        module = TaskConditionedSetDecoder(
+            hidden_size=8,
+            num_object_queries=3,
+            num_decoder_layers=3,
+            reference_position_encoding=True,
+        )
+        memory = torch.randn(1, 9, 8)
+        first = module(memory, torch.tensor([0])).slot_tokens
+        with torch.no_grad():
+            module.reference_box_logits.add_(1.0)
+        second = module(memory, torch.tensor([0])).slot_tokens
+        self.assertFalse(torch.allclose(first, second))
+
+    def test_m32_per_level_scale_router_varies_by_image(self):
+        torch.manual_seed(61)
+        module = RelationConditionedDetailPyramid(
+            8,
+            8,
+            2,
+            4,
+            task_scale_router=True,
+            per_level_scale_router=True,
+        )
+        with torch.no_grad():
+            module.per_level_scale_scorer[-1].weight.normal_(std=0.2)
+        features = tuple(torch.randn(8, 8) for _ in range(3))
+        output = module(
+            features,
+            torch.tensor([[2, 2], [2, 2]]),
+            torch.tensor([0, 0]),
+            torch.tensor([0, 0]),
+            image_flags=torch.tensor([1, 1]),
+        )
+        self.assertGreater(float(output.scale_weights.std(dim=0).max()), 1.0e-5)
+
+    def test_m32_constrained_bbox_decoding_enforces_fixed_grammar(self):
+        token_ids = {
+            "box_start_token_id": 1,
+            "box_end_token_id": 2,
+            "coord_start_token_id": 3,
+            "coord_end_token_id": 7,
+            "none_token_id": 8,
+            "im_end_token_id": 9,
+            "null_token_id": 10,
+        }
+        logits = torch.zeros(1, 1, 12)
+        after_box = constrain_ui5_bbox_logits(
+            logits,
+            torch.tensor([1]),
+            token_ids,
+            mtp=False,
+        )
+        finite = torch.isfinite(after_box[0, 0]) & (
+            after_box[0, 0] > torch.finfo(after_box.dtype).min
+        )
+        self.assertEqual(finite.nonzero(as_tuple=False).flatten().tolist(), [3, 4, 5, 6, 7, 8])
+        after_four = constrain_ui5_bbox_logits(
+            logits,
+            torch.tensor([1, 3, 4, 5, 6]),
+            token_ids,
+            mtp=False,
+        )
+        self.assertEqual(int(after_four.argmax(dim=-1).item()), 2)
+        exhausted = constrain_ui5_bbox_logits(
+            logits,
+            torch.tensor(([1, 3, 4, 5, 6, 2] * 8)),
+            token_ids,
+            mtp=False,
+            max_boxes=8,
+        )
+        self.assertEqual(int(exhausted.argmax(dim=-1).item()), 9)
+
+        mtp_logits = torch.full((1, 6, 12), -5.0)
+        mtp_logits[0, 0, 1] = 5.0
+        mtp_logits[0, 1, 8] = 6.0
+        mtp_logits[0, 1, 3:8] = 1.0
+        constrained_mtp = constrain_ui5_bbox_logits(
+            mtp_logits,
+            torch.empty(0, dtype=torch.long),
+            token_ids,
+            mtp=True,
+        )
+        self.assertEqual(int(constrained_mtp[0, 1].argmax().item()), 8)
+        self.assertEqual(int(constrained_mtp[0, 2].argmax().item()), 2)
+        self.assertEqual(int(constrained_mtp[0, 3].argmax().item()), 10)
 
     def test_dynamic_routing_state_is_isolated_between_packed_samples(self):
         module = RelationToPBD(8, 10, dynamic_slot=True)

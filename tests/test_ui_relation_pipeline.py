@@ -23,6 +23,7 @@ from eaglevl.model.locany.relation_modules import (
     relation_gate_output_override,
 )
 from eaglevl.model.locany.ui_relation_setup import (
+    TC_MSED_STAGE_CONFIGS,
     configure_ui5_model_config,
     initialize_or_validate_ui_relation,
     ui_relation_collective_device,
@@ -33,6 +34,25 @@ class UIRelationPipelineTest(unittest.TestCase):
     BOX = 101
     MASK = 102
     BLOCK_SIZE = 6
+
+    def test_m32_stage_is_explicit_and_does_not_change_m31(self):
+        self.assertEqual(
+            set(TC_MSED_STAGE_CONFIGS["m31"]),
+            {
+                "task_scale_router", "set_localizer", "dynamic_slot_pbd",
+                "coordinate_bridge", "soft_gate", "legacy_overlap_adapter",
+                "task_hard_router", "task_experts", "set_decoder",
+                "image_gate_mode", "image_gate_loss_weight",
+            },
+        )
+        m32 = TC_MSED_STAGE_CONFIGS["m32"]
+        self.assertTrue(m32["straight_through_slot_router"])
+        self.assertTrue(m32["set_decoder_deep_supervision"])
+        self.assertTrue(m32["reference_position_encoding"])
+        self.assertTrue(m32["per_level_scale_router"])
+        self.assertTrue(m32["constrained_bbox_decoding"])
+        self.assertEqual(m32["image_gate_mode"], "observe")
+        self.assertEqual(m32["image_gate_loss_weight"], 0.0)
 
     def test_nccl_consistency_audit_uses_current_rank_cuda_device(self):
         with (

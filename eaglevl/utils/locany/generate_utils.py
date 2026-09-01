@@ -48,6 +48,137 @@ def get_token_ids_from_config(config) -> Dict[str, int]:
     return token_ids
 
 
+def constrain_ui5_bbox_logits(
+    logits: torch.Tensor,
+    generated_tokens: torch.Tensor,
+    token_ids: Dict[str, int],
+    *,
+    mtp: bool,
+    max_boxes: int = 8,
+    temperature: float = 0.0,
+) -> torch.Tensor:
+    """Apply the fixed UI5 bbox grammar without changing allowed logits.
+
+    MTP predicts one complete six-token box block.  AR infers its next grammar
+    state from tokens generated after the prompt.  Disallowed vocabulary items
+    receive the dtype minimum, so coordinate top-k is necessarily drawn only
+    from the coordinate vocabulary.
+    """
+
+    if logits.ndim != 3 or logits.shape[0] != 1:
+        raise ValueError("UI5 constrained decoding expects logits [1,L,V]")
+    box_start = int(token_ids["box_start_token_id"])
+    box_end = int(token_ids["box_end_token_id"])
+    coord_start = int(token_ids["coord_start_token_id"])
+    coord_end = int(token_ids["coord_end_token_id"])
+    none_token = int(token_ids["none_token_id"])
+    eos_token = int(token_ids["im_end_token_id"])
+    null_token = int(token_ids["null_token_id"])
+    vocab_size = logits.shape[-1]
+
+    def mask_position(output: torch.Tensor, position: int, allowed) -> None:
+        mask = torch.ones(vocab_size, device=output.device, dtype=torch.bool)
+        if isinstance(allowed, tuple):
+            start, end = allowed
+            mask[max(0, start) : min(vocab_size, end + 1)] = False
+        else:
+            for token in allowed:
+                if 0 <= int(token) < vocab_size:
+                    mask[int(token)] = False
+        output[:, position, :].masked_fill_(mask, torch.finfo(output.dtype).min)
+
+    def choose_allowed_token(
+        output: torch.Tensor, position: int, allowed: list[int]
+    ) -> int:
+        """Choose an MTP grammar branch before independently sampling its block.
+
+        MTP samples all six positions together.  Leaving both ``none`` and a
+        coordinate branch open while constraining positions 2--5 from an
+        argmax can therefore produce a structurally mixed block under
+        temperature sampling.  Select the branch once, then mask the block so
+        the later vectorized sampler cannot disagree with that decision.
+        """
+
+        candidates = torch.tensor(
+            [token for token in allowed if 0 <= int(token) < vocab_size],
+            device=output.device,
+            dtype=torch.long,
+        )
+        if candidates.numel() == 0:
+            raise ValueError("UI5 constrained decoding has no valid branch token")
+        values = output[0, position].index_select(0, candidates).float()
+        if float(temperature) > 0.0:
+            probabilities = torch.softmax(values / float(temperature), dim=-1)
+            chosen_offset = int(torch.multinomial(probabilities, 1).item())
+        else:
+            chosen_offset = int(values.argmax().item())
+        return int(candidates[chosen_offset].item())
+
+    output = logits.clone()
+    generated_box_count = int(
+        generated_tokens.reshape(-1).eq(box_end).sum().item()
+    )
+    if mtp:
+        if output.shape[1] != 6:
+            raise ValueError("UI5 MTP constrained decoding requires six logits positions")
+        allow_end = bool(generated_tokens.numel()) and int(generated_tokens[-1].item()) == box_end
+        if allow_end and generated_box_count >= int(max_boxes):
+            first_allowed = [eos_token]
+        else:
+            first_allowed = [box_start, eos_token] if allow_end else [box_start]
+        first = choose_allowed_token(output, 0, first_allowed)
+        mask_position(output, 0, [first])
+        if first == eos_token:
+            for position in range(1, 6):
+                mask_position(output, position, [null_token])
+            return output
+        second_allowed = [none_token, *range(coord_start, coord_end + 1)]
+        second = choose_allowed_token(output, 1, second_allowed)
+        if second == none_token:
+            mask_position(output, 1, [none_token])
+            mask_position(output, 2, [box_end])
+            for position in range(3, 6):
+                mask_position(output, position, [null_token])
+        else:
+            mask_position(output, 1, (coord_start, coord_end))
+            for position in range(2, 5):
+                mask_position(output, position, (coord_start, coord_end))
+            mask_position(output, 5, [box_end])
+        return output
+
+    if output.shape[1] != 1:
+        raise ValueError("UI5 AR constrained decoding requires one logits position")
+    tokens = [int(value) for value in generated_tokens.reshape(-1).tolist()]
+    if not tokens:
+        allowed = [box_start]
+    elif tokens[-1] == box_end:
+        allowed = (
+            [eos_token]
+            if generated_box_count >= int(max_boxes)
+            else [box_start, eos_token]
+        )
+    elif tokens[-1] == box_start:
+        allowed = [none_token, *range(coord_start, coord_end + 1)]
+    elif tokens[-1] == none_token:
+        allowed = [box_end]
+    elif coord_start <= tokens[-1] <= coord_end:
+        last_anchor = max(
+            (index for index, token in enumerate(tokens) if token == box_start),
+            default=-1,
+        )
+        coordinate_count = sum(
+            coord_start <= token <= coord_end for token in tokens[last_anchor + 1 :]
+        )
+        allowed = (
+            list(range(coord_start, coord_end + 1))
+            if coordinate_count < 4 else [box_end]
+        )
+    else:
+        allowed = [eos_token]
+    mask_position(output, 0, allowed)
+    return output
+
+
 def top_p_logits(
     logits: torch.Tensor,
     top_p: float = None

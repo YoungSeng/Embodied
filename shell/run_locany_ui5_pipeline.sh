@@ -150,7 +150,7 @@ case "${TC_MSED_STAGE}" in
       export RELATION_COVERAGE_LOSS_WEIGHT="${RELATION_COVERAGE_LOSS_WEIGHT:-0.0}"
     fi
     ;;
-  m31)
+  m31|m32)
     export RELATION_GATE_LOSS_WEIGHT="0.0"
     export RELATION_SLOT_GATE_LOSS_WEIGHT="${RELATION_SLOT_OBJECTNESS_LOSS_WEIGHT:-${RELATION_SLOT_GATE_LOSS_WEIGHT:-0.5}}"
     export RELATION_SLOT_OBJECTNESS_LOSS_WEIGHT="${RELATION_SLOT_GATE_LOSS_WEIGHT}"
@@ -161,8 +161,9 @@ case "${TC_MSED_STAGE}" in
     export RELATION_TASK_HARD_ROUTER="1"
     export RELATION_TASK_EXPERT_RANK="${RELATION_TASK_EXPERT_RANK:-8}"
     export RELATION_SET_DECODER_LAYERS="${RELATION_SET_DECODER_LAYERS:-3}"
+    export RELATION_AUX_BUDGET_RATIO="${RELATION_AUX_BUDGET_RATIO:-1.0}"
     ;;
-  *) locany_die 22 "Unsupported TC_MSED_STAGE=${TC_MSED_STAGE}; expected v4/m1/m2/m3/m4/m5/m31" ;;
+  *) locany_die 22 "Unsupported TC_MSED_STAGE=${TC_MSED_STAGE}; expected v4/m1/m2/m3/m4/m5/m31/m32" ;;
 esac
 export RELATION_COORD_PRIOR_SIGMA="${RELATION_COORD_PRIOR_SIGMA:-0.05}"
 export EVAL_ENABLE_PBD="${EVAL_ENABLE_PBD:-1}"
@@ -170,7 +171,7 @@ if [[ "${EVAL_ENABLE_PBD}" != "0" && "${EVAL_ENABLE_PBD}" != "1" ]]; then
   locany_die 22 "EVAL_ENABLE_PBD must be 0 or 1, got ${EVAL_ENABLE_PBD}"
 fi
 export RELATION_GATE_THRESHOLD="${RELATION_GATE_THRESHOLD:-0.5}"
-if [[ "${TC_MSED_STAGE}" == "m31" ]]; then
+if [[ "${TC_MSED_STAGE}" == "m31" || "${TC_MSED_STAGE}" == "m32" ]]; then
   export RELATION_GATE_MODE="observe"
 elif [[ "${TC_MSED_STAGE}" == "m4" || "${TC_MSED_STAGE}" == "m5" ]]; then
   export RELATION_GATE_MODE="${RELATION_GATE_MODE:-soft}"
@@ -227,6 +228,7 @@ printf '%-28s: %s\n' \
   "RELATION_TASK_EXPERT_RANK" "${RELATION_TASK_EXPERT_RANK:-8}" \
   "RELATION_SET_DECODER_LAYERS" "${RELATION_SET_DECODER_LAYERS:-3}" \
   "RELATION_COORD_PRIOR_SIGMA" "${RELATION_COORD_PRIOR_SIGMA}" \
+  "RELATION_AUX_BUDGET_RATIO" "${RELATION_AUX_BUDGET_RATIO:-1.0}" \
   "ENABLE_EVAL" "${ENABLE_EVAL}" \
   "EVAL_AT_START" "${EVAL_AT_START}" \
   "EVAL_INTERVAL_STEPS" "${EVAL_INTERVAL_STEPS}" \
@@ -379,9 +381,13 @@ run_evaluation() {
 
 has_successful_evaluation() {
   local step="$1"
+  local checkpoint="${OUTPUT_DIR}/checkpoint-${step}"
   "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/collect_ui5_metrics.py" \
     has-success --history-dir "${OUTPUT_DIR}/evaluation" --step "${step}" \
-    --relation-gate-mode "${RELATION_GATE_MODE}"
+    --relation-gate-mode "${RELATION_GATE_MODE}" \
+    --checkpoint "${checkpoint}" \
+    --git-commit "${GIT_COMMIT}" \
+    --config-hash "${UI5_CONFIG_HASH}"
 }
 
 if [[ "${PIPELINE_MODE}" == "eval" ]]; then
@@ -533,7 +539,8 @@ if [[ "${EVAL_AT_START}" == "1" ]] && ! has_successful_evaluation 0; then
     --relation-coverage-loss-weight "${RELATION_COVERAGE_LOSS_WEIGHT}" \
     --relation-coord-prior-sigma "${RELATION_COORD_PRIOR_SIGMA}" \
     --relation-task-expert-rank "${RELATION_TASK_EXPERT_RANK:-8}" \
-    --relation-set-decoder-layers "${RELATION_SET_DECODER_LAYERS:-3}"
+    --relation-set-decoder-layers "${RELATION_SET_DECODER_LAYERS:-3}" \
+    --relation-aux-budget-ratio "${RELATION_AUX_BUDGET_RATIO:-1.0}"
   if run_evaluation 0 "${CHECKPOINT_ZERO}" 0; then
     :
   else

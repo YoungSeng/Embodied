@@ -90,6 +90,12 @@ class LocateAnythingConfig(PretrainedConfig):
             relation_task_expert_rank=8,
             relation_set_decoder=False,
             relation_set_decoder_layers=3,
+            relation_straight_through_slot_router=False,
+            relation_set_decoder_deep_supervision=False,
+            relation_reference_position_encoding=False,
+            relation_per_level_scale_router=False,
+            relation_constrained_bbox_decoding=False,
+            relation_aux_budget_ratio=1.0,
             relation_box_l1_loss_weight=0.0,
             relation_box_giou_loss_weight=0.0,
             relation_coverage_loss_weight=0.0,
@@ -164,8 +170,8 @@ class LocateAnythingConfig(PretrainedConfig):
             raise ValueError("relation_gate_mode must be 'observe', 'hard', or 'soft'")
         self.relation_gate_thresholds = dict(relation_gate_thresholds or {})
         self.tc_msed_stage = str(tc_msed_stage).lower()
-        if self.tc_msed_stage not in {"v4", "m1", "m2", "m3", "m4", "m5", "m31"}:
-            raise ValueError("tc_msed_stage must be one of v4/m1/m2/m3/m4/m5/m31")
+        if self.tc_msed_stage not in {"v4", "m1", "m2", "m3", "m4", "m5", "m31", "m32"}:
+            raise ValueError("tc_msed_stage must be one of v4/m1/m2/m3/m4/m5/m31/m32")
         self.relation_task_scale_router = bool(relation_task_scale_router)
         self.relation_set_localizer = bool(relation_set_localizer)
         self.relation_dynamic_slot_pbd = bool(relation_dynamic_slot_pbd)
@@ -177,6 +183,22 @@ class LocateAnythingConfig(PretrainedConfig):
         self.relation_task_expert_rank = int(relation_task_expert_rank)
         self.relation_set_decoder = bool(relation_set_decoder)
         self.relation_set_decoder_layers = int(relation_set_decoder_layers)
+        self.relation_straight_through_slot_router = bool(
+            relation_straight_through_slot_router
+        )
+        self.relation_set_decoder_deep_supervision = bool(
+            relation_set_decoder_deep_supervision
+        )
+        self.relation_reference_position_encoding = bool(
+            relation_reference_position_encoding
+        )
+        self.relation_per_level_scale_router = bool(relation_per_level_scale_router)
+        self.relation_constrained_bbox_decoding = bool(
+            relation_constrained_bbox_decoding
+        )
+        self.relation_aux_budget_ratio = float(relation_aux_budget_ratio)
+        if not 0.0 <= self.relation_aux_budget_ratio <= 1.0:
+            raise ValueError("relation_aux_budget_ratio must be in [0, 1]")
         self.relation_box_l1_loss_weight = float(relation_box_l1_loss_weight)
         self.relation_box_giou_loss_weight = float(relation_box_giou_loss_weight)
         self.relation_coverage_loss_weight = float(relation_coverage_loss_weight)
@@ -237,6 +259,12 @@ class LocateAnythingConfig(PretrainedConfig):
         output['relation_task_expert_rank'] = self.relation_task_expert_rank
         output['relation_set_decoder'] = self.relation_set_decoder
         output['relation_set_decoder_layers'] = self.relation_set_decoder_layers
+        output['relation_straight_through_slot_router'] = self.relation_straight_through_slot_router
+        output['relation_set_decoder_deep_supervision'] = self.relation_set_decoder_deep_supervision
+        output['relation_reference_position_encoding'] = self.relation_reference_position_encoding
+        output['relation_per_level_scale_router'] = self.relation_per_level_scale_router
+        output['relation_constrained_bbox_decoding'] = self.relation_constrained_bbox_decoding
+        output['relation_aux_budget_ratio'] = self.relation_aux_budget_ratio
         output['relation_box_l1_loss_weight'] = self.relation_box_l1_loss_weight
         output['relation_box_giou_loss_weight'] = self.relation_box_giou_loss_weight
         output['relation_coverage_loss_weight'] = self.relation_coverage_loss_weight

@@ -1833,6 +1833,9 @@ class StreamPackingMTPTrainer(Trainer):
         "loss_box_giou_contribution",
         "loss_coverage_contribution",
         "loss_coordinate_bridge_contribution",
+        "relation_aux_budget_scale",
+        "relation_aux_raw_contribution",
+        "relation_aux_scaled_contribution",
         "loss_reconstructed",
         "loss_reconstruction_error",
         "attention_active_batch_rate",
@@ -1866,6 +1869,18 @@ class StreamPackingMTPTrainer(Trainer):
         "slot_usage_entropy",
         "unique_slot_count",
         "duplicate_slot_rate",
+        "route_top1_match_accuracy",
+        "pre_mask_route_top1_accuracy",
+        "predicted_center_diversity",
+        "attention_diversity",
+        "slot_usage_0",
+        "slot_usage_1",
+        "slot_usage_2",
+        "slot_usage_3",
+        "slot_usage_4",
+        "slot_usage_5",
+        "slot_usage_6",
+        "slot_usage_7",
         "relation_grad_norm",
         "image_gate_grad_norm",
         "slot_gate_grad_norm",
@@ -2939,7 +2954,7 @@ class StreamPackingMTPTrainer(Trainer):
             group_missing = [name for name, parameter in trainable if not in_optimizer(parameter)]
             group_frozen = [name for name, parameter in parameters if not parameter.requires_grad]
             if (
-                str(getattr(self.model.config, "tc_msed_stage", "v4")).lower() == "m31"
+                str(getattr(self.model.config, "tc_msed_stage", "v4")).lower() in {"m31", "m32"}
                 and group_name == "image_gate"
             ):
                 group_frozen = []
@@ -3050,6 +3065,9 @@ class StreamPackingMTPTrainer(Trainer):
             ("loss_box_giou_contribution", "loss_box_giou_contribution"),
             ("loss_coverage_contribution", "loss_coverage_contribution"),
             ("loss_coordinate_bridge_contribution", "loss_coordinate_bridge_contribution"),
+            ("relation_aux_budget_scale", "relation_aux_budget_scale"),
+            ("relation_aux_raw_contribution", "relation_aux_raw_contribution"),
+            ("relation_aux_scaled_contribution", "relation_aux_scaled_contribution"),
             ("loss_reconstructed", "loss_reconstructed"),
             ("loss_reconstruction_error", "loss_reconstruction_error"),
             ("attention_active", "attention_active_batch_rate"),
@@ -3132,8 +3150,16 @@ class StreamPackingMTPTrainer(Trainer):
             ("slot_usage_entropy", "slot_usage_entropy"),
             ("unique_slot_count", "unique_slot_count"),
             ("duplicate_slot_rate", "duplicate_slot_rate"),
+            ("route_top1_match_accuracy", "route_top1_match_accuracy"),
+            ("pre_mask_route_top1_match_accuracy", "pre_mask_route_top1_accuracy"),
+            ("predicted_center_diversity", "predicted_center_diversity"),
+            ("attention_diversity", "attention_diversity"),
         ):
             self._add_ui5_scalar(metric_name, getattr(outputs, output_name, None))
+        usage_histogram = getattr(outputs, "slot_usage_histogram", None)
+        if torch.is_tensor(usage_histogram):
+            for index, value in enumerate(usage_histogram.detach().float().reshape(-1)[:8]):
+                self._add_ui5_scalar(f"slot_usage_{index}", value)
 
         if not self._ui5_real_data_audit_logged and torch.is_tensor(detail_norm):
             detail_weights_for_audit = getattr(outputs, "detail_layer_weights", None)
@@ -3321,7 +3347,7 @@ class StreamPackingMTPTrainer(Trainer):
                     self._ui5_tasks[task][f"{prefix}_count"] += 1.0
 
         if (
-            str(getattr(config, "tc_msed_stage", "v4")).lower() == "m31"
+            str(getattr(config, "tc_msed_stage", "v4")).lower() in {"m31", "m32"}
             and (int(self.state.global_step) + 1) % 100 == 0
         ):
             shared_parameter = self.model.relation_pyramid.level_projections[0][1].weight
@@ -3659,6 +3685,9 @@ class StreamPackingMTPTrainer(Trainer):
             "loss_box_giou_contribution": self._average(scalars["loss_box_giou_contribution"]),
             "loss_coverage_contribution": self._average(scalars["loss_coverage_contribution"]),
             "loss_coordinate_bridge_contribution": self._average(scalars["loss_coordinate_bridge_contribution"]),
+            "relation_aux_budget_scale": self._average(scalars["relation_aux_budget_scale"]),
+            "relation_aux_raw_contribution": self._average(scalars["relation_aux_raw_contribution"]),
+            "relation_aux_scaled_contribution": self._average(scalars["relation_aux_scaled_contribution"]),
             "loss_reconstructed": self._average(scalars["loss_reconstructed"]),
             "loss_reconstruction_error": self._average(scalars["loss_reconstruction_error"]),
             "attention_active_batch_rate": self._average(scalars["attention_active_batch_rate"]),
@@ -3698,6 +3727,13 @@ class StreamPackingMTPTrainer(Trainer):
             "box_anchor_count": scalars["box_anchor_count"]["sum"],
             "unique_slot_count": self._average(scalars["unique_slot_count"]),
             "duplicate_slot_rate": self._average(scalars["duplicate_slot_rate"]),
+            "route_top1_match_accuracy": self._average(scalars["route_top1_match_accuracy"]),
+            "pre_mask_route_top1_accuracy": self._average(scalars["pre_mask_route_top1_accuracy"]),
+            "predicted_center_diversity": self._average(scalars["predicted_center_diversity"]),
+            "attention_diversity": self._average(scalars["attention_diversity"]),
+            "per_slot_usage_histogram": [
+                scalars[f"slot_usage_{index}"]["sum"] for index in range(8)
+            ],
             "relation_grad_norm": relation_grad_norm,
             "gate_grad_norm": gate_grad_norm,
             "image_gate_grad_norm": image_gate_grad_norm,
@@ -3934,21 +3970,21 @@ class StreamPackingMTPTrainer(Trainer):
             if step == 20:
                 required_groups = {"relation", "slot_gate"}
                 stage = str(getattr(self.model.config, "tc_msed_stage", "v4"))
-                if stage == "m31":
+                if stage in {"m31", "m32"}:
                     if self._ui5_scalar["pbd_active_positions"]["sum"] <= 0:
                         logger.warning(
-                            "[m31 diagnostic] step-20 window saw no PBD-active "
-                            "prediction positions"
+                            "[%s diagnostic] step-20 window saw no PBD-active "
+                            "prediction positions", stage
                         )
                     if self._ui5_scalar["matched_slots"]["sum"] <= 0:
                         logger.warning(
-                            "[m31 diagnostic] step-20 window saw no "
-                            "Hungarian-matched slots"
+                            "[%s diagnostic] step-20 window saw no "
+                            "Hungarian-matched slots", stage
                         )
                     if self._ui5_scalar["unique_slot_count"]["max"] <= 1.0:
                         logger.warning(
-                            "[m31 diagnostic] step-20 window did not route a "
-                            "multi-box sample to multiple slots"
+                            "[%s diagnostic] step-20 window did not route a "
+                            "multi-box sample to multiple slots", stage
                         )
                     missing_expert_gradients = [
                         defect_id
@@ -3959,9 +3995,9 @@ class StreamPackingMTPTrainer(Trainer):
                     ]
                     if missing_expert_gradients:
                         logger.warning(
-                            "[m31 diagnostic] step-20 window did not activate all "
+                            "[%s diagnostic] step-20 window did not activate all "
                             "five task experts; missing=%s",
-                            missing_expert_gradients,
+                            stage, missing_expert_gradients,
                         )
                     missing_losses = [
                         name
@@ -3975,18 +4011,18 @@ class StreamPackingMTPTrainer(Trainer):
                     ]
                     if missing_losses:
                         logger.warning(
-                            "[m31 diagnostic] step-20 window did not observe all "
+                            "[%s diagnostic] step-20 window did not observe all "
                             "reference losses: %s",
-                            missing_losses,
+                            stage, missing_losses,
                         )
                     required_groups.add("pbd")
                 elif self._ui5_scalar["pbd_active_positions"]["sum"] > 0:
                     required_groups.add("pbd")
-                if stage != "m31":
+                if stage not in {"m31", "m32"}:
                     required_groups.add("image_gate")
-                if stage in {"m2", "m3", "m4", "m5", "m31"}:
+                if stage in {"m2", "m3", "m4", "m5", "m31", "m32"}:
                     required_groups.add("coarse_box")
-                if stage in {"m3", "m4", "m5", "m31"}:
+                if stage in {"m3", "m4", "m5", "m31", "m32"}:
                     required_groups.add("coord_bridge")
                 failed_groups = [
                     group
@@ -3998,8 +4034,8 @@ class StreamPackingMTPTrainer(Trainer):
                         "UI modules had effective supervision but no parameter "
                         f"update through optimizer step 20: {failed_groups}"
                     )
-                    if stage == "m31":
-                        logger.warning("[m31 diagnostic] %s", message)
+                    if stage in {"m31", "m32"}:
+                        logger.warning("[%s diagnostic] %s", stage, message)
                     else:
                         raise RuntimeError(message)
             if step >= 500 and step % 100 == 0:
@@ -4007,11 +4043,11 @@ class StreamPackingMTPTrainer(Trainer):
                 required_groups = {"relation", "slot_gate"}
                 if self._ui5_scalar["pbd_active_positions"]["sum"] > 0:
                     required_groups.add("pbd")
-                if stage != "m31":
+                if stage not in {"m31", "m32"}:
                     required_groups.add("image_gate")
-                if stage in {"m2", "m3", "m4", "m5", "m31"}:
+                if stage in {"m2", "m3", "m4", "m5", "m31", "m32"}:
                     required_groups.add("coarse_box")
-                if stage in {"m3", "m4", "m5", "m31"}:
+                if stage in {"m3", "m4", "m5", "m31", "m32"}:
                     required_groups.add("coord_bridge")
                 inactive = []
                 for group in sorted(required_groups):
@@ -4030,8 +4066,8 @@ class StreamPackingMTPTrainer(Trainer):
                         "TC-MSED parameter update ratio stayed below 1e-6 "
                         f"through optimizer step {step}: {inactive}"
                     )
-                    if stage == "m31":
-                        logger.warning("[m31 diagnostic] %s", message)
+                    if stage in {"m31", "m32"}:
+                        logger.warning("[%s diagnostic] %s", stage, message)
                     else:
                         raise RuntimeError(message)
         if self._ui5_enabled and (
@@ -4331,6 +4367,7 @@ def main():
             relation_coord_prior_sigma=model_args.relation_coord_prior_sigma,
             relation_task_expert_rank=model_args.relation_task_expert_rank,
             relation_set_decoder_layers=model_args.relation_set_decoder_layers,
+            relation_aux_budget_ratio=model_args.relation_aux_budget_ratio,
         )
         logger.info(f'Text attn: {model_args.attn_implementation}, Vision attn: flash_attention_2')
 
@@ -4402,7 +4439,11 @@ def main():
             relation_num_slots=model_args.relation_num_slots,
             relation_adapter_bottleneck=model_args.relation_adapter_bottleneck,
             relation_detail_layers=relation_detail_layers,
-            relation_gate_loss_weight=(0.0 if model_args.tc_msed_stage == "m31" else model_args.relation_gate_loss_weight),
+            relation_gate_loss_weight=(
+                0.0
+                if model_args.tc_msed_stage in {"m31", "m32"}
+                else model_args.relation_gate_loss_weight
+            ),
             relation_slot_gate_loss_weight=model_args.relation_slot_gate_loss_weight,
             relation_attention_loss_weight=model_args.relation_attention_loss_weight,
             relation_gate_threshold=model_args.relation_gate_threshold,
@@ -4421,6 +4462,22 @@ def main():
             relation_task_expert_rank=model_args.relation_task_expert_rank,
             relation_set_decoder=stage_flags["set_decoder"],
             relation_set_decoder_layers=model_args.relation_set_decoder_layers,
+            relation_straight_through_slot_router=stage_flags.get(
+                "straight_through_slot_router", False
+            ),
+            relation_set_decoder_deep_supervision=stage_flags.get(
+                "set_decoder_deep_supervision", False
+            ),
+            relation_reference_position_encoding=stage_flags.get(
+                "reference_position_encoding", False
+            ),
+            relation_per_level_scale_router=stage_flags.get(
+                "per_level_scale_router", False
+            ),
+            relation_constrained_bbox_decoding=stage_flags.get(
+                "constrained_bbox_decoding", False
+            ),
+            relation_aux_budget_ratio=model_args.relation_aux_budget_ratio,
             relation_box_l1_loss_weight=model_args.relation_box_l1_loss_weight,
             relation_box_giou_loss_weight=model_args.relation_box_giou_loss_weight,
             relation_coverage_loss_weight=model_args.relation_coverage_loss_weight,

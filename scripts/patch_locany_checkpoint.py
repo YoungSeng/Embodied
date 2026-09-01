@@ -159,11 +159,18 @@ def validate_relation_weight_keys(
             "relation_pbd.semantic_task_experts.",
             "relation_pbd.geometry_task_experts.",
         ),
+        "m32": (
+            "relation_pyramid.task_set_decoder.",
+            "relation_pyramid.relation_semantic_experts.",
+            "relation_pyramid.per_level_scale_scorer.",
+            "relation_pbd.semantic_task_experts.",
+            "relation_pbd.geometry_task_experts.",
+        ),
     }
     stage_order = ("v4", "m1", "m2", "m3", "m4", "m5")
     required = list(REQUIRED_RELATION_WEIGHT_GROUPS)
-    if stage == "m31":
-        required.extend(stage_groups["m31"])
+    if stage in {"m31", "m32"}:
+        required.extend(stage_groups[stage])
     elif stage not in stage_order:
         return {
             "valid": False,

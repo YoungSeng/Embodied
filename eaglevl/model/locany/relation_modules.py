@@ -139,8 +139,10 @@ class RelationPyramidOutput:
     gate_loss: Optional[torch.Tensor] = None
     image_gate_loss: Optional[torch.Tensor] = None
     slot_gate_loss: Optional[torch.Tensor] = None
+    slot_objectness_loss: Optional[torch.Tensor] = None
     per_task_image_gate_loss: Optional[Dict[int, torch.Tensor]] = None
     per_task_slot_gate_loss: Optional[Dict[int, torch.Tensor]] = None
+    per_task_slot_objectness_loss: Optional[Dict[int, torch.Tensor]] = None
     attention_loss: Optional[torch.Tensor] = None
     attention_kl_loss: Optional[torch.Tensor] = None
     attention_ce_diagnostic: Optional[torch.Tensor] = None
@@ -155,6 +157,8 @@ class RelationPyramidOutput:
     matched_slots: Optional[torch.Tensor] = None
     unmatched_slots: Optional[torch.Tensor] = None
     slot_usage_entropy: Optional[torch.Tensor] = None
+    predicted_center_diversity: Optional[torch.Tensor] = None
+    attention_diversity: Optional[torch.Tensor] = None
 
 
 def class_balanced_focal_loss(
@@ -429,6 +433,9 @@ class TaskConditionedSetDecoderOutput:
     slot_attention: torch.Tensor
     auxiliary_boxes_norm: Tuple[torch.Tensor, ...]
     auxiliary_objectness_logits: Tuple[torch.Tensor, ...]
+    auxiliary_attention: Tuple[torch.Tensor, ...]
+    predicted_center_diversity: torch.Tensor
+    attention_diversity: torch.Tensor
 
 
 class _TaskConditionedSetDecoderLayer(nn.Module):
@@ -465,13 +472,19 @@ class _TaskConditionedSetDecoderLayer(nn.Module):
         queries: torch.Tensor,
         memory: torch.Tensor,
         defect_type: torch.Tensor,
+        query_position: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        normalized = self.self_norm(queries)
+        positioned_queries = (
+            queries if query_position is None else queries + query_position
+        )
+        normalized = self.self_norm(positioned_queries)
         update, _ = self.self_attention(
             normalized, normalized, normalized, need_weights=False
         )
         queries = queries + update
-        normalized = self.cross_norm(queries)
+        normalized = self.cross_norm(
+            queries if query_position is None else queries + query_position
+        )
         update, attention = self.cross_attention(
             normalized,
             memory,
@@ -496,6 +509,7 @@ class TaskConditionedSetDecoder(nn.Module):
         num_attention_heads: Optional[int] = None,
         num_defect_types: int = 5,
         expert_rank: int = 8,
+        reference_position_encoding: bool = False,
     ) -> None:
         super().__init__()
         if num_object_queries <= 0 or num_decoder_layers <= 0:
@@ -509,12 +523,19 @@ class TaskConditionedSetDecoder(nn.Module):
         self.hidden_size = int(hidden_size)
         self.num_object_queries = int(num_object_queries)
         self.num_defect_types = int(num_defect_types)
+        self.reference_position_encoding = bool(reference_position_encoding)
         self.global_query = nn.Parameter(torch.empty(1, hidden_size))
         self.object_queries = nn.Parameter(torch.empty(num_object_queries, hidden_size))
         self.task_embedding = nn.Embedding(num_defect_types, hidden_size)
         self.reference_box_logits = nn.Parameter(
             torch.empty(num_object_queries, 4)
         )
+        if self.reference_position_encoding:
+            self.reference_position_projection = nn.Sequential(
+                nn.Linear(4, hidden_size),
+                nn.GELU(),
+                nn.Linear(hidden_size, hidden_size),
+            )
         self.layers = nn.ModuleList(
             [
                 _TaskConditionedSetDecoderLayer(
@@ -591,11 +612,24 @@ class TaskConditionedSetDecoder(nn.Module):
         )
         auxiliary_boxes: List[torch.Tensor] = []
         auxiliary_objectness: List[torch.Tensor] = []
+        auxiliary_attention: List[torch.Tensor] = []
         final_attention = memory.new_zeros(
             (batch, self.num_object_queries, memory.shape[1]), dtype=torch.float32
         )
         for index, layer in enumerate(self.layers):
-            queries, attention = layer(queries, memory, tasks)
+            query_position = None
+            if self.reference_position_encoding:
+                object_position = self.reference_position_projection(
+                    inverse_sigmoid(reference).to(
+                        dtype=self.reference_position_projection[0].weight.dtype
+                    )
+                ).to(dtype=queries.dtype)
+                query_position = torch.cat(
+                    (torch.zeros_like(object_position[:, :1]), object_position), dim=1
+                )
+            queries, attention = layer(
+                queries, memory, tasks, query_position=query_position
+            )
             slots = queries[:, 1:]
             delta = self.shared_box_deltas[index](slots).float()
             delta = delta + self.task_box_deltas[index](slots, tasks).float()
@@ -604,8 +638,29 @@ class TaskConditionedSetDecoder(nn.Module):
             auxiliary_boxes.append(cxcywh_to_xyxy_unit(reference))
             auxiliary_objectness.append(objectness)
             final_attention = attention[:, 1:].float()
+            auxiliary_attention.append(final_attention)
         queries = self.output_norm(queries)
         boxes_norm = auxiliary_boxes[-1]
+        centers = 0.5 * (boxes_norm[..., :2] + boxes_norm[..., 2:])
+        if self.num_object_queries > 1:
+            center_distances = torch.cdist(centers.float(), centers.float(), p=2)
+            pair_mask = ~torch.eye(
+                self.num_object_queries, device=centers.device, dtype=torch.bool
+            ).unsqueeze(0)
+            predicted_center_diversity = center_distances[pair_mask.expand_as(center_distances)].reshape(
+                batch, -1
+            ).mean(dim=-1)
+            normalized_attention = F.normalize(final_attention.float(), dim=-1)
+            attention_similarity = normalized_attention @ normalized_attention.transpose(-1, -2)
+            attention_diversity = (
+                1.0
+                - attention_similarity[pair_mask.expand_as(attention_similarity)].reshape(
+                    batch, -1
+                ).mean(dim=-1)
+            )
+        else:
+            predicted_center_diversity = centers.new_zeros((batch,), dtype=torch.float32)
+            attention_diversity = centers.new_zeros((batch,), dtype=torch.float32)
         return TaskConditionedSetDecoderOutput(
             global_task_token=queries[:, 0],
             slot_tokens=queries[:, 1:],
@@ -615,6 +670,9 @@ class TaskConditionedSetDecoder(nn.Module):
             slot_attention=final_attention,
             auxiliary_boxes_norm=tuple(auxiliary_boxes),
             auxiliary_objectness_logits=tuple(auxiliary_objectness),
+            auxiliary_attention=tuple(auxiliary_attention),
+            predicted_center_diversity=predicted_center_diversity,
+            attention_diversity=attention_diversity,
         )
 
 
@@ -639,6 +697,9 @@ class RelationConditionedDetailPyramid(nn.Module):
         task_expert_rank: int = 8,
         set_decoder: bool = False,
         set_decoder_layers: int = 3,
+        set_decoder_deep_supervision: bool = False,
+        reference_position_encoding: bool = False,
+        per_level_scale_router: bool = False,
     ) -> None:
         super().__init__()
         self.detail_hidden_size = detail_hidden_size
@@ -655,6 +716,9 @@ class RelationConditionedDetailPyramid(nn.Module):
         self.task_expert_rank = int(task_expert_rank)
         self.set_decoder = bool(set_decoder)
         self.set_decoder_layers = int(set_decoder_layers)
+        self.set_decoder_deep_supervision = bool(set_decoder_deep_supervision)
+        self.reference_position_encoding = bool(reference_position_encoding)
+        self.per_level_scale_router = bool(per_level_scale_router)
         if self.set_decoder and not (self.task_hard_router and self.task_experts):
             raise ValueError(
                 "m31 set decoder requires deterministic task routing and experts"
@@ -680,6 +744,13 @@ class RelationConditionedDetailPyramid(nn.Module):
             self.task_scale_embedding = nn.Embedding(num_defect_types, detail_hidden_size)
             self.task_scale_projection = nn.Linear(detail_hidden_size, 3, bias=False)
             self.image_scale_projection = nn.Linear(detail_hidden_size, 3, bias=False)
+            if self.per_level_scale_router:
+                self.per_level_scale_scorer = nn.Sequential(
+                    nn.LayerNorm(detail_hidden_size),
+                    nn.Linear(detail_hidden_size, detail_hidden_size),
+                    nn.GELU(),
+                    nn.Linear(detail_hidden_size, 1, bias=False),
+                )
 
         self.evidence_queries = nn.Parameter(
             torch.empty(num_families, num_slots, detail_hidden_size)
@@ -742,6 +813,7 @@ class RelationConditionedDetailPyramid(nn.Module):
                 num_decoder_layers=set_decoder_layers,
                 num_defect_types=num_defect_types,
                 expert_rank=task_expert_rank,
+                reference_position_encoding=self.reference_position_encoding,
             )
             self.relation_semantic_experts = TaskRoutedExpertBank(
                 detail_hidden_size,
@@ -764,6 +836,8 @@ class RelationConditionedDetailPyramid(nn.Module):
         if self.task_scale_router:
             nn.init.zeros_(self.task_scale_projection.weight)
             nn.init.zeros_(self.image_scale_projection.weight)
+            if self.per_level_scale_router:
+                nn.init.zeros_(self.per_level_scale_scorer[-1].weight)
         if self.set_localizer:
             nn.init.zeros_(self.coarse_box_head[-1].weight)
             nn.init.zeros_(self.coarse_box_head[-1].bias)
@@ -1050,6 +1124,11 @@ class RelationConditionedDetailPyramid(nn.Module):
         coarse_ious: List[torch.Tensor] = []
         matched_counts: List[torch.Tensor] = []
         unmatched_counts: List[torch.Tensor] = []
+        predicted_center_diversities: List[torch.Tensor] = []
+        attention_diversities: List[torch.Tensor] = []
+        deep_slot_losses: List[torch.Tensor] = []
+        deep_box_l1_losses: List[torch.Tensor] = []
+        deep_box_giou_losses: List[torch.Tensor] = []
 
         image_index = 0
         parameter_zero = self.evidence_queries.sum() * 0.0
@@ -1093,6 +1172,8 @@ class RelationConditionedDetailPyramid(nn.Module):
                 unmatched_counts.append(parameter_zero.detach().float() + self.num_slots)
                 fused_norms.append(parameter_zero.detach().float())
                 relation_context_norms.append(parameter_zero.detach().float())
+                predicted_center_diversities.append(parameter_zero.detach().float())
+                attention_diversities.append(parameter_zero.detach().float())
                 # Even text-only samples carry one dummy 2x2 grid in the base
                 # pipeline, so keep the image cursor aligned with grid_hws.
                 image_index += max(num_images, 1)
@@ -1104,15 +1185,26 @@ class RelationConditionedDetailPyramid(nn.Module):
             height, width = [int(v) for v in grid_hws[image_index].tolist()]
             image_index += num_images
             if self.task_scale_router:
-                image_descriptor = torch.stack(
-                    [level.float().mean(dim=0) for level in levels], dim=0
-                ).mean(dim=0)
-                task_residual = self.task_scale_projection(
-                    self.task_scale_embedding.weight[task]
-                ).float()
-                image_residual = self.image_scale_projection(
-                    image_descriptor.to(dtype=self.image_scale_projection.weight.dtype)
-                ).float()
+                task_embedding = self.task_scale_embedding.weight[task]
+                if self.per_level_scale_router:
+                    # M3.2 keeps the three visual descriptors separate until
+                    # scoring.  The scorer is shared across levels while the
+                    # known task embedding conditions every score.
+                    descriptors = torch.stack(
+                        [level.float().mean(dim=0) for level in levels], dim=0
+                    ).to(dtype=task_embedding.dtype)
+                    conditioned = descriptors + task_embedding.unsqueeze(0)
+                    level_residual = self.per_level_scale_scorer(conditioned).squeeze(-1).float()
+                    task_residual = self.task_scale_projection(task_embedding).float()
+                    image_residual = level_residual
+                else:
+                    image_descriptor = torch.stack(
+                        [level.float().mean(dim=0) for level in levels], dim=0
+                    ).mean(dim=0)
+                    task_residual = self.task_scale_projection(task_embedding).float()
+                    image_residual = self.image_scale_projection(
+                        image_descriptor.to(dtype=self.image_scale_projection.weight.dtype)
+                    ).float()
                 weights = (
                     self.scale_logits[family].float()
                     + task_residual
@@ -1133,6 +1225,12 @@ class RelationConditionedDetailPyramid(nn.Module):
             if self.set_decoder:
                 task_tensor = defect_type[sample_index : sample_index + 1]
                 decoded = self.task_set_decoder(fused.unsqueeze(0), task_tensor)
+                predicted_center_diversities.append(
+                    decoded.predicted_center_diversity[0].detach().float()
+                )
+                attention_diversities.append(
+                    decoded.attention_diversity[0].detach().float()
+                )
                 adapted_relation = self.relation_semantic_experts(
                     decoded.slot_tokens, task_tensor
                 )[0]
@@ -1158,6 +1256,8 @@ class RelationConditionedDetailPyramid(nn.Module):
                 ).squeeze(-1).detach()
                 relation_tokens_for_sample = adapted_relation
             else:
+                predicted_center_diversities.append(parameter_zero.detach().float())
+                attention_diversities.append(parameter_zero.detach().float())
                 conditioning = self._sanitize(
                     self.family_embedding.weight[family] + self.defect_embedding.weight[task],
                     limit=32.0,
@@ -1230,6 +1330,7 @@ class RelationConditionedDetailPyramid(nn.Module):
             matched_for_sample = torch.full(
                 (target_capacity,), -1, device=fused.device, dtype=torch.long
             )
+            deep_valid_boxes: Optional[torch.Tensor] = None
             if target_boxes is not None and target_box_mask is not None and self.set_localizer:
                 box_evidence, box_context, valid_boxes = self._box_attention_targets(
                     target_boxes[sample_index],
@@ -1255,6 +1356,7 @@ class RelationConditionedDetailPyramid(nn.Module):
                     box_evidence = box_evidence[keep]
                     box_context = box_context[keep]
                     valid_target_ordinals = valid_target_ordinals[keep]
+                deep_valid_boxes = valid_boxes
                 if valid_boxes.shape[0] > 0:
                     positive_focal_cost = (
                         (1.0 - torch.sigmoid(gate_logits.float())).pow(self.focal_gamma)
@@ -1360,6 +1462,88 @@ class RelationConditionedDetailPyramid(nn.Module):
             else:
                 matched_counts.append(parameter_zero.detach().float())
                 unmatched_counts.append(parameter_zero.detach().float() + self.num_slots)
+            if (
+                self.set_decoder
+                and self.set_decoder_deep_supervision
+                and target_boxes is not None
+                and target_box_mask is not None
+            ):
+                layer_weights = torch.tensor(
+                    [0.25, 0.5, 1.0], device=fused.device, dtype=torch.float32
+                )
+                if len(decoded.auxiliary_boxes_norm) != layer_weights.numel():
+                    layer_weights = torch.tensor(
+                        [2.0 ** index for index in range(len(decoded.auxiliary_boxes_norm))],
+                        device=fused.device,
+                        dtype=torch.float32,
+                    )
+                layer_weights = layer_weights / layer_weights.sum()
+                sample_slot_terms: List[torch.Tensor] = []
+                sample_l1_terms: List[torch.Tensor] = []
+                sample_giou_terms: List[torch.Tensor] = []
+                for layer_weight, layer_boxes_norm, layer_logits_batch in zip(
+                    layer_weights,
+                    decoded.auxiliary_boxes_norm,
+                    decoded.auxiliary_objectness_logits,
+                ):
+                    layer_boxes = canonicalize_xyxy(
+                        layer_boxes_norm[0].float() * 1000.0
+                    )
+                    layer_logits = layer_logits_batch[0].float()
+                    layer_targets = torch.zeros_like(layer_logits)
+                    layer_l1 = layer_boxes.sum() * 0.0
+                    layer_giou = layer_boxes.sum() * 0.0
+                    if deep_valid_boxes is not None and deep_valid_boxes.shape[0] > 0:
+                        layer_positive_cost = (
+                            (1.0 - torch.sigmoid(layer_logits)).pow(self.focal_gamma)
+                            * F.softplus(-layer_logits)
+                        )[:, None]
+                        layer_cost = (
+                            2.0 * layer_positive_cost
+                            + 5.0
+                            * torch.cdist(
+                                layer_boxes / 1000.0,
+                                deep_valid_boxes.float() / 1000.0,
+                                p=1,
+                            )
+                            + 2.0
+                            * (
+                                1.0
+                                - pairwise_generalized_box_iou(
+                                    layer_boxes, deep_valid_boxes.float()
+                                )
+                            )
+                        )
+                        layer_slots, layer_targets_indices = hungarian_assignment(
+                            layer_cost
+                        )
+                        layer_targets[layer_slots] = 1.0
+                        layer_predicted = layer_boxes[layer_slots]
+                        layer_expected = deep_valid_boxes[layer_targets_indices].float()
+                        layer_l1 = F.l1_loss(
+                            layer_predicted / 1000.0,
+                            layer_expected / 1000.0,
+                            reduction="mean",
+                        )
+                        layer_giou = (
+                            1.0
+                            - aligned_generalized_box_iou(
+                                layer_predicted, layer_expected
+                            )
+                        ).mean()
+                    layer_objectness = class_balanced_focal_loss(
+                        layer_logits.unsqueeze(0),
+                        layer_targets.unsqueeze(0),
+                        defect_type[sample_index : sample_index + 1],
+                        gamma=self.focal_gamma,
+                        beta=self.focal_beta,
+                    )
+                    sample_slot_terms.append(layer_weight * layer_objectness)
+                    sample_l1_terms.append(layer_weight * layer_l1)
+                    sample_giou_terms.append(layer_weight * layer_giou)
+                deep_slot_losses.append(torch.stack(sample_slot_terms).sum())
+                deep_box_l1_losses.append(torch.stack(sample_l1_terms).sum())
+                deep_box_giou_losses.append(torch.stack(sample_giou_terms).sum())
             gate_targets_list.append(gate_targets)
             matched_indices_list.append(matched_for_sample)
 
@@ -1425,6 +1609,8 @@ class RelationConditionedDetailPyramid(nn.Module):
                             gamma=self.focal_gamma,
                             beta=self.focal_beta,
                         )
+                if self.set_decoder_deep_supervision and deep_slot_losses:
+                    slot_gate_loss = torch.stack(deep_slot_losses).mean()
         attention_loss = torch.stack(evidence_losses).mean() if evidence_losses else None
         attention_kl_loss = (
             torch.stack(attention_kl_losses).mean() if attention_kl_losses else None
@@ -1432,8 +1618,16 @@ class RelationConditionedDetailPyramid(nn.Module):
         attention_ce_diagnostic = (
             torch.stack(attention_ce_values).mean() if attention_ce_values else None
         )
-        box_l1_loss = torch.stack(box_l1_losses).mean() if box_l1_losses else None
-        box_giou_loss = torch.stack(box_giou_losses).mean() if box_giou_losses else None
+        box_l1_loss = (
+            torch.stack(deep_box_l1_losses).mean()
+            if self.set_decoder_deep_supervision and deep_box_l1_losses
+            else (torch.stack(box_l1_losses).mean() if box_l1_losses else None)
+        )
+        box_giou_loss = (
+            torch.stack(deep_box_giou_losses).mean()
+            if self.set_decoder_deep_supervision and deep_box_giou_losses
+            else (torch.stack(box_giou_losses).mean() if box_giou_losses else None)
+        )
         per_task_attention_loss = {
             task: torch.stack(values).mean()
             for task, values in attention_losses_by_task.items()
@@ -1515,12 +1709,14 @@ class RelationConditionedDetailPyramid(nn.Module):
             per_task_gate_loss=per_task_image_gate_loss,
             per_task_image_gate_loss=per_task_image_gate_loss,
             per_task_slot_gate_loss=per_task_slot_gate_loss,
+            per_task_slot_objectness_loss=per_task_slot_gate_loss,
             per_task_attention_loss=per_task_attention_loss,
             per_task_box_l1_loss=per_task_box_l1_loss,
             per_task_box_giou_loss=per_task_box_giou_loss,
             gate_loss=image_gate_loss,
             image_gate_loss=image_gate_loss,
             slot_gate_loss=slot_gate_loss,
+            slot_objectness_loss=slot_gate_loss,
             attention_loss=attention_loss,
             attention_kl_loss=attention_kl_loss,
             attention_ce_diagnostic=attention_ce_diagnostic,
@@ -1535,6 +1731,8 @@ class RelationConditionedDetailPyramid(nn.Module):
             matched_slots=torch.stack(matched_counts).mean(),
             unmatched_slots=torch.stack(unmatched_counts).mean(),
             slot_usage_entropy=slot_usage_entropy,
+            predicted_center_diversity=torch.stack(predicted_center_diversities).mean(),
+            attention_diversity=torch.stack(attention_diversities).mean(),
         )
 
     def parameter_count(self) -> int:
@@ -1966,6 +2164,10 @@ class PBDForwardOutput:
     coverage_loss: Optional[torch.Tensor] = None
     unique_slot_count: Optional[torch.Tensor] = None
     duplicate_slot_rate: Optional[torch.Tensor] = None
+    pre_mask_selected_slot_indices: Optional[torch.Tensor] = None
+    route_top1_match_accuracy: Optional[torch.Tensor] = None
+    pre_mask_route_top1_match_accuracy: Optional[torch.Tensor] = None
+    slot_usage_histogram: Optional[torch.Tensor] = None
 
 
 class RelationToPBD(nn.Module):
@@ -1983,6 +2185,7 @@ class RelationToPBD(nn.Module):
         task_experts: bool = False,
         task_expert_rank: int = 8,
         separate_global_geometry: bool = False,
+        straight_through_hard_routing: bool = False,
     ) -> None:
         super().__init__()
         self.semantic_projection = nn.Sequential(
@@ -2002,6 +2205,7 @@ class RelationToPBD(nn.Module):
         self.coordinate_bridge = bool(coordinate_bridge)
         self.task_experts = bool(task_experts)
         self.separate_global_geometry = bool(separate_global_geometry)
+        self.straight_through_hard_routing = bool(straight_through_hard_routing)
         if self.task_experts:
             self.semantic_task_experts = TaskRoutedExpertBank(
                 relation_hidden_size,
@@ -2112,12 +2316,16 @@ class RelationToPBD(nn.Module):
             block_size=block_size,
         )
         selected_slot_indices = torch.full_like(active_positions, -1)
+        pre_mask_selected_slot_indices = torch.full_like(active_positions, -1)
         routing_weights = None
         selected_coarse_boxes = hidden_states.new_zeros((active_positions.numel(), 4))
         final_slot_usage = None
         coverage_loss = hidden_states.new_zeros((), dtype=torch.float32)
         unique_slot_count = hidden_states.new_zeros((), dtype=torch.float32)
         duplicate_slot_rate = hidden_states.new_zeros((), dtype=torch.float32)
+        route_top1_match_accuracy = hidden_states.new_zeros((), dtype=torch.float32)
+        pre_mask_route_top1_match_accuracy = hidden_states.new_zeros((), dtype=torch.float32)
+        slot_usage_histogram = None
         if active_positions.numel() > 0:
             required_samples = int(active_samples.max().item()) + 1
             if relation_summary.shape[0] < required_samples:
@@ -2162,6 +2370,9 @@ class RelationToPBD(nn.Module):
                 soft_anchor_weights: List[torch.Tensor] = []
                 seen_route_weights: Dict[Tuple[int, int], torch.Tensor] = {}
                 seen_selected_slots: Dict[Tuple[int, int], int] = {}
+                seen_pre_mask_slots: Dict[Tuple[int, int], int] = {}
+                route_teacher_matches: List[torch.Tensor] = []
+                pre_mask_teacher_matches: List[torch.Tensor] = []
                 for active_index in range(active_positions.numel()):
                     sample = int(active_samples[active_index].item())
                     ordinal = int(active_anchor_ordinals[active_index].item())
@@ -2169,37 +2380,74 @@ class RelationToPBD(nn.Module):
                     if group not in seen_route_weights:
                         query = self.router_query(flat_hidden[active_positions[active_index]]).float()
                         keys = self.router_key(relation_tokens[sample]).float()
-                        route_logits = (
+                        pre_mask_route_logits = (
                             query @ keys.transpose(0, 1) / math.sqrt(float(relation_dim))
                             + F.logsigmoid(slot_gate_logits[sample].float())
                             - self.coverage_gamma.float().abs() * final_slot_usage[sample]
                         )
+                        pre_mask_chosen = int(pre_mask_route_logits.argmax().item())
+                        route_logits = pre_mask_route_logits
+                        has_available_slot = True
                         if self.task_experts:
                             available = final_slot_usage[sample] <= 0
                             if bool(available.any()):
                                 route_logits = route_logits.masked_fill(~available, -1.0e4)
-                        soft_weights = route_logits.softmax(dim=-1)
-                        chosen = int(soft_weights.argmax().item())
+                            elif self.straight_through_hard_routing:
+                                # More generated anchors than object slots: do
+                                # not silently reuse an already-consumed slot.
+                                # The extra anchor receives no slot residual.
+                                has_available_slot = False
+                        soft_weights = (
+                            route_logits.softmax(dim=-1)
+                            if has_available_slot
+                            else route_logits.new_zeros((num_slots,))
+                        )
+                        chosen = (
+                            int(soft_weights.argmax().item())
+                            if has_available_slot
+                            else -1
+                        )
                         if matched_slot_indices is not None and ordinal < matched_slot_indices.shape[1]:
                             teacher_slot = int(matched_slot_indices[sample, ordinal].item())
                             if teacher_slot >= 0:
                                 coverage_loss = coverage_loss + F.cross_entropy(
-                                    route_logits.unsqueeze(0),
-                                    torch.tensor([teacher_slot], device=route_logits.device),
+                                    pre_mask_route_logits.unsqueeze(0),
+                                    torch.tensor([teacher_slot], device=pre_mask_route_logits.device),
                                 )
-                                chosen = teacher_slot
-                        selected = F.one_hot(
-                            torch.tensor(chosen, device=route_logits.device), num_slots
-                        ).float()
+                                route_teacher_matches.append(
+                                    route_logits.new_tensor(float(chosen == teacher_slot))
+                                )
+                                pre_mask_teacher_matches.append(
+                                    route_logits.new_tensor(float(pre_mask_chosen == teacher_slot))
+                                )
+                                # Preserve the released m31 behavior exactly;
+                                # m32 teacher slots supervise router CE only.
+                                if not self.straight_through_hard_routing:
+                                    chosen = teacher_slot
+                        selected = (
+                            F.one_hot(
+                                torch.tensor(chosen, device=route_logits.device),
+                                num_slots,
+                            ).float()
+                            if chosen >= 0
+                            else route_logits.new_zeros((num_slots,))
+                        )
                         # The first TC-MSED experiment keeps the differentiable
                         # soft mixture.  The discrete (teacher/argmax) slot is
                         # used only for coverage state, coarse geometry and
                         # diagnostics.  This lets LM loss train q/k/v routing;
                         # straight-through top-1 remains a separate ablation.
-                        seen_route_weights[group] = (
-                            selected if self.task_experts else soft_weights
-                        )
+                        if self.straight_through_hard_routing:
+                            # Forward is predicted hard top-1; backward follows
+                            # the soft path so LM loss reaches router q/k.
+                            route_weights = (
+                                selected + soft_weights - soft_weights.detach()
+                            )
+                        else:
+                            route_weights = selected if self.task_experts else soft_weights
+                        seen_route_weights[group] = route_weights
                         seen_selected_slots[group] = chosen
+                        seen_pre_mask_slots[group] = pre_mask_chosen
                         soft_anchor_weights.append(soft_weights)
                         # ``final_slot_usage[sample]`` participates in the
                         # route_logits graph for this and previous anchors.
@@ -2213,9 +2461,12 @@ class RelationToPBD(nn.Module):
                     all_weights[active_index] = route_weights
                     selected_index = seen_selected_slots[group]
                     selected_slot_indices[active_index] = selected_index
+                    pre_mask_selected_slot_indices[active_index] = seen_pre_mask_slots[group]
                     # K=1 is a strict degeneration to the legacy selected token;
                     # do not add an otherwise unidentifiable value projection.
-                    if self.task_experts:
+                    if selected_index < 0:
+                        token = relation_tokens[sample].new_zeros((relation_dim,))
+                    elif self.task_experts and not self.straight_through_hard_routing:
                         token = self.router_value(
                             relation_tokens[sample, selected_index]
                         )
@@ -2229,7 +2480,7 @@ class RelationToPBD(nn.Module):
                             self.overlap_adapter_down(token)
                         )
                     routed_tokens[active_index] = token
-                    if coarse_boxes is not None:
+                    if coarse_boxes is not None and selected_index >= 0:
                         selected_coarse_boxes[active_index] = coarse_boxes[sample, selected_index]
                 if len(soft_anchor_weights) > 1:
                     by_sample: Dict[int, List[torch.Tensor]] = {}
@@ -2253,7 +2504,8 @@ class RelationToPBD(nn.Module):
                     )
                 anchor_selected = []
                 for group, selected_index in seen_selected_slots.items():
-                    anchor_selected.append((group[0], int(selected_index)))
+                    if int(selected_index) >= 0:
+                        anchor_selected.append((group[0], int(selected_index)))
                 if anchor_selected:
                     total = len(anchor_selected)
                     unique_per_sample = []
@@ -2265,6 +2517,20 @@ class RelationToPBD(nn.Module):
                     unique_slot_count = hidden_states.new_tensor(unique_per_sample).mean()
                     duplicate_slot_rate = hidden_states.new_tensor(float(duplicates / max(total, 1)))
                     coverage_loss = coverage_loss / max(total, 1)
+                    slot_usage_histogram = torch.bincount(
+                        torch.tensor(
+                            [slot for _, slot in anchor_selected],
+                            device=hidden_states.device,
+                            dtype=torch.long,
+                        ),
+                        minlength=num_slots,
+                    ).float()
+                if route_teacher_matches:
+                    route_top1_match_accuracy = torch.stack(route_teacher_matches).mean()
+                if pre_mask_teacher_matches:
+                    pre_mask_route_top1_match_accuracy = torch.stack(
+                        pre_mask_teacher_matches
+                    ).mean()
             active_hidden = flat_hidden.index_select(0, active_positions)
             enhanced_active_hidden = self.enhance_routed_hidden(
                 active_hidden,
@@ -2305,4 +2571,8 @@ class RelationToPBD(nn.Module):
             coverage_loss=coverage_loss,
             unique_slot_count=unique_slot_count,
             duplicate_slot_rate=duplicate_slot_rate,
+            pre_mask_selected_slot_indices=pre_mask_selected_slot_indices,
+            route_top1_match_accuracy=route_top1_match_accuracy,
+            pre_mask_route_top1_match_accuracy=pre_mask_route_top1_match_accuracy,
+            slot_usage_histogram=slot_usage_histogram,
         )

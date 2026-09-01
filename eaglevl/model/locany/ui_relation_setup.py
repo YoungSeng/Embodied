@@ -64,6 +64,19 @@ TC_MSED_STAGE_CONFIGS = {
         "image_gate_mode": "observe",
         "image_gate_loss_weight": 0.0,
     },
+    "m32": {
+        "task_scale_router": True, "set_localizer": True,
+        "dynamic_slot_pbd": True, "coordinate_bridge": True,
+        "soft_gate": False, "legacy_overlap_adapter": False,
+        "task_hard_router": True, "task_experts": True, "set_decoder": True,
+        "image_gate_mode": "observe",
+        "image_gate_loss_weight": 0.0,
+        "straight_through_slot_router": True,
+        "set_decoder_deep_supervision": True,
+        "reference_position_encoding": True,
+        "per_level_scale_router": True,
+        "constrained_bbox_decoding": True,
+    },
 }
 
 
@@ -126,6 +139,7 @@ def configure_ui5_model_config(
     relation_coord_prior_sigma: float = 0.05,
     relation_task_expert_rank: int = 8,
     relation_set_decoder_layers: int = 3,
+    relation_aux_budget_ratio: float = 1.0,
 ):
     """Apply the one authoritative UI5 configuration to a model config."""
 
@@ -181,12 +195,30 @@ def configure_ui5_model_config(
     config.relation_set_decoder = bool(stage_config["set_decoder"])
     config.relation_task_expert_rank = int(relation_task_expert_rank)
     config.relation_set_decoder_layers = int(relation_set_decoder_layers)
+    config.relation_straight_through_slot_router = bool(
+        stage_config.get("straight_through_slot_router", False)
+    )
+    config.relation_set_decoder_deep_supervision = bool(
+        stage_config.get("set_decoder_deep_supervision", False)
+    )
+    config.relation_reference_position_encoding = bool(
+        stage_config.get("reference_position_encoding", False)
+    )
+    config.relation_per_level_scale_router = bool(
+        stage_config.get("per_level_scale_router", False)
+    )
+    config.relation_constrained_bbox_decoding = bool(
+        stage_config.get("constrained_bbox_decoding", False)
+    )
+    config.relation_aux_budget_ratio = float(relation_aux_budget_ratio)
+    if not 0.0 <= config.relation_aux_budget_ratio <= 1.0:
+        raise ValueError("relation_aux_budget_ratio must be in [0, 1]")
     config.relation_box_l1_loss_weight = float(relation_box_l1_loss_weight)
     config.relation_box_giou_loss_weight = float(relation_box_giou_loss_weight)
     config.relation_coverage_loss_weight = float(relation_coverage_loss_weight)
     config.relation_coord_prior_sigma = float(relation_coord_prior_sigma)
     config.relation_gate_mode = str(stage_config["image_gate_mode"])
-    if stage == "m31":
+    if stage in {"m31", "m32"}:
         # Image Gate is retained as detached diagnostics only.
         config.relation_gate_loss_weight = 0.0
     if not hasattr(config, "relation_gate_thresholds"):

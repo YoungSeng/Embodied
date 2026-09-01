@@ -383,6 +383,7 @@ if torchrun \
   --relation_box_l1_loss_weight "${RELATION_BOX_L1_LOSS_WEIGHT:-0.0}" \
   --relation_box_giou_loss_weight "${RELATION_BOX_GIOU_LOSS_WEIGHT:-0.0}" \
   --relation_coverage_loss_weight "${RELATION_COVERAGE_LOSS_WEIGHT:-0.0}" \
+  --relation_aux_budget_ratio "${RELATION_AUX_BUDGET_RATIO:-1.0}" \
   --relation_coord_prior_sigma "${RELATION_COORD_PRIOR_SIGMA:-0.05}" \
   --balance_ui_defects "${BALANCE_UI_DEFECTS:-True}" \
   --ui_records_per_class "${UI_RECORDS_PER_CLASS:-17604}" \

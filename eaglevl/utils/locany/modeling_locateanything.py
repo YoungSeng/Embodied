@@ -28,6 +28,7 @@ from .mask_magi_utils import *
 from .configuration_qwen2 import Qwen2Config
 
 from .generate_utils import (
+    constrain_ui5_bbox_logits,
     sample_tokens,
     handle_pattern,
     get_token_ids_from_config,
@@ -191,6 +192,15 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 task_expert_rank=int(getattr(config, "relation_task_expert_rank", 8)),
                 set_decoder=bool(getattr(config, "relation_set_decoder", False)),
                 set_decoder_layers=int(getattr(config, "relation_set_decoder_layers", 3)),
+                set_decoder_deep_supervision=bool(
+                    getattr(config, "relation_set_decoder_deep_supervision", False)
+                ),
+                reference_position_encoding=bool(
+                    getattr(config, "relation_reference_position_encoding", False)
+                ),
+                per_level_scale_router=bool(
+                    getattr(config, "relation_per_level_scale_router", False)
+                ),
             )
             self.relation_pbd = RelationToPBD(
                 detail_hidden_size,
@@ -201,6 +211,9 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 task_experts=bool(getattr(config, "relation_task_experts", False)),
                 task_expert_rank=int(getattr(config, "relation_task_expert_rank", 8)),
                 separate_global_geometry=bool(getattr(config, "relation_set_decoder", False)),
+                straight_through_hard_routing=bool(
+                    getattr(config, "relation_straight_through_slot_router", False)
+                ),
             )
         self._last_ui_defect_interface = None
 
@@ -493,11 +506,11 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             if defect_type is None:
                 defect_type = inferred_defect_type
             if (
-                str(getattr(self.config, "tc_msed_stage", "v4")).lower() == "m31"
+                str(getattr(self.config, "tc_msed_stage", "v4")).lower() in {"m31", "m32"}
                 and (relation_family is None or defect_type is None)
             ):
                 raise ValueError(
-                    "m31 requires one of the five fixed UI5 prompts; refusing to "
+                    "m31/m32 requires one of the five fixed UI5 prompts; refusing to "
                     "silently route an unknown prompt to task 0"
                 )
         if relation_family is not None and not isinstance(relation_family, torch.Tensor):
@@ -528,7 +541,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             if relation_gate_mode is not None
             else getattr(self.config, "relation_gate_mode", "observe")
         ).lower()
-        if str(getattr(self.config, "tc_msed_stage", "v4")).lower() == "m31":
+        if str(getattr(self.config, "tc_msed_stage", "v4")).lower() in {"m31", "m32"}:
             # M3.1 keeps the legacy image head as detached diagnostics only.
             # A caller-provided hard/soft mode must not change raw generation.
             gate_mode = "observe"
@@ -636,6 +649,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         runtime_enable_pbd = bool(getattr(self, "_runtime_enable_pbd", True))
         slot_usage_state = None
         selected_slot_history = []
+        pre_mask_selected_slot_history = []
         pending_ar_coordinate_box = None
         pending_ar_coordinate_offset = 0
 
@@ -711,6 +725,15 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         def _sample_token_in_mtp(generated, outputs):
             """Sample tokens using MTP (Multi-Token Prediction) mode."""
             next_token_logits = outputs.logits[:, -n_future_tokens:, :]
+            if bool(getattr(self.config, "relation_constrained_bbox_decoding", False)):
+                next_token_logits = constrain_ui5_bbox_logits(
+                    next_token_logits,
+                    generated[:, seq_len:].reshape(-1),
+                    self.token_ids,
+                    mtp=True,
+                    max_boxes=int(getattr(self.config, "relation_num_slots", 8)),
+                    temperature=float(generate_kwargs.get("temperature", 0.0)),
+                )
             probs, confidence, x0, box_avg = sample_tokens(
                 next_token_logits, generated, self.token_ids, keep_k=5, **generate_kwargs
             )
@@ -728,6 +751,14 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         def _sample_token_in_ar(generated, outputs):
             """Sample a single token using AR (Auto-Regressive) mode."""
             next_token_logits = outputs.logits[:, -1:, :]
+            if bool(getattr(self.config, "relation_constrained_bbox_decoding", False)):
+                next_token_logits = constrain_ui5_bbox_logits(
+                    next_token_logits,
+                    generated[:, seq_len:].reshape(-1),
+                    self.token_ids,
+                    mtp=False,
+                    max_boxes=int(getattr(self.config, "relation_num_slots", 8)),
+                )
             probs, confidence, x0, _ = sample_tokens(
                 next_token_logits, generated, self.token_ids, **generate_kwargs
             )
@@ -834,6 +865,17 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                             int(value) for value in anchor_selection.detach().cpu().tolist()
                             if int(value) >= 0
                         )
+                        if pbd_output.pre_mask_selected_slot_indices is not None:
+                            pre_mask_anchor_selection = (
+                                pbd_output.pre_mask_selected_slot_indices[
+                                    pbd_output.active_offsets == 0
+                                ]
+                            )
+                            pre_mask_selected_slot_history.extend(
+                                int(value)
+                                for value in pre_mask_anchor_selection.detach().cpu().tolist()
+                                if int(value) >= 0
+                            )
                     if pbd_output.active_positions.numel() > 0:
                         pbd_applied_this_round = True
                         active_count = int(pbd_output.active_positions.numel())
@@ -1048,6 +1090,13 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 ),
                 "defect_type": defect_type,
                 "selected_slot_indices": selected_slot_history,
+                "pre_mask_selected_slot_indices": pre_mask_selected_slot_history,
+                "slot_usage_histogram": [
+                    selected_slot_history.count(index)
+                    for index in range(int(getattr(self.config, "relation_num_slots", 8)))
+                ],
+                "predicted_center_diversity": relation_output.predicted_center_diversity,
+                "attention_diversity": relation_output.attention_diversity,
                 "pbd_enabled": runtime_enable_pbd,
                 "coordinate_bridge_enabled": bool(
                     runtime_enable_pbd and self.relation_pbd.coordinate_bridge

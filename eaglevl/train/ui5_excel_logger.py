@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import os
+import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -54,6 +55,9 @@ TRAIN_BASE_COLUMNS = (
     "loss_box_giou_contribution",
     "loss_coverage_contribution",
     "loss_coordinate_bridge_contribution",
+    "relation_aux_budget_scale",
+    "relation_aux_raw_contribution",
+    "relation_aux_scaled_contribution",
     "loss_reconstructed",
     "loss_reconstruction_error",
     "attention_active_batch_rate",
@@ -123,6 +127,12 @@ TRAIN_MODULE_COLUMNS = (
     "selected_slot_iou",
     "oracle_8slot_iou",
     "route_top1_match_accuracy",
+    "pre_mask_route_top1_accuracy",
+    "oracle_slot_hit_rate",
+    "selected_oracle_iou_ratio",
+    "per_slot_usage_histogram",
+    "predicted_center_diversity",
+    "attention_diversity",
     "matched_slots",
     "unmatched_slots",
     "slot_usage_entropy",
@@ -233,6 +243,12 @@ EVAL_COLUMNS = (
     "selected_slot_iou",
     "oracle_8slot_iou",
     "route_top1_match_accuracy",
+    "pre_mask_route_top1_accuracy",
+    "oracle_slot_hit_rate",
+    "selected_oracle_iou_ratio",
+    "per_slot_usage_histogram",
+    "predicted_center_diversity",
+    "attention_diversity",
     "duplicate_slot_rate",
     "pbd_enabled",
     "coordinate_bridge_enabled",
@@ -243,6 +259,7 @@ EVAL_COLUMNS = (
     "run_name",
     "tc_msed_stage",
     "config_hash",
+    "model_signature",
     "task_name",
     "defect_type",
 )
@@ -270,6 +287,8 @@ def _value(value: Any) -> Any:
         return None
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
+    if isinstance(value, (list, tuple, dict)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     detach = getattr(value, "detach", None)
     if callable(detach):
         value = detach()
@@ -499,9 +518,18 @@ class UI5ExcelLogger:
         sheet = workbook[SHEET_EVAL]
         headers = [cell.value for cell in sheet[1]]
         existing = [dict(zip(headers, values)) for values in sheet.iter_rows(min_row=2, values_only=True)]
-        if sum(int(row.get("step", -1)) == step for row in existing) == 12:
-            workbook.close()
-            return False
+        existing_for_step = [
+            row for row in existing if int(row.get("step", -1)) == step
+        ]
+        if len(existing_for_step) == 12:
+            identity_columns = ("git_commit", "config_hash", "model_signature")
+            new_identity = tuple(rows[0].get(column) for column in identity_columns)
+            if all(
+                tuple(row.get(column) for column in identity_columns) == new_identity
+                for row in existing_for_step
+            ):
+                workbook.close()
+                return False
 
         retained = [row for row in existing if int(row.get("step", -1)) != step]
         if len(retained) != len(existing):
@@ -559,6 +587,7 @@ def build_eval_rows(
                     "run_name": metadata.get("run_name"),
                     "tc_msed_stage": metadata.get("tc_msed_stage"),
                     "config_hash": metadata.get("config_hash"),
+                    "model_signature": metadata.get("model_signature"),
                     "checkpoint": checkpoint,
                     "task": diagnostic_task,
                     "task_name": diagnostic_task,
@@ -642,6 +671,12 @@ def build_eval_rows(
                     "selected_slot_iou": gate.get("selected_slot_iou"),
                     "oracle_8slot_iou": gate.get("oracle_8slot_iou"),
                     "route_top1_match_accuracy": gate.get("route_top1_match_accuracy"),
+                    "pre_mask_route_top1_accuracy": gate.get("pre_mask_route_top1_accuracy"),
+                    "oracle_slot_hit_rate": gate.get("oracle_slot_hit_rate"),
+                    "selected_oracle_iou_ratio": gate.get("selected_oracle_iou_ratio"),
+                    "per_slot_usage_histogram": gate.get("per_slot_usage_histogram"),
+                    "predicted_center_diversity": gate.get("predicted_center_diversity"),
+                    "attention_diversity": gate.get("attention_diversity"),
                     "duplicate_slot_rate": gate.get("duplicate_slot_rate"),
                     "pbd_enabled": gate.get("pbd_enabled"),
                     "coordinate_bridge_enabled": gate.get("coordinate_bridge_enabled"),
@@ -694,6 +729,7 @@ def build_eval_rows(
                 "run_name": metadata.get("run_name"),
                 "tc_msed_stage": metadata.get("tc_msed_stage"),
                 "config_hash": metadata.get("config_hash"),
+                "model_signature": metadata.get("model_signature"),
                 "checkpoint": checkpoint,
                 "task": "five_task_macro",
                 "task_name": "five_task_macro",
@@ -835,6 +871,34 @@ def build_eval_rows(
                         float(row.get("route_top1_match_accuracy") or 0.0)
                         for row in source_rows
                     )
+                    / len(source_rows)
+                ),
+                "pre_mask_route_top1_accuracy": (
+                    sum(float(row.get("pre_mask_route_top1_accuracy") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "oracle_slot_hit_rate": (
+                    sum(float(row.get("oracle_slot_hit_rate") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "selected_oracle_iou_ratio": (
+                    sum(float(row.get("selected_oracle_iou_ratio") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "per_slot_usage_histogram": [
+                    sum(
+                        int((row.get("per_slot_usage_histogram") or [0] * 8)[slot])
+                        if slot < len(row.get("per_slot_usage_histogram") or []) else 0
+                        for row in source_rows
+                    )
+                    for slot in range(8)
+                ],
+                "predicted_center_diversity": (
+                    sum(float(row.get("predicted_center_diversity") or 0.0) for row in source_rows)
+                    / len(source_rows)
+                ),
+                "attention_diversity": (
+                    sum(float(row.get("attention_diversity") or 0.0) for row in source_rows)
                     / len(source_rows)
                 ),
                 "duplicate_slot_rate": (

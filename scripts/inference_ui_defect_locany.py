@@ -1233,6 +1233,16 @@ class LocateAnythingInferencer:
             ),
             "defect_type": self._scalar(interface.get("defect_type")),
             "selected_slot_indices": interface.get("selected_slot_indices", []),
+            "pre_mask_selected_slot_indices": interface.get(
+                "pre_mask_selected_slot_indices", []
+            ),
+            "slot_usage_histogram": interface.get("slot_usage_histogram", []),
+            "predicted_center_diversity": self._scalar(
+                interface.get("predicted_center_diversity")
+            ),
+            "attention_diversity": self._scalar(
+                interface.get("attention_diversity")
+            ),
             "pbd_enabled": bool(interface.get("pbd_enabled", self.args.enable_pbd)),
             "coordinate_bridge_enabled": bool(
                 interface.get("coordinate_bridge_enabled", False)

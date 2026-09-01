@@ -60,7 +60,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument(
         "--tc-msed-stage",
-        choices=("v4", "m1", "m2", "m3", "m4", "m5", "m31"),
+        choices=("v4", "m1", "m2", "m3", "m4", "m5", "m31", "m32"),
         default="v4",
         help="Architecture ablation stage; v4 is the exact fallback baseline",
     )
@@ -99,6 +99,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--relation-gate-mode", choices=("observe", "hard", "soft"), default=None
     )
     parser.add_argument("--relation-gate-threshold", type=float, default=None)
+    parser.add_argument("--relation-aux-budget-ratio", type=float, default=None)
     pbd_group = parser.add_mutually_exclusive_group()
     pbd_group.add_argument(
         "--eval-enable-pbd", dest="eval_enable_pbd", action="store_true"
@@ -201,11 +202,12 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "RUN_NAME": args.run_name,
         "SCORER_ROOT": args.scorer_root,
         "RELATION_GATE_THRESHOLD": getattr(args, "relation_gate_threshold", None),
+        "RELATION_AUX_BUDGET_RATIO": getattr(args, "relation_aux_budget_ratio", None),
         "TRAINING_DATA_SOURCE_DIR": args.training_data_source_dir,
         "TRAINING_DATA_DIR": args.training_data_dir,
     }
     env.update(explicit)
-    if tc_msed_stage == "m31":
+    if tc_msed_stage in {"m31", "m32"}:
         env.update(
             {
                 "RELATION_GATE_MODE": "observe",
@@ -220,6 +222,11 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
                 "RELATION_TASK_EXPERT_RANK": "8",
                 "RELATION_SET_DECODER_LAYERS": "3",
                 "RELATION_NUM_SLOTS": "8",
+                "RELATION_AUX_BUDGET_RATIO": str(
+                    1.0
+                    if getattr(args, "relation_aux_budget_ratio", None) is None
+                    else getattr(args, "relation_aux_budget_ratio")
+                ),
             }
         )
     eval_max_images = optional["EVAL_MAX_IMAGES_PER_TASK"]
@@ -317,6 +324,7 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "RELATION_TASK_EXPERT_RANK",
         "RELATION_SET_DECODER_LAYERS",
         "RELATION_COORD_PRIOR_SIGMA",
+        "RELATION_AUX_BUDGET_RATIO",
         "MAX_SEQ_LENGTH",
         "MAX_NUM_TOKENS_PER_SAMPLE",
         "MAX_NUM_TOKENS",
@@ -416,6 +424,7 @@ def main() -> int:
         "RELATION_BOX_GIOU_LOSS_WEIGHT",
         "RELATION_COVERAGE_LOSS_WEIGHT",
         "RELATION_COORD_PRIOR_SIGMA",
+        "RELATION_AUX_BUDGET_RATIO",
         "RELATION_GATE_MODE",
         "RELATION_GATE_THRESHOLD",
         "RELATION_FOCAL_BETA",
