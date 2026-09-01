@@ -17,6 +17,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Mapping, Sequence
 
 
@@ -37,7 +38,9 @@ from run_locany_cpt_ui5_checkpoint_sweep import (  # noqa: E402
 
 
 DEFAULT_INFERENCE = PROJECT_ROOT / "scripts/inference_ui_defect_locany.py"
+DEFAULT_PARALLEL_INFERENCE = PROJECT_ROOT / "scripts/run_ui5_parallel_inference.py"
 DEFAULT_SCORER = PROJECT_ROOT / "qwen3vl_merge_and_score_fixed_5tasks.py"
+EXTERNAL_EVALUATION_PROTOCOL_VERSION = "cpt-external-ui5-v2"
 
 
 def utc_now() -> str:
@@ -56,9 +59,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--inference-script", type=Path, default=DEFAULT_INFERENCE)
+    parser.add_argument(
+        "--parallel-inference-script", type=Path, default=DEFAULT_PARALLEL_INFERENCE
+    )
     parser.add_argument("--scorer-script", type=Path, default=DEFAULT_SCORER)
     parser.add_argument("--metrics-jsonl", type=Path, default=None)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--gpu-devices", default="0")
     parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--vision-attn-implementation", default="flash_attention_2")
@@ -115,17 +122,18 @@ def run(command: Sequence[str]) -> None:
     subprocess.run(list(command), cwd=PROJECT_ROOT, check=True)
 
 
-def inference_command(args: argparse.Namespace, prediction_dir: Path) -> list[str]:
+def inference_command(
+    args: argparse.Namespace, prediction_dir: Path, tasks: Sequence[str]
+) -> list[str]:
     command = [
         str(args.python),
-        str(args.inference_script),
+        str(args.parallel_inference_script),
         "--checkpoint", str(args.checkpoint),
         "--processor-path", str(args.processor_path or args.base_model),
         "--input-dir", str(args.input_dir),
         "--output-dir", str(prediction_dir),
-        "--summary-path", str(prediction_dir / "_summary.json"),
-        "--cuda-visible-devices", "0",
-        "--device", args.device,
+        "--gpu-devices", args.gpu_devices,
+        "--inference-script", str(args.inference_script),
         "--dtype", args.dtype,
         "--attn-implementation", args.attn_implementation,
         "--vision-attn-implementation", args.vision_attn_implementation,
@@ -133,9 +141,9 @@ def inference_command(args: argparse.Namespace, prediction_dir: Path) -> list[st
         "--max-new-tokens", str(args.max_new_tokens),
         "--n-future-tokens", str(args.n_future_tokens),
         "--seed", str(args.seed),
-        "--tasks", "all",
-        "--skip-figma",
-        "--fail-fast",
+        "--tasks", *tasks,
+        "--task-retries", "1",
+        "--continue-on-task-failure",
         "--save-raw-answer",
         "--relation-gate-mode", "observe",
         "--no-enable-ui-relation",
@@ -179,7 +187,12 @@ def score_predictions(
     tag = threshold_tag(threshold)
     cached = output_dir / "metrics" / f"{tag}.json"
     if cached.is_file() and not args.force:
-        return cached, load_metric_json(cached)
+        existing = load_metric_json(cached)
+        if all(
+            "mean_iou" in existing.get("tasks", {}).get(task, {}).get("bbox", {})
+            for task in TASKS
+        ):
+            return cached, existing
     attempt = "attempt-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     score_root = output_dir / "score_runs" / tag
     run(score_command(args, prediction_dir, score_root, attempt, threshold))
@@ -264,7 +277,8 @@ def print_metrics(step: int, metrics: Mapping[str, Any]) -> None:
         bbox = metrics[f"bbox_{aggregate}"]
         print(
             f"{aggregate} | image_f1={float(image.get('f1', 0)):.4f} "
-            f"bbox_f1={float(bbox.get('f1', 0)):.4f}",
+            f"bbox_f1={float(bbox.get('f1', 0)):.4f} "
+            f"bbox_mean_iou={float(bbox.get('mean_iou', 0)):.4f}",
             flush=True,
         )
 
@@ -329,7 +343,7 @@ def evaluation_identity(
     *, manifest_id: str, checkpoint: Path, step: int, threshold: float
 ) -> str:
     payload = {
-        "protocol": "cpt-external-ui5-v1",
+        "protocol": EXTERNAL_EVALUATION_PROTOCOL_VERSION,
         "manifest_id": manifest_id,
         "checkpoint": str(checkpoint),
         "step": step,
@@ -352,9 +366,13 @@ def base_bootstrap_command(args: argparse.Namespace, *, force: bool) -> list[str
         "--input-dir", str(args.input_dir),
         "--python", str(args.python),
         "--inference-script", str(args.inference_script),
+        "--parallel-inference-script", str(
+            getattr(args, "parallel_inference_script", DEFAULT_PARALLEL_INFERENCE)
+        ),
         "--scorer-script", str(args.scorer_script),
         "--metrics-jsonl", str(args.metrics_jsonl),
         "--device", args.device,
+        "--gpu-devices", getattr(args, "gpu_devices", "0"),
         "--dtype", args.dtype,
         "--attn-implementation", args.attn_implementation,
         "--vision-attn-implementation", args.vision_attn_implementation,
@@ -373,9 +391,12 @@ def base_bootstrap_command(args: argparse.Namespace, *, force: bool) -> list[str
 
 
 def main() -> int:
+    evaluation_started = datetime.now(timezone.utc)
+    wall_started = time.time()
     args = parse_args()
     for name in (
-        "checkpoint", "base_model", "run_dir", "input_dir", "inference_script", "scorer_script"
+        "checkpoint", "base_model", "run_dir", "input_dir", "inference_script",
+        "parallel_inference_script", "scorer_script"
     ):
         value = getattr(args, name)
         setattr(args, name, value.expanduser().resolve())
@@ -391,6 +412,7 @@ def main() -> int:
         (args.base_model, "Base model", "dir"),
         (args.input_dir, "external UI5 data", "dir"),
         (args.inference_script, "inference script", "file"),
+        (args.parallel_inference_script, "parallel inference script", "file"),
         (args.scorer_script, "canonical scorer", "file"),
     ):
         exists = path.is_dir() if kind == "dir" else path.is_file()
@@ -412,6 +434,8 @@ def main() -> int:
                 if (
                     existing_base.get("manifest_id") != manifest["manifest_id"]
                     or set(existing_base.get("metrics", {})) != expected_tags
+                    or existing_base.get("evaluation_protocol_version")
+                    != EXTERNAL_EVALUATION_PROTOCOL_VERSION
                 ):
                     bootstrap_reason = "identity_mismatch"
             except (OSError, ValueError, json.JSONDecodeError):
@@ -436,7 +460,54 @@ def main() -> int:
         f"checkpoint={args.checkpoint} manifest_id={manifest['manifest_id']}",
         flush=True,
     )
-    run(inference_command(args, prediction_dir))
+    parallel_status_path = prediction_dir / "parallel_inference_status.json"
+    pending_tasks = list(TASKS)
+    previous_parallel_status: dict[str, Any] = {}
+    if parallel_status_path.is_file() and not args.force:
+        try:
+            previous_parallel_status = json.loads(
+                parallel_status_path.read_text(encoding="utf-8")
+            )
+            if previous_parallel_status.get("success") and set(
+                previous_parallel_status.get("tasks", {})
+            ) == set(TASKS):
+                pending_tasks = []
+            else:
+                failed = [
+                    task for task, value in previous_parallel_status.get("tasks", {}).items()
+                    if int(value.get("return_code", 1)) != 0
+                ]
+                missing = [
+                    task for task in TASKS
+                    if task not in previous_parallel_status.get("tasks", {})
+                ]
+                pending_tasks = list(dict.fromkeys([*failed, *missing])) or list(TASKS)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pending_tasks = list(TASKS)
+    if pending_tasks:
+        print(f"EXTERNAL_UI5_PENDING_TASKS={','.join(pending_tasks)}", flush=True)
+        run(inference_command(args, prediction_dir, pending_tasks))
+        if previous_parallel_status and set(pending_tasks) != set(TASKS):
+            repaired_status = json.loads(parallel_status_path.read_text(encoding="utf-8"))
+            merged_tasks = dict(previous_parallel_status.get("tasks", {}))
+            merged_tasks.update(repaired_status.get("tasks", {}))
+            missing = [
+                task for task in TASKS
+                if task not in merged_tasks
+                or int(merged_tasks[task].get("return_code", 1)) != 0
+            ]
+            repaired_status["tasks"] = merged_tasks
+            repaired_status["missing_tasks"] = missing
+            repaired_status["success"] = not missing
+            atomic_write_json(parallel_status_path, repaired_status)
+    else:
+        print("EXTERNAL_UI5_GENERATION=CACHE_HIT all five tasks complete", flush=True)
+    parallel_status = json.loads(parallel_status_path.read_text(encoding="utf-8"))
+    if not parallel_status.get("success"):
+        raise RuntimeError(
+            "external UI5 parallel generation is incomplete: "
+            f"{parallel_status_path}"
+        )
 
     current_metrics: dict[str, dict[str, Any]] = {}
     metric_paths: dict[str, str] = {}
@@ -468,6 +539,7 @@ def main() -> int:
     summary = {
         "schema_version": 1,
         "evaluation_kind": "external_ui5_generalization",
+        "evaluation_protocol_version": EXTERNAL_EVALUATION_PROTOCOL_VERSION,
         "split": "external_ui5",
         "step": args.checkpoint_step,
         "checkpoint": str(args.checkpoint),
@@ -485,6 +557,10 @@ def main() -> int:
         "base_metrics": base_metrics,
         "metric_paths": metric_paths,
         "prediction_dir": str(prediction_dir),
+        "complete_five_task_external_ui5": True,
+        "inference_error_count": 0,
+        "eval_wall_time_seconds": time.time() - wall_started,
+        "started_at": evaluation_started.isoformat(),
         "completed_at": utc_now(),
     }
     summary_path = output_dir / "summary.json"
@@ -509,7 +585,7 @@ def main() -> int:
             {
                 "schema_version": 1,
                 "evaluation_id": evaluation_id,
-                "evaluation_protocol_id": f"cpt-external-ui5-v1-{manifest['manifest_id'][:16]}-iou-{threshold:g}",
+                "evaluation_protocol_id": f"{EXTERNAL_EVALUATION_PROTOCOL_VERSION}-{manifest['manifest_id'][:16]}-iou-{threshold:g}",
                 "evaluation_kind": "external_ui5_generalization",
                 "eligible_for_best_checkpoint": False,
                 "checkpoint": str(args.checkpoint),
@@ -529,6 +605,10 @@ def main() -> int:
                     if isinstance(primary, (int, float)) and isinstance(base_primary, (int, float))
                     else None
                 ),
+                "inference_error_count": 0,
+                "evaluation_status": "complete",
+                "complete_five_task_external_ui5": True,
+                "eval_wall_time_seconds": summary["eval_wall_time_seconds"],
                 "metrics": metrics,
                 "base_metrics": base,
                 "summary": str(summary_path),

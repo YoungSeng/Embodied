@@ -14,7 +14,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from locany_ui5_common import TASK_JSONL, TASKS, parse_gpu_devices
 
@@ -33,6 +33,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--inference-script", type=Path, required=True)
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
+    parser.add_argument(
+        "--vision-attn-implementation",
+        choices=("sdpa", "flash_attention_2", "eager"),
+        default="flash_attention_2",
+    )
+    parser.add_argument(
+        "--generation-mode", choices=("fast", "slow", "hybrid"), default="hybrid"
+    )
+    parser.add_argument("--max-new-tokens", type=int, default=4096)
+    parser.add_argument("--n-future-tokens", type=int, default=6)
+    parser.add_argument("--seed", type=int, default=20260826)
     parser.add_argument("--runtime-profile", type=Path, default=None)
     parser.add_argument("--tasks", nargs="+", choices=TASKS, default=list(TASKS))
     parser.add_argument("--max-images-per-task", type=int, default=0)
@@ -46,6 +58,12 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="独立控制 PBD/coordinate bridge，供同 checkpoint 消融使用",
     )
+    parser.add_argument(
+        "--enable-ui-relation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--save-raw-answer", action="store_true")
     parser.add_argument(
         "--model-load-preflight",
         action=argparse.BooleanOptionalAction,
@@ -63,6 +81,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--task-retries",
+        type=int,
+        default=0,
+        help="retry a failed task this many times on the same physical GPU",
+    )
+    parser.add_argument(
+        "--continue-on-task-failure",
+        action="store_true",
+        help="allow other queued tasks to finish after a task exhausts retries",
+    )
     return parser.parse_args()
 
 
@@ -126,9 +155,17 @@ def build_command(
         "--attn-implementation",
         args.attn_implementation,
         "--vision-attn-implementation",
-        "flash_attention_2",
+        args.vision_attn_implementation,
+        "--dtype",
+        args.dtype,
         "--generation-mode",
-        "hybrid",
+        args.generation_mode,
+        "--max-new-tokens",
+        str(args.max_new_tokens),
+        "--n-future-tokens",
+        str(args.n_future_tokens),
+        "--seed",
+        str(args.seed),
         "--tasks",
         task,
         "--skip-figma",
@@ -136,7 +173,10 @@ def build_command(
         "--relation-gate-mode",
         args.relation_gate_mode,
     ]
+    command.append("--enable-ui-relation" if args.enable_ui_relation else "--no-enable-ui-relation")
     command.append("--enable-pbd" if args.enable_pbd else "--no-enable-pbd")
+    if args.save_raw_answer:
+        command.append("--save-raw-answer")
     if args.relation_gate_threshold is not None:
         command.extend(
             ["--relation-gate-threshold", str(args.relation_gate_threshold)]
@@ -177,12 +217,84 @@ def print_failure_log(label: str, path: Path, line_count: int) -> str:
     return tail
 
 
+def run_priority_gpu_tasks(
+    *,
+    tasks: list[str],
+    gpu_devices: list[str],
+    estimates: dict[str, float],
+    runner: Callable[[str, str, int], dict[str, Any]],
+    retries: int = 0,
+    continue_on_failure: bool = True,
+) -> dict[str, dict[str, Any]]:
+    """Run dynamically assigned tasks with one subprocess at a time per GPU.
+
+    This is the shared scheduler used by both UI5 and CPT held-out evaluation.
+    A retry is deliberately performed inside the same worker so the failed
+    task remains on its original physical GPU.
+    """
+    if retries < 0:
+        raise ValueError("retries cannot be negative")
+    work_queue: queue.PriorityQueue[tuple[float, str]] = queue.PriorityQueue()
+    for task in tasks:
+        work_queue.put((-float(estimates.get(task, 0.0)), task))
+    lock = threading.Lock()
+    stop_event = threading.Event()
+    results: dict[str, dict[str, Any]] = {}
+
+    def worker(gpu: str) -> None:
+        while not stop_event.is_set():
+            try:
+                _, task = work_queue.get_nowait()
+            except queue.Empty:
+                return
+            attempts: list[dict[str, Any]] = []
+            final: dict[str, Any] | None = None
+            try:
+                for attempt in range(1, retries + 2):
+                    try:
+                        current = dict(runner(task, gpu, attempt))
+                    except Exception as exc:
+                        current = {
+                            "return_code": 99,
+                            "error": f"scheduler runner raised {type(exc).__name__}: {exc}",
+                        }
+                    current.setdefault("task", task)
+                    current.setdefault("physical_gpu", gpu)
+                    current["attempt"] = attempt
+                    attempts.append(current)
+                    final = current
+                    if int(current.get("return_code", 1)) == 0:
+                        break
+                assert final is not None
+                final = dict(final)
+                final["attempts"] = attempts
+                final["retry_count"] = max(0, len(attempts) - 1)
+                with lock:
+                    results[task] = final
+                if int(final.get("return_code", 1)) != 0 and not continue_on_failure:
+                    stop_event.set()
+            finally:
+                work_queue.task_done()
+
+    threads = [
+        threading.Thread(target=worker, args=(gpu,), name=f"gpu-{gpu}", daemon=False)
+        for gpu in gpu_devices
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return results
+
+
 def main() -> int:
     args = parse_args()
     if args.max_images_per_task < 0:
         raise ValueError("--max-images-per-task cannot be negative")
     if args.failure_log_lines < 0:
         raise ValueError("--failure-log-lines cannot be negative")
+    if args.task_retries < 0:
+        raise ValueError("--task-retries cannot be negative")
     args.checkpoint = args.checkpoint.expanduser().resolve()
     args.processor_path = args.processor_path.expanduser().resolve()
     args.input_dir = args.input_dir.expanduser().resolve()
@@ -250,10 +362,6 @@ def main() -> int:
             f"{task:16s}: records={counts[task]:6d}, "
             f"estimated={estimates[task]:.2f} ({source})"
         )
-
-    work_queue: queue.PriorityQueue[tuple[float, str]] = queue.PriorityQueue()
-    for task in ordered:
-        work_queue.put((-estimates[task], task))
 
     summaries_dir = args.output_dir / "_worker_summaries"
     logs_dir = args.output_dir / "_worker_logs"
@@ -344,21 +452,12 @@ def main() -> int:
             flush=True,
         )
 
-    lock = threading.Lock()
-    stop_event = threading.Event()
-    results: dict[str, dict[str, Any]] = {}
-
-    def run_worker(gpu: str) -> None:
-        while not stop_event.is_set():
-            try:
-                _, task = work_queue.get_nowait()
-            except queue.Empty:
-                return
+    def run_task(task: str, gpu: str, attempt: int) -> dict[str, Any]:
             summary_path = summaries_dir / f"{task}.json"
             log_path = logs_dir / f"{task}.log"
             command = build_command(args, task, gpu, summary_path)
             print(
-                f"[START] task={task} physical_gpu={gpu} logical_device=cuda:0 "
+                f"[START] task={task} attempt={attempt} physical_gpu={gpu} logical_device=cuda:0 "
                 f"command={shlex.join(command)}",
                 flush=True,
             )
@@ -371,7 +470,8 @@ def main() -> int:
                 child_env["PYTHONUNBUFFERED"] = "1"
                 with log_path.open("a", encoding="utf-8") as log_handle:
                     log_handle.write(
-                        f"\n===== {datetime.now(timezone.utc).isoformat()} task={task} gpu={gpu} =====\n"
+                        f"\n===== {datetime.now(timezone.utc).isoformat()} task={task} "
+                        f"gpu={gpu} attempt={attempt} =====\n"
                     )
                     log_handle.write(shlex.join(command) + "\n")
                     log_handle.flush()
@@ -383,13 +483,8 @@ def main() -> int:
                         check=False,
                     )
                 return_code = process.returncode
-                task_dir = args.output_dir / task
-                prediction_files = list(task_dir.glob("*.json")) if task_dir.is_dir() else []
                 if return_code != 0:
                     error = f"inference subprocess exited with code {return_code}"
-                if return_code == 0 and not prediction_files:
-                    return_code = 90
-                    error = f"no prediction JSON files found under {task_dir}"
             elapsed = time.time() - started
             log_tail = ""
             if return_code != 0:
@@ -398,7 +493,7 @@ def main() -> int:
                     log_path,
                     args.failure_log_lines,
                 )
-            result = {
+            result: dict[str, Any] = {
                 "task": task,
                 "physical_gpu": gpu,
                 "logical_device": "cuda:0",
@@ -411,12 +506,9 @@ def main() -> int:
                 "error": error,
                 "log_tail": log_tail,
             }
-            with lock:
-                results[task] = result
             if return_code != 0:
-                stop_event.set()
                 print(
-                    f"[FAILED] task={task} GPU={gpu} exit_code={return_code} "
+                    f"[FAILED] task={task} attempt={attempt} GPU={gpu} exit_code={return_code} "
                     f"command={shlex.join(command)} log={log_path} error={error}",
                     flush=True,
                 )
@@ -425,16 +517,16 @@ def main() -> int:
                     f"[DONE] task={task} GPU={gpu} elapsed={elapsed:.1f}s log={log_path}",
                     flush=True,
                 )
-            work_queue.task_done()
+            return result
 
-    threads = [
-        threading.Thread(target=run_worker, args=(gpu,), name=f"gpu-{gpu}", daemon=False)
-        for gpu in gpus
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    results = run_priority_gpu_tasks(
+        tasks=ordered,
+        gpu_devices=gpus,
+        estimates=estimates,
+        runner=run_task,
+        retries=args.task_retries,
+        continue_on_failure=args.continue_on_task_failure,
+    )
 
     missing_tasks = [task for task in args.tasks if task not in results]
     failures = [result for result in results.values() if result["return_code"] != 0]

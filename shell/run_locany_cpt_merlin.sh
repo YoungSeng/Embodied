@@ -170,6 +170,13 @@ df -h /tmp "${FILESYSTEM_ROOT}" || true
 nvidia-smi
 
 LAUNCH_LOG="${SHARED_RUNTIME_DIR}/launcher.log"
+export LAUNCH_LOG
+
+if [[ "${CPT_SEGMENTED_PIPELINE:-0}" == "1" ]]; then
+  echo "CPT_SEGMENTED_PIPELINE=1: entering natural-exit train/eval/resume loop" | tee -a "${LAUNCH_LOG}"
+  exec bash "${PROJECT_ROOT}/shell/run_locany_cpt_segmented_pipeline.sh" \
+    "${MACHINE_TYPE}" "${CPT_MODE}"
+fi
 
 run_training_phase() {
   local phase_name="$1"

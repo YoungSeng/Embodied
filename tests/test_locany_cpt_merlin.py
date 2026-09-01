@@ -37,6 +37,13 @@ class LocateAnythingCPTMerlinTest(unittest.TestCase):
             "gpu: 2",
             'CUDA_DEVICES: "0,1"',
         ),
+        "locany_cpt_v4_h20x2_formal_segmented_eval_merlin.yaml": (
+            "shell/run_locany_cpt_merlin.sh h20 formal",
+            "gpuv: NVIDIA_H20",
+            "clusterId: 20",
+            "gpu: 2",
+            'CUDA_DEVICES: "0,1"',
+        ),
         "locany_cpt_v4_h20x2_smoke_merlin.yaml": (
             "shell/run_locany_cpt_merlin.sh h20 smoke",
             "gpuv: NVIDIA_H20",

@@ -1689,7 +1689,10 @@ def publish_cpt_checkpoint_completion(
                 temporary,
             )
 
-    if _env_flag("LOCANY_CPT_MODE", default=False):
+    if (
+        _env_flag("LOCANY_CPT_MODE", default=False)
+        and not _env_flag("CPT_SEGMENTED_PIPELINE", default=False)
+    ):
         queue_path = output_dir / "diagnostics" / "cpt_eval_queue.jsonl"
         try:
             enqueue_pending_eval(
@@ -1709,6 +1712,11 @@ def publish_cpt_checkpoint_completion(
                 "checkpoint marker was published, but eval queue publish failed: "
                 f"queue={queue_path}; {type(exc).__name__}: {exc}"
             ) from exc
+    elif _env_flag("CPT_SEGMENTED_PIPELINE", default=False):
+        logger.info(
+            "[Checkpoint] segmented CPT evaluates synchronously after torchrun exits; "
+            "single-GPU eval queue publication is disabled"
+        )
     return report
 
 
@@ -2009,7 +2017,15 @@ class StreamPackingMTPTrainer(Trainer):
             "output_dir": self.args.output_dir,
             "world_size": int(self.args.world_size),
             "seed": int(self.args.seed),
-            "max_steps": int(self.args.max_steps),
+            "max_steps": int(
+                os.environ.get("LOCANY_PIPELINE_FINAL_STEP", self.args.max_steps)
+            ),
+            "segment_target_max_steps": int(self.args.max_steps),
+            "lr_scheduler_total_steps": int(
+                os.environ.get(
+                    "LOCANY_LR_SCHEDULER_TOTAL_STEPS", self.args.max_steps
+                )
+            ),
             "learning_rate": float(self.args.learning_rate),
             "max_num_tokens": self._max_num_tokens,
             "max_num_tokens_per_sample": getattr(
@@ -2972,6 +2988,32 @@ class StreamPackingMTPTrainer(Trainer):
         if frozen:
             raise RuntimeError(f"Unexpected frozen UI parameters: {frozen}")
         return optimizer
+
+    def create_scheduler(self, num_training_steps: int, optimizer=None):
+        """Keep one LR schedule across naturally exiting training segments.
+
+        The segmented CPT launcher deliberately changes ``--max_steps`` from
+        1000 to 2000, ... so every torchrun invocation reaches its own target
+        and exits normally. The learning-rate schedule must still use the
+        full formal-training horizon.
+        """
+        total_steps_text = os.environ.get("LOCANY_LR_SCHEDULER_TOTAL_STEPS", "").strip()
+        scheduler_steps = int(total_steps_text) if total_steps_text else int(num_training_steps)
+        if scheduler_steps < int(num_training_steps):
+            raise ValueError(
+                "LOCANY_LR_SCHEDULER_TOTAL_STEPS cannot be smaller than the current "
+                f"segment target: scheduler={scheduler_steps}, target={num_training_steps}"
+            )
+        if total_steps_text and self.is_world_process_zero():
+            logger.warning(
+                "[CPT segmented scheduler] target_max_steps=%s scheduler_total_steps=%s",
+                num_training_steps,
+                scheduler_steps,
+            )
+        return super().create_scheduler(
+            num_training_steps=scheduler_steps,
+            optimizer=optimizer,
+        )
 
     def _add_ui5_weighted_scalar(self, name, value, weight):
         value = self._tensor_float(value)
@@ -4660,7 +4702,10 @@ def main():
 
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         segment_mode = _env_flag("LOCANY_SEGMENT_MODE", default=False)
-        final_segment = trainer.state.global_step >= training_args.max_steps
+        pipeline_final_step = int(
+            os.environ.get("LOCANY_PIPELINE_FINAL_STEP", training_args.max_steps)
+        )
+        final_segment = trainer.state.global_step >= pipeline_final_step
         if not segment_mode or final_segment:
             trainer.save_model()
         elif get_rank() == 0:
@@ -4716,8 +4761,11 @@ def main():
         trainer.save_state()
         
     segment_mode = _env_flag("LOCANY_SEGMENT_MODE", default=False)
+    pipeline_final_step = int(
+        os.environ.get("LOCANY_PIPELINE_FINAL_STEP", training_args.max_steps)
+    )
     training_complete = (not training_args.do_train) or (
-        'trainer' in locals() and trainer.state.global_step >= training_args.max_steps
+        'trainer' in locals() and trainer.state.global_step >= pipeline_final_step
     )
     if not segment_mode or training_complete:
         with open(osp.join(training_args.output_dir, 'done.txt'), 'w') as f:

@@ -329,6 +329,21 @@ def totals_for(metrics: Mapping[str, Any], granularity: str) -> dict[str, Any]:
             if weight
             else 0.0
         )
+        matched_iou_sum = sum(
+            float(group.get("matched_iou_sum", 0.0)) for group in groups
+        )
+        matched_iou_count = sum(
+            int(group.get("matched_iou_count", 0)) for group in groups
+        )
+        result.update(
+            {
+                "matched_iou_sum": matched_iou_sum,
+                "matched_iou_count": matched_iou_count,
+                "mean_iou": (
+                    matched_iou_sum / matched_iou_count if matched_iou_count else 0.0
+                ),
+            }
+        )
     return result
 
 

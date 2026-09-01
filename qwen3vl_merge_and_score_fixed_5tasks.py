@@ -363,7 +363,7 @@ def merge_gt_and_swift_jsonl_preds(
     output_path: str,
     coord_base: float,
     target_issue: str,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """
     将 swift infer 汇总 JSONL 中的 response 按图片 ID 合并到 GT，
     并将 Qwen3-VL 的 0~1000 坐标转换成原图真实像素坐标。
@@ -1127,6 +1127,8 @@ def evaluate_merged_file(
         "count_match": 0,
         "total_samples": 0,
         "invalid_pred": 0,
+        "matched_iou_sum": 0.0,
+        "matched_iou_count": 0,
     }
 
     with open(merged_path, "r", encoding="utf-8") as f:
@@ -1189,6 +1191,11 @@ def evaluate_merged_file(
                     )
 
             row_indices, col_indices = linear_sum_assignment(-iou_matrix)
+            metrics["matched_iou_sum"] += sum(
+                float(iou_matrix[row_index, col_index])
+                for row_index, col_index in zip(row_indices, col_indices)
+            )
+            metrics["matched_iou_count"] += len(row_indices)
             matched_tp = sum(
                 1
                 for row_index, col_index in zip(row_indices, col_indices)
@@ -1213,7 +1220,7 @@ def safe_prf(tp: int, fp: int, fn: int) -> tuple[float, float, float]:
     return precision, recall, f1
 
 
-def build_metrics_summary(metrics: dict[str, int]) -> dict[str, Any]:
+def build_metrics_summary(metrics: dict[str, Any]) -> dict[str, Any]:
     bbox_precision, bbox_recall, bbox_f1 = safe_prf(
         metrics["tp"], metrics["fp"], metrics["fn"]
     )
@@ -1247,6 +1254,12 @@ def build_metrics_summary(metrics: dict[str, int]) -> dict[str, Any]:
             "fp": metrics["fp"],
             "fn": metrics["fn"],
             "count_accuracy": count_accuracy,
+            "mean_iou": (
+                float(metrics["matched_iou_sum"]) / int(metrics["matched_iou_count"])
+                if int(metrics["matched_iou_count"]) else 0.0
+            ),
+            "matched_iou_sum": float(metrics["matched_iou_sum"]),
+            "matched_iou_count": int(metrics["matched_iou_count"]),
         },
         "image": {
             "precision": image_precision,
@@ -1310,6 +1323,7 @@ def print_evaluation(
         "fn",
         "tn",
         "accuracy",
+        "mean_iou",
     ]
     rows = [
         [
@@ -1322,6 +1336,7 @@ def print_evaluation(
             summary["bbox"]["fn"],
             "",
             f"{summary['bbox']['count_accuracy']:.4f}",
+            f"{summary['bbox']['mean_iou']:.4f}",
         ],
         [
             "image",
@@ -1333,6 +1348,7 @@ def print_evaluation(
             summary["image"]["fn"],
             summary["image"]["tn"],
             f"{summary['image']['accuracy']:.4f}",
+            "",
         ],
     ]
 
@@ -1356,6 +1372,7 @@ def format_bbox_table(summary: dict[str, Any]) -> str:
         "fp",
         "fn",
         "accuracy",
+        "mean_iou",
     ]
 
     rows = [[
@@ -1366,6 +1383,7 @@ def format_bbox_table(summary: dict[str, Any]) -> str:
         bbox["fp"],
         bbox["fn"],
         f"{bbox['count_accuracy']:.4f}",
+        f"{bbox['mean_iou']:.4f}",
     ]]
 
     return format_markdown_table(headers, rows)
@@ -1560,6 +1578,7 @@ def write_all_tasks_summary(
         "fp",
         "fn",
         "accuracy",
+        "mean_iou",
     ]
 
     image_headers = [
@@ -1596,6 +1615,7 @@ def write_all_tasks_summary(
             bbox["fp"],
             bbox["fn"],
             f"{bbox['count_accuracy']:.4f}",
+            f"{bbox['mean_iou']:.4f}",
         ])
 
         image_rows.append([
@@ -1624,6 +1644,7 @@ def write_all_tasks_summary(
             "",
             "",
             f"{np.mean([x['bbox']['count_accuracy'] for x in summaries]):.4f}",
+            f"{np.mean([x['bbox']['mean_iou'] for x in summaries]):.4f}",
         ])
 
         image_rows.append([
@@ -1663,11 +1684,16 @@ def write_all_tasks_summary(
     write_summary(sys.stdout)
 
     def metric_group(name: str) -> dict[str, float]:
-        return {
+        output = {
             "precision": float(np.mean([x[name]["precision"] for x in summaries])),
             "recall": float(np.mean([x[name]["recall"] for x in summaries])),
             "f1": float(np.mean([x[name]["f1"] for x in summaries])),
         }
+        if name == "bbox":
+            output["mean_iou"] = float(
+                np.mean([x[name]["mean_iou"] for x in summaries])
+            )
+        return output
 
     json_summary = {
         "schema_version": 1,

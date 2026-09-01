@@ -711,8 +711,9 @@ Magi；跨模型严谨对比则必须让所有待比较模型使用同一 backen
 训练由 YAML 固定为 SDPA，与这个旧 CPT sweep 是两个实验协议。
 
 `0.1` 与仓库现有 `qwen3vl_merge_and_score_fixed_5tasks.py` 的历史默认口径一致，和既有
-Qwen/同事模型报告比较时统一使用该阈值；formal 的 held-out 和 external UI5 都只使用
-IoU=0.1，不再生成或选择 IoU=0.5 指标。
+Qwen/同事模型报告比较时统一使用该阈值。这里的旧 checkpoint sweep 命令仍只输出 0.1；
+下文 CPT v3 segmented formal 会对同一份 external prediction 同时离线计算 0.1、0.5 和
+mean IoU。
 
 推理逐图片断点续跑；Ctrl-C 后重新执行同一条完整命令即可，已有图片不会重推。每个
 checkpoint 的预测保存在 `predictions/checkpoint-STEP/`，原始文本在各任务的 `raw/`。
@@ -760,6 +761,53 @@ python scripts/analyze_locany_cpt_curves.py \
 
 至少三个 milestone 才判定趋势；两点不足以声称“没有过拟合”。
 
+## 6.1 CPT v3：同一 Merlin job 的 1000-step 分段训练与双卡评测
+
+正式 CPT v3 不再使用单卡 evaluator daemon，也不在仍存活的 `torchrun` 旁边启动推理。
+唯一提交命令是：
+
+```bash
+git pull
+mlx job submitv2 --path locany_cpt_v4_h20x2_formal_segmented_eval_merlin.yaml
+```
+
+该 job 固定执行以下状态机：
+
+```text
+Base step-0 双卡评测
+→ torchrun 训练到 target max_steps=1000 后全部 rank 自然退出
+→ checkpoint-1000 resume 完整性校验
+→ GPU 0/1 PriorityQueue 并行评测十个 val_fast task 和外部 UI5 五任务
+→ 合并 JSONL/Excel
+→ 从 checkpoint-1000 恢复并把 target max_steps 改为 2000
+→ ... → 20000
+```
+
+分段过程不设置 `LOCANY_STOP_AFTER_STEP` 或 callback early-stop。每一段都由相同的
+`target max_steps` 在所有 rank 上自然结束；只有 `torchrun` 返回且 checkpoint 的
+optimizer、scheduler、trainer/rank state 和每个 rank 的 dataloader state 都验证通过后，
+才会释放训练模型并开始推理。`LOCANY_LR_SCHEDULER_TOTAL_STEPS=20000` 保证 target 每段递增
+时 cosine scheduler 仍然使用同一条 20k-step 曲线，不会在 step 1000 提前衰减到零。
+
+十个 held-out task 默认固定 hash 选择 `val_fast` 每任务 200 条。每张物理 GPU 同一时刻只
+运行一个 task；完成后自动领取下一个。单 task 在原 GPU 失败会自动重试一次，仍失败则把
+GPU、命令、worker log 和 fragment 写入 checkpoint 状态。`EVAL_FAIL_POLICY=warn` 保留
+checkpoint 并继续下一训练段，进入下一次评测前优先修复先前 incomplete checkpoint。
+只有十个 fragment 全部完成才写 `complete_ten_task_heldout=true`。
+
+Base 十任务只在 step 0 生成，并按 manifest/protocol/task 缓存；step>0 worker 使用
+`--skip-base-if-cached`，缓存缺失会明确失败，禁止偷偷重复推 Base。外部 UI5 五任务同样使用
+GPU PriorityQueue（H20×2 为 2+2+1），保持 relation/PBD 关闭。每个 checkpoint 只生成一份
+原始 prediction，再离线计算 IoU=0.1、IoU=0.5 和 Hungarian one-to-one matched mean IoU。
+
+关键状态文件：
+
+- `eval/checkpoint-STEP/parallel_heldout_status.json`：十任务 worker、重试和完整性；
+- `eval/checkpoint-STEP/segmented_eval_status.json`：held-out、external、Excel 总状态；
+- `eval_external_ui5/checkpoint-STEP/predictions/parallel_inference_status.json`：外部五任务；
+- `diagnostics/cpt_eval_metrics.jsonl`：原子合并后的权威评测行；
+- `diagnostics/cpt_training_evaluation.xlsx`：三 sheet 汇总。
+
 ## 7. JSON/JSONL 与 Excel
 
 Source of truth 只有：
@@ -783,7 +831,8 @@ python scripts/build_locany_cpt_excel.py \
 - `EvalMetrics`：同时保存 `split=heldout` 的十任务 CE/primary/Base delta/best，以及
   `split=external_ui5` 的外部五类总体指标；
 - `UIDefectMetrics`：held-out 与 external_ui5 的 Base/checkpoint × 五类 × image/bbox
-  P/R/F1 和 macro/micro；held-out 与外部五类的 `iou_threshold` 都固定为 0.1。
+  P/R/F1 和 macro/micro；held-out primary 使用 IoU=0.1，外部五类同时保存 IoU=0.1、
+  IoU=0.5 和 mean IoU，多个阈值共享同一份 prediction。
 
 缺失值保持空白，不写成 0。`openpyxl` 缺失或保存失败只产生 warning，不会终止训练；
 JSON/JSONL 仍是 source of truth，Excel 可随时重建。

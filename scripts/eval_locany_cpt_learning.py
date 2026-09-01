@@ -100,7 +100,28 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="optional completed referring_kg manual-review JSONL",
     )
-    parser.add_argument("--tasks", default="all")
+    parser.add_argument(
+        "--tasks",
+        nargs="+",
+        default=("all",),
+        help="one or more CPT tasks; comma-separated legacy values remain supported",
+    )
+    parser.add_argument(
+        "--output-fragment",
+        type=Path,
+        default=None,
+        help="atomically write this worker's summary/metric rows without appending the run JSONL",
+    )
+    parser.add_argument(
+        "--skip-base-if-cached",
+        action="store_true",
+        help="require a valid Base cache entry instead of ever rerunning Base inference",
+    )
+    parser.add_argument(
+        "--gpu-device",
+        default=None,
+        help="physical GPU identity recorded in the worker fragment (the logical device is --device)",
+    )
     parser.add_argument(
         "--subset-strategy", choices=("hash", "random", "first"), default="hash"
     )
@@ -939,6 +960,11 @@ def load_or_run_base(
                         iou_threshold=args.iou_threshold,
                     )
                 return results, path, True
+        if args.skip_base_if_cached:
+            raise FileNotFoundError(
+                "--skip-base-if-cached was requested but no matching Base cache exists: "
+                f"{path}. Run the step-0 ten-task evaluation first."
+            )
         results = run_model("base", args.base_model, examples, args)
         temporary = path.with_suffix(path.suffix + f".tmp-{os.getpid()}")
         temporary.write_text(
@@ -1166,7 +1192,7 @@ def build_eval_metric_rows(
         args.vision_attn_implementation,
         args.iou_threshold,
         Path(args.processor_path or args.base_model).expanduser().resolve(),
-        *sorted(checkpoint_per_task),
+        *sorted(CPT_TASKS),
     )
     rows = []
     for task, metrics in checkpoint_per_task.items():
@@ -1211,6 +1237,9 @@ def build_eval_metric_rows(
                 else None
             ),
             "eval_loss_tokens": metrics.get("eval_main_loss_tokens"),
+            "inference_error_count": int(
+                summary["checkpoint_metrics"].get("errors", {}).get(task, 0)
+            ),
             "metrics": metrics,
             "base_metrics": base_per_task.get(task, {}),
         }
@@ -1242,6 +1271,9 @@ def build_eval_metric_rows(
         "eval_token_ce": summary["checkpoint_metrics"].get("task_macro_eval_main_token_ce"),
         "eval_micro_token_ce": summary["checkpoint_metrics"].get("eval_main_token_ce"),
         "eval_loss_tokens": summary["checkpoint_metrics"].get("eval_main_loss_tokens"),
+        "inference_error_count": int(
+            sum(summary["checkpoint_metrics"].get("errors", {}).values())
+        ),
     }
     complete_heldout = (
         args.eval_split == "heldout"
@@ -1302,6 +1334,7 @@ def write_eval_metric_rows(
                     if row.get("evaluation_id") not in replacement_ids
                     and not (
                         row.get("split") == "heldout"
+                        and row.get("task") != "__heldout_status__"
                         and active_heldout_thresholds
                         and (
                             not isinstance(row.get("iou_threshold"), (int, float))
@@ -1341,9 +1374,21 @@ def main() -> int:
     evaluation_started = time.time()
     args = parse_args()
     ensure_checkpoint_remote_code(args.checkpoint, args.base_model)
-    selected = None if args.tasks.strip().lower() == "all" else {
-        value.strip() for value in args.tasks.split(",") if value.strip()
-    }
+    task_values = [
+        task.strip()
+        for value in args.tasks
+        for task in str(value).split(",")
+        if task.strip()
+    ]
+    if not task_values or "all" in {value.lower() for value in task_values}:
+        if len(task_values) > 1:
+            raise ValueError("--tasks all cannot be combined with explicit task names")
+        selected = None
+    else:
+        unknown = sorted(set(task_values).difference(CPT_TASKS))
+        if unknown:
+            raise ValueError(f"unknown CPT tasks: {unknown}")
+        selected = set(task_values)
     manifest = args.manifest
     if manifest is None:
         candidate = (
@@ -1430,9 +1475,38 @@ def main() -> int:
     summary["evaluation_protocol_id"] = metric_rows[0]["evaluation_protocol_id"]
     for row in metric_rows:
         row["eval_wall_time_seconds"] = summary["eval_wall_time_seconds"]
+        row["gpu_device"] = args.gpu_device
     summary["checkpoint_selection"] = selection
     write_outputs(args, examples, base_results, checkpoint_results, summary)
-    write_eval_metric_rows(args.output_dir, metric_rows, args.metrics_jsonl)
+    write_eval_metric_rows(
+        args.output_dir,
+        metric_rows,
+        None if args.output_fragment is not None else args.metrics_jsonl,
+    )
+    if args.output_fragment is not None:
+        fragment = {
+            "schema_version": 1,
+            "evaluator_protocol_version": EVALUATOR_PROTOCOL_VERSION,
+            "status": "complete",
+            "gpu_device": args.gpu_device,
+            "tasks": sorted(checkpoint_summary.get("per_task", {})),
+            "summary": summary,
+            "metric_rows": metric_rows,
+            "output_dir": str(args.output_dir),
+            "finished_at": time.time(),
+        }
+        args.output_fragment.parent.mkdir(parents=True, exist_ok=True)
+        temporary = args.output_fragment.with_name(
+            f".{args.output_fragment.name}.tmp-{os.getpid()}"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(fragment, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, args.output_fragment)
+        finally:
+            temporary.unlink(missing_ok=True)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 
