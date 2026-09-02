@@ -12,7 +12,12 @@ from eaglevl.model.locany.relation_modules import (
     coordinate_bridge_prediction_groups,
     coordinate_gaussian_prior,
 )
-from eaglevl.utils.locany.generate_utils import constrain_ui5_bbox_logits
+from eaglevl.utils.locany.generate_utils import (
+    constrain_ui5_bbox_logits,
+    count_generated_ui5_bbox_frames,
+    handle_pattern,
+    resolve_ui5_mtp_frame,
+)
 
 
 class RelationModulesTest(unittest.TestCase):
@@ -402,8 +407,9 @@ class RelationModulesTest(unittest.TestCase):
         )
         self.assertGreater(float(output.scale_weights.std(dim=0).max()), 1.0e-5)
 
-    def test_m32_constrained_bbox_decoding_enforces_fixed_grammar(self):
-        token_ids = {
+    @staticmethod
+    def _ui5_constraint_token_ids():
+        return {
             "box_start_token_id": 1,
             "box_end_token_id": 2,
             "coord_start_token_id": 3,
@@ -411,7 +417,11 @@ class RelationModulesTest(unittest.TestCase):
             "none_token_id": 8,
             "im_end_token_id": 9,
             "null_token_id": 10,
+            "ref_end_token_id": 11,
         }
+
+    def test_m32_constrained_bbox_decoding_enforces_ar_state_machine(self):
+        token_ids = self._ui5_constraint_token_ids()
         logits = torch.zeros(1, 1, 12)
         after_box = constrain_ui5_bbox_logits(
             logits,
@@ -439,19 +449,74 @@ class RelationModulesTest(unittest.TestCase):
         )
         self.assertEqual(int(exhausted.argmax(dim=-1).item()), 9)
 
-        mtp_logits = torch.full((1, 6, 12), -5.0)
-        mtp_logits[0, 0, 1] = 5.0
-        mtp_logits[0, 1, 8] = 6.0
-        mtp_logits[0, 1, 3:8] = 1.0
-        constrained_mtp = constrain_ui5_bbox_logits(
-            mtp_logits,
-            torch.empty(0, dtype=torch.long),
-            token_ids,
-            mtp=True,
+        after_none = constrain_ui5_bbox_logits(
+            logits, torch.tensor([1, 8]), token_ids, mtp=False
         )
-        self.assertEqual(int(constrained_mtp[0, 1].argmax().item()), 8)
-        self.assertEqual(int(constrained_mtp[0, 2].argmax().item()), 2)
-        self.assertEqual(int(constrained_mtp[0, 3].argmax().item()), 10)
+        self.assertEqual(int(after_none.argmax(dim=-1).item()), 2)
+        self.assertEqual(
+            count_generated_ui5_bbox_frames(
+                torch.tensor([1, 8, 2, 1, 3, 4, 5, 6, 2]), token_ids
+            ),
+            1,
+        )
+
+    def test_m32_complete_negative_frame_is_forced_empty(self):
+        token_ids = self._ui5_constraint_token_ids()
+        logits = torch.full((1, 6, 12), -8.0)
+        logits[0, 0, 1] = 8.0
+        logits[0, 1, 8] = 8.0
+        logits[0, 2, 2] = 8.0
+        logits[0, 3:6, 10] = 8.0
+        self.assertEqual(resolve_ui5_mtp_frame(logits[0], token_ids), "empty_box")
+        output = constrain_ui5_bbox_logits(
+            logits, torch.empty(0, dtype=torch.long), token_ids, mtp=True
+        )
+        self.assertEqual(output.argmax(dim=-1).tolist(), [[1, 8, 2, 10, 10, 10]])
+
+    def test_m32_complete_positive_frame_is_constrained_as_legal_bbox(self):
+        token_ids = self._ui5_constraint_token_ids()
+        logits = torch.full((1, 6, 12), -8.0)
+        logits[0, 0, 1] = 8.0
+        for position, coordinate in enumerate((3, 4, 5, 6), start=1):
+            logits[0, position, coordinate] = 8.0
+        logits[0, 5, 2] = 8.0
+        self.assertEqual(resolve_ui5_mtp_frame(logits[0], token_ids), "legal_box")
+        output = constrain_ui5_bbox_logits(
+            logits, torch.empty(0, dtype=torch.long), token_ids, mtp=True
+        )
+        self.assertEqual(output.argmax(dim=-1).tolist(), [[1, 3, 4, 5, 6, 2]])
+
+    def test_m32_position_one_none_top1_does_not_override_joint_positive_frame(self):
+        token_ids = self._ui5_constraint_token_ids()
+        logits = torch.full((1, 6, 12), -8.0)
+        logits[0, 0, 1] = 8.0
+        logits[0, 1, 8] = 8.0
+        logits[0, 1, 3] = 7.9
+        for position, coordinate in zip((2, 3, 4), (4, 5, 6)):
+            logits[0, position, coordinate] = 8.0
+        logits[0, 5, 2] = 8.0
+        self.assertEqual(resolve_ui5_mtp_frame(logits[0], token_ids), "legal_box")
+        output = constrain_ui5_bbox_logits(
+            logits, torch.empty(0, dtype=torch.long), token_ids, mtp=True
+        )
+        self.assertNotEqual(int(output[0, 1].argmax().item()), 8)
+        self.assertEqual(int(output[0, 1].argmax().item()), 3)
+
+    def test_m32_ambiguous_mtp_frame_is_identity_and_can_fall_back_to_ar(self):
+        token_ids = self._ui5_constraint_token_ids()
+        logits = torch.zeros(1, 6, 12)
+        logits[0, 0, 1] = 1.5
+        logits[0, 1, 3] = 1.0
+        logits[0, 2, 0] = 1.0
+        self.assertEqual(resolve_ui5_mtp_frame(logits[0], token_ids), "ambiguous")
+        output = constrain_ui5_bbox_logits(
+            logits, torch.empty(0, dtype=torch.long), token_ids, mtp=True
+        )
+        self.assertIs(output, logits)
+        raw_tokens = output.argmax(dim=-1)[0]
+        pattern = handle_pattern(raw_tokens, token_ids, generation_mode="hybrid")
+        self.assertEqual(pattern["type"], "error_box")
+        self.assertTrue(pattern["need_switch_to_ar"])
 
     def test_dynamic_routing_state_is_isolated_between_packed_samples(self):
         module = RelationToPBD(8, 10, dynamic_slot=True)

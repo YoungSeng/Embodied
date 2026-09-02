@@ -872,6 +872,32 @@ class HistoryTests(unittest.TestCase):
                     )
                 )
 
+    def test_constraint_on_off_produce_distinct_evaluation_cache_signatures(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            disabled = root / "constraint-off"
+            enabled = root / "constraint-on"
+            disabled.mkdir()
+            enabled.mkdir()
+            shared = {
+                "enable_ui_relation": True,
+                "tc_msed_stage": "m32",
+                "relation_set_decoder": True,
+            }
+            (disabled / "config.json").write_text(
+                json.dumps({**shared, "relation_constrained_bbox_decoding": False}),
+                encoding="utf-8",
+            )
+            (enabled / "config.json").write_text(
+                json.dumps({**shared, "relation_constrained_bbox_decoding": True}),
+                encoding="utf-8",
+            )
+            disabled_signature = collect_ui5_metrics.ui_model_signature(disabled)
+            enabled_signature = collect_ui5_metrics.ui_model_signature(enabled)
+            self.assertNotEqual(disabled_signature, enabled_signature)
+            self.assertIn('"relation_constrained_bbox_decoding":false', disabled_signature)
+            self.assertIn('"relation_constrained_bbox_decoding":true', enabled_signature)
+
 
 class ParallelInferenceTests(unittest.TestCase):
     def test_five_tasks_run_through_four_worker_queue(self) -> None:

@@ -32,6 +32,7 @@ from .generate_utils import (
     sample_tokens,
     handle_pattern,
     get_token_ids_from_config,
+    resolve_ui5_mtp_frame,
 )
 from .relation_modules import (
     DEFECT_TYPES,
@@ -642,6 +643,8 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         if not use_mtp:
             past_key_values = DynamicCache()
         switch_to_ar_count = 0
+        ambiguous_mtp_frame_count = 0
+        ambiguous_mtp_to_ar_count = 0
         box_anchor_hidden = None
         coordinate_logits = None
         pbd_delta_sum = 0.0
@@ -725,7 +728,11 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         def _sample_token_in_mtp(generated, outputs):
             """Sample tokens using MTP (Multi-Token Prediction) mode."""
             next_token_logits = outputs.logits[:, -n_future_tokens:, :]
+            raw_frame_type = None
             if bool(getattr(self.config, "relation_constrained_bbox_decoding", False)):
+                raw_frame_type = resolve_ui5_mtp_frame(
+                    next_token_logits[0], self.token_ids
+                )
                 next_token_logits = constrain_ui5_bbox_logits(
                     next_token_logits,
                     generated[:, seq_len:].reshape(-1),
@@ -745,7 +752,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             out_type = out_pattern['type']
             out_token = torch.tensor(out_pattern['tokens'], dtype=x0.dtype, device=x0.device)
 
-            return out_type, out_token
+            return out_type, out_token, raw_frame_type
 
 
         def _sample_token_in_ar(generated, outputs):
@@ -1030,9 +1037,14 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
 
             # Step 3: Sample tokens
             if use_mtp:
-                out_type, out_token = _sample_token_in_mtp(generated, outputs)
+                out_type, out_token, raw_frame_type = _sample_token_in_mtp(
+                    generated, outputs
+                )
+                if raw_frame_type == "ambiguous":
+                    ambiguous_mtp_frame_count += 1
             else:
                 out_type, out_token = _sample_token_in_ar(generated, outputs)
+                raw_frame_type = None
 
             if verbose:
                 sampling_history.append(('ar' if 'ar' in out_type else 'mtp', tokenizer.decode(out_token, skip_special_tokens=False)))
@@ -1047,6 +1059,8 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 if out_type == 'error_box':
                     use_mtp = False
                     switch_to_ar_count += 1
+                    if raw_frame_type == "ambiguous":
+                        ambiguous_mtp_to_ar_count += 1
                 elif out_type == 'box_end_ar':
                     use_mtp = True
                     pending_ar_coordinate_box = None
@@ -1109,6 +1123,8 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                     (len(selected_slot_history) - len(set(selected_slot_history)))
                     / max(len(selected_slot_history), 1)
                 ),
+                "mtp_ambiguous_frame_count": ambiguous_mtp_frame_count,
+                "mtp_ambiguous_ar_fallback_count": ambiguous_mtp_to_ar_count,
                 "query_attention": relation_output.query_attention,
                 "box_anchor_hidden": box_anchor_hidden,
                 "coordinate_logits": coordinate_logits,
@@ -1136,7 +1152,9 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                     f"num_boxes={num_boxes}; " + \
                     f"bps={(num_boxes / total_time):.4f}; " + \
                     f"prefill_time={(prefill_time):.4f}; " + \
-                    f"switch_to_ar={switch_to_ar_count}\n"
+                    f"switch_to_ar={switch_to_ar_count}; " + \
+                    f"ambiguous_mtp={ambiguous_mtp_frame_count}; " + \
+                    f"ambiguous_mtp_to_ar={ambiguous_mtp_to_ar_count}\n"
             print(out_info)
 
             return response[0], sampling_history, out_info

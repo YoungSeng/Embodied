@@ -57,12 +57,19 @@ def constrain_ui5_bbox_logits(
     max_boxes: int = 8,
     temperature: float = 0.0,
 ) -> torch.Tensor:
-    """Apply the fixed UI5 bbox grammar without changing allowed logits.
+    """Apply the fixed UI5 bbox grammar without inventing a frame decision.
 
-    MTP predicts one complete six-token box block.  AR infers its next grammar
-    state from tokens generated after the prompt.  Disallowed vocabulary items
-    receive the dtype minimum, so coordinate top-k is necessarily drawn only
-    from the coordinate vocabulary.
+    MTP first resolves the *unmasked* six-position evidence with the same
+    resolver used by :func:`decode_bbox_avg`.  Grammar masks are applied only
+    after the frame is jointly identified as ``empty_box`` or ``legal_box``.
+    Ambiguous frames are returned byte-for-byte unchanged so the legacy
+    MTP-to-AR fallback remains responsible for recovery.  ``temperature`` is
+    retained for API/checkpoint compatibility but deliberately does not choose
+    the positive/negative branch.
+
+    AR infers its next grammar state from tokens generated after the prompt.
+    Disallowed vocabulary items receive the dtype minimum, so coordinate top-k
+    is necessarily drawn only from the coordinate vocabulary.
     """
 
     if logits.ndim != 3 or logits.shape[0] != 1:
@@ -87,65 +94,45 @@ def constrain_ui5_bbox_logits(
                     mask[int(token)] = False
         output[:, position, :].masked_fill_(mask, torch.finfo(output.dtype).min)
 
-    def choose_allowed_token(
-        output: torch.Tensor, position: int, allowed: list[int]
-    ) -> int:
-        """Choose an MTP grammar branch before independently sampling its block.
-
-        MTP samples all six positions together.  Leaving both ``none`` and a
-        coordinate branch open while constraining positions 2--5 from an
-        argmax can therefore produce a structurally mixed block under
-        temperature sampling.  Select the branch once, then mask the block so
-        the later vectorized sampler cannot disagree with that decision.
-        """
-
-        candidates = torch.tensor(
-            [token for token in allowed if 0 <= int(token) < vocab_size],
-            device=output.device,
-            dtype=torch.long,
-        )
-        if candidates.numel() == 0:
-            raise ValueError("UI5 constrained decoding has no valid branch token")
-        values = output[0, position].index_select(0, candidates).float()
-        if float(temperature) > 0.0:
-            probabilities = torch.softmax(values / float(temperature), dim=-1)
-            chosen_offset = int(torch.multinomial(probabilities, 1).item())
-        else:
-            chosen_offset = int(values.argmax().item())
-        return int(candidates[chosen_offset].item())
-
-    output = logits.clone()
-    generated_box_count = int(
-        generated_tokens.reshape(-1).eq(box_end).sum().item()
+    del temperature
+    flat_generated = generated_tokens.reshape(-1)
+    generated_box_count = count_generated_ui5_bbox_frames(
+        flat_generated, token_ids
     )
     if mtp:
-        if output.shape[1] != 6:
+        if logits.shape[1] != 6:
             raise ValueError("UI5 MTP constrained decoding requires six logits positions")
-        allow_end = bool(generated_tokens.numel()) and int(generated_tokens[-1].item()) == box_end
+        allow_end = bool(flat_generated.numel()) and int(flat_generated[-1].item()) == box_end
         if allow_end and generated_box_count >= int(max_boxes):
-            first_allowed = [eos_token]
-        else:
-            first_allowed = [box_start, eos_token] if allow_end else [box_start]
-        first = choose_allowed_token(output, 0, first_allowed)
-        mask_position(output, 0, [first])
-        if first == eos_token:
+            output = logits.clone()
+            mask_position(output, 0, [eos_token])
             for position in range(1, 6):
                 mask_position(output, position, [null_token])
             return output
-        second_allowed = [none_token, *range(coord_start, coord_end + 1)]
-        second = choose_allowed_token(output, 1, second_allowed)
-        if second == none_token:
+
+        frame_type = resolve_ui5_mtp_frame(logits[0], token_ids)
+        if frame_type == "ambiguous":
+            # This identity return is intentional.  In hybrid mode the
+            # unmodified block is handled by sample_tokens()/handle_pattern(),
+            # which can switch to the legacy AR recovery path.
+            return logits
+
+        output = logits.clone()
+        mask_position(output, 0, [box_start])
+        if frame_type == "empty_box":
             mask_position(output, 1, [none_token])
             mask_position(output, 2, [box_end])
             for position in range(3, 6):
                 mask_position(output, position, [null_token])
-        else:
-            mask_position(output, 1, (coord_start, coord_end))
-            for position in range(2, 5):
+        elif frame_type == "legal_box":
+            for position in range(1, 5):
                 mask_position(output, position, (coord_start, coord_end))
             mask_position(output, 5, [box_end])
+        else:  # pragma: no cover - resolver is intentionally closed-ended
+            raise RuntimeError(f"Unknown UI5 MTP frame type: {frame_type}")
         return output
 
+    output = logits.clone()
     if output.shape[1] != 1:
         raise ValueError("UI5 AR constrained decoding requires one logits position")
     tokens = [int(value) for value in generated_tokens.reshape(-1).tolist()]
@@ -177,6 +164,30 @@ def constrain_ui5_bbox_logits(
         allowed = [eos_token]
     mask_position(output, 0, allowed)
     return output
+
+
+def count_generated_ui5_bbox_frames(
+    generated_tokens: torch.Tensor,
+    token_ids: Dict[str, int],
+) -> int:
+    """Count completed canonical four-coordinate boxes, excluding empty frames."""
+
+    tokens = [int(value) for value in generated_tokens.reshape(-1).tolist()]
+    box_start = int(token_ids["box_start_token_id"])
+    box_end = int(token_ids["box_end_token_id"])
+    coord_start = int(token_ids["coord_start_token_id"])
+    coord_end = int(token_ids["coord_end_token_id"])
+    count = 0
+    for index in range(max(len(tokens) - 5, 0)):
+        frame = tokens[index : index + 6]
+        if (
+            len(frame) == 6
+            and frame[0] == box_start
+            and all(coord_start <= token <= coord_end for token in frame[1:5])
+            and frame[5] == box_end
+        ):
+            count += 1
+    return count
 
 
 def top_p_logits(
@@ -381,27 +392,67 @@ def is_valid_box_frame(
     end_thresh=0.2,
     topk=5,
 ):
+    """Resolve one MTP frame from joint, unmasked six-position evidence.
+
+    This is the single decision source shared by constrained grammar masking
+    and the legacy averaged-coordinate decoder.  A frame is never classified
+    from position 1 alone.
+    """
+
+    if probs.ndim != 2 or probs.shape[0] != 6:
+        raise ValueError("UI5 MTP frame resolver expects probabilities [6,V]")
     box_start_token_id = token_ids['box_start_token_id']
     box_end_token_id = token_ids['box_end_token_id']
     null_token_id = token_ids['null_token_id']
-    im_end_token_id = token_ids['im_end_token_id']
     none_token_id = token_ids['none_token_id'] # none
+    coord_start_token_id = token_ids['coord_start_token_id']
+    coord_end_token_id = token_ids['coord_end_token_id']
 
     p_start = probs[0, box_start_token_id]
     if p_start >= start_thresh:
         if (probs[1, none_token_id] > 0.2 and 
             probs[2, box_end_token_id] > 0.2 and 
             probs[3, null_token_id] > 0.1 and 
-            probs[4, null_token_id] > 0.1):
+            probs[4, null_token_id] > 0.1 and
+            probs[5, null_token_id] > 0.1):
             return 'empty_box'
 
-    end_target_ids = torch.tensor([box_end_token_id, null_token_id, im_end_token_id], device=probs.device)
-    end_score = probs[5, end_target_ids].sum()
-
-    if end_score >= end_thresh:
-            return 'legal_box'
+    keep_k = min(max(int(topk), 1), int(probs.shape[-1]))
+    coordinate_topk = torch.topk(probs[1:5], k=keep_k, dim=-1).indices
+    coordinate_evidence = (
+        (coordinate_topk >= coord_start_token_id)
+        & (coordinate_topk <= coord_end_token_id)
+    ).any(dim=-1).all()
+    if (
+        p_start >= start_thresh
+        and probs[5, box_end_token_id] >= end_thresh
+        and bool(coordinate_evidence)
+    ):
+        return 'legal_box'
 
     return 'illegal_box'
+
+
+def resolve_ui5_mtp_frame(
+    logits: torch.Tensor,
+    token_ids: Dict[str, int],
+    *,
+    start_thresh: float = 0.7,
+    end_thresh: float = 0.2,
+    topk: int = 5,
+) -> str:
+    """Return ``empty_box``, ``legal_box`` or ``ambiguous`` for raw logits."""
+
+    if logits.ndim != 2 or logits.shape[0] != 6:
+        raise ValueError("UI5 MTP frame resolver expects logits [6,V]")
+    frame_type = is_valid_box_frame(
+        torch.softmax(logits.float(), dim=-1),
+        token_ids,
+        start_thresh=start_thresh,
+        end_thresh=end_thresh,
+        topk=topk,
+    )
+    return "ambiguous" if frame_type == "illegal_box" else frame_type
 
 
 def decode_bbox_avg(

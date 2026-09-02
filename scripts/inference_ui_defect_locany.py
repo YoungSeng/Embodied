@@ -1237,6 +1237,12 @@ class LocateAnythingInferencer:
                 "pre_mask_selected_slot_indices", []
             ),
             "slot_usage_histogram": interface.get("slot_usage_histogram", []),
+            "mtp_ambiguous_frame_count": int(
+                interface.get("mtp_ambiguous_frame_count", 0) or 0
+            ),
+            "mtp_ambiguous_ar_fallback_count": int(
+                interface.get("mtp_ambiguous_ar_fallback_count", 0) or 0
+            ),
             "predicted_center_diversity": self._scalar(
                 interface.get("predicted_center_diversity")
             ),
