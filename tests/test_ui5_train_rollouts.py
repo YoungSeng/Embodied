@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import shutil
 import sys
 import tempfile
 import types
@@ -83,16 +84,17 @@ class UI5TrainRolloutTest(unittest.TestCase):
                     "same_task_polarity_conflict": False,
                 }
             )
-            task_aware.append(
-                {
-                    "sample_id": sample_id,
-                    "image_id": image_id,
-                    "task": f"ui_{task}",
-                    "base_tiles": [[0, 0, 100, 50], [0, 50, 100, 100]],
-                    "final_tiles": [[0, 0, 100, 100]],
-                    "removed_gt_crossing_seams": [50],
-                }
-            )
+            if task != "text_overflow":
+                task_aware.append(
+                    {
+                        "sample_id": sample_id,
+                        "image_id": image_id,
+                        "task": f"ui_{task}",
+                        "base_tiles": [[0, 0, 100, 50], [0, 50, 100, 100]],
+                        "final_tiles": [[0, 0, 100, 100]],
+                        "removed_gt_crossing_seams": [50],
+                    }
+                )
         write_jsonl(
             audit / "manifest" / "unique_images.jsonl",
             [
@@ -113,6 +115,17 @@ class UI5TrainRolloutTest(unittest.TestCase):
             task_samples,
         )
         crop.mkdir(parents=True)
+        write_jsonl(
+            crop.parent / "excluded_training_samples.jsonl",
+            [
+                {
+                    "sample_id": "sample_text_overflow",
+                    "image_id": image_id,
+                    "task": "ui_text_overflow",
+                    "reason": "annotation_error",
+                }
+            ],
+        )
         (crop / "base_scan_plans.json").write_text(
             json.dumps(
                 {
@@ -139,6 +152,11 @@ class UI5TrainRolloutTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        # Simulate the real failure mode: image copying completed, then the
+        # sample pass stopped and left a partial output directory behind.
+        (output / "images").mkdir(parents=True)
+        (output / "manifest").mkdir(parents=True)
+        shutil.copy2(image_path, output / "images" / f"{image_id}.png")
         summary = prepare.build(
             SimpleNamespace(
                 full_data=full,
@@ -148,6 +166,11 @@ class UI5TrainRolloutTest(unittest.TestCase):
             )
         )
         self.assertEqual(summary["pipeline_coverage_failures"], 4)
+        self.assertEqual(summary["registered_annotation_exclusions"], 1)
+        samples = prepare.read_jsonl(output / "manifest" / "task_samples.jsonl")
+        excluded = next(row for row in samples if row["task"] == "text_overflow")
+        self.assertTrue(excluded["annotation_anomaly"])
+        self.assertFalse(excluded["grpo_eligible"])
         portable = json.loads((output / "base_scan_plans.json").read_text())
         self.assertIn("base_tiles", portable[image_id])
         self.assertNotIn("final_tiles", portable[image_id])

@@ -21,7 +21,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from PIL import Image
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TASKS = (
     "occlusion",
     "cropping",
@@ -362,9 +362,25 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             return existing
         raise RuntimeError(f"existing bundle is not complete: {output}")
     if output.exists() and any(output.iterdir()):
-        raise RuntimeError(
-            f"refusing to mix with a partial/nonempty bundle directory: {output}"
+        # All bundle metadata is written atomically and is regenerated below.
+        # Reusing a partial image copy is safe because every expected image is
+        # content-addressed by image_id and validated again before completion.
+        allowed_partial_entries = {
+            "images",
+            "manifest",
+            "base_scan_plans.json",
+            "task_aware_manifest.jsonl",
+        }
+        unexpected = sorted(
+            path.name for path in output.iterdir()
+            if path.name not in allowed_partial_entries
         )
+        if unexpected:
+            raise RuntimeError(
+                "refusing to mix with an unrecognized partial bundle directory; "
+                f"unexpected entries={unexpected}: {output}"
+            )
+        print(f"[bundle] safely resuming partial output: {output}", flush=True)
     output.mkdir(parents=True, exist_ok=True)
     (output / "images").mkdir(parents=True, exist_ok=True)
     (output / "manifest").mkdir(parents=True, exist_ok=True)
@@ -383,6 +399,31 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         (str(row["image_id"]), normalize_task(str(row["task"])))
         for row in audit_task_rows
     }
+    exclusion_registry = crop_root.parent / "excluded_training_samples.jsonl"
+    exclusion_rows = (
+        read_jsonl(exclusion_registry) if exclusion_registry.is_file() else []
+    )
+    samples_by_id = {str(row["sample_id"]): row for row in sample_input}
+    if len(samples_by_id) != len(sample_input):
+        raise ValueError("duplicate sample_id in source task_samples manifest")
+    exclusions_by_sample_task: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in exclusion_rows:
+        sample_id = str(row["sample_id"])
+        task = normalize_task(str(row["task"]))
+        sample = samples_by_id.get(sample_id)
+        if sample is None:
+            raise ValueError(
+                f"annotation exclusion references unknown sample_id={sample_id}"
+            )
+        image_id = str(sample["image_id"])
+        if row.get("image_id") is not None and str(row["image_id"]) != image_id:
+            raise ValueError(f"annotation exclusion image_id mismatch: {sample_id}")
+        if normalize_task(str(sample["task"])) != task:
+            raise ValueError(f"annotation exclusion task mismatch: {sample_id}")
+        key = (sample_id, task)
+        if key in exclusions_by_sample_task:
+            raise ValueError(f"duplicate annotation exclusion: {key}")
+        exclusions_by_sample_task[key] = row
     raw_plans = json.loads(required["base_scan_plans"].read_text(encoding="utf-8"))
     if not isinstance(raw_plans, dict):
         raise ValueError("base_scan_plans.json must be an object indexed by image_id")
@@ -425,6 +466,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     task_rows: list[dict[str, Any]] = []
     crop_rows: list[dict[str, Any]] = []
     portable_task_aware: list[dict[str, Any]] = []
+    portable_annotation_exclusions: list[dict[str, Any]] = []
     portable_plans: dict[str, dict[str, Any]] = {}
     polarity = Counter()
     original_record_count = 0
@@ -436,9 +478,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     ):
         image_id = str(sample["image_id"])
         task = normalize_task(str(sample["task"]))
+        sample_id = str(sample["sample_id"])
+        annotation_exclusion = exclusions_by_sample_task.get((sample_id, task))
         if image_id not in image_by_id:
             raise ValueError(f"task sample references unknown image: {image_id}")
-        if (image_id, task) not in audit_keys:
+        if (image_id, task) not in audit_keys and annotation_exclusion is None:
             raise ValueError(f"crop task-aware manifest misses {(image_id, task)}")
         image = image_by_id[image_id]
         width, height = int(image["width"]), int(image["height"])
@@ -446,7 +490,6 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         gt_1000 = [[int(round(float(v))) for v in box] for box in sample.get("gt_boxes_1000", [])]
         if len(gt_global) != len(gt_1000):
             raise ValueError(f"GT pixel/norm count mismatch: {sample.get('sample_id')}")
-        sample_id = str(sample["sample_id"])
         provenance_rows = list(sample.get("source_records") or [])
         if not provenance_rows:
             provenance_rows = [
@@ -503,13 +546,25 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             original_record_count += 1
         prompt_set = {value for value in prompts if value}
         annotation_anomaly = bool(
-            sample.get("same_task_polarity_conflict")
+            annotation_exclusion
+            or sample.get("same_task_polarity_conflict")
             or len(prompt_set) != 1
             or source_gt_union != {tuple(box) for box in gt_global}
         )
         prompt = min(prompt_set) if prompt_set else ""
         if not prompt:
             annotation_anomaly = True
+        portable_exclusion = None
+        if annotation_exclusion is not None:
+            portable_exclusion = {
+                "record_id": sample_id,
+                "sample_id": sample_id,
+                "source_image_id": image_id,
+                "task": task,
+                "reason": str(annotation_exclusion.get("reason") or "annotation_error"),
+                "source": "crop_audit_v4_gt_repair/excluded_training_samples.jsonl",
+            }
+            portable_annotation_exclusions.append(portable_exclusion)
 
         if task == "content_missing":
             base_tiles = [[0, 0, width, height]]
@@ -610,6 +665,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "source_record_ids": source_ids,
             "original_training_record": representative_record,
             "annotation_anomaly": annotation_anomaly,
+            "annotation_exclusion": portable_exclusion,
             "coordinate_transform_anomaly": sample_coordinate_anomaly,
             "pipeline_coverage_failure": coverage_failure,
             "coverage_failure_type": (
@@ -638,6 +694,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 "base_tiles": base_tiles,
                 "crop_ids": sample_crop_ids,
                 "pipeline_coverage_failure": coverage_failure,
+                "annotation_anomaly": annotation_anomaly,
+                "annotation_exclusion": portable_exclusion,
                 "base_seam_crossing_gt_indices": crossing,
                 "content_missing_global_view": task == "content_missing",
                 "geometry_source": "base_scan_plans.base_tiles",
@@ -654,9 +712,16 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     task_rows.sort(key=lambda row: (row["task"], row["record_id"]))
     crop_rows.sort(key=lambda row: (row["task"], row["record_id"], row["crop_index"]))
     portable_task_aware.sort(key=lambda row: (row["task"], row["record_id"]))
+    portable_annotation_exclusions.sort(
+        key=lambda row: (row["task"], row["record_id"])
+    )
     atomic_jsonl(output / "manifest" / "source_records.jsonl", source_rows)
     atomic_jsonl(output / "manifest" / "task_samples.jsonl", task_rows)
     atomic_jsonl(output / "manifest" / "crop_samples.jsonl", crop_rows)
+    atomic_jsonl(
+        output / "manifest" / "annotation_exclusions.jsonl",
+        portable_annotation_exclusions,
+    )
     atomic_jsonl(output / "task_aware_manifest.jsonl", portable_task_aware)
     atomic_json(output / "base_scan_plans.json", portable_plans)
     detector = detector_state(audit_root, crop_root)
@@ -675,6 +740,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "materialized_crop_images": 0,
         "pipeline_coverage_failures": coverage_failures,
         "coordinate_transform_anomalies": coordinate_anomalies,
+        "registered_annotation_exclusions": len(portable_annotation_exclusions),
         "positive_negative_by_task": {
             task: {
                 "positive": polarity[(task, "positive")],
@@ -699,6 +765,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "manifest/source_records.jsonl",
         "manifest/task_samples.jsonl",
         "manifest/crop_samples.jsonl",
+        "manifest/annotation_exclusions.jsonl",
         "manifest/detector_digest.json",
         "base_scan_plans.json",
         "task_aware_manifest.jsonl",

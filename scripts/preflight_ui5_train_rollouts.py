@@ -288,6 +288,7 @@ def bundle_inventory(bundle: Path) -> tuple[dict[str, Any], list[list[Any]]]:
         "source_records": bundle / "manifest" / "source_records.jsonl",
         "task_samples": bundle / "manifest" / "task_samples.jsonl",
         "crop_samples": bundle / "manifest" / "crop_samples.jsonl",
+        "annotation_exclusions": bundle / "manifest" / "annotation_exclusions.jsonl",
         "base_scan_plans": bundle / "base_scan_plans.json",
         "task_aware_manifest": bundle / "task_aware_manifest.jsonl",
         "detector_digest": bundle / "manifest" / "detector_digest.json",
@@ -308,6 +309,7 @@ def bundle_inventory(bundle: Path) -> tuple[dict[str, Any], list[list[Any]]]:
     source = read_jsonl(required["source_records"])
     samples = read_jsonl(required["task_samples"])
     crops = read_jsonl(required["crop_samples"])
+    annotation_exclusions = read_jsonl(required["annotation_exclusions"])
     task_aware = read_jsonl(required["task_aware_manifest"])
     plans = json.loads(required["base_scan_plans"].read_text(encoding="utf-8"))
     detector = json.loads(required["detector_digest"].read_text(encoding="utf-8"))
@@ -377,6 +379,12 @@ def bundle_inventory(bundle: Path) -> tuple[dict[str, Any], list[list[Any]]]:
         ["bundle", "all", "pipeline_coverage_failures", coverage],
         ["bundle", "all", "coordinate_transform_anomalies", coord],
         ["bundle", "all", "annotation_anomalies", annotation],
+        [
+            "bundle",
+            "all",
+            "registered_annotation_exclusions",
+            len(annotation_exclusions),
+        ],
     ]
     for task in TASKS:
         rows.extend(
@@ -420,6 +428,7 @@ def bundle_inventory(bundle: Path) -> tuple[dict[str, Any], list[list[Any]]]:
         "pipeline_coverage_failures_by_task": dict(coverage_by_task),
         "coordinate_transform_anomalies": coord,
         "annotation_anomalies": annotation,
+        "registered_annotation_exclusions": len(annotation_exclusions),
         "missing_images": missing_images[:100],
         "missing_image_count": len(missing_images),
         "absolute_bundle_paths": absolute_bundle_paths[:100],
