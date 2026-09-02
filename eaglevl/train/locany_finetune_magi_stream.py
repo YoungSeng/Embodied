@@ -70,7 +70,11 @@ from eaglevl.train.dataset_sampling import (
     resolve_dataset_sampling_weight,
     resolve_recipe_entry_paths,
 )
-from eaglevl.train.optimizer_utils import optimizer_parameters
+from eaglevl.train.optimizer_utils import (
+    optimizer_learning_rates,
+    optimizer_parameters,
+    two_learning_rate_parameter_groups,
+)
 from eaglevl.train.cpt_observability import (
     CPT_ID_TO_TASK,
     CPT_TASKS,
@@ -2926,7 +2930,43 @@ class StreamPackingMTPTrainer(Trainer):
             self._set_ui5_scalar(f"{group}_changed_element_count", changed[group])
 
     def create_optimizer(self):
-        optimizer = super().create_optimizer()
+        ui_relation_learning_rate = getattr(
+            self.args, "ui_relation_learning_rate", None
+        )
+        if self.optimizer is None and ui_relation_learning_rate is not None:
+            decay_parameters = self.get_decay_parameter_names(self.model)
+            optimizer_groups = two_learning_rate_parameter_groups(
+                self.model.named_parameters(),
+                decay_parameter_names=decay_parameters,
+                inherited_learning_rate=float(self.args.learning_rate),
+                ui_relation_learning_rate=float(ui_relation_learning_rate),
+                weight_decay=float(self.args.weight_decay),
+            )
+            if not any(
+                group.get("ui5_lr_group") == "ui_relation"
+                for group in optimizer_groups
+            ):
+                raise RuntimeError(
+                    "UI_RELATION_LEARNING_RATE was set, but no trainable "
+                    "relation_pyramid.* or relation_pbd.* parameters were found"
+                )
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
+                self.args
+            )
+            self.optimizer = optimizer_cls(optimizer_groups, **optimizer_kwargs)
+            group_report = {
+                group["ui5_lr_group"]: {
+                    "learning_rate": group["lr"],
+                    "parameter_count": sum(
+                        parameter.numel() for parameter in group["params"]
+                    ),
+                }
+                for group in optimizer_groups
+            }
+            logger.info("UI5 optimizer two-LR groups: %s", group_report)
+            optimizer = self.optimizer
+        else:
+            optimizer = super().create_optimizer()
         if not self._ui5_enabled:
             return optimizer
         audited_parameters = optimizer_parameters(self.optimizer)
@@ -3641,6 +3681,7 @@ class StreamPackingMTPTrainer(Trainer):
             if image_gate_grad_norm is not None or slot_gate_grad_norm is not None
             else None
         )
+        actual_learning_rates = optimizer_learning_rates(self.optimizer)
         metrics = {
             "step": step,
             "git_commit": os.environ.get("GIT_COMMIT", ""),
@@ -3652,6 +3693,15 @@ class StreamPackingMTPTrainer(Trainer):
             "gpu_num": self.args.world_size,
             "max_num_tokens": self._max_num_tokens,
             "learning_rate": logs.get("learning_rate"),
+            "base_learning_rate": actual_learning_rates.get("cpt_inherited"),
+            "ui_relation_learning_rate": actual_learning_rates.get("ui_relation"),
+            "init_checkpoint": os.environ.get("INIT_CHECKPOINT", ""),
+            "init_cpt_step": int(os.environ.get("INIT_CPT_STEP", "0")),
+            "sft_step": step,
+            "is_best_image": False,
+            "is_best_bbox": False,
+            "is_4000_milestone": step in {4000, 8000, 12000, 16000},
+            "checkpoint_kept": step in {4000, 8000, 12000, 16000},
             "gate_loss_weight": float(getattr(config, "relation_gate_loss_weight", 1.0)),
             "slot_gate_loss_weight": float(getattr(config, "relation_slot_gate_loss_weight", 0.1)),
             "slot_objectness_loss_weight": float(getattr(
@@ -4495,6 +4545,22 @@ def main():
         processor_config["chat_template"] = chat_template_data["chat_template"]
         processor = LocateAnythingProcessor(tokenizer=tokenizer, image_processor=image_processor, **processor_config)
         
+    model.config.init_checkpoint = os.environ.get(
+        "INIT_CHECKPOINT", model_args.model_name_or_path or ""
+    )
+    model.config.init_cpt_step = int(os.environ.get("INIT_CPT_STEP", "0"))
+    model.config.sft_base_learning_rate = float(training_args.learning_rate)
+    model.config.sft_ui_relation_learning_rate = (
+        float(model_args.ui_relation_learning_rate)
+        if model_args.ui_relation_learning_rate is not None
+        else float(training_args.learning_rate)
+    )
+    model.config.sft_warmup_steps = int(training_args.warmup_steps)
+    model.config.sft_lr_scheduler_type = str(
+        getattr(training_args.lr_scheduler_type, "value", training_args.lr_scheduler_type)
+    )
+    model.config.sft_weight_decay = float(training_args.weight_decay)
+    model.config.sft_max_grad_norm = float(training_args.max_grad_norm)
     model.neftune_alpha = data_args.neftune_alpha
     # The fused loss emits detached per-token CE only for CPT diagnostics.
     # Keeping the flag off by default preserves the SFT forward contract and
@@ -4617,8 +4683,21 @@ def main():
     set_seed(training_args.seed)
 
     if model_args.lr_scale is not None:
+        if model_args.ui_relation_learning_rate is not None:
+            raise ValueError(
+                "--lr_scale and --ui_relation_learning_rate are mutually exclusive"
+            )
         training_args.lr_scale = model_args.lr_scale
         replace_create_optimizer_with_various_lr()
+    if model_args.ui_relation_learning_rate is not None:
+        training_args.ui_relation_learning_rate = float(
+            model_args.ui_relation_learning_rate
+        )
+        logger.info(
+            "Configured optimizer learning rates: inherited=%s, ui_relation=%s",
+            training_args.learning_rate,
+            training_args.ui_relation_learning_rate,
+        )
 
     # Callbacks
     my_callbacks = []

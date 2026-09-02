@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--init-cpt-step", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--block-size", type=int, default=6)
     parser.add_argument("--attn-implementation", required=True)
@@ -98,6 +99,8 @@ def main() -> int:
             "relation_reference_position_encoding": stage_flags.get("reference_position_encoding", False),
             "relation_per_level_scale_router": stage_flags.get("per_level_scale_router", False),
             "relation_constrained_bbox_decoding": stage_flags.get("constrained_bbox_decoding", False),
+            "init_checkpoint": str(base),
+            "init_cpt_step": args.init_cpt_step,
         }
         mismatches = {
             key: {"existing": existing_config.get(key), "requested": expected}
@@ -162,6 +165,8 @@ def main() -> int:
     config.relation_gate_thresholds = {}
     config.ui_relation_initialization_seed = args.seed
     config.ui_relation_initialization_reason = "checkpoint-0-export"
+    config.init_checkpoint = str(base)
+    config.init_cpt_step = args.init_cpt_step
 
     model, loading_info = LocateAnythingForConditionalGeneration.from_pretrained(
         base,
@@ -199,6 +204,8 @@ def main() -> int:
             {
                 "schema_version": 1,
                 "base_model": str(base),
+                "init_checkpoint": str(base),
+                "init_cpt_step": args.init_cpt_step,
                 "checkpoint": str(output),
                 "initialization": init_report,
                 "num_new_tokens": num_new_tokens,

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import posixpath
+import re
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -198,6 +199,20 @@ def resolve_runtime_config(
             join_runtime_path(workspace, shared["base_model_relative_path"]),
         )
     )
+    model_path = str(_env_value(env, "MODEL_PATH", base_model))
+    init_checkpoint = str(_env_value(env, "INIT_CHECKPOINT", base_model))
+    init_step_match = re.search(r"(?:^|/)checkpoint-(\d+)/?$", init_checkpoint)
+    init_cpt_step = int(
+        _env_value(
+            env,
+            "INIT_CPT_STEP",
+            init_step_match.group(1) if init_step_match is not None else 0,
+        )
+    )
+    learning_rate = str(_env_value(env, "LEARNING_RATE", "2e-5"))
+    ui_relation_learning_rate = str(
+        _env_value(env, "UI_RELATION_LEARNING_RATE", learning_rate)
+    )
     scorer_root = str(
         _env_value(
             env,
@@ -237,7 +252,9 @@ def resolve_runtime_config(
             )
         ),
         "BASE_MODEL": base_model,
-        "MODEL_PATH": str(_env_value(env, "MODEL_PATH", base_model)),
+        "MODEL_PATH": model_path,
+        "INIT_CHECKPOINT": init_checkpoint,
+        "INIT_CPT_STEP": init_cpt_step,
         "SCORER_ROOT": scorer_root,
         "DATA_VERSION": data_version,
         "VERSION": version,
@@ -266,8 +283,26 @@ def resolve_runtime_config(
         ),
         "MAX_NUM_TOKENS_SCOPE": "per_rank_packed_batch",
         "MAX_STEPS": max_steps,
+        "SEED": int(_env_value(env, "SEED", 42)),
         "WARMUP_STEPS": int(_env_value(env, "WARMUP_STEPS", 500)),
-        "LEARNING_RATE": str(_env_value(env, "LEARNING_RATE", "2e-5")),
+        "LEARNING_RATE": learning_rate,
+        "UI_RELATION_LEARNING_RATE": ui_relation_learning_rate,
+        "WEIGHT_DECAY": float(_env_value(env, "WEIGHT_DECAY", 0.01)),
+        "MAX_GRAD_NORM": float(_env_value(env, "MAX_GRAD_NORM", 1.0)),
+        "LR_SCHEDULER_TYPE": str(
+            _env_value(env, "LR_SCHEDULER_TYPE", "cosine")
+        ).lower(),
+        "BF16": int(parse_bool(_env_value(env, "BF16", "1"), name="BF16")),
+        "PER_DEVICE_TRAIN_BATCH_SIZE": int(
+            _env_value(env, "PER_DEVICE_TRAIN_BATCH_SIZE", 1)
+        ),
+        "DEEPSPEED_CONFIG": str(
+            _env_value(
+                env,
+                "DEEPSPEED_CONFIG",
+                "deepspeed_configs/zero_stage2_two_lr_config.json",
+            )
+        ),
         "GRADIENT_ACCUMULATION_STEPS": int(
             _env_value(
                 env,
@@ -352,6 +387,22 @@ def resolve_runtime_config(
         )
     if resolved["GRADIENT_ACCUMULATION_STEPS"] < 1:
         raise ValueError("GRADIENT_ACCUMULATION_STEPS must be positive")
+    if resolved["SEED"] != 42:
+        raise ValueError("UI5 M32 initialization requires SEED=42")
+    if float(resolved["LEARNING_RATE"]) <= 0.0:
+        raise ValueError("LEARNING_RATE must be positive")
+    if float(resolved["UI_RELATION_LEARNING_RATE"]) <= 0.0:
+        raise ValueError("UI_RELATION_LEARNING_RATE must be positive")
+    if resolved["WEIGHT_DECAY"] < 0.0:
+        raise ValueError("WEIGHT_DECAY cannot be negative")
+    if resolved["MAX_GRAD_NORM"] <= 0.0:
+        raise ValueError("MAX_GRAD_NORM must be positive")
+    if resolved["LR_SCHEDULER_TYPE"] != "cosine":
+        raise ValueError("UI5 formal training requires LR_SCHEDULER_TYPE=cosine")
+    if resolved["BF16"] != 1:
+        raise ValueError("UI5 formal training requires BF16=True")
+    if resolved["PER_DEVICE_TRAIN_BATCH_SIZE"] != 1:
+        raise ValueError("UI5 formal training requires PER_DEVICE_TRAIN_BATCH_SIZE=1")
     if resolved["EVAL_ENABLE_PBD"] not in {0, 1}:
         raise ValueError("EVAL_ENABLE_PBD must be 0 or 1")
     if not 0.0 <= resolved["RELATION_GATE_THRESHOLD"] <= 1.0:

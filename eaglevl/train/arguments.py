@@ -81,6 +81,15 @@ class ModelArguments:
         default=None,
         metadata={'help': "available: [None, 'vision_model: 0.1, mlp: 1.0, llm: 1.0']"}
     )
+    ui_relation_learning_rate: Optional[float] = field(
+        default=None,
+        metadata={
+            'help': (
+                'Absolute learning rate for relation_pyramid.* and relation_pbd.*; '
+                'all inherited parameters use TrainingArguments.learning_rate.'
+            )
+        },
+    )
     use_fp8: bool = field(
         default=False,
         metadata={'help': 'Set to True to use fp8.'}

@@ -155,7 +155,9 @@ if [[ -z "${GRADIENT_ACCUMULATION_STEPS:-}" ]]; then
 fi
 
 MAX_STEPS="${MAX_STEPS:-25000}"
+SEED="${SEED:-42}"
 LEARNING_RATE="${LEARNING_RATE:-2e-5}"
+UI_RELATION_LEARNING_RATE="${UI_RELATION_LEARNING_RATE:-${LEARNING_RATE}}"
 WARMUP_STEPS="${WARMUP_STEPS:-500}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 SAVE_STRATEGY="${SAVE_STRATEGY:-steps}"
@@ -318,7 +320,15 @@ echo "RELATION_BOX_L1_LOSS_WEIGHT   : ${RELATION_BOX_L1_LOSS_WEIGHT:-0.0}"
 echo "RELATION_BOX_GIOU_LOSS_WEIGHT : ${RELATION_BOX_GIOU_LOSS_WEIGHT:-0.0}"
 echo "RELATION_COVERAGE_LOSS_WEIGHT : ${RELATION_COVERAGE_LOSS_WEIGHT:-0.0}"
 echo "LEARNING_RATE                 : ${LEARNING_RATE}"
+echo "UI_RELATION_LEARNING_RATE     : ${UI_RELATION_LEARNING_RATE}"
+echo "WARMUP_STEPS                  : ${WARMUP_STEPS}"
+echo "WEIGHT_DECAY                  : ${WEIGHT_DECAY}"
+echo "MAX_GRAD_NORM                 : ${MAX_GRAD_NORM:-1.0}"
+echo "LR_SCHEDULER_TYPE             : ${LR_SCHEDULER_TYPE:-cosine}"
+echo "BF16                          : ${BF16}"
+echo "PER_DEVICE_TRAIN_BATCH_SIZE   : ${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
 echo "MAX_STEPS                     : ${MAX_STEPS}"
+echo "SEED                          : ${SEED}"
 echo "SAVE_EVERY_N_HOURS            : ${SAVE_EVERY_N_HOURS:-0}"
 echo "FREEZE_LLM                    : ${FREEZE_LLM}"
 echo "FREEZE_BACKBONE               : ${FREEZE_BACKBONE}"
@@ -385,18 +395,20 @@ if torchrun \
   --relation_coverage_loss_weight "${RELATION_COVERAGE_LOSS_WEIGHT:-0.0}" \
   --relation_aux_budget_ratio "${RELATION_AUX_BUDGET_RATIO:-1.0}" \
   --relation_coord_prior_sigma "${RELATION_COORD_PRIOR_SIGMA:-0.05}" \
+  --ui_relation_learning_rate "${UI_RELATION_LEARNING_RATE}" \
   --balance_ui_defects "${BALANCE_UI_DEFECTS:-True}" \
   --ui_records_per_class "${UI_RECORDS_PER_CLASS:-17604}" \
   --ui_negative_to_positive_ratio "${UI_NEGATIVE_TO_POSITIVE_RATIO:-2.0}" \
   --bf16 "${BF16}" \
   --max_steps "${MAX_STEPS}" \
-  --per_device_train_batch_size 1 \
+  --seed "${SEED}" \
+  --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE:-1}" \
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}" \
   --learning_rate "${LEARNING_RATE}" \
   --weight_decay "${WEIGHT_DECAY}" \
   --warmup_steps "${WARMUP_STEPS}" \
-  --lr_scheduler_type cosine \
-  --max_grad_norm 1.0 \
+  --lr_scheduler_type "${LR_SCHEDULER_TYPE:-cosine}" \
+  --max_grad_norm "${MAX_GRAD_NORM:-1.0}" \
   --dataloader_num_workers "${DATALOADER_NUM_WORKERS}" \
   --packing_buffer_size "${PACKING_BUFFER_SIZE}" \
   --max_seq_length "${MAX_SEQ_LENGTH}" \

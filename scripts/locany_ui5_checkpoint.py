@@ -51,6 +51,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def metric_best_steps(output_dir: Path) -> set[int]:
+    """Return every historical strict Image/Bbox best marked for permanent retention."""
+
+    path = output_dir / "evaluation" / "best_checkpoints.json"
+    if not path.is_file():
+        return set()
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Invalid best checkpoint manifest: {path}: {exc}") from exc
+    result = set()
+    for entry in document.get("evaluation_history", []):
+        if not isinstance(entry, dict) or not entry.get("checkpoint_kept"):
+            continue
+        if entry.get("is_best_image") or entry.get("is_best_bbox"):
+            result.add(int(entry["step"]))
+    return result
+
+
 def main() -> int:
     args = build_parser().parse_args()
     if args.command == "validate":
@@ -115,8 +134,13 @@ def main() -> int:
         )
     removed: list[str] = []
     kept: list[str] = []
+    best_steps = metric_best_steps(output_dir)
     for step, path in list_checkpoints(output_dir):
-        should_keep = step == args.latest_step or step % args.formal_interval == 0
+        should_keep = (
+            step == args.latest_step
+            or step % args.formal_interval == 0
+            or step in best_steps
+        )
         if should_keep or step > args.latest_step:
             kept.append(str(path))
             continue
@@ -125,7 +149,12 @@ def main() -> int:
             safe_remove_checkpoint(path, output_dir)
     print(
         json.dumps(
-            {"removed": removed, "kept": kept, "dry_run": args.dry_run},
+            {
+                "removed": removed,
+                "kept": kept,
+                "metric_best_steps": sorted(best_steps),
+                "dry_run": args.dry_run,
+            },
             ensure_ascii=False,
             indent=2,
         )

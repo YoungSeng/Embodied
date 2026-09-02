@@ -197,6 +197,15 @@ TRAIN_COLUMNS = (
     "git_commit",
     "run_name",
     "config_hash",
+    "base_learning_rate",
+    "ui_relation_learning_rate",
+    "init_checkpoint",
+    "init_cpt_step",
+    "sft_step",
+    "is_best_image",
+    "is_best_bbox",
+    "is_4000_milestone",
+    "checkpoint_kept",
 )
 
 EVAL_COLUMNS = (
@@ -262,6 +271,13 @@ EVAL_COLUMNS = (
     "model_signature",
     "task_name",
     "defect_type",
+    "init_checkpoint",
+    "init_cpt_step",
+    "sft_step",
+    "is_best_image",
+    "is_best_bbox",
+    "is_4000_milestone",
+    "checkpoint_kept",
 )
 
 SHEET_TRAIN = "train_100steps"
@@ -544,6 +560,49 @@ class UI5ExcelLogger:
         self._atomic_save(workbook)
         return True
 
+    def update_checkpoint_status(
+        self,
+        step: int,
+        *,
+        is_best_image: bool,
+        is_best_bbox: bool,
+        is_4000_milestone: bool,
+        checkpoint_kept: bool,
+    ) -> bool:
+        """Apply scorer-derived retention flags to both sheets for one SFT step."""
+
+        if not self.path.is_file():
+            return False
+        step = int(step)
+        updates = {
+            "sft_step": step,
+            "is_best_image": bool(is_best_image),
+            "is_best_bbox": bool(is_best_bbox),
+            "is_4000_milestone": bool(is_4000_milestone),
+            "checkpoint_kept": bool(checkpoint_kept),
+        }
+        workbook = self._load_or_create()
+        changed = False
+        for sheet_name in EXPECTED_SHEETS:
+            sheet = workbook[sheet_name]
+            headers = {
+                cell.value: cell.column for cell in sheet[1] if cell.value is not None
+            }
+            for row_index in range(2, sheet.max_row + 1):
+                value = sheet.cell(row=row_index, column=headers["step"]).value
+                if value is None or int(value) != step:
+                    continue
+                for name, new_value in updates.items():
+                    cell = sheet.cell(row=row_index, column=headers[name])
+                    if cell.value != new_value:
+                        cell.value = new_value
+                        changed = True
+        if changed:
+            self._atomic_save(workbook)
+        else:
+            workbook.close()
+        return changed
+
 
 def build_eval_rows(
     *,
@@ -588,6 +647,15 @@ def build_eval_rows(
                     "tc_msed_stage": metadata.get("tc_msed_stage"),
                     "config_hash": metadata.get("config_hash"),
                     "model_signature": metadata.get("model_signature"),
+                    "init_checkpoint": metadata.get("init_checkpoint"),
+                    "init_cpt_step": metadata.get("init_cpt_step"),
+                    "sft_step": step,
+                    "is_best_image": metadata.get("is_best_image", False),
+                    "is_best_bbox": metadata.get("is_best_bbox", False),
+                    "is_4000_milestone": metadata.get(
+                        "is_4000_milestone", False
+                    ),
+                    "checkpoint_kept": metadata.get("checkpoint_kept", False),
                     "checkpoint": checkpoint,
                     "task": diagnostic_task,
                     "task_name": diagnostic_task,
@@ -730,6 +798,15 @@ def build_eval_rows(
                 "tc_msed_stage": metadata.get("tc_msed_stage"),
                 "config_hash": metadata.get("config_hash"),
                 "model_signature": metadata.get("model_signature"),
+                "init_checkpoint": metadata.get("init_checkpoint"),
+                "init_cpt_step": metadata.get("init_cpt_step"),
+                "sft_step": step,
+                "is_best_image": metadata.get("is_best_image", False),
+                "is_best_bbox": metadata.get("is_best_bbox", False),
+                "is_4000_milestone": metadata.get(
+                    "is_4000_milestone", False
+                ),
+                "checkpoint_kept": metadata.get("checkpoint_kept", False),
                 "checkpoint": checkpoint,
                 "task": "five_task_macro",
                 "task_name": "five_task_macro",

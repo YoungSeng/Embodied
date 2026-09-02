@@ -29,6 +29,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--machine", choices=("a800", "h20"), required=True)
     parser.add_argument(
+        "--project-root",
+        default=None,
+        help="Cluster-visible project worktree to mount and execute",
+    )
+    parser.add_argument(
+        "--base-model",
+        default=None,
+        help=(
+            "Initialization checkpoint used by training, checkpoint-0 export, "
+            "and the evaluation processor"
+        ),
+    )
+    parser.add_argument(
         "--resource-group",
         default="default",
         help=(
@@ -55,6 +68,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--learning-rate", default="2e-5")
+    parser.add_argument(
+        "--ui-relation-learning-rate",
+        default=None,
+        help="Learning rate for relation_pyramid.* and relation_pbd.* parameters",
+    )
     parser.add_argument("--version", default="v4")
     parser.add_argument("--data-version", default="v3")
     parser.add_argument("--run-name", default=None)
@@ -193,6 +211,13 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         ),
     }
     optional = {
+        "PROJECT_ROOT": getattr(args, "project_root", None),
+        "BASE_MODEL": getattr(args, "base_model", None),
+        "MODEL_PATH": getattr(args, "base_model", None),
+        "INIT_CHECKPOINT": getattr(args, "base_model", None),
+        "UI_RELATION_LEARNING_RATE": getattr(
+            args, "ui_relation_learning_rate", None
+        ),
         "MAX_NUM_TOKENS": args.max_num_tokens,
         "MAX_SEQ_LENGTH": args.max_seq_length,
         "MAX_NUM_TOKENS_PER_SAMPLE": args.max_num_tokens_per_sample,
@@ -233,6 +258,10 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
     if eval_max_images is not None and int(eval_max_images) < 0:
         raise ValueError("--eval-max-images-per-task cannot be negative")
     env.update({key: str(value) for key, value in optional.items() if value is not None})
+    base_model = getattr(args, "base_model", None)
+    if base_model is not None:
+        match = re.search(r"(?:^|/)checkpoint-(\d+)/?$", str(base_model))
+        env["INIT_CPT_STEP"] = match.group(1) if match is not None else "0"
     if (args.eval_checkpoint is None) != (args.eval_step is None):
         raise ValueError("--eval-checkpoint and --eval-step must be provided together")
     if args.eval_checkpoint is not None:
@@ -295,6 +324,11 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         }
     )
     env_keys = (
+        "PROJECT_ROOT",
+        "BASE_MODEL",
+        "MODEL_PATH",
+        "INIT_CHECKPOINT",
+        "INIT_CPT_STEP",
         "MACHINE_TYPE",
         "RESOURCE_GROUP",
         "GPU_COUNT",
@@ -304,8 +338,16 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "DATA_VERSION",
         "VERSION",
         "MAX_STEPS",
+        "SEED",
         "WARMUP_STEPS",
         "LEARNING_RATE",
+        "UI_RELATION_LEARNING_RATE",
+        "WEIGHT_DECAY",
+        "MAX_GRAD_NORM",
+        "LR_SCHEDULER_TYPE",
+        "BF16",
+        "PER_DEVICE_TRAIN_BATCH_SIZE",
+        "DEEPSPEED_CONFIG",
         "GRADIENT_ACCUMULATION_STEPS",
         "RELATION_GATE_LOSS_WEIGHT",
         "RELATION_SLOT_GATE_LOSS_WEIGHT",
@@ -367,8 +409,8 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
             f"LocateAnything UI5 {runtime['VERSION']} - "
             f"{args.machine.upper()} x {args.gpus} [{resource_group}]"
         ),
-        "PROJECT_ROOT": resource["project_root"],
-        "ENV_DIR": resource["env_dir"],
+        "PROJECT_ROOT": runtime["PROJECT_ROOT"],
+        "ENV_DIR": runtime["ENV_DIR"],
         "IMAGE_URL": resource["image_url"],
         "IMAGE_VID": resource["image_vid"],
         "JOB_NAME": job_name,
@@ -406,6 +448,11 @@ def main() -> int:
 
     print("===== LocateAnything UI5 submission =====")
     for key in (
+        "PROJECT_ROOT",
+        "BASE_MODEL",
+        "MODEL_PATH",
+        "INIT_CHECKPOINT",
+        "INIT_CPT_STEP",
         "MACHINE_TYPE",
         "RESOURCE_GROUP",
         "GPU_COUNT",
@@ -415,6 +462,16 @@ def main() -> int:
         "MAX_NUM_TOKENS_PER_SAMPLE",
         "MAX_NUM_TOKENS",
         "MAX_NUM_TOKENS_SCOPE",
+        "SEED",
+        "LEARNING_RATE",
+        "UI_RELATION_LEARNING_RATE",
+        "WARMUP_STEPS",
+        "WEIGHT_DECAY",
+        "MAX_GRAD_NORM",
+        "LR_SCHEDULER_TYPE",
+        "BF16",
+        "PER_DEVICE_TRAIN_BATCH_SIZE",
+        "DEEPSPEED_CONFIG",
         "GRADIENT_ACCUMULATION_STEPS",
         "TC_MSED_STAGE",
         "RELATION_GATE_LOSS_WEIGHT",

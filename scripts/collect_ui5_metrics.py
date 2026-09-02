@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import importlib.util
 import json
 import os
@@ -44,6 +45,14 @@ BASE_COLUMNS = [
     "prediction_dir",
     "evaluation_run_dir",
     "error",
+    "init_checkpoint",
+    "init_cpt_step",
+    "sft_step",
+    "is_best_image",
+    "is_best_bbox",
+    "is_4000_milestone",
+    "checkpoint_kept",
+    "checkpoint_keep_reasons",
 ]
 TASK_COLUMNS = [
     f"{task}_{granularity}_{metric}"
@@ -52,6 +61,7 @@ TASK_COLUMNS = [
     for metric in ("precision", "recall", "f1")
 ]
 CSV_COLUMNS = BASE_COLUMNS + TASK_COLUMNS
+PERMANENT_MILESTONE_STEPS = frozenset({4000, 8000, 12000, 16000})
 
 
 def norm1000_box_to_pixel(
@@ -177,28 +187,28 @@ def ui_model_signature(checkpoint: Path) -> str:
     if not config_path.is_file():
         return ""
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    has_image_gate = False
+    state_dict_keys: set[str] = set()
     index_path = checkpoint / "model.safetensors.index.json"
     if index_path.is_file():
         index = json.loads(index_path.read_text(encoding="utf-8"))
-        has_image_gate = any(
-            "relation_pyramid.image_gate_heads" in key
-            for key in index.get("weight_map", {})
-        )
+        state_dict_keys.update(index.get("weight_map", {}))
     else:
         try:
             from safetensors import safe_open
 
             for path in checkpoint.glob("model*.safetensors"):
                 with safe_open(path, framework="pt", device="cpu") as handle:
-                    if any(
-                        "relation_pyramid.image_gate_heads" in key
-                        for key in handle.keys()
-                    ):
-                        has_image_gate = True
-                        break
+                    state_dict_keys.update(handle.keys())
         except ImportError:
             pass
+    state_dict_key_sha256 = (
+        hashlib.sha256("\n".join(sorted(state_dict_keys)).encode("utf-8")).hexdigest()
+        if state_dict_keys
+        else ""
+    )
+    has_image_gate = any(
+        "relation_pyramid.image_gate_heads" in key for key in state_dict_keys
+    )
     signature = {
         "enable_ui_relation": bool(config.get("enable_ui_relation", False)),
         "relation_detail_layers": config.get("relation_detail_layers"),
@@ -250,6 +260,8 @@ def ui_model_signature(checkpoint: Path) -> str:
         "mtp_block_size": (config.get("text_config") or {}).get("block_size"),
         "causal_attn": (config.get("text_config") or {}).get("causal_attn"),
         "has_image_gate": has_image_gate,
+        "state_dict_key_count": len(state_dict_keys),
+        "state_dict_key_sha256": state_dict_key_sha256,
     }
     return json.dumps(signature, sort_keys=True, separators=(",", ":"))
 
@@ -746,6 +758,9 @@ def build_row(args: argparse.Namespace) -> dict[str, Any]:
         "prediction_dir": str(args.prediction_dir or ""),
         "evaluation_run_dir": str(args.evaluation_run_dir or ""),
         "error": args.error or "",
+        "init_checkpoint": os.environ.get("INIT_CHECKPOINT", ""),
+        "init_cpt_step": int(os.environ.get("INIT_CPT_STEP", "0")),
+        "sft_step": args.step,
         "tasks": metrics.get("tasks", {}),
     }
     for task in TASKS:
@@ -760,6 +775,7 @@ def build_row(args: argparse.Namespace) -> dict[str, Any]:
 def append_excel_evaluation(
     args: argparse.Namespace,
     metrics: dict[str, Any],
+    retention: dict[str, Any],
 ) -> Path:
     checkpoint_config = (
         json.loads((args.checkpoint / "config.json").read_text(encoding="utf-8"))
@@ -866,10 +882,137 @@ def append_excel_evaluation(
             "tc_msed_stage": tc_msed_stage,
             "config_hash": os.environ.get("UI5_CONFIG_HASH", ""),
             "model_signature": ui_model_signature(args.checkpoint),
+            "init_checkpoint": os.environ.get("INIT_CHECKPOINT", ""),
+            "init_cpt_step": int(os.environ.get("INIT_CPT_STEP", "0")),
+            "is_best_image": retention["is_best_image"],
+            "is_best_bbox": retention["is_best_bbox"],
+            "is_4000_milestone": retention["is_4000_milestone"],
+            "checkpoint_kept": retention["checkpoint_kept"],
         },
     )
-    UI5ExcelLogger(diagnostics_path).append_eval(args.step, rows)
+    excel = UI5ExcelLogger(diagnostics_path)
+    excel.append_eval(args.step, rows)
+    excel.update_checkpoint_status(
+        args.step,
+        is_best_image=retention["is_best_image"],
+        is_best_bbox=retention["is_best_bbox"],
+        is_4000_milestone=retention["is_4000_milestone"],
+        checkpoint_kept=retention["checkpoint_kept"],
+    )
     return diagnostics_path
+
+
+def build_best_checkpoints_document(
+    rows: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[int, dict[str, Any]]]:
+    """Select strict scorer-metric improvements and all permanent checkpoints."""
+
+    successful = sorted(
+        (
+            row
+            for row in rows
+            if row.get("evaluation_status") == "success"
+        ),
+        key=lambda row: int(row.get("step", 0)),
+    )
+    best_image: float | None = None
+    best_bbox: float | None = None
+    current_image: dict[str, Any] | None = None
+    current_bbox: dict[str, Any] | None = None
+    selections: dict[int, dict[str, Any]] = {}
+    history: list[dict[str, Any]] = []
+    for row in successful:
+        step = int(row["step"])
+        image_f1 = row.get("image_macro_f1")
+        bbox_f1 = row.get("bbox_macro_f1")
+        is_best_image = image_f1 is not None and (
+            best_image is None or float(image_f1) > best_image
+        )
+        is_best_bbox = bbox_f1 is not None and (
+            best_bbox is None or float(bbox_f1) > best_bbox
+        )
+        milestone = step in PERMANENT_MILESTONE_STEPS
+        reasons = []
+        if step == 0:
+            reasons.append("checkpoint-0")
+        if milestone:
+            reasons.append(f"milestone-{step}")
+        if is_best_image:
+            reasons.append("strict-best-image-macro-f1")
+        if is_best_bbox:
+            reasons.append("strict-best-bbox-macro-f1@0.1")
+        selection = {
+            "step": step,
+            "image_macro_f1": image_f1,
+            "bbox_macro_f1_at_0_1": bbox_f1,
+            "checkpoint": row.get("checkpoint"),
+            "is_best_image": bool(is_best_image),
+            "is_best_bbox": bool(is_best_bbox),
+            "is_4000_milestone": milestone,
+            "checkpoint_kept": bool(reasons),
+            "keep_reasons": reasons,
+        }
+        selections[step] = selection
+        history.append(selection)
+        if is_best_image:
+            best_image = float(image_f1)
+            current_image = selection
+        if is_best_bbox:
+            best_bbox = float(bbox_f1)
+            current_bbox = selection
+
+    document = {
+        "schema_version": 1,
+        "primary_best_metric": "bbox_macro_f1@0.1",
+        "init_checkpoint": os.environ.get("INIT_CHECKPOINT", ""),
+        "init_cpt_step": int(os.environ.get("INIT_CPT_STEP", "0")),
+        "current_best": {
+            "image": current_image,
+            "bbox_at_0_1": current_bbox,
+        },
+        "best_history": [
+            entry
+            for entry in history
+            if entry["is_best_image"] or entry["is_best_bbox"]
+        ],
+        "evaluation_history": history,
+        "permanently_kept_steps": [
+            entry["step"] for entry in history if entry["checkpoint_kept"]
+        ],
+    }
+    return document, selections
+
+
+def print_metric_summary(
+    *,
+    step: int,
+    metrics: dict[str, Any],
+    retention: dict[str, Any],
+    diagnostics_xlsx: Path,
+) -> None:
+    def triple(values: dict[str, Any]) -> str:
+        return "P={:.6f} R={:.6f} F1={:.6f}".format(
+            float(values.get("precision") or 0.0),
+            float(values.get("recall") or 0.0),
+            float(values.get("f1") or 0.0),
+        )
+
+    print(f"===== UI5 full-test scorer metrics: SFT step {step} =====")
+    for task in TASKS:
+        values = metrics.get("tasks", {}).get(task, {})
+        issue = TASK_ISSUE_NAMES[task]
+        print(f"{issue} Image {triple(values.get('image', {}))}")
+        print(f"{issue} Bbox@0.1 {triple(values.get('bbox', {}))}")
+    macro = metrics.get("macro", {})
+    print(f"Image Macro {triple(macro.get('image', {}))}")
+    print(f"Bbox Macro@0.1 {triple(macro.get('bbox', {}))}")
+    print(
+        "checkpoint 是否永久保留及原因: "
+        f"{'是' if retention['checkpoint_kept'] else '否'}; "
+        f"{','.join(retention['keep_reasons']) or 'temporary-evaluated-checkpoint'}"
+    )
+    print(f"Excel 路径: {diagnostics_xlsx}")
+    print("=====================================================")
 
 
 def write_history(history_dir: Path, rows: list[dict[str, Any]]) -> None:
@@ -1018,10 +1161,37 @@ def main() -> int:
     rows = [existing for existing in rows if int(existing.get("step", -1)) != args.step]
     rows.append(row)
     diagnostics_xlsx = None
+    best_checkpoints_path = None
     if args.status == "success":
         metrics = load_metrics(args.metrics_json)
-        diagnostics_xlsx = append_excel_evaluation(args, metrics)
+        best_document, selections = build_best_checkpoints_document(rows)
+        retention = selections[args.step]
+        row.update(
+            {
+                "is_best_image": retention["is_best_image"],
+                "is_best_bbox": retention["is_best_bbox"],
+                "is_4000_milestone": retention["is_4000_milestone"],
+                "checkpoint_kept": retention["checkpoint_kept"],
+                "checkpoint_keep_reasons": retention["keep_reasons"],
+            }
+        )
+        diagnostics_xlsx = append_excel_evaluation(args, metrics, retention)
     write_history(args.history_dir.expanduser().resolve(), rows)
+    if args.status == "success":
+        best_checkpoints_path = (
+            args.history_dir.expanduser().resolve() / "best_checkpoints.json"
+        )
+        atomic_write_text(
+            best_checkpoints_path,
+            json.dumps(best_document, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+        )
+        print_metric_summary(
+            step=args.step,
+            metrics=metrics,
+            retention=retention,
+            diagnostics_xlsx=diagnostics_xlsx,
+        )
     print(
         json.dumps(
             {
@@ -1031,6 +1201,11 @@ def main() -> int:
                 "status": args.status,
                 "diagnostics_xlsx": (
                     str(diagnostics_xlsx) if diagnostics_xlsx is not None else None
+                ),
+                "best_checkpoints_json": (
+                    str(best_checkpoints_path)
+                    if best_checkpoints_path is not None
+                    else None
                 ),
             },
             ensure_ascii=False,

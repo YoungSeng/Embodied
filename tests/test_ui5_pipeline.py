@@ -322,6 +322,41 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(runtime["RESOURCE_GROUP"], "aiai_locate")
         self.assertEqual(runtime["RESOURCE_GROUP_ID"], 2146)
 
+    def test_formal_cpt_sft_paths_and_two_learning_rates_are_fully_rendered(self) -> None:
+        project_root = (
+            "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/"
+            "Eagle_LocateUI5_v4/Embodied-m32-cpt-sft-v1"
+        )
+        base_model = (
+            "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_models/"
+            "locany-3b-ui-cpt-v4-v3-h20x2-formal-segmented-eval/checkpoint-3000"
+        )
+        args = submit_locany_ui5.parse_args(
+            [
+                "--project-root", project_root,
+                "--base-model", base_model,
+                "--machine", "a800",
+                "--resource-group", "aiai_locate",
+                "--gpus", "4",
+                "--learning-rate", "1e-5",
+                "--ui-relation-learning-rate", "2e-5",
+                "--tc-msed-stage", "m32",
+                "--render-only",
+            ]
+        )
+        rendered, runtime = submit_locany_ui5.render_job(args)
+        self.assertIn(f"mnt: {project_root}", rendered)
+        self.assertIn(f'PROJECT_ROOT: "{project_root}"', rendered)
+        self.assertIn(f'BASE_MODEL: "{base_model}"', rendered)
+        self.assertIn(f'MODEL_PATH: "{base_model}"', rendered)
+        self.assertIn('INIT_CPT_STEP: "3000"', rendered)
+        self.assertIn('LEARNING_RATE: "1e-5"', rendered)
+        self.assertIn('UI_RELATION_LEARNING_RATE: "2e-5"', rendered)
+        self.assertIn('SEED: "42"', rendered)
+        self.assertEqual(runtime["OUTPUT_DIR"], f"{project_root}/work_dirs/{runtime['RUN_NAME']}")
+        self.assertEqual(runtime["DEEPSPEED_CONFIG"], "deepspeed_configs/zero_stage2_two_lr_config.json")
+        self.assertEqual(runtime["SEED"], 42)
+
     def test_formal_eval_pbd_ablation_is_explicitly_rendered(self) -> None:
         args = submit_locany_ui5.parse_args(
             [
@@ -728,8 +763,72 @@ class CheckpointTests(unittest.TestCase):
                 [4000],
             )
 
+    def test_cleanup_manifest_exposes_all_historical_metric_best_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            evaluation = output / "evaluation"
+            evaluation.mkdir()
+            (evaluation / "best_checkpoints.json").write_text(
+                json.dumps(
+                    {
+                        "evaluation_history": [
+                            {
+                                "step": 1000,
+                                "checkpoint_kept": True,
+                                "is_best_image": True,
+                                "is_best_bbox": False,
+                            },
+                            {
+                                "step": 2000,
+                                "checkpoint_kept": False,
+                                "is_best_image": False,
+                                "is_best_bbox": False,
+                            },
+                            {
+                                "step": 3000,
+                                "checkpoint_kept": True,
+                                "is_best_image": False,
+                                "is_best_bbox": True,
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                locany_ui5_checkpoint.metric_best_steps(output), {1000, 3000}
+            )
+
 
 class HistoryTests(unittest.TestCase):
+    def test_best_checkpoint_manifest_uses_strict_real_macro_improvements(self) -> None:
+        rows = []
+        for step, image, bbox in (
+            (0, 0.20, 0.10),
+            (1000, 0.25, 0.10),
+            (2000, 0.24, 0.12),
+            (4000, 0.23, 0.11),
+        ):
+            rows.append(
+                {
+                    "step": step,
+                    "evaluation_status": "success",
+                    "checkpoint": f"/run/checkpoint-{step}",
+                    "image_macro_f1": image,
+                    "bbox_macro_f1": bbox,
+                }
+            )
+        document, selections = collect_ui5_metrics.build_best_checkpoints_document(rows)
+        self.assertTrue(selections[0]["is_best_image"])
+        self.assertTrue(selections[0]["is_best_bbox"])
+        self.assertTrue(selections[1000]["is_best_image"])
+        self.assertFalse(selections[1000]["is_best_bbox"])
+        self.assertTrue(selections[2000]["is_best_bbox"])
+        self.assertTrue(selections[4000]["is_4000_milestone"])
+        self.assertTrue(selections[4000]["checkpoint_kept"])
+        self.assertEqual(document["current_best"]["image"]["step"], 1000)
+        self.assertEqual(document["current_best"]["bbox_at_0_1"]["step"], 2000)
+        self.assertEqual(document["permanently_kept_steps"], [0, 1000, 2000, 4000])
     def test_gate_sweep_zero_is_raw_and_selects_without_regeneration(self) -> None:
         metrics = {
             task: {"_sweep_samples": []}
@@ -897,6 +996,45 @@ class HistoryTests(unittest.TestCase):
             self.assertNotEqual(disabled_signature, enabled_signature)
             self.assertIn('"relation_constrained_bbox_decoding":false', disabled_signature)
             self.assertIn('"relation_constrained_bbox_decoding":true', enabled_signature)
+
+    def test_model_signature_covers_exact_state_dict_key_structure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            left = root / "left"
+            right = root / "right"
+            left.mkdir()
+            right.mkdir()
+            for checkpoint in (left, right):
+                (checkpoint / "config.json").write_text(
+                    json.dumps({"enable_ui_relation": True, "tc_msed_stage": "m32"}),
+                    encoding="utf-8",
+                )
+            (left / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "weight_map": {
+                            "language_model.weight": "model-1.safetensors",
+                            "relation_pyramid.scale_logits": "model-1.safetensors",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (right / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "weight_map": {
+                            "language_model.weight": "model-1.safetensors",
+                            "relation_pbd.box_scale": "model-1.safetensors",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertNotEqual(
+                collect_ui5_metrics.ui_model_signature(left),
+                collect_ui5_metrics.ui_model_signature(right),
+            )
 
 
 class ParallelInferenceTests(unittest.TestCase):

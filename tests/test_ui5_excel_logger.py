@@ -23,6 +23,11 @@ def training_metrics(step: int) -> dict:
         "gpu_num": 4,
         "max_num_tokens": 12800,
         "learning_rate": 2e-5,
+        "base_learning_rate": 1e-5,
+        "ui_relation_learning_rate": 2e-5,
+        "init_checkpoint": "/models/cpt/checkpoint-3000",
+        "init_cpt_step": 3000,
+        "sft_step": step,
         "loss_total": 1.0,
         "pbd_delta_norm": 0.25,
         "pbd_active_positions": 6,
@@ -185,6 +190,44 @@ class UI5ExcelLoggerTest(unittest.TestCase):
                         for cell in row
                     )
                 )
+            finally:
+                workbook.close()
+
+    def test_retention_metadata_updates_both_existing_sheets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "ui5_training_evaluation.xlsx"
+            logger = UI5ExcelLogger(path)
+            logger.update_train(1000, training_metrics(1000))
+            rows = build_eval_rows(
+                step=1000,
+                checkpoint="checkpoint-1000",
+                metrics=scorer_metrics(0.5),
+                metadata={
+                    "init_checkpoint": "/models/cpt/checkpoint-3000",
+                    "init_cpt_step": 3000,
+                },
+            )
+            logger.append_eval(1000, rows)
+            self.assertTrue(
+                logger.update_checkpoint_status(
+                    1000,
+                    is_best_image=True,
+                    is_best_bbox=False,
+                    is_4000_milestone=False,
+                    checkpoint_kept=True,
+                )
+            )
+            workbook = load_workbook(path, read_only=True)
+            try:
+                for sheet_name in EXPECTED_SHEETS:
+                    sheet = workbook[sheet_name]
+                    header = [cell.value for cell in sheet[1]]
+                    for values in sheet.iter_rows(min_row=2, values_only=True):
+                        row = dict(zip(header, values))
+                        self.assertEqual(row["sft_step"], 1000)
+                        self.assertTrue(row["is_best_image"])
+                        self.assertFalse(row["is_best_bbox"])
+                        self.assertTrue(row["checkpoint_kept"])
             finally:
                 workbook.close()
 
