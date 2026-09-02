@@ -1,0 +1,882 @@
+#!/usr/bin/env python3
+"""Aggregate the eight UI5 train rollouts without re-running inference."""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import statistics
+import sys
+from collections import Counter, defaultdict
+from contextlib import ExitStack
+from datetime import datetime, timezone
+from itertools import zip_longest
+from pathlib import Path
+from typing import Any, Iterable, Iterator, Mapping, Sequence
+
+from run_ui5_train_rollout_worker import last_jsonl_row, load_module, score_prediction
+
+
+SCHEMA_VERSION = 1
+MODELS = ("m31", "crop")
+TASKS = ("occlusion", "cropping", "text_overflow", "text_ellipsis", "content_missing")
+THRESHOLDS = (0.1, 0.3, 0.5)
+ERROR_TYPES = (
+    "TN",
+    "FP_ONLY",
+    "FN_NO_PRED",
+    "LOC_WRONG",
+    "PARTIAL_MISS",
+    "PARTIAL_EXTRA",
+    "PARTIAL_BOTH",
+    "EXACT_TP",
+    "PARSE_ERROR",
+)
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--bundle-root", type=Path, required=True)
+    parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
+    return parser.parse_args(argv)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def raw_iterator(root: Path, model: str, rollout: int) -> Iterator[dict[str, Any]]:
+    directory = root / "raw" / model / f"rollout_{rollout}"
+    parts = sorted(directory.glob("part-*.jsonl"))
+    if not parts:
+        raise FileNotFoundError(f"no raw rollout parts: {directory}")
+    for part in parts:
+        with part.open("r", encoding="utf-8") as handle:
+            for line_no, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    raise ValueError(f"expected object at {part}:{line_no}")
+                yield value
+
+
+def grouped_rollouts(root: Path, model: str) -> Iterator[list[dict[str, Any]]]:
+    iterators = [raw_iterator(root, model, rollout) for rollout in range(4)]
+    for row_index, values in enumerate(zip_longest(*iterators), 1):
+        if any(value is None for value in values):
+            raise RuntimeError(f"{model} rollout lengths differ at row {row_index}")
+        rows = [value for value in values if value is not None]
+        ids = {str(row["record_id"]) for row in rows}
+        rollout_ids = {int(row["rollout_id"]) for row in rows}
+        if len(ids) != 1 or rollout_ids != {0, 1, 2, 3}:
+            raise RuntimeError(
+                f"unaligned {model} rollouts at row {row_index}: ids={ids}, rollouts={rollout_ids}"
+            )
+        yield sorted(rows, key=lambda row: int(row["rollout_id"]))
+
+
+def safe_div(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0.0
+
+
+class Accumulator:
+    def __init__(self) -> None:
+        self.total = 0
+        self.image = Counter()
+        self.tp_box = 0
+        self.fp_box = 0
+        self.fn_box = 0
+        self.parse_errors = 0
+        self.exact = 0
+        self.pair_count = 0
+        self.iou_sum = 0.0
+        self.center_px_sum = 0.0
+        self.center_norm_sum = 0.0
+        self.area_ratio_sum = 0.0
+
+    def add(self, score: Mapping[str, Any]) -> None:
+        self.total += 1
+        self.image[str(score["image_confusion"])] += 1
+        self.tp_box += int(score["TP_box"])
+        self.fp_box += int(score["FP_box"])
+        self.fn_box += int(score["FN_box"])
+        self.parse_errors += int(score.get("error_type") == "PARSE_ERROR")
+        self.exact += int(bool(score.get("exact_correct")))
+        for pair in score.get("matched_pairs", []):
+            if not pair.get("is_tp"):
+                continue
+            self.pair_count += 1
+            self.iou_sum += float(pair["iou"])
+            self.center_px_sum += float(pair["center_distance_px"])
+            self.center_norm_sum += float(pair["center_distance_normalized"])
+            self.area_ratio_sum += float(pair["pred_gt_area_ratio"])
+
+    def metrics(self) -> dict[str, Any]:
+        tp, tn = self.image["TP"], self.image["TN"]
+        fp, fn = self.image["FP"], self.image["FN"]
+        precision = safe_div(tp, tp + fp)
+        recall = safe_div(tp, tp + fn)
+        specificity = safe_div(tn, tn + fp)
+        fpr = safe_div(fp, fp + tn)
+        fnr = safe_div(fn, fn + tp)
+        npv = safe_div(tn, tn + fn)
+        accuracy = safe_div(tp + tn, self.total)
+        balanced = (recall + specificity) / 2
+        f1 = safe_div(2 * precision * recall, precision + recall)
+        bbox_precision = safe_div(self.tp_box, self.tp_box + self.fp_box)
+        bbox_recall = safe_div(self.tp_box, self.tp_box + self.fn_box)
+        bbox_f1 = safe_div(
+            2 * bbox_precision * bbox_recall, bbox_precision + bbox_recall
+        )
+        return {
+            "total_samples": self.total,
+            "image_TP": tp,
+            "image_TN": tn,
+            "image_FP": fp,
+            "image_FN": fn,
+            "image_TP_ratio": safe_div(tp, self.total),
+            "image_TN_ratio": safe_div(tn, self.total),
+            "image_FP_ratio": safe_div(fp, self.total),
+            "image_FN_ratio": safe_div(fn, self.total),
+            "precision": precision,
+            "recall": recall,
+            "specificity": specificity,
+            "FPR": fpr,
+            "FNR": fnr,
+            "NPV": npv,
+            "accuracy": accuracy,
+            "balanced_accuracy": balanced,
+            "F1": f1,
+            "bbox_TP": self.tp_box,
+            "bbox_FP": self.fp_box,
+            "bbox_FN": self.fn_box,
+            "bbox_precision": bbox_precision,
+            "bbox_recall": bbox_recall,
+            "bbox_F1": bbox_f1,
+            "matched_pair_count": self.pair_count,
+            "mean_matched_iou": safe_div(self.iou_sum, self.pair_count),
+            "mean_center_distance_px": safe_div(self.center_px_sum, self.pair_count),
+            "mean_center_distance_normalized": safe_div(
+                self.center_norm_sum, self.pair_count
+            ),
+            "mean_pred_gt_area_ratio": safe_div(self.area_ratio_sum, self.pair_count),
+            "parse_errors": self.parse_errors,
+            "exact_correct": self.exact,
+            "exact_correct_ratio": safe_div(self.exact, self.total),
+        }
+
+
+class JsonlWriter:
+    def __init__(self, path: Path):
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+        self.handle = self.temporary.open("w", encoding="utf-8")
+        self.count = 0
+
+    def write(self, row: Mapping[str, Any]) -> None:
+        self.handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        self.count += 1
+
+    def close(self) -> None:
+        self.handle.flush()
+        os.fsync(self.handle.fileno())
+        self.handle.close()
+        os.replace(self.temporary, self.path)
+
+
+def compact_rollout(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "rollout_id": row["rollout_id"],
+        "seed": row["seed"],
+        "checkpoint": row["checkpoint"],
+        "git_commit": row["git_commit"],
+        "baseline_git_commit": row["baseline_git_commit"],
+        "generation_config": row["generation_config"],
+        "parse_status": row["parse_status"],
+        "error_type": row["error_type"],
+        "exact_correct": row["exact_correct"],
+        "TP_box": row["TP_box"],
+        "FP_box": row["FP_box"],
+        "FN_box": row["FN_box"],
+        "latency_seconds": row["latency_seconds"],
+    }
+
+
+def selection_base(rows: Sequence[Mapping[str, Any]], correct_count: int) -> dict[str, Any]:
+    first = rows[0]
+    return {
+        "record_id": first["record_id"],
+        "sample_id": first["sample_id"],
+        "source_image_id": first["source_image_id"],
+        "task": first["task"],
+        "image_relpath": first["image_relpath"],
+        "prompt": first["prompt"],
+        "gt_global": first["gt_global"],
+        "source_records": first.get("source_records", []),
+        "original_training_record": first.get("original_training_record"),
+        "correct_count": correct_count,
+        "rollouts": [compact_rollout(row) for row in rows],
+        "pipeline_coverage_failure": bool(first.get("pipeline_coverage_failure")),
+        "annotation_anomaly": bool(first.get("annotation_anomaly")),
+        "coordinate_transform_anomaly": bool(
+            first.get("coordinate_transform_anomaly")
+        ),
+    }
+
+
+def metric_fields() -> tuple[str, ...]:
+    return (
+        "precision",
+        "recall",
+        "specificity",
+        "FPR",
+        "FNR",
+        "NPV",
+        "accuracy",
+        "balanced_accuracy",
+        "F1",
+        "bbox_precision",
+        "bbox_recall",
+        "bbox_F1",
+        "mean_matched_iou",
+        "mean_center_distance_normalized",
+        "mean_pred_gt_area_ratio",
+        "exact_correct_ratio",
+    )
+
+
+def mean_std(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for field in metric_fields():
+        values = [float(row.get(field, 0.0)) for row in rows]
+        output[f"{field}_mean"] = statistics.fmean(values) if values else 0.0
+        output[f"{field}_std"] = statistics.pstdev(values) if len(values) > 1 else 0.0
+    return output
+
+
+def macro_row(task_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    return {
+        field: statistics.fmean(float(row.get(field, 0.0)) for row in task_rows)
+        for field in metric_fields()
+    }
+
+
+def workbook(
+    path: Path,
+    overview: Mapping[str, Any],
+    tables: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> None:
+    try:
+        import openpyxl
+        from openpyxl.styles import Alignment, Font, PatternFill
+    except ImportError as exc:
+        raise RuntimeError("openpyxl>=3.1 is required for the formal report") from exc
+    book = openpyxl.Workbook()
+    book.remove(book.active)
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    section_fill = PatternFill("solid", fgColor="D9EAF7")
+    white_font = Font(color="FFFFFF", bold=True)
+    for sheet_name, rows in tables.items():
+        sheet = book.create_sheet(sheet_name[:31])
+        if sheet_name == "overview":
+            sheet.append(["metric", "value"])
+            for key, value in overview.items():
+                sheet.append(
+                    [key, json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value]
+                )
+        else:
+            columns = sorted({key for row in rows for key in row})
+            if not columns:
+                columns = ["note"]
+                rows = [{"note": "no rows"}]
+            sheet.append(columns)
+            for row in rows:
+                sheet.append([row.get(column) for column in columns])
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        sheet.sheet_view.showGridLines = False
+        for cell in sheet[1]:
+            cell.fill = header_fill
+            cell.font = white_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        for column_cells in sheet.columns:
+            values = [str(cell.value or "") for cell in column_cells[:200]]
+            width = min(48, max(10, max(map(len, values), default=8) + 2))
+            sheet.column_dimensions[column_cells[0].column_letter].width = width
+        for row in sheet.iter_rows(min_row=2):
+            for cell in row:
+                if isinstance(cell.value, float):
+                    cell.number_format = "0.0000"
+                cell.alignment = Alignment(vertical="top", wrap_text=False)
+        if sheet.max_row > 2:
+            for cell in sheet[2]:
+                cell.fill = section_fill
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}.xlsx")
+    book.save(temporary)
+    verified = openpyxl.load_workbook(temporary, read_only=True, data_only=False)
+    required = set(tables)
+    if not required.issubset(set(verified.sheetnames)):
+        raise RuntimeError("workbook verification missed required sheets")
+    for sheet in verified.worksheets:
+        if sheet.max_row < 2 or sheet.max_column < 1:
+            raise RuntimeError(f"workbook sheet is unexpectedly empty: {sheet.title}")
+        for row in sheet.iter_rows():
+            for cell in row:
+                if isinstance(cell.value, str) and cell.value.startswith(
+                    ("#REF!", "#DIV/0!", "#VALUE!", "#NAME?", "#N/A")
+                ):
+                    raise RuntimeError(f"formula/error token in {sheet.title}!{cell.coordinate}")
+    verified.close()
+    os.replace(temporary, path)
+
+
+def run(args: argparse.Namespace) -> dict[str, Any]:
+    root = args.output_root.expanduser().resolve(strict=True)
+    bundle = args.bundle_root.expanduser().resolve(strict=True)
+    repo = args.repo_root.expanduser().resolve(strict=True)
+    reports = root / "reports"
+    selection_dir = root / "selection"
+    reports.mkdir(parents=True, exist_ok=True)
+    selection_dir.mkdir(parents=True, exist_ok=True)
+    scorer = load_module(
+        repo / "qwen3vl_merge_and_score_fixed_5tasks.py",
+        f"ui5_aggregate_formal_scorer_{os.getpid()}",
+    )
+    accumulators: dict[tuple[str, int, str, float], Accumulator] = defaultdict(Accumulator)
+    error_counts = Counter()
+    consistency: dict[str, dict[str, dict[str, Any]]] = {model: {} for model in MODELS}
+    correct_distributions = Counter()
+    selection_counts = Counter()
+    run_metadata: dict[str, dict[str, Any]] = {}
+    selection_writers: dict[tuple[str, str], JsonlWriter] = {}
+    for model in MODELS:
+        for category in ("easy", "partial", "hard", "grpo_candidates"):
+            selection_writers[(model, category)] = JsonlWriter(
+                selection_dir / f"{model}_{category}.jsonl"
+            )
+
+    for model in MODELS:
+        for group in grouped_rollouts(root, model):
+            first = group[0]
+            if model not in run_metadata:
+                run_metadata[model] = {
+                    "checkpoint": first["checkpoint"],
+                    "git_commit": first["git_commit"],
+                    "baseline_git_commit": first["baseline_git_commit"],
+                    "generation_config": first["generation_config"],
+                    "seeds": [int(row["seed"]) for row in group],
+                }
+            elif [int(row["seed"]) for row in group] != run_metadata[model]["seeds"]:
+                raise RuntimeError(f"{model} rollout seeds changed between records")
+            if any(
+                row["checkpoint"] != run_metadata[model]["checkpoint"]
+                or row["git_commit"] != run_metadata[model]["git_commit"]
+                or row["generation_config"] != run_metadata[model]["generation_config"]
+                for row in group
+            ):
+                raise RuntimeError(f"{model} checkpoint/code/generation identity changed")
+            task = str(first["task"])
+            if task not in TASKS:
+                raise ValueError(f"unknown task in raw rollout: {task}")
+            threshold_scores: dict[tuple[int, float], dict[str, Any]] = {}
+            width = int(first["image_size"]["width"])
+            height = int(first["image_size"]["height"])
+            for row in group:
+                for threshold in THRESHOLDS:
+                    score = score_prediction(
+                        scorer,
+                        row["gt_global"],
+                        row["pred_global"],
+                        row["parse_status"],
+                        threshold,
+                        (width, height),
+                    )
+                    threshold_scores[(int(row["rollout_id"]), threshold)] = score
+                    accumulators[(model, int(row["rollout_id"]), task, threshold)].add(score)
+                    accumulators[(model, int(row["rollout_id"]), "micro", threshold)].add(score)
+                    if threshold == 0.1:
+                        error_counts[
+                            (model, int(row["rollout_id"]), task, score["error_type"])
+                        ] += 1
+            correct_count = sum(
+                bool(threshold_scores[(int(row["rollout_id"]), 0.1)]["exact_correct"])
+                for row in group
+            )
+            correct_distributions[(model, task, correct_count)] += 1
+            correct_distributions[(model, "micro", correct_count)] += 1
+            base = selection_base(group, correct_count)
+            base["model_id"] = model
+            if correct_count == 4:
+                selection_writers[(model, "easy")].write(base)
+                selection_counts[(model, "easy")] += 1
+            elif correct_count == 0:
+                selection_writers[(model, "hard")].write(base)
+                selection_counts[(model, "hard")] += 1
+            else:
+                selection_writers[(model, "partial")].write(base)
+                selection_counts[(model, "partial")] += 1
+            excluded = bool(
+                first.get("pipeline_coverage_failure")
+                or first.get("annotation_anomaly")
+                or first.get("coordinate_transform_anomaly")
+                or any(row.get("parse_status") == "parse_error" for row in group)
+                or any(row.get("runtime_error") for row in group)
+            )
+            if model == "m31" and 1 <= correct_count <= 3 and not excluded:
+                candidate = dict(base)
+                candidate.update(
+                    {
+                        "group_model_id": model,
+                        "group_key": first["record_id"],
+                        "crop_id": "full_image",
+                        "answers": [row["raw_output"] for row in group],
+                        "rewards_exact": [
+                            bool(threshold_scores[(int(row["rollout_id"]), 0.1)]["exact_correct"])
+                            for row in group
+                        ],
+                        "group_size": 4,
+                        "cross_model_group": False,
+                    }
+                )
+                selection_writers[(model, "grpo_candidates")].write(candidate)
+                selection_counts[(model, "grpo_candidates")] += 1
+            if model == "crop" and not excluded:
+                crop_maps = [
+                    {str(item["crop_id"]): item for item in row.get("crop_outputs", [])}
+                    for row in group
+                ]
+                crop_ids = set(crop_maps[0])
+                if any(set(mapping) != crop_ids for mapping in crop_maps[1:]):
+                    raise RuntimeError(f"crop IDs differ across rollouts: {first['record_id']}")
+                for crop_id in sorted(crop_ids):
+                    items = [mapping[crop_id] for mapping in crop_maps]
+                    local_correct = sum(bool(item.get("exact_correct")) for item in items)
+                    if not 1 <= local_correct <= 3:
+                        continue
+                    if any(item.get("parse_status") == "parse_error" for item in items):
+                        continue
+                    candidate = dict(base)
+                    candidate.update(
+                        {
+                            "group_model_id": model,
+                            "group_key": f"{first['record_id']}:{crop_id}",
+                            "crop_id": crop_id,
+                            "crop_xyxy": items[0]["crop_xyxy"],
+                            "gt_local": items[0]["gt_local"],
+                            "answers": [item["raw_output"] for item in items],
+                            "rewards_exact": [bool(item["exact_correct"]) for item in items],
+                            "correct_count": local_correct,
+                            "group_size": 4,
+                            "cross_model_group": False,
+                        }
+                    )
+                    selection_writers[(model, "grpo_candidates")].write(candidate)
+                    selection_counts[(model, "grpo_candidates")] += 1
+            compact_gallery = []
+            for row in group:
+                compact_gallery.append(
+                    {
+                        "rollout_id": row["rollout_id"],
+                        "pred_global": row["pred_global"],
+                        "matched_pairs": row["matched_pairs"],
+                        "error_type": row["error_type"],
+                        "exact_correct": row["exact_correct"],
+                        "crop_boundaries": [
+                            item["crop_xyxy"] for item in row.get("crop_outputs", [])
+                        ],
+                    }
+                )
+            consistency[model][str(first["record_id"])] = {
+                **base,
+                "model_id": model,
+                "error_types": sorted({str(row["error_type"]) for row in group}),
+                "gallery_rollouts": compact_gallery,
+            }
+
+    for writer in selection_writers.values():
+        writer.close()
+
+    common_ids = sorted(set(consistency["m31"]) & set(consistency["crop"]))
+    joint_0to8 = Counter()
+    joint_5x5 = Counter()
+    cross_writers = {
+        category: JsonlWriter(selection_dir / f"{category}.jsonl")
+        for category in ("both_hard", "m31_better", "crop_better")
+    }
+    for record_id in common_ids:
+        m31 = consistency["m31"][record_id]
+        crop = consistency["crop"][record_id]
+        m31_count, crop_count = int(m31["correct_count"]), int(crop["correct_count"])
+        joint_0to8[m31_count + crop_count] += 1
+        joint_5x5[(m31_count, crop_count)] += 1
+        category = None
+        if m31_count == 0 and crop_count == 0:
+            category = "both_hard"
+        elif m31_count > crop_count:
+            category = "m31_better"
+        elif crop_count > m31_count:
+            category = "crop_better"
+        if category:
+            row = {
+                "record_id": record_id,
+                "sample_id": m31["sample_id"],
+                "source_image_id": m31["source_image_id"],
+                "task": m31["task"],
+                "image_relpath": m31["image_relpath"],
+                "prompt": m31["prompt"],
+                "gt_global": m31["gt_global"],
+                "source_records": m31["source_records"],
+                "m31_correct_count": m31_count,
+                "crop_correct_count": crop_count,
+                "category": category,
+            }
+            cross_writers[category].write(row)
+            selection_counts[("cross", category)] += 1
+    for writer in cross_writers.values():
+        writer.close()
+
+    per_task: list[dict[str, Any]] = []
+    per_rollout: list[dict[str, Any]] = []
+    for (model, rollout, scope, threshold), accumulator in sorted(accumulators.items()):
+        row = {
+            "model_id": model,
+            "rollout_id": rollout,
+            "scope": scope,
+            "iou_threshold": threshold,
+            **accumulator.metrics(),
+        }
+        if scope == "micro":
+            per_rollout.append(row)
+        else:
+            row["task"] = scope
+            per_task.append(row)
+
+    four_rollout_summary: list[dict[str, Any]] = []
+    for model in MODELS:
+        for threshold in THRESHOLDS:
+            micro_rows = [
+                row
+                for row in per_rollout
+                if row["model_id"] == model and row["iou_threshold"] == threshold
+            ]
+            macro_rows = []
+            for rollout in range(4):
+                task_rows = [
+                    row
+                    for row in per_task
+                    if row["model_id"] == model
+                    and row["rollout_id"] == rollout
+                    and row["iou_threshold"] == threshold
+                ]
+                macro_rows.append(macro_row(task_rows))
+            four_rollout_summary.extend(
+                [
+                    {
+                        "model_id": model,
+                        "iou_threshold": threshold,
+                        "aggregation": "micro",
+                        **mean_std(micro_rows),
+                    },
+                    {
+                        "model_id": model,
+                        "iou_threshold": threshold,
+                        "aggregation": "macro_task",
+                        **mean_std(macro_rows),
+                    },
+                ]
+            )
+
+    correct_rows = [
+        {
+            "model_id": model,
+            "task": task,
+            "correct_count": count,
+            "samples": correct_distributions[(model, task, count)],
+            "proportion": safe_div(
+                correct_distributions[(model, task, count)],
+                sum(correct_distributions[(model, task, item)] for item in range(5)),
+            ),
+        }
+        for model in MODELS
+        for task in (*TASKS, "micro")
+        for count in range(5)
+    ]
+    joint_rows = [
+        {
+            "table": "joint_0to8",
+            "m31_correct_count": None,
+            "crop_correct_count": None,
+            "joint_correct_count": count,
+            "samples": joint_0to8[count],
+            "proportion": safe_div(joint_0to8[count], len(common_ids)),
+        }
+        for count in range(9)
+    ] + [
+        {
+            "table": "m31_x_crop_5x5",
+            "m31_correct_count": m31_count,
+            "crop_correct_count": crop_count,
+            "joint_correct_count": m31_count + crop_count,
+            "samples": joint_5x5[(m31_count, crop_count)],
+            "proportion": safe_div(joint_5x5[(m31_count, crop_count)], len(common_ids)),
+        }
+        for m31_count in range(5)
+        for crop_count in range(5)
+    ]
+    error_rows = [
+        {
+            "model_id": model,
+            "rollout_id": rollout,
+            "task": task,
+            "error_type": error_type,
+            "samples": error_counts[(model, rollout, task, error_type)],
+        }
+        for model in MODELS
+        for rollout in range(4)
+        for task in TASKS
+        for error_type in ERROR_TYPES
+    ]
+
+    gallery_writer = JsonlWriter(reports / "gallery_selection.jsonl")
+    gallery_counts = Counter()
+    for model in MODELS:
+        for record_id in sorted(consistency[model]):
+            row = consistency[model][record_id]
+            count = int(row["correct_count"])
+            categories = [
+                "4_of_4" if count == 4 else ("0_of_4" if count == 0 else f"{count}_of_4")
+            ]
+            for error_type in row["error_types"]:
+                if error_type == "FP_ONLY":
+                    categories.append("FP")
+                elif error_type in {"FN_NO_PRED", "LOC_WRONG"}:
+                    categories.append(error_type)
+                elif error_type.startswith("PARTIAL_"):
+                    categories.append("PARTIAL")
+            other = consistency["crop" if model == "m31" else "m31"].get(record_id)
+            if other:
+                own, peer = count, int(other["correct_count"])
+                if own == 0 and peer == 0:
+                    categories.append("both_hard")
+                elif model == "m31" and own > peer or model == "crop" and peer > own:
+                    categories.append("m31_better")
+                elif model == "crop" and own > peer or model == "m31" and peer > own:
+                    categories.append("crop_better")
+            for category in sorted(set(categories)):
+                key = (model, row["task"], category)
+                if gallery_counts[key] >= 10:
+                    continue
+                gallery_writer.write(
+                    {
+                        "model_id": model,
+                        "task": row["task"],
+                        "category": category,
+                        "record_id": record_id,
+                        "source_image_id": row["source_image_id"],
+                        "image_relpath": row["image_relpath"],
+                        "gt_global": row["gt_global"],
+                        "correct_count": count,
+                        "rollouts": row["gallery_rollouts"],
+                    }
+                )
+                gallery_counts[key] += 1
+    gallery_writer.close()
+
+    runtime_rows = []
+    for model in MODELS:
+        for rollout in range(4):
+            progress_path = root / "progress" / model / f"rollout_{rollout}.jsonl"
+            latest = last_jsonl_row(progress_path) or {}
+            runtime_rows.append(
+                {
+                    "model_id": model,
+                    "rollout_id": rollout,
+                    "status": latest.get("status"),
+                    "completed": latest.get("completed"),
+                    "total": latest.get("total"),
+                    "elapsed_seconds": latest.get("elapsed_seconds"),
+                    "throughput_samples_per_second": latest.get(
+                        "throughput_samples_per_second"
+                    ),
+                    "remaining_seconds": latest.get("remaining_seconds"),
+                    "estimated_completion": latest.get("estimated_completion"),
+                    "errors": latest.get("errors"),
+                }
+            )
+    total_eta = last_jsonl_row(root / "progress" / "total_eta.jsonl")
+    selection_count_rows = [
+        {"scope": scope, "category": category, "samples": count}
+        for (scope, category), count in sorted(selection_counts.items())
+    ]
+    analysis = {
+        "schema_version": SCHEMA_VERSION,
+        "created_at": utc_now(),
+        "semantics": {
+            "rollout_4_plus_4": "cross-model consistency only",
+            "not_pass_at_8": True,
+            "not_one_policy_grpo_group": True,
+            "grpo_group_rule": "same model + same image/crop + same prompt, four answers",
+            "official_main_iou_threshold": 0.1,
+            "rescored_thresholds_without_inference": [0.3, 0.5],
+            "image_confusion": "presence-level GT/pred emptiness; wrong location remains Image TP",
+            "bbox_tn_defined": False,
+        },
+        "paths": {"output_root": str(root), "bundle_root": str(bundle)},
+        "per_rollout": per_rollout,
+        "per_task": per_task,
+        "four_rollout_summary": four_rollout_summary,
+        "correct_0to4": correct_rows,
+        "joint_0to8_and_5x5": joint_rows,
+        "common_image_task_intersection": len(common_ids),
+        "error_subtypes": error_rows,
+        "selection_counts": selection_count_rows,
+        "runtime_eta": runtime_rows,
+        "total_eta_last_snapshot": total_eta,
+    }
+    analysis_path = reports / "ui5_train_rollout_analysis.json"
+    atomic_json(analysis_path, analysis)
+    run_config = {
+        "schema_version": SCHEMA_VERSION,
+        "created_at": utc_now(),
+        "models": {
+            model: {
+                "checkpoint": run_metadata.get(model, {}).get("checkpoint"),
+                "git_commit": run_metadata.get(model, {}).get("git_commit"),
+                "baseline_git_commit": run_metadata.get(model, {}).get(
+                    "baseline_git_commit"
+                ),
+                "generation_config": run_metadata.get(model, {}).get(
+                    "generation_config"
+                ),
+                "rollouts": 4,
+            }
+            for model in MODELS
+        },
+        "rollout_seeds": {
+            model: run_metadata.get(model, {}).get("seeds", [])
+            for model in MODELS
+        },
+        "generation": {
+            "dtype": "bf16",
+            "attention": "sdpa",
+            "mode": "hybrid",
+            "sampling": True,
+            "main_iou": 0.1,
+            "rescore_iou": [0.3, 0.5],
+        },
+        "bundle_root": str(bundle),
+        "output_root": str(root),
+    }
+    atomic_json(root / "run_config.snapshot.json", run_config)
+    overview = {
+        "title": "UI5 train dual-model 4+4 rollout analysis",
+        "created_at": analysis["created_at"],
+        "main_iou_threshold": 0.1,
+        "rollout_semantics": "cross-model consistency; not pass@8",
+        "grpo_semantics": "four answers from one model and one image/crop prompt only",
+        "common_image_task_intersection": len(common_ids),
+        "raw_results": str(root / "raw"),
+        "analysis_json": str(analysis_path),
+    }
+    tables = {
+        "overview": [],
+        "per_rollout": per_rollout,
+        "per_task": per_task,
+        "image_presence_confusion": [
+            {
+                key: row[key]
+                for key in (
+                    "model_id",
+                    "rollout_id",
+                    "task",
+                    "iou_threshold",
+                    "total_samples",
+                    "image_TP",
+                    "image_TN",
+                    "image_FP",
+                    "image_FN",
+                    "image_TP_ratio",
+                    "image_TN_ratio",
+                    "image_FP_ratio",
+                    "image_FN_ratio",
+                    "precision",
+                    "recall",
+                    "specificity",
+                    "FPR",
+                    "FNR",
+                    "NPV",
+                    "accuracy",
+                    "balanced_accuracy",
+                    "F1",
+                )
+            }
+            for row in per_task
+        ],
+        "bbox_metrics": [
+            {
+                key: row[key]
+                for key in (
+                    "model_id",
+                    "rollout_id",
+                    "task",
+                    "iou_threshold",
+                    "bbox_TP",
+                    "bbox_FP",
+                    "bbox_FN",
+                    "bbox_precision",
+                    "bbox_recall",
+                    "bbox_F1",
+                    "mean_matched_iou",
+                    "mean_center_distance_px",
+                    "mean_center_distance_normalized",
+                    "mean_pred_gt_area_ratio",
+                )
+            }
+            for row in per_task
+        ],
+        "correct_0to4": correct_rows,
+        "joint_0to8": joint_rows,
+        "error_subtypes": error_rows,
+        "selection_counts": selection_count_rows,
+        "runtime_eta": runtime_rows,
+        "four_rollout_summary": four_rollout_summary,
+        "sample_index": [
+            {
+                "model_id": model,
+                "task": task,
+                "category": category,
+                "samples": count,
+            }
+            for (model, task, category), count in sorted(gallery_counts.items())
+        ],
+    }
+    workbook(reports / "ui5_train_rollout_analysis.xlsx", overview, tables)
+    print(json.dumps({"analysis": str(analysis_path), "common": len(common_ids)}, ensure_ascii=False))
+    return analysis
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    run(parse_args(argv))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

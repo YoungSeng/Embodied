@@ -1,0 +1,61 @@
+# Submit: mlx job submitv2 --path jobs/ui5_train_rollouts_h20x2_merlin.yaml
+caption: 'UI5 Train Dual-Model 4+4 Rollouts - H20x2'
+
+jobDefVersion:
+  entrypointMode: FULL_SCRIPT
+
+  gitRepo:
+    mnt: /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-ui5-rollout8-crop
+
+  imageMeta:
+    imageSource: url
+    imageUrl: hub.byted.org/base/lab.cuda.devel:0ffcd17bfdf8d07a198e6cff167eae26
+    imageVid: d8ap37f1enlcr23291ug
+
+  lazyDownloadCode: true
+  name: 'ui5-train-rollout8-20260903-h20x2'
+
+  resource:
+    arnoldConfig:
+      clusterId: 20
+      elasticTraining: {}
+      groupIds:
+        - 1000
+      bytenasVolumes:
+        - name: intelligent-service-arnold-hl
+          accessMode: RW
+          roles:
+            - worker
+          subPath: ""
+      keepMins: 1
+      preemptible: false
+      quotaPool: default
+      roles:
+        - name: worker
+          num: 1
+          cpu: 40
+          gpu: 2
+          gpuv: NVIDIA_H20
+          queueName: compute-329-hl-cloudnative-ai-iesqa.llm4se-guarantee
+          memory: 460800
+          ports: 1
+    backend: ARNOLD
+
+  volumes:
+    - volumeId: 18834
+      mountPath: /mnt/bn/intelligent-service-arnold-hl
+
+jobRunParams:
+  entrypointFullScript: |
+    set -Eeuo pipefail
+    export WORKSPACE=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace
+    export CROP_REPO=${WORKSPACE}/code/Eagle/Embodied-ui5-rollout8-crop
+    export M31_REPO=${WORKSPACE}/code/Eagle/Embodied-ui5-rollout8-m31
+    cd "${CROP_REPO}"
+    exec bash shell/run_ui5_train_rollouts_h20x2.sh
+
+  envsList:
+    OUTPUT_ROOT: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_rollouts/ui5-train-rollout8-20260903"
+    BUNDLE_ROOT: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_data/ui5_train_rollout_bundle_v1"
+
+namespace: /user/sicheng.yang
