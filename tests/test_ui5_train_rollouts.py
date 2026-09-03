@@ -22,6 +22,7 @@ import aggregate_ui5_train_rollouts as aggregate
 import preflight_ui5_train_rollouts as preflight
 import prepare_ui5_train_rollout_bundle as prepare
 import render_ui5_train_rollout_gallery as gallery
+import snapshot_ui5_train_rollouts as snapshot
 from run_ui5_train_rollout_worker import load_module, score_prediction
 
 
@@ -245,11 +246,38 @@ class UI5TrainRolloutTest(unittest.TestCase):
             output = root / "rollouts"
             output.mkdir()
             samples = prepare.read_jsonl(bundle / "manifest" / "task_samples.jsonl")
+            first_snapshot, first_summary = snapshot.create_snapshot(
+                output,
+                bundle,
+                kind="hourly",
+                scheduled_hour=3,
+                started_at_epoch=0.0,
+                created_at_epoch=3 * 3600 + 1,
+            )
+            self.assertTrue(first_snapshot.name.startswith("hour_003_"))
+            self.assertEqual(
+                first_summary["difficulty_counts"],
+                {
+                    "easy": 0,
+                    "medium": 0,
+                    "hard": 0,
+                    "incomplete_or_runtime_error": 5,
+                },
+            )
+            self.assertEqual(first_summary["file_counts"]["delta_since_previous"], 5)
             for model in ("m31", "crop"):
                 for rollout in range(4):
                     raw_rows = []
                     for sample in samples:
-                        correct = rollout < (2 if model == "m31" else 1)
+                        task = sample["task"]
+                        if task == "cropping":
+                            correct = True
+                        elif task == "occlusion":
+                            correct = False
+                        elif task == "content_missing":
+                            correct = model == "m31"
+                        else:
+                            correct = rollout < (2 if model == "m31" else 1)
                         pred = sample["gt_global"] if correct else [[70, 70, 90, 90]]
                         score = score_prediction(
                             scorer,
@@ -365,6 +393,62 @@ class UI5TrainRolloutTest(unittest.TestCase):
                             }
                         ],
                     )
+            second_snapshot, second_summary = snapshot.create_snapshot(
+                output,
+                bundle,
+                kind="hourly",
+                scheduled_hour=6,
+                started_at_epoch=0.0,
+                created_at_epoch=6 * 3600 + 1,
+            )
+            self.assertTrue(second_snapshot.name.startswith("hour_006_"))
+            self.assertEqual(
+                second_summary["difficulty_counts"],
+                {
+                    "easy": 1,
+                    "medium": 2,
+                    "hard": 1,
+                    "incomplete_or_runtime_error": 1,
+                },
+            )
+            self.assertEqual(second_summary["file_counts"]["delta_since_previous"], 5)
+            self.assertEqual(second_summary["grpo_ready_counts"], {"m31": 1, "crop": 1})
+            medium_rows = snapshot.read_jsonl(second_snapshot / "medium.jsonl")
+            no_reward_variance = next(
+                row for row in medium_rows if row["task"] == "content_missing"
+            )
+            self.assertEqual(no_reward_variance["m31_correct_count"], 4)
+            self.assertEqual(no_reward_variance["crop_correct_count"], 0)
+            self.assertFalse(no_reward_variance["grpo_ready_m31"])
+            self.assertFalse(no_reward_variance["grpo_ready_crop"])
+            third_snapshot, third_summary = snapshot.create_snapshot(
+                output,
+                bundle,
+                kind="hourly",
+                scheduled_hour=9,
+                started_at_epoch=0.0,
+                created_at_epoch=9 * 3600 + 1,
+            )
+            self.assertTrue(third_snapshot.name.startswith("hour_009_"))
+            self.assertEqual(third_summary["file_counts"]["delta_since_previous"], 0)
+            final_snapshot, final_summary = snapshot.create_snapshot(
+                output,
+                bundle,
+                kind="final",
+                scheduled_hour=None,
+                started_at_epoch=0.0,
+                export_selection_dir=output / "selection",
+                created_at_epoch=12 * 3600 + 1,
+            )
+            self.assertTrue(final_snapshot.name.startswith("final_"))
+            self.assertEqual(final_summary["file_counts"]["delta_since_previous"], 0)
+            self.assertFalse((first_snapshot / "cross_model_complete8.jsonl").exists())
+            launcher = (PROJECT_ROOT / "shell" / "run_ui5_train_rollouts_h20x2.sh").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("SNAPSHOT_INTERVAL_SECONDS=10800", launcher)
+            self.assertIn("NEXT_SNAPSHOT_HOUR=$((NEXT_SNAPSHOT_HOUR + 3))", launcher)
+            self.assertNotIn("SNAPSHOT_SAMPLE", launcher)
             analysis = aggregate.run(
                 SimpleNamespace(output_root=output, bundle_root=bundle, repo_root=PROJECT_ROOT)
             )
@@ -379,6 +463,18 @@ class UI5TrainRolloutTest(unittest.TestCase):
             self.assertEqual(m31_r3["runtime_error"], 1)
             self.assertEqual(m31_r3["inference_success"], 4)
             self.assertTrue(all(row["complete"] for row in analysis["raw_alignment"]))
+            self.assertEqual(
+                analysis["difficulty_file_counts"],
+                {
+                    "easy": 1,
+                    "medium": 2,
+                    "hard": 1,
+                    "incomplete_or_runtime_error": 1,
+                    "grpo_m31_ready": 1,
+                    "grpo_crop_ready": 1,
+                },
+            )
+            self.assertFalse((output / "selection" / "cross_model_complete8.jsonl").exists())
             self.assertTrue((output / "summary.json").is_file())
             self.assertTrue((output / "reports" / "ui5_train_rollout_analysis.xlsx").is_file())
             rendered = gallery.render(

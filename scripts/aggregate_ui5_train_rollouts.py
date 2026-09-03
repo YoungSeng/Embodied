@@ -16,9 +16,14 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from run_ui5_train_rollout_worker import last_jsonl_row, load_module, score_prediction
+from snapshot_ui5_train_rollouts import (
+    DIFFICULTIES,
+    build_difficulty_records,
+    write_difficulty_exports,
+)
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MODELS = ("m31", "crop")
 TASKS = ("occlusion", "cropping", "text_overflow", "text_ellipsis", "content_missing")
 THRESHOLDS = (0.1, 0.3, 0.5)
@@ -448,13 +453,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     runtime_error_types = Counter()
     runtime_excluded_groups = Counter()
     run_metadata: dict[str, dict[str, Any]] = {}
-    selection_writers: dict[tuple[str, str], JsonlWriter] = {}
-    for model in MODELS:
-        for category in ("easy", "partial", "hard", "grpo_candidates"):
-            selection_writers[(model, category)] = JsonlWriter(
-                selection_dir / f"{model}_{category}.jsonl"
-            )
-
     for model in MODELS:
         for group in grouped_rollouts(root, model):
             first = group[0]
@@ -529,72 +527,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             correct_distributions[(model, "micro", correct_count)] += 1
             base = selection_base(group, correct_count)
             base["model_id"] = model
-            if correct_count == 4:
-                selection_writers[(model, "easy")].write(base)
-                selection_counts[(model, "easy")] += 1
-            elif correct_count == 0:
-                selection_writers[(model, "hard")].write(base)
-                selection_counts[(model, "hard")] += 1
-            else:
-                selection_writers[(model, "partial")].write(base)
-                selection_counts[(model, "partial")] += 1
-            excluded = bool(
-                first.get("pipeline_coverage_failure")
-                or first.get("annotation_anomaly")
-                or first.get("coordinate_transform_anomaly")
-                or any(row.get("parse_status") == "parse_error" for row in group)
-                or any(row.get("runtime_error") for row in group)
-            )
-            if model == "m31" and 1 <= correct_count <= 3 and not excluded:
-                candidate = dict(base)
-                candidate.update(
-                    {
-                        "group_model_id": model,
-                        "group_key": first["record_id"],
-                        "crop_id": "full_image",
-                        "answers": [row["raw_output"] for row in group],
-                        "rewards_exact": [
-                            bool(threshold_scores[(int(row["rollout_id"]), 0.1)]["exact_correct"])
-                            for row in group
-                        ],
-                        "group_size": 4,
-                        "cross_model_group": False,
-                    }
-                )
-                selection_writers[(model, "grpo_candidates")].write(candidate)
-                selection_counts[(model, "grpo_candidates")] += 1
-            if model == "crop" and not excluded:
-                crop_maps = [
-                    {str(item["crop_id"]): item for item in row.get("crop_outputs", [])}
-                    for row in group
-                ]
-                crop_ids = set(crop_maps[0])
-                if any(set(mapping) != crop_ids for mapping in crop_maps[1:]):
-                    raise RuntimeError(f"crop IDs differ across rollouts: {first['record_id']}")
-                for crop_id in sorted(crop_ids):
-                    items = [mapping[crop_id] for mapping in crop_maps]
-                    local_correct = sum(bool(item.get("exact_correct")) for item in items)
-                    if not 1 <= local_correct <= 3:
-                        continue
-                    if any(item.get("parse_status") == "parse_error" for item in items):
-                        continue
-                    candidate = dict(base)
-                    candidate.update(
-                        {
-                            "group_model_id": model,
-                            "group_key": f"{first['record_id']}:{crop_id}",
-                            "crop_id": crop_id,
-                            "crop_xyxy": items[0]["crop_xyxy"],
-                            "gt_local": items[0]["gt_local"],
-                            "answers": [item["raw_output"] for item in items],
-                            "rewards_exact": [bool(item["exact_correct"]) for item in items],
-                            "correct_count": local_correct,
-                            "group_size": 4,
-                            "cross_model_group": False,
-                        }
-                    )
-                    selection_writers[(model, "grpo_candidates")].write(candidate)
-                    selection_counts[(model, "grpo_candidates")] += 1
             compact_gallery = []
             for row in group:
                 compact_gallery.append(
@@ -615,9 +547,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "error_types": sorted({str(row["error_type"]) for row in group}),
                 "gallery_rollouts": compact_gallery,
             }
-
-    for writer in selection_writers.values():
-        writer.close()
 
     common_ids = sorted(set(consistency["m31"]) & set(consistency["crop"]))
     joint_0to8 = Counter()
@@ -657,6 +586,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             selection_counts[("cross", category)] += 1
     for writer in cross_writers.values():
         writer.close()
+
+    difficulty_records, _ = build_difficulty_records(root, bundle)
+    difficulty_file_counts = write_difficulty_exports(
+        selection_dir, difficulty_records
+    )
+    difficulty_counts = Counter(
+        str(row["difficulty"]) for row in difficulty_records
+    )
+    difficulty_task_counts = Counter(
+        (str(row["task"]), str(row["difficulty"]))
+        for row in difficulty_records
+    )
+    for difficulty in DIFFICULTIES:
+        selection_counts[("cross_model_8", difficulty)] = difficulty_file_counts[
+            difficulty
+        ]
+    selection_counts[("cross_model_8", "grpo_m31_ready")] = (
+        difficulty_file_counts["grpo_m31_ready"]
+    )
+    selection_counts[("cross_model_8", "grpo_crop_ready")] = (
+        difficulty_file_counts["grpo_crop_ready"]
+    )
 
     per_task: list[dict[str, Any]] = []
     per_rollout: list[dict[str, Any]] = []
@@ -772,6 +723,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for task in (*TASKS, "micro")
         for count in range(5)
     ]
+    difficulty_rows = []
+    for task in (*TASKS, "micro"):
+        denominator = (
+            len(difficulty_records)
+            if task == "micro"
+            else sum(
+                1 for row in difficulty_records if str(row["task"]) == task
+            )
+        )
+        for difficulty in DIFFICULTIES:
+            samples = (
+                difficulty_counts[difficulty]
+                if task == "micro"
+                else difficulty_task_counts[(task, difficulty)]
+            )
+            difficulty_rows.append(
+                {
+                    "task": task,
+                    "difficulty": difficulty,
+                    "samples": samples,
+                    "proportion": safe_div(samples, denominator),
+                }
+            )
     joint_rows = [
         {
             "table": "joint_0to8",
@@ -894,12 +868,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "rescored_thresholds_without_inference": [0.3, 0.5],
             "image_confusion": "presence-level GT/pred emptiness; wrong location remains Image TP",
             "bbox_tn_defined": False,
+            "difficulty_rule": (
+                "only eight complete runtime-error-free records enter easy/medium/hard"
+            ),
+            "grpo_ready_rule": (
+                "medium subset; same-model four-rollout correct count is 1..3"
+            ),
         },
         "paths": {"output_root": str(root), "bundle_root": str(bundle)},
         "per_rollout": per_rollout,
         "per_task": per_task,
         "four_rollout_summary": four_rollout_summary,
         "correct_0to4": correct_rows,
+        "difficulty_8route": difficulty_rows,
+        "difficulty_file_counts": difficulty_file_counts,
         "joint_0to8_and_5x5": joint_rows,
         "common_image_task_intersection": len(common_ids),
         "error_subtypes": error_rows,
@@ -1013,6 +995,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             for row in per_task
         ],
         "correct_0to4": correct_rows,
+        "difficulty_8route": difficulty_rows,
         "joint_0to8": joint_rows,
         "error_subtypes": error_rows,
         "execution_counts": execution_rows,
@@ -1043,6 +1026,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "execution_counts": execution_rows,
             "runtime_errors": runtime_error_rows,
             "correct_0to4": correct_rows,
+            "difficulty_8route": difficulty_rows,
+            "difficulty_file_counts": difficulty_file_counts,
             "analysis_json": str(analysis_path),
             "analysis_excel": str(
                 reports / "ui5_train_rollout_analysis.xlsx"

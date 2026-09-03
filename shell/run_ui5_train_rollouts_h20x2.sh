@@ -37,6 +37,7 @@ test -f "${M31_REPO}/scripts/inference_ui_defect_locany.py" || { echo "ERROR: M3
 test -f "${CROP_REPO}/scripts/inference_ui_defect_locany.py" || { echo "ERROR: crop inference entrypoint missing" >&2; exit 26; }
 test -f "${ORCHESTRATOR_REPO}/scripts/run_ui5_train_rollout_worker.py" || { echo "ERROR: v2 rollout worker missing" >&2; exit 27; }
 test -f "${ORCHESTRATOR_REPO}/scripts/aggregate_ui5_train_rollouts.py" || { echo "ERROR: v2 aggregator missing" >&2; exit 28; }
+test -f "${ORCHESTRATOR_REPO}/scripts/snapshot_ui5_train_rollouts.py" || { echo "ERROR: v2 incremental snapshotter missing" >&2; exit 29; }
 
 export PATH="${ENV_DIR}/bin:${PATH}"
 export PYTHONUNBUFFERED=1
@@ -62,6 +63,13 @@ CUDA_VISIBLE_DEVICES="" "${PYTHON_BIN}" "${ORCHESTRATOR_REPO}/scripts/preflight_
 
 "${PYTHON_BIN}" -c 'import openpyxl, scipy, PIL; assert tuple(map(int, openpyxl.__version__.split(".")[:2])) >= (3, 1)'
 nvidia-smi
+
+RUN_STARTED_EPOCH=$(date +%s)
+NEXT_SNAPSHOT_HOUR=3
+SNAPSHOT_INTERVAL_SECONDS=10800
+NEXT_SNAPSHOT_ELAPSED_SECONDS=${SNAPSHOT_INTERVAL_SECONDS}
+snapshot_failures=0
+echo "[ROLLOUT_START] epoch=${RUN_STARTED_EPOCH} first_snapshot_hour=${NEXT_SNAPSHOT_HOUR} interval_seconds=${SNAPSHOT_INTERVAL_SECONDS}"
 
 PIDS=()
 NAMES=()
@@ -162,6 +170,31 @@ terminate_workers() {
 trap 'terminate_workers; exit 130' INT
 trap 'terminate_workers; exit 143' TERM
 
+run_incremental_snapshot() {
+  local kind=$1
+  local scheduled_hour=${2:-}
+  local snapshot_args=(
+    --output-root "${OUTPUT_ROOT}"
+    --bundle-root "${BUNDLE_ROOT}"
+    --kind "${kind}"
+    --started-at-epoch "${RUN_STARTED_EPOCH}"
+  )
+  if [[ "${kind}" == "hourly" ]]; then
+    snapshot_args+=(--scheduled-hour "${scheduled_hour}")
+  else
+    snapshot_args+=(--export-selection-dir "${OUTPUT_ROOT}/selection")
+  fi
+  echo "[INCREMENTAL_SNAPSHOT_START] kind=${kind} scheduled_hour=${scheduled_hour:-none}"
+  if CUDA_VISIBLE_DEVICES="" "${PYTHON_BIN}" \
+    "${ORCHESTRATOR_REPO}/scripts/snapshot_ui5_train_rollouts.py" \
+    "${snapshot_args[@]}"; then
+    echo "[INCREMENTAL_SNAPSHOT_OK] kind=${kind} scheduled_hour=${scheduled_hour:-none}"
+  else
+    snapshot_failures=$((snapshot_failures + 1))
+    echo "[INCREMENTAL_SNAPSHOT_FAIL] kind=${kind} scheduled_hour=${scheduled_hour:-none}" >&2
+  fi
+}
+
 while true; do
   running=0
   for pid in "${PIDS[@]}"; do
@@ -173,6 +206,13 @@ while true; do
     --mode progress-snapshot \
     --output-root "${OUTPUT_ROOT}" \
     --expected-workers 8 || true
+  current_epoch=$(date +%s)
+  elapsed_seconds=$((current_epoch - RUN_STARTED_EPOCH))
+  while (( elapsed_seconds >= NEXT_SNAPSHOT_ELAPSED_SECONDS )); do
+    run_incremental_snapshot hourly "${NEXT_SNAPSHOT_HOUR}"
+    NEXT_SNAPSHOT_HOUR=$((NEXT_SNAPSHOT_HOUR + 3))
+    NEXT_SNAPSHOT_ELAPSED_SECONDS=$((NEXT_SNAPSHOT_ELAPSED_SECONDS + SNAPSHOT_INTERVAL_SECONDS))
+  done
   if [[ ${running} -eq 0 ]]; then
     break
   fi
@@ -191,6 +231,8 @@ for index in "${!PIDS[@]}"; do
 done
 set -e
 
+run_incremental_snapshot final
+
 aggregate_status=0
 gallery_status=0
 set +e
@@ -207,8 +249,8 @@ if [[ ${aggregate_status} -eq 0 ]]; then
 fi
 set -e
 
-if [[ ${worker_failures} -ne 0 || ${aggregate_status} -ne 0 || ${gallery_status} -ne 0 ]]; then
-  echo "ERROR: rollout job failed workers=${worker_failures} aggregate=${aggregate_status} gallery=${gallery_status}" >&2
+if [[ ${worker_failures} -ne 0 || ${snapshot_failures} -ne 0 || ${aggregate_status} -ne 0 || ${gallery_status} -ne 0 ]]; then
+  echo "ERROR: rollout job failed workers=${worker_failures} snapshots=${snapshot_failures} aggregate=${aggregate_status} gallery=${gallery_status}" >&2
   exit 1
 fi
 echo "UI5 train rollout 4+4 completed: ${OUTPUT_ROOT}"
