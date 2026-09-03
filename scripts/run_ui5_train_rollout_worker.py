@@ -23,7 +23,7 @@ from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BASE_COMMITS = {"m31": "5d7a313", "crop": "945ce39"}
 MODEL_IDS = ("m31", "crop")
 
@@ -40,8 +40,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--inference-script", type=Path, default=None)
-    parser.add_argument("--rollout-id", type=int)
-    parser.add_argument("--seed", type=int)
+    parser.add_argument("--rollout-ids")
+    parser.add_argument("--seeds")
+    parser.add_argument("--physical-gpu", type=int)
+    parser.add_argument("--gpu-model-processes", type=int, default=2)
     parser.add_argument("--part-size", type=int, default=10000)
     parser.add_argument("--progress-every", type=int, default=100)
     parser.add_argument("--progress-seconds", type=float, default=60.0)
@@ -344,13 +346,26 @@ class ProgressWriter:
         self.started = time.monotonic()
         self.last_emit = self.started
 
-    def emit(self, completed: int, status: str, *, force: bool = False, errors: int = 0) -> None:
+    def should_emit(self, attempted: int, every: int, seconds: float) -> bool:
         now = time.monotonic()
-        if not force and completed % 100 != 0 and now - self.last_emit < 60:
+        return bool(attempted % every == 0 or now - self.last_emit >= seconds)
+
+    def emit(
+        self,
+        counters: Mapping[str, int],
+        status: str,
+        *,
+        force: bool = False,
+        memory: Mapping[str, Any] | None = None,
+    ) -> None:
+        now = time.monotonic()
+        attempted = int(counters["attempted"])
+        if not force and not self.should_emit(attempted, 100, 60.0):
             return
         elapsed = max(0.0, now - self.started)
-        throughput = completed / elapsed if completed and elapsed else 0.0
-        remaining = (self.total - completed) / throughput if throughput else None
+        inference_success = int(counters["inference_success"])
+        throughput = inference_success / elapsed if inference_success and elapsed else 0.0
+        remaining = (self.total - attempted) / throughput if throughput else None
         eta = (
             datetime.fromtimestamp(time.time() + remaining, timezone.utc).isoformat()
             if remaining is not None
@@ -362,17 +377,35 @@ class ProgressWriter:
             "rollout_id": self.rollout_id,
             "seed": self.seed,
             "status": status,
-            "completed": completed,
+            "attempted": attempted,
+            "completed": attempted,
+            "inference_success": inference_success,
+            "runtime_error": int(counters["runtime_error"]),
+            "parse_error": int(counters["parse_error"]),
             "total": self.total,
+            "throughput_inference_success_per_second": throughput,
             "throughput_samples_per_second": throughput,
             "elapsed_seconds": elapsed,
             "remaining_seconds": remaining,
             "estimated_completion": eta,
-            "errors": errors,
+            "gpu_memory": dict(memory or {}),
         }
         self.handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
         self.handle.flush()
         os.fsync(self.handle.fileno())
+        print(
+            "[PROGRESS] "
+            f"model={self.model_id} rollout={self.rollout_id} "
+            f"attempted={attempted}/{self.total} "
+            f"inference_success={inference_success} "
+            f"runtime_error={counters['runtime_error']} "
+            f"parse_error={counters['parse_error']} "
+            f"throughput={throughput:.6f} elapsed={elapsed:.1f} "
+            f"eta_seconds={remaining} estimated_completion={eta} "
+            f"gpu_allocated_gib={(memory or {}).get('allocated_gib')} "
+            f"gpu_reserved_gib={(memory or {}).get('reserved_gib')}",
+            flush=True,
+        )
         self.last_emit = now
 
     def close(self) -> None:
@@ -587,22 +620,19 @@ def worker_record(
         "sample_seed": result["sample_seed"],
         "latency_seconds": result["latency_seconds"],
         "finished_at": utc_now(),
+        "inference_success": True,
+        "runtime_error": None,
     }
 
 
 def error_record(
-    args: argparse.Namespace, code: Mapping[str, Any], row: Mapping[str, Any], exc: Exception
+    args: argparse.Namespace,
+    code: Mapping[str, Any],
+    row: Mapping[str, Any],
+    exc: Exception,
+    latency_seconds: float,
 ) -> dict[str, Any]:
     width, height = int(row["width"]), int(row["height"])
-    score = {
-        "matched_pairs": [],
-        "TP_box": 0,
-        "FP_box": 0 if row.get("gt_global") else 1,
-        "FN_box": len(row.get("gt_global", [])),
-        "image_confusion": "FN" if row.get("gt_global") else "FP",
-        "error_type": "PARSE_ERROR",
-        "exact_correct": False,
-    }
     return {
         "schema_version": SCHEMA_VERSION,
         "model_id": args.model_id,
@@ -626,12 +656,18 @@ def error_record(
         "prompt": row["prompt"],
         "gt_local": row.get("gt_global", []),
         "gt_global": row.get("gt_global", []),
-        "raw_output": "",
-        "parse_status": "parse_error",
-        "parse_warnings": [f"runtime exception: {type(exc).__name__}: {exc}"],
-        "pred_local": [],
-        "pred_global": [],
-        **score,
+        "raw_output": None,
+        "parse_status": "not_attempted",
+        "parse_warnings": [],
+        "pred_local": None,
+        "pred_global": None,
+        "matched_pairs": [],
+        "TP_box": None,
+        "FP_box": None,
+        "FN_box": None,
+        "image_confusion": None,
+        "error_type": "RUNTIME_ERROR",
+        "exact_correct": None,
         "iou_threshold": args.iou_threshold,
         "gate_diagnostics": {},
         "crop_outputs": [],
@@ -641,14 +677,59 @@ def error_record(
         "coordinate_transform_anomaly": bool(row.get("coordinate_transform_anomaly")),
         "grpo_eligible": False,
         "runtime_error": {
-            "type": type(exc).__name__,
+            "type": classify_runtime_error(exc),
+            "python_type": type(exc).__name__,
             "message": str(exc),
-            "traceback": traceback.format_exc(limit=20),
+            "traceback": traceback.format_exc(limit=50),
         },
+        "inference_success": False,
         "sample_seed": stable_seed(int(args.seed), str(row["record_id"])),
-        "latency_seconds": 0.0,
+        "latency_seconds": latency_seconds,
         "finished_at": utc_now(),
     }
+
+
+def parse_int_csv(value: str | None, name: str) -> list[int]:
+    if value is None:
+        raise ValueError(f"--{name} is required")
+    try:
+        values = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise ValueError(f"--{name} must be a comma-separated integer list") from exc
+    if not values:
+        raise ValueError(f"--{name} cannot be empty")
+    return values
+
+
+def classify_runtime_error(exc: BaseException) -> str:
+    message = f"{type(exc).__name__}: {exc}".lower()
+    if "out of memory" in message or "cuda_oom" in message:
+        return "CUDA_OOM"
+    if "cuda" in message:
+        return "CUDA_ERROR"
+    return type(exc).__name__
+
+
+def cuda_memory(torch: Any) -> dict[str, Any]:
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        divisor = float(1024**3)
+        return {
+            "allocated_gib": round(torch.cuda.memory_allocated() / divisor, 3),
+            "reserved_gib": round(torch.cuda.memory_reserved() / divisor, 3),
+            "device_free_gib": round(free_bytes / divisor, 3),
+            "device_total_gib": round(total_bytes / divisor, 3),
+        }
+    except Exception as exc:
+        return {"memory_query_error": f"{type(exc).__name__}: {exc}"}
+
+
+def rollout_args(
+    args: argparse.Namespace, rollout_id: int, seed: int
+) -> argparse.Namespace:
+    values = dict(vars(args))
+    values.update({"rollout_id": rollout_id, "seed": seed})
+    return argparse.Namespace(**values)
 
 
 def validate_run_args(args: argparse.Namespace) -> None:
@@ -657,16 +738,27 @@ def validate_run_args(args: argparse.Namespace) -> None:
         "checkpoint": args.checkpoint,
         "processor-path": args.processor_path,
         "bundle-root": args.bundle_root,
-        "rollout-id": args.rollout_id,
-        "seed": args.seed,
+        "rollout-ids": args.rollout_ids,
+        "seeds": args.seeds,
+        "physical-gpu": args.physical_gpu,
     }
     missing = [name for name, value in required.items() if value is None]
     if missing:
         raise ValueError("run mode missing arguments: " + ", ".join(missing))
-    if args.rollout_id not in range(4):
-        raise ValueError("--rollout-id must be 0,1,2,3")
+    rollout_ids = parse_int_csv(args.rollout_ids, "rollout-ids")
+    seeds = parse_int_csv(args.seeds, "seeds")
+    if len(rollout_ids) != 2 or len(set(rollout_ids)) != 2:
+        raise ValueError("--rollout-ids must contain exactly two distinct rollout IDs")
+    if any(rollout_id not in range(4) for rollout_id in rollout_ids):
+        raise ValueError("--rollout-ids values must be in 0,1,2,3")
+    if len(seeds) != len(rollout_ids):
+        raise ValueError("--seeds must have one seed per rollout ID")
+    if args.gpu_model_processes != 2:
+        raise ValueError("formal H20x2 execution requires two model processes per GPU")
     if args.part_size <= 0:
         raise ValueError("--part-size must be positive")
+    if args.progress_every <= 0 or args.progress_seconds <= 0:
+        raise ValueError("progress intervals must be positive")
     if not 0 <= args.iou_threshold <= 1 or not 0 <= args.tile_nms_iou <= 1:
         raise ValueError("IoU thresholds must be in [0,1]")
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
@@ -721,104 +813,232 @@ def run_worker(args: argparse.Namespace) -> int:
                 for index, item in enumerate(metadata)
             ]
 
+    rollout_ids = parse_int_csv(args.rollout_ids, "rollout-ids")
+    seeds = parse_int_csv(args.seeds, "seeds")
+    assigned = [
+        rollout_args(args, rollout_id, seed)
+        for rollout_id, seed in zip(rollout_ids, seeds)
+    ]
+    output_root = args.output_root.expanduser().resolve(strict=False)
+    contexts = []
+    for assigned_args in assigned:
+        raw_dir = (
+            output_root
+            / "raw"
+            / str(args.model_id)
+            / f"rollout_{assigned_args.rollout_id}"
+        )
+        progress_path = (
+            output_root
+            / "progress"
+            / str(args.model_id)
+            / f"rollout_{assigned_args.rollout_id}.jsonl"
+        )
+        contexts.append(
+            {
+                "args": assigned_args,
+                "writer": PartWriter(raw_dir, args.part_size),
+                "progress": ProgressWriter(
+                    progress_path,
+                    str(args.model_id),
+                    int(assigned_args.rollout_id),
+                    int(assigned_args.seed),
+                    len(samples),
+                ),
+                "counters": {
+                    "attempted": 0,
+                    "inference_success": 0,
+                    "runtime_error": 0,
+                    "parse_error": 0,
+                },
+            }
+        )
+    rollout_text = ",".join(map(str, rollout_ids))
+    print(
+        "[MODEL_PROCESS_START] "
+        f"model={args.model_id} gpu={args.physical_gpu} pid={os.getpid()} "
+        f"rollouts={rollout_text} gpu_model_processes={args.gpu_model_processes} "
+        f"checkpoint={args.checkpoint} processor={args.processor_path}",
+        flush=True,
+    )
     inference_path = (
         args.inference_script.expanduser().resolve(strict=True)
         if args.inference_script is not None
         else repo / "scripts" / "inference_ui_defect_locany.py"
     )
-    module = load_module(inference_path, f"ui5_rollout_inference_{args.model_id}_{os.getpid()}")
-    scorer = load_module(
-        repo / "qwen3vl_merge_and_score_fixed_5tasks.py",
-        f"ui5_formal_scorer_{args.model_id}_{os.getpid()}",
-    )
-    tiling = None
-    if args.model_id == "crop":
-        tiling = load_module(
-            repo / "scripts" / "ui5_lossless_tiling.py",
-            f"ui5_lossless_tiling_worker_{os.getpid()}",
-        )
-    import torch
-    from PIL import Image
-
-    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
-        raise RuntimeError(
-            f"worker expected one visible CUDA device, got available={torch.cuda.is_available()} "
-            f"count={torch.cuda.device_count()}"
-        )
-    output_root = args.output_root.expanduser().resolve(strict=False)
-    raw_dir = output_root / "raw" / str(args.model_id) / f"rollout_{args.rollout_id}"
-    progress_path = (
-        output_root / "progress" / str(args.model_id) / f"rollout_{args.rollout_id}.jsonl"
-    )
-    writer = PartWriter(raw_dir, args.part_size)
-    progress = ProgressWriter(
-        progress_path, str(args.model_id), int(args.rollout_id), int(args.seed), len(samples)
-    )
-    errors = 0
-    completed_count = 0
+    load_started = time.monotonic()
+    memory_before: dict[str, Any] = {}
+    model_loaded = False
     try:
-        progress.emit(0, "loading_model", force=True)
-        model_args = make_generation_args(args)
+        module = load_module(
+            inference_path, f"ui5_rollout_inference_{args.model_id}_{os.getpid()}"
+        )
+        scorer = load_module(
+            repo / "qwen3vl_merge_and_score_fixed_5tasks.py",
+            f"ui5_formal_scorer_{args.model_id}_{os.getpid()}",
+        )
+        tiling = None
+        if args.model_id == "crop":
+            tiling = load_module(
+                repo / "scripts" / "ui5_lossless_tiling.py",
+                f"ui5_lossless_tiling_worker_{os.getpid()}",
+            )
+        import torch
+        from PIL import Image
+
+        if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+            raise RuntimeError(
+                "worker expected exactly one visible CUDA device; "
+                f"available={torch.cuda.is_available()} count={torch.cuda.device_count()}"
+            )
+        memory_before = cuda_memory(torch)
+        for context in contexts:
+            context["progress"].emit(
+                context["counters"], "loading_model", force=True, memory=memory_before
+            )
+        model_args = make_generation_args(assigned[0])
         inferencer = module.LocateAnythingInferencer(model_args)
-        progress.emit(0, "running", force=True)
-        for completed, row in enumerate(samples, 1):
+        torch.cuda.synchronize()
+        model_loaded = True
+        load_seconds = time.monotonic() - load_started
+        memory_after = cuda_memory(torch)
+        print(
+            "[MODEL_LOAD_OK] "
+            f"model={args.model_id} gpu={args.physical_gpu} pid={os.getpid()} "
+            f"rollouts={rollout_text} checkpoint={args.checkpoint} "
+            f"processor={args.processor_path} load_seconds={load_seconds:.3f} "
+            f"memory_before={json.dumps(memory_before, sort_keys=True)} "
+            f"memory_after={json.dumps(memory_after, sort_keys=True)}",
+            flush=True,
+        )
+        for context in contexts:
+            context["progress"].emit(
+                context["counters"], "running", force=True, memory=memory_after
+            )
+        for row in samples:
+            image = None
             try:
                 image_path = bundle / str(row["image_relpath"])
                 with Image.open(image_path) as opened:
                     image = opened.convert("RGB")
-                try:
-                    config = task_config(module, str(row["task"]))
-                    if args.model_id == "m31":
-                        result = full_image_prediction(
-                            module=module,
-                            inferencer=inferencer,
-                            scorer=scorer,
-                            row=row,
-                            image=image,
-                            args=args,
-                            config=config,
-                        )
-                    else:
-                        assert tiling is not None
-                        result = crop_prediction(
-                            module=module,
-                            tiling=tiling,
-                            inferencer=inferencer,
-                            scorer=scorer,
-                            row=row,
-                            crop_rows=crop_index[str(row["record_id"])],
-                            image=image,
-                            args=args,
-                            config=config,
-                        )
-                    record = worker_record(args, code, row, result)
-                finally:
-                    image.close()
             except Exception as exc:
-                errors += 1
-                record = error_record(args, code, row, exc)
-            writer.write(record)
-            completed_count = completed
-            now = time.monotonic()
-            if (
-                completed % args.progress_every == 0
-                or now - progress.last_emit >= args.progress_seconds
-                or completed == len(samples)
-            ):
-                writer.flush()
-                progress.emit(completed, "running", force=True, errors=errors)
-        writer.flush()
-        progress.emit(
-            len(samples), "completed" if not errors else "completed_with_errors",
-            force=True, errors=errors
+                for context in contexts:
+                    context["counters"]["attempted"] += 1
+                    context["counters"]["runtime_error"] += 1
+                    context["writer"].write(
+                        error_record(context["args"], code, row, exc, 0.0)
+                    )
+            else:
+                for context in contexts:
+                    inference_started = time.monotonic()
+                    context["counters"]["attempted"] += 1
+                    try:
+                        assigned_args = context["args"]
+                        assert image is not None
+                        config = task_config(module, str(row["task"]))
+                        if args.model_id == "m31":
+                            result = full_image_prediction(
+                                module=module,
+                                inferencer=inferencer,
+                                scorer=scorer,
+                                row=row,
+                                image=image,
+                                args=assigned_args,
+                                config=config,
+                            )
+                        else:
+                            assert tiling is not None
+                            result = crop_prediction(
+                                module=module,
+                                tiling=tiling,
+                                inferencer=inferencer,
+                                scorer=scorer,
+                                row=row,
+                                crop_rows=crop_index[str(row["record_id"])],
+                                image=image,
+                                args=assigned_args,
+                                config=config,
+                            )
+                        record = worker_record(assigned_args, code, row, result)
+                        context["counters"]["inference_success"] += 1
+                        context["counters"]["parse_error"] += int(
+                            result["parse_status"] == "parse_error"
+                            or result.get("contains_crop_parse_error", False)
+                        )
+                    except Exception as exc:
+                        context["counters"]["runtime_error"] += 1
+                        record = error_record(
+                            context["args"],
+                            code,
+                            row,
+                            exc,
+                            time.monotonic() - inference_started,
+                        )
+                    context["writer"].write(record)
+            finally:
+                if image is not None:
+                    image.close()
+            due_contexts = [
+                context
+                for context in contexts
+                if context["progress"].should_emit(
+                    context["counters"]["attempted"],
+                    args.progress_every,
+                    args.progress_seconds,
+                )
+            ]
+            if due_contexts:
+                memory = cuda_memory(torch)
+            for context in due_contexts:
+                progress = context["progress"]
+                counters = context["counters"]
+                context["writer"].flush()
+                progress.emit(counters, "running", force=True, memory=memory)
+        final_memory = cuda_memory(torch)
+        for context in contexts:
+            context["writer"].flush()
+            status = (
+                "completed"
+                if context["counters"]["runtime_error"] == 0
+                else "completed_with_runtime_errors"
+            )
+            context["progress"].emit(
+                context["counters"], status, force=True, memory=final_memory
+            )
+        return 0
+    except BaseException as exc:
+        load_seconds = time.monotonic() - load_started
+        error_type = classify_runtime_error(exc)
+        try:
+            import torch
+
+            memory_after_failure = cuda_memory(torch)
+        except Exception:
+            memory_after_failure = {}
+        event = "MODEL_LOAD_FAIL" if not model_loaded else "WORKER_FATAL"
+        print(
+            f"[{event}] "
+            f"model={args.model_id} gpu={args.physical_gpu} pid={os.getpid()} "
+            f"rollouts={rollout_text} checkpoint={args.checkpoint} "
+            f"processor={args.processor_path} error={error_type} "
+            f"message={str(exc)!r} load_seconds={load_seconds:.3f} "
+            f"memory_before={json.dumps(memory_before, sort_keys=True)} "
+            f"memory_after={json.dumps(memory_after_failure, sort_keys=True)}",
+            flush=True,
         )
-    except BaseException:
-        progress.emit(completed_count, "failed", force=True, errors=errors + 1)
-        raise
+        for context in contexts:
+            context["progress"].emit(
+                context["counters"],
+                "model_load_failed" if not model_loaded else "failed",
+                force=True,
+                memory=memory_after_failure,
+            )
+        traceback.print_exc()
+        return 2
     finally:
-        writer.close()
-        progress.close()
-    return 0 if errors == 0 else 1
+        for context in contexts:
+            context["writer"].close()
+            context["progress"].close()
 
 
 def last_jsonl_row(path: Path) -> dict[str, Any] | None:

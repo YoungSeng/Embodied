@@ -18,7 +18,7 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 from run_ui5_train_rollout_worker import last_jsonl_row, load_module, score_prediction
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MODELS = ("m31", "crop")
 TASKS = ("occlusion", "cropping", "text_overflow", "text_ellipsis", "content_missing")
 THRESHOLDS = (0.1, 0.3, 0.5)
@@ -89,6 +89,70 @@ def grouped_rollouts(root: Path, model: str) -> Iterator[list[dict[str, Any]]]:
                 f"unaligned {model} rollouts at row {row_index}: ids={ids}, rollouts={rollout_ids}"
             )
         yield sorted(rows, key=lambda row: int(row["rollout_id"]))
+
+
+def bundle_sample_keys(bundle: Path) -> tuple[list[tuple[str, str]], int]:
+    manifest = json.loads((bundle / "bundle_manifest.json").read_text(encoding="utf-8"))
+    expected_total = int(manifest["rollout_samples"])
+    keys: list[tuple[str, str]] = []
+    path = bundle / "manifest" / "task_samples.jsonl"
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            keys.append((str(row["record_id"]), str(row["sample_id"])))
+    if len(keys) != expected_total:
+        raise RuntimeError(
+            "bundle expected_total disagrees with task_samples: "
+            f"manifest={expected_total} rows={len(keys)}"
+        )
+    if len(set(keys)) != len(keys):
+        raise RuntimeError("bundle task_samples has duplicate record_id/sample_id keys")
+    return keys, expected_total
+
+
+def validate_raw_alignment(
+    root: Path, bundle: Path
+) -> tuple[list[dict[str, Any]], int]:
+    expected_keys, expected_total = bundle_sample_keys(bundle)
+    reports: list[dict[str, Any]] = []
+    for model in MODELS:
+        for rollout in range(4):
+            actual_count = 0
+            for row_index, row in enumerate(raw_iterator(root, model, rollout)):
+                if row_index >= expected_total:
+                    raise RuntimeError(
+                        f"{model} rollout {rollout} exceeds expected_total={expected_total}"
+                    )
+                actual = (str(row["record_id"]), str(row["sample_id"]))
+                expected = expected_keys[row_index]
+                if actual != expected:
+                    raise RuntimeError(
+                        f"{model} rollout {rollout} sample alignment mismatch at "
+                        f"row={row_index + 1}: actual={actual} expected={expected}"
+                    )
+                if int(row["rollout_id"]) != rollout:
+                    raise RuntimeError(
+                        f"{model} rollout directory contains rollout_id={row['rollout_id']}"
+                    )
+                actual_count += 1
+            if actual_count != expected_total:
+                raise RuntimeError(
+                    f"{model} rollout {rollout} count={actual_count}, "
+                    f"expected_total={expected_total}"
+                )
+            reports.append(
+                {
+                    "model_id": model,
+                    "rollout_id": rollout,
+                    "expected_total": expected_total,
+                    "actual_total": actual_count,
+                    "sample_ids_aligned": True,
+                    "complete": True,
+                }
+            )
+    return reports, expected_total
 
 
 def safe_div(numerator: float, denominator: float) -> float:
@@ -216,6 +280,8 @@ def compact_rollout(row: Mapping[str, Any]) -> dict[str, Any]:
         "FP_box": row["FP_box"],
         "FN_box": row["FN_box"],
         "latency_seconds": row["latency_seconds"],
+        "inference_success": row.get("inference_success", True),
+        "runtime_error": row.get("runtime_error"),
     }
 
 
@@ -308,7 +374,14 @@ def workbook(
                 rows = [{"note": "no rows"}]
             sheet.append(columns)
             for row in rows:
-                sheet.append([row.get(column) for column in columns])
+                sheet.append(
+                    [
+                        json.dumps(value, ensure_ascii=False, sort_keys=True)
+                        if isinstance(value, (dict, list))
+                        else value
+                        for value in (row.get(column) for column in columns)
+                    ]
+                )
         sheet.freeze_panes = "A2"
         sheet.auto_filter.ref = sheet.dimensions
         sheet.sheet_view.showGridLines = False
@@ -356,15 +429,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     selection_dir = root / "selection"
     reports.mkdir(parents=True, exist_ok=True)
     selection_dir.mkdir(parents=True, exist_ok=True)
+    raw_alignment, expected_total = validate_raw_alignment(root, bundle)
     scorer = load_module(
         repo / "qwen3vl_merge_and_score_fixed_5tasks.py",
         f"ui5_aggregate_formal_scorer_{os.getpid()}",
     )
     accumulators: dict[tuple[str, int, str, float], Accumulator] = defaultdict(Accumulator)
+    for model in MODELS:
+        for rollout in range(4):
+            for scope in (*TASKS, "micro"):
+                for threshold in THRESHOLDS:
+                    accumulators[(model, rollout, scope, threshold)]
     error_counts = Counter()
     consistency: dict[str, dict[str, dict[str, Any]]] = {model: {} for model in MODELS}
     correct_distributions = Counter()
     selection_counts = Counter()
+    execution_counts = Counter()
+    runtime_error_types = Counter()
+    runtime_excluded_groups = Counter()
     run_metadata: dict[str, dict[str, Any]] = {}
     selection_writers: dict[tuple[str, str], JsonlWriter] = {}
     for model in MODELS:
@@ -400,6 +482,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             width = int(first["image_size"]["width"])
             height = int(first["image_size"]["height"])
             for row in group:
+                rollout_id = int(row["rollout_id"])
+                for scope in (task, "micro"):
+                    execution_counts[(model, rollout_id, scope, "attempted")] += 1
+                runtime_error = row.get("runtime_error")
+                if runtime_error:
+                    runtime_type = str(runtime_error.get("type") or "UNKNOWN")
+                    for scope in (task, "micro"):
+                        execution_counts[(model, rollout_id, scope, "runtime_error")] += 1
+                        runtime_error_types[
+                            (model, rollout_id, scope, runtime_type)
+                        ] += 1
+                    continue
+                for scope in (task, "micro"):
+                    execution_counts[(model, rollout_id, scope, "inference_success")] += 1
+                has_parse_error = bool(
+                    row.get("parse_status") == "parse_error"
+                    or row.get("contains_crop_parse_error")
+                )
+                if has_parse_error:
+                    for scope in (task, "micro"):
+                        execution_counts[(model, rollout_id, scope, "parse_error")] += 1
                 for threshold in THRESHOLDS:
                     score = score_prediction(
                         scorer,
@@ -409,13 +512,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         threshold,
                         (width, height),
                     )
-                    threshold_scores[(int(row["rollout_id"]), threshold)] = score
-                    accumulators[(model, int(row["rollout_id"]), task, threshold)].add(score)
-                    accumulators[(model, int(row["rollout_id"]), "micro", threshold)].add(score)
+                    threshold_scores[(rollout_id, threshold)] = score
+                    accumulators[(model, rollout_id, task, threshold)].add(score)
+                    accumulators[(model, rollout_id, "micro", threshold)].add(score)
                     if threshold == 0.1:
-                        error_counts[
-                            (model, int(row["rollout_id"]), task, score["error_type"])
-                        ] += 1
+                        error_counts[(model, rollout_id, task, score["error_type"])] += 1
+            if any(row.get("runtime_error") for row in group):
+                runtime_excluded_groups[(model, task)] += 1
+                runtime_excluded_groups[(model, "micro")] += 1
+                continue
             correct_count = sum(
                 bool(threshold_scores[(int(row["rollout_id"]), 0.1)]["exact_correct"])
                 for row in group
@@ -569,6 +674,53 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             row["task"] = scope
             per_task.append(row)
 
+    execution_rows = []
+    for model in MODELS:
+        for rollout in range(4):
+            for scope in (*TASKS, "micro"):
+                attempted = execution_counts[(model, rollout, scope, "attempted")]
+                inference_success = execution_counts[
+                    (model, rollout, scope, "inference_success")
+                ]
+                runtime_error = execution_counts[
+                    (model, rollout, scope, "runtime_error")
+                ]
+                parse_error = execution_counts[(model, rollout, scope, "parse_error")]
+                execution_rows.append(
+                    {
+                        "model_id": model,
+                        "rollout_id": rollout,
+                        "scope": scope,
+                        "attempted": attempted,
+                        "inference_success": inference_success,
+                        "runtime_error": runtime_error,
+                        "parse_error": parse_error,
+                        "inference_success_ratio": safe_div(
+                            inference_success, attempted
+                        ),
+                        "runtime_error_ratio": safe_div(runtime_error, attempted),
+                        "parse_error_ratio_of_inference_success": safe_div(
+                            parse_error, inference_success
+                        ),
+                    }
+                )
+    runtime_error_rows = [
+        {
+            "model_id": model,
+            "rollout_id": rollout,
+            "scope": scope,
+            "runtime_error_type": runtime_type,
+            "samples": count,
+            "ratio_of_attempted": safe_div(
+                count,
+                execution_counts[(model, rollout, scope, "attempted")],
+            ),
+        }
+        for (model, rollout, scope, runtime_type), count in sorted(
+            runtime_error_types.items()
+        )
+    ]
+
     four_rollout_summary: list[dict[str, Any]] = []
     for model in MODELS:
         for threshold in THRESHOLDS:
@@ -614,6 +766,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 correct_distributions[(model, task, count)],
                 sum(correct_distributions[(model, task, item)] for item in range(5)),
             ),
+            "runtime_excluded_samples": runtime_excluded_groups[(model, task)],
         }
         for model in MODELS
         for task in (*TASKS, "micro")
@@ -710,7 +863,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "model_id": model,
                     "rollout_id": rollout,
                     "status": latest.get("status"),
-                    "completed": latest.get("completed"),
+                    "attempted": latest.get("attempted", latest.get("completed")),
+                    "inference_success": latest.get("inference_success"),
+                    "runtime_error": latest.get("runtime_error"),
+                    "parse_error": latest.get("parse_error"),
                     "total": latest.get("total"),
                     "elapsed_seconds": latest.get("elapsed_seconds"),
                     "throughput_samples_per_second": latest.get(
@@ -718,7 +874,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     ),
                     "remaining_seconds": latest.get("remaining_seconds"),
                     "estimated_completion": latest.get("estimated_completion"),
-                    "errors": latest.get("errors"),
+                    "gpu_memory": latest.get("gpu_memory"),
                 }
             )
     total_eta = last_jsonl_row(root / "progress" / "total_eta.jsonl")
@@ -747,6 +903,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "joint_0to8_and_5x5": joint_rows,
         "common_image_task_intersection": len(common_ids),
         "error_subtypes": error_rows,
+        "execution_counts": execution_rows,
+        "runtime_errors": runtime_error_rows,
+        "raw_alignment": raw_alignment,
+        "expected_total_per_rollout": expected_total,
         "selection_counts": selection_count_rows,
         "runtime_eta": runtime_rows,
         "total_eta_last_snapshot": total_eta,
@@ -855,6 +1015,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "correct_0to4": correct_rows,
         "joint_0to8": joint_rows,
         "error_subtypes": error_rows,
+        "execution_counts": execution_rows,
+        "runtime_errors": runtime_error_rows,
+        "raw_alignment": raw_alignment,
         "selection_counts": selection_count_rows,
         "runtime_eta": runtime_rows,
         "four_rollout_summary": four_rollout_summary,
@@ -869,6 +1032,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ],
     }
     workbook(reports / "ui5_train_rollout_analysis.xlsx", overview, tables)
+    atomic_json(
+        root / "summary.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "created_at": analysis["created_at"],
+            "status": "completed",
+            "expected_total_per_rollout": expected_total,
+            "raw_alignment": raw_alignment,
+            "execution_counts": execution_rows,
+            "runtime_errors": runtime_error_rows,
+            "correct_0to4": correct_rows,
+            "analysis_json": str(analysis_path),
+            "analysis_excel": str(
+                reports / "ui5_train_rollout_analysis.xlsx"
+            ),
+        },
+    )
     print(json.dumps({"analysis": str(analysis_path), "common": len(common_ids)}, ensure_ascii=False))
     return analysis
 

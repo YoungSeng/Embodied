@@ -55,8 +55,10 @@ M31_REPO = (
 )
 CROP_REPO = (
     "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/"
-    "Embodied-ui5-rollout8-crop"
+    "Embodied-rollout8-h20x2-v2"
 )
+M31_ROLLOUT_COMMIT = "6367cc6660f7eb933048b81100915a05f9b49bf4"
+CROP_V2_BASE_COMMIT = "2448006bf6ee44f1dc99d3a9c2faf843b16ddc39"
 A800_M31_SOURCE = (
     "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/"
     "Eagle_LocateUI5_v4/Embodied/work_dirs/"
@@ -85,6 +87,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--m31-repo", type=Path, default=Path(M31_REPO))
     parser.add_argument("--crop-repo", type=Path, default=Path(CROP_REPO))
+    parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument(
         "--require-runtime",
         action="store_true",
@@ -257,7 +260,12 @@ def check_processor(path: Path) -> dict[str, Any]:
     return report
 
 
-def git_revision(repo: Path) -> dict[str, Any]:
+def git_revision(
+    repo: Path,
+    *,
+    expected_head: str | None = None,
+    required_ancestor: str | None = None,
+) -> dict[str, Any]:
     report: dict[str, Any] = {
         "path": str(repo),
         "exists": repo.is_dir(),
@@ -275,9 +283,58 @@ def git_revision(repo: Path) -> dict[str, Any]:
             capture_output=True,
         )
         report["head"] = result.stdout.strip()
+        if expected_head is not None:
+            report["expected_head"] = expected_head
+            report["head_matches_expected"] = report["head"] == expected_head
+        if required_ancestor is not None:
+            ancestor = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "merge-base",
+                    "--is-ancestor",
+                    required_ancestor,
+                    "HEAD",
+                ],
+                check=False,
+                capture_output=True,
+            )
+            report["required_ancestor"] = required_ancestor
+            report["required_ancestor_present"] = ancestor.returncode == 0
     except (OSError, subprocess.CalledProcessError) as exc:
         report["git_error"] = str(exc)
-    report["complete"] = bool(report["head"] and report["inference_entrypoint"])
+    report["complete"] = bool(
+        report["head"]
+        and report["inference_entrypoint"]
+        and report.get("head_matches_expected", True)
+        and report.get("required_ancestor_present", True)
+    )
+    return report
+
+
+def check_output_root(path: Path) -> dict[str, Any]:
+    report: dict[str, Any] = {"path": str(path), "writable": False, "fresh": False}
+    path.mkdir(parents=True, exist_ok=True)
+    disallowed = sorted(
+        child.name
+        for child in path.iterdir()
+        if child.name not in {"diagnostics", "logs"}
+    )
+    probe = path / f".preflight-write-{os.getpid()}"
+    try:
+        with probe.open("x", encoding="utf-8") as handle:
+            handle.write("ui5 rollout output write check\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        report["writable"] = True
+    except OSError as exc:
+        report["write_error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        probe.unlink(missing_ok=True)
+    report["unexpected_entries"] = disallowed
+    report["fresh"] = not disallowed
+    report["complete"] = bool(report["writable"] and report["fresh"])
     return report
 
 
@@ -421,6 +478,9 @@ def bundle_inventory(bundle: Path) -> tuple[dict[str, Any], list[list[Any]]]:
         "unique_images": len(unique),
         "runtime_crop_records": len(crops),
         "base_scan_plan_images": len(plans),
+        "crop_scan_plan_cache_complete": bool(
+            plans and crops and len(samples) == len(task_aware) and m31_keys == crop_keys
+        ),
         "m31_image_task_keys": len(m31_keys),
         "crop_image_task_keys": len(crop_keys),
         "common_image_task_intersection": len(common),
@@ -509,7 +569,7 @@ def copy_commands(
                 "",
             ]
         )
-    if bundle.as_posix() != H20_BUNDLE:
+    if bundle.as_posix() != H20_BUNDLE or not (bundle / "bundle_manifest.json").is_file():
         lines.extend(
             [
                 f'mkdir -p "{H20_BUNDLE_PARENT}"',
@@ -546,14 +606,27 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     selected_processor = next(
         (report["path"] for report in processors if report.get("complete")), None
     )
-    m31_repo = git_revision(args.m31_repo.expanduser().resolve(strict=False))
-    crop_repo = git_revision(args.crop_repo.expanduser().resolve(strict=False))
+    m31_repo = git_revision(
+        args.m31_repo.expanduser().resolve(strict=False),
+        expected_head=M31_ROLLOUT_COMMIT,
+    )
+    crop_repo = git_revision(
+        args.crop_repo.expanduser().resolve(strict=False),
+        required_ancestor=CROP_V2_BASE_COMMIT,
+    )
+    output_arg = getattr(args, "output_root", None)
+    output = (
+        check_output_root(output_arg.expanduser().resolve(strict=False))
+        if output_arg is not None
+        else None
+    )
     runtime_ready = bool(
         m31.get("complete")
         and crop.get("complete")
         and selected_processor
         and m31_repo.get("complete")
         and crop_repo.get("complete")
+        and (output is None or output.get("complete"))
     )
     ready = bool(data.get("complete") and (runtime_ready or not args.require_runtime))
     summary = {
@@ -568,6 +641,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "processor_candidates": processors,
         "selected_processor": selected_processor,
         "repositories": {"m31": m31_repo, "crop": crop_repo},
+        "output": output,
         "runtime_ready": runtime_ready,
         "require_runtime": args.require_runtime,
         "ready": ready,
@@ -583,7 +657,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "repositories_h20": {"m31": M31_REPO, "crop": CROP_REPO},
         "rollout_output_h20": (
             "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/"
-            "gui_rollouts/ui5-train-rollout8-20260903"
+            "gui_rollouts/ui5-train-rollout8-h20x2-v2-20260903"
         ),
     }
     atomic_json(diagnostics / "preflight_summary.json", summary)
@@ -597,11 +671,12 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             writer.writerow(["checkpoint", model, "weight_bytes", report.get("total_weight_bytes", 0)])
         for index, report in enumerate(processors):
             writer.writerow(["processor", str(index), "complete", int(bool(report.get("complete")))])
-    atomic_text(
-        diagnostics / "nastk_copy_commands.sh",
-        copy_commands(m31, crop, processors, bundle),
-    )
+    commands = copy_commands(m31, crop, processors, bundle)
+    atomic_text(diagnostics / "nastk_copy_commands.sh", commands)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if args.require_runtime and not ready:
+        print("[COPY_COMMANDS_IF_DATA_IS_MISSING]", flush=True)
+        print(commands, end="", flush=True)
     return summary, 0 if ready else 1
 
 

@@ -26,6 +26,9 @@ ARGS=(
 if [[ "${REQUIRE_RUNTIME:-0}" == "1" ]]; then
   ARGS+=(--require-runtime)
 fi
+if [[ -n "${OUTPUT_ROOT:-}" ]]; then
+  ARGS+=(--output-root "${OUTPUT_ROOT}")
+fi
 
 cd "${PROJECT_ROOT}"
 exec "${PYTHON_BIN}" scripts/preflight_ui5_train_rollouts.py "${ARGS[@]}"

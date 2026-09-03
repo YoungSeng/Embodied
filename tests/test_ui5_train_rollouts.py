@@ -244,80 +244,142 @@ class UI5TrainRolloutTest(unittest.TestCase):
 
             output = root / "rollouts"
             output.mkdir()
-            sample = json.loads(
-                (bundle / "manifest" / "task_samples.jsonl").read_text().splitlines()[0]
-            )
+            samples = prepare.read_jsonl(bundle / "manifest" / "task_samples.jsonl")
             for model in ("m31", "crop"):
                 for rollout in range(4):
-                    correct = rollout < (2 if model == "m31" else 1)
-                    pred = sample["gt_global"] if correct else [[70, 70, 90, 90]]
-                    score = score_prediction(
-                        scorer, sample["gt_global"], pred, "defect", 0.1, (100, 100)
-                    )
-                    crop_outputs = []
-                    if model == "crop":
-                        crop_outputs = [
-                            {
-                                "crop_id": crop_id,
-                                "crop_xyxy": [0, 0, 100, 50] if index == 0 else [0, 50, 100, 100],
-                                "gt_local": [],
-                                "raw_output": "<box>none</box>",
-                                "parse_status": "ok",
-                                "exact_correct": True,
-                            }
-                            for index, crop_id in enumerate(sample["crop_ids"])
-                        ]
-                    raw = {
-                        "model_id": model,
-                        "checkpoint": f"/{model}/checkpoint",
-                        "git_commit": "deadbeef",
-                        "baseline_git_commit": "5d7a313" if model == "m31" else "945ce39",
-                        "rollout_id": rollout,
-                        "seed": 100 + rollout,
-                        "generation_config": {"mode": "hybrid", "do_sample": True},
-                        "record_id": sample["record_id"],
-                        "sample_id": sample["sample_id"],
-                        "source_image_id": sample["source_image_id"],
-                        "image_id": sample["source_image_id"],
-                        "image_relpath": sample["image_relpath"],
-                        "image_size": {"width": 100, "height": 100},
-                        "task": sample["task"],
-                        "source_records": sample["source_records"],
-                        "original_training_record": sample["original_training_record"],
-                        "prompt": sample["prompt"],
-                        "gt_global": sample["gt_global"],
-                        "pred_global": pred,
-                        "parse_status": "defect",
-                        "latency_seconds": 1.0,
-                        "crop_outputs": crop_outputs,
-                        "pipeline_coverage_failure": True,
-                        "annotation_anomaly": False,
-                        "coordinate_transform_anomaly": False,
-                        **score,
-                    }
+                    raw_rows = []
+                    for sample in samples:
+                        correct = rollout < (2 if model == "m31" else 1)
+                        pred = sample["gt_global"] if correct else [[70, 70, 90, 90]]
+                        score = score_prediction(
+                            scorer,
+                            sample["gt_global"],
+                            pred,
+                            "defect",
+                            0.1,
+                            (100, 100),
+                        )
+                        crop_outputs = []
+                        if model == "crop":
+                            crop_outputs = [
+                                {
+                                    "crop_id": crop_id,
+                                    "crop_xyxy": (
+                                        [0, 0, 100, 50]
+                                        if index == 0
+                                        else [0, 50, 100, 100]
+                                    ),
+                                    "gt_local": [],
+                                    "raw_output": "<box>none</box>",
+                                    "parse_status": "ok",
+                                    "exact_correct": True,
+                                }
+                                for index, crop_id in enumerate(sample["crop_ids"])
+                            ]
+                        raw = {
+                            "model_id": model,
+                            "checkpoint": f"/{model}/checkpoint",
+                            "git_commit": "deadbeef",
+                            "baseline_git_commit": (
+                                "5d7a313" if model == "m31" else "945ce39"
+                            ),
+                            "rollout_id": rollout,
+                            "seed": 100 + rollout,
+                            "generation_config": {"mode": "hybrid", "do_sample": True},
+                            "record_id": sample["record_id"],
+                            "sample_id": sample["sample_id"],
+                            "source_image_id": sample["source_image_id"],
+                            "image_id": sample["source_image_id"],
+                            "image_relpath": sample["image_relpath"],
+                            "image_size": {"width": 100, "height": 100},
+                            "task": sample["task"],
+                            "source_records": sample["source_records"],
+                            "original_training_record": sample[
+                                "original_training_record"
+                            ],
+                            "prompt": sample["prompt"],
+                            "gt_global": sample["gt_global"],
+                            "pred_global": pred,
+                            "raw_output": "<box>synthetic</box>",
+                            "parse_status": "defect",
+                            "latency_seconds": 1.0,
+                            "crop_outputs": crop_outputs,
+                            "pipeline_coverage_failure": bool(
+                                sample["pipeline_coverage_failure"]
+                            ),
+                            "annotation_anomaly": bool(sample["annotation_anomaly"]),
+                            "coordinate_transform_anomaly": False,
+                            "inference_success": True,
+                            "runtime_error": None,
+                            **score,
+                        }
+                        if (
+                            model == "m31"
+                            and rollout == 3
+                            and sample["task"] == "text_overflow"
+                        ):
+                            raw.update(
+                                {
+                                    "pred_global": None,
+                                    "parse_status": "not_attempted",
+                                    "matched_pairs": [],
+                                    "TP_box": None,
+                                    "FP_box": None,
+                                    "FN_box": None,
+                                    "image_confusion": None,
+                                    "error_type": "RUNTIME_ERROR",
+                                    "exact_correct": None,
+                                    "inference_success": False,
+                                    "runtime_error": {
+                                        "type": "CUDA_OOM",
+                                        "python_type": "RuntimeError",
+                                        "message": "synthetic OOM",
+                                        "traceback": "synthetic",
+                                    },
+                                }
+                            )
+                        raw_rows.append(raw)
                     write_jsonl(
                         output / "raw" / model / f"rollout_{rollout}" / "part-00000.jsonl",
-                        [raw],
+                        raw_rows,
                     )
                     write_jsonl(
                         output / "progress" / model / f"rollout_{rollout}.jsonl",
                         [
                             {
                                 "status": "completed",
-                                "completed": 1,
-                                "total": 1,
+                                "attempted": 5,
+                                "inference_success": (
+                                    4 if model == "m31" and rollout == 3 else 5
+                                ),
+                                "runtime_error": (
+                                    1 if model == "m31" and rollout == 3 else 0
+                                ),
+                                "parse_error": 0,
+                                "total": 5,
                                 "elapsed_seconds": 1.0,
                                 "throughput_samples_per_second": 1.0,
                                 "remaining_seconds": 0.0,
                                 "estimated_completion": None,
-                                "errors": 0,
+                                "gpu_memory": {"allocated_gib": 7.0},
                             }
                         ],
                     )
             analysis = aggregate.run(
                 SimpleNamespace(output_root=output, bundle_root=bundle, repo_root=PROJECT_ROOT)
             )
-            self.assertEqual(analysis["common_image_task_intersection"], 1)
+            self.assertEqual(analysis["common_image_task_intersection"], 4)
+            m31_r3 = next(
+                row
+                for row in analysis["execution_counts"]
+                if row["model_id"] == "m31"
+                and row["rollout_id"] == 3
+                and row["scope"] == "micro"
+            )
+            self.assertEqual(m31_r3["runtime_error"], 1)
+            self.assertEqual(m31_r3["inference_success"], 4)
+            self.assertTrue(all(row["complete"] for row in analysis["raw_alignment"]))
+            self.assertTrue((output / "summary.json").is_file())
             self.assertTrue((output / "reports" / "ui5_train_rollout_analysis.xlsx").is_file())
             rendered = gallery.render(
                 SimpleNamespace(output_root=output, bundle_root=bundle, panel_long_side=160)
