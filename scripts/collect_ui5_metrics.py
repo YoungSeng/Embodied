@@ -182,6 +182,33 @@ def load_metrics(path: Path | None) -> dict[str, Any]:
     return value
 
 
+def canonical_state_dict_keys(
+    config: dict[str, Any], state_dict_keys: set[str]
+) -> set[str]:
+    """Compare logical model keys, independent of tied-weight serialization.
+
+    ``save_pretrained`` may omit ``lm_head.weight`` when it aliases the input
+    embedding. A DeepSpeed gathered state dict materializes that alias as a
+    separate tensor, even though both checkpoints instantiate the same module
+    state dict. Restore the declared tied alias before hashing while keeping
+    every non-alias key under exact comparison.
+    """
+
+    canonical = set(state_dict_keys)
+    text_config = config.get("text_config") or {}
+    tied_embeddings = bool(
+        config.get(
+            "tie_word_embeddings",
+            text_config.get("tie_word_embeddings", False),
+        )
+    )
+    input_embedding = "language_model.model.embed_tokens.weight"
+    output_embedding = "language_model.lm_head.weight"
+    if tied_embeddings and input_embedding in canonical:
+        canonical.add(output_embedding)
+    return canonical
+
+
 def ui_model_signature(checkpoint: Path) -> str:
     config_path = checkpoint / "config.json"
     if not config_path.is_file():
@@ -201,6 +228,7 @@ def ui_model_signature(checkpoint: Path) -> str:
                     state_dict_keys.update(handle.keys())
         except ImportError:
             pass
+    state_dict_keys = canonical_state_dict_keys(config, state_dict_keys)
     state_dict_key_sha256 = (
         hashlib.sha256("\n".join(sorted(state_dict_keys)).encode("utf-8")).hexdigest()
         if state_dict_keys
@@ -264,6 +292,21 @@ def ui_model_signature(checkpoint: Path) -> str:
         "state_dict_key_sha256": state_dict_key_sha256,
     }
     return json.dumps(signature, sort_keys=True, separators=(",", ":"))
+
+
+def refresh_row_model_signature(row: dict[str, Any]) -> dict[str, Any]:
+    """Refresh cached signatures so pre-fix histories resume without re-eval."""
+
+    checkpoint_value = str(row.get("checkpoint", "")).strip()
+    if not checkpoint_value:
+        return row
+    checkpoint = Path(checkpoint_value).expanduser().resolve(strict=False)
+    if not checkpoint.is_dir():
+        return row
+    signature = ui_model_signature(checkpoint)
+    if signature:
+        row["ui_model_signature"] = signature
+    return row
 
 
 def evaluation_cache_row_matches(
@@ -1103,7 +1146,7 @@ def main() -> int:
         requested_signature = ui_model_signature(args.checkpoint)
         found = any(
             evaluation_cache_row_matches(
-                row,
+                refresh_row_model_signature(row),
                 step=args.step,
                 relation_gate_mode=args.relation_gate_mode,
                 git_commit=args.git_commit,
@@ -1148,6 +1191,7 @@ def main() -> int:
             None,
         )
         if step_zero is not None:
+            refresh_row_model_signature(step_zero)
             if step_zero.get("relation_gate_mode") not in (None, row["relation_gate_mode"]):
                 raise RuntimeError(
                     "checkpoint-0 and checkpoint-N evaluation gate modes differ: "

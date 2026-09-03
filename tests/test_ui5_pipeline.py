@@ -1036,6 +1036,84 @@ class HistoryTests(unittest.TestCase):
                 collect_ui5_metrics.ui_model_signature(right),
             )
 
+    def test_model_signature_normalizes_declared_tied_lm_head_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            omitted = root / "omitted-alias"
+            materialized = root / "materialized-alias"
+            omitted.mkdir()
+            materialized.mkdir()
+            config = {
+                "enable_ui_relation": True,
+                "tc_msed_stage": "m32",
+                "tie_word_embeddings": True,
+                "text_config": {"tie_word_embeddings": True},
+            }
+            for checkpoint in (omitted, materialized):
+                (checkpoint / "config.json").write_text(
+                    json.dumps(config), encoding="utf-8"
+                )
+            shared_keys = {
+                "language_model.model.embed_tokens.weight": "model-1.safetensors",
+                "relation_pyramid.scale_logits": "model-1.safetensors",
+            }
+            (omitted / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": shared_keys}), encoding="utf-8"
+            )
+            (materialized / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "weight_map": {
+                            **shared_keys,
+                            "language_model.lm_head.weight": "model-1.safetensors",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                collect_ui5_metrics.ui_model_signature(omitted),
+                collect_ui5_metrics.ui_model_signature(materialized),
+            )
+
+    def test_model_signature_does_not_normalize_untied_missing_lm_head(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            omitted = root / "omitted-head"
+            materialized = root / "materialized-head"
+            omitted.mkdir()
+            materialized.mkdir()
+            config = {
+                "enable_ui_relation": True,
+                "tc_msed_stage": "m32",
+                "tie_word_embeddings": False,
+            }
+            for checkpoint in (omitted, materialized):
+                (checkpoint / "config.json").write_text(
+                    json.dumps(config), encoding="utf-8"
+                )
+            shared_keys = {
+                "language_model.model.embed_tokens.weight": "model-1.safetensors",
+            }
+            (omitted / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": shared_keys}), encoding="utf-8"
+            )
+            (materialized / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "weight_map": {
+                            **shared_keys,
+                            "language_model.lm_head.weight": "model-1.safetensors",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertNotEqual(
+                collect_ui5_metrics.ui_model_signature(omitted),
+                collect_ui5_metrics.ui_model_signature(materialized),
+            )
+
 
 class ParallelInferenceTests(unittest.TestCase):
     def test_five_tasks_run_through_four_worker_queue(self) -> None:

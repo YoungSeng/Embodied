@@ -197,7 +197,30 @@ def main() -> int:
         model.language_model.config.vocab_size = len(tokenizer)
 
     output.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(output, safe_serialization=True, max_shard_size="5GB")
+    # DeepSpeed's gathered state dict expands tied input/output embeddings into
+    # separate tensors. Expand the same alias here so fresh checkpoint-0
+    # exports have the identical physical key layout as checkpoint-N. Only
+    # the tied LM head is cloned; the remaining 3B state dict stays zero-copy.
+    save_state_dict = model.state_dict()
+    input_embedding_key = "language_model.model.embed_tokens.weight"
+    output_embedding_key = "language_model.lm_head.weight"
+    expanded_tied_aliases = []
+    if (
+        input_embedding_key in save_state_dict
+        and output_embedding_key in save_state_dict
+        and save_state_dict[input_embedding_key].data_ptr()
+        == save_state_dict[output_embedding_key].data_ptr()
+    ):
+        save_state_dict[output_embedding_key] = save_state_dict[
+            output_embedding_key
+        ].clone()
+        expanded_tied_aliases.append(output_embedding_key)
+    model.save_pretrained(
+        output,
+        state_dict=save_state_dict,
+        safe_serialization=True,
+        max_shard_size="5GB",
+    )
     tokenizer.save_pretrained(output)
     complete_marker.write_text(
         json.dumps(
@@ -209,6 +232,7 @@ def main() -> int:
                 "checkpoint": str(output),
                 "initialization": init_report,
                 "num_new_tokens": num_new_tokens,
+                "expanded_tied_aliases": expanded_tied_aliases,
             },
             ensure_ascii=False,
             indent=2,
