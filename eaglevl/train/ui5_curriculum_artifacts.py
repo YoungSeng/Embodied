@@ -68,6 +68,9 @@ TRAIN_CURVE_COLUMNS = (
 )
 UI5_OVERALL_COLUMNS = (
     "step",
+    "total_samples",
+    "invalid_predictions",
+    "invalid_prediction_rate",
     "image_macro_precision",
     "image_macro_recall",
     "image_macro_f1",
@@ -97,6 +100,9 @@ UI5_BY_TASK_COLUMNS = (
     "tn",
     "accuracy",
     "predicted_positive",
+    "total_samples",
+    "invalid_predictions",
+    "invalid_prediction_rate",
     "candidate_checkpoint",
 )
 HARD_TRANSITION_COLUMNS = (
@@ -397,6 +403,46 @@ def _normalize_metric_group(
     return output
 
 
+def _normalize_task_health(
+    raw: Mapping[str, Any], *, task: str, fallback_total: int
+) -> dict[str, Any]:
+    """Normalize compact per-task scorer health without retaining sample IDs."""
+
+    label = f"tasks.{task}"
+    raw_total = raw.get("total_samples")
+    total_samples = _count(
+        fallback_total if raw_total is None else raw_total,
+        f"{label}.total_samples",
+    )
+    if total_samples != fallback_total:
+        raise ValueError(
+            f"{label}.total_samples must equal image confusion total: "
+            f"{total_samples} != {fallback_total}"
+        )
+    invalid_values = [
+        (name, _count(raw[name], f"{label}.{name}"))
+        for name in ("invalid_pred", "invalid_predictions")
+        if raw.get(name) is not None
+    ]
+    if len({value for _, value in invalid_values}) > 1:
+        raise ValueError(
+            f"{label}.invalid_pred and {label}.invalid_predictions disagree"
+        )
+    invalid_predictions = invalid_values[0][1] if invalid_values else 0
+    if invalid_predictions > total_samples:
+        raise ValueError(
+            f"{label}.invalid_predictions must not exceed total_samples: "
+            f"{invalid_predictions} > {total_samples}"
+        )
+    return {
+        "total_samples": total_samples,
+        "invalid_predictions": invalid_predictions,
+        "invalid_prediction_rate": (
+            invalid_predictions / total_samples if total_samples else 0.0
+        ),
+    }
+
+
 def _mean(values: Sequence[Any]) -> float | None:
     present = [float(value) for value in values if value is not None]
     return sum(present) / len(present) if present else None
@@ -462,7 +508,7 @@ def normalize_scorer_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
         raw_task = raw_tasks[source_name]
         if not isinstance(raw_task, Mapping):
             raise ValueError(f"tasks.{source_name} must be an object")
-        tasks[canonical] = {
+        task_metrics = {
             granularity: _normalize_metric_group(
                 raw_task.get(granularity),
                 task=canonical,
@@ -470,6 +516,14 @@ def normalize_scorer_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
             )
             for granularity in GRANULARITIES
         }
+        task_metrics.update(
+            _normalize_task_health(
+                raw_task,
+                task=canonical,
+                fallback_total=int(task_metrics["image"]["samples"]),
+            )
+        )
+        tasks[canonical] = task_metrics
     extras = sorted(str(name) for name in raw_tasks if name not in consumed)
     if extras:
         raise ValueError(f"unexpected scorer task entries: {extras}")
@@ -546,6 +600,10 @@ def normalize_scorer_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
     image_macro_f1 = float(macro["image"]["f1"])
     bbox_macro_f1 = float(macro["bbox"]["f1"])
     joint_score = (image_macro_f1 + bbox_macro_f1) / 2.0
+    total_samples = sum(int(tasks[task]["total_samples"]) for task in TASKS)
+    invalid_predictions = sum(
+        int(tasks[task]["invalid_predictions"]) for task in TASKS
+    )
     return {
         "schema_version": 1,
         "tasks": tasks,
@@ -555,6 +613,11 @@ def normalize_scorer_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
             "image_macro_f1": image_macro_f1,
             "bbox_macro_f1": bbox_macro_f1,
             "joint_score": joint_score,
+            "total_samples": total_samples,
+            "invalid_predictions": invalid_predictions,
+            "invalid_prediction_rate": (
+                invalid_predictions / total_samples if total_samples else 0.0
+            ),
         },
     }
 
@@ -765,7 +828,14 @@ def _same_metrics(
             )
             for name in ("image_macro_f1", "bbox_macro_f1", "joint_score")
         )
-    return previous == normalized
+    if not isinstance(previous, Mapping):
+        return False
+    try:
+        # Re-normalization upgrades legacy state that predates compact task
+        # health fields, preserving idempotence when repairing its workbook.
+        return normalize_scorer_metrics(previous) == normalized
+    except (TypeError, ValueError):
+        return False
 
 
 def _best_record(
@@ -863,9 +933,26 @@ def _overall_rows(state: Mapping[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for evaluation in state["evaluations"]:
         metrics = evaluation["metrics"]
+        task_health = [
+            _normalize_task_health(
+                metrics["tasks"][task],
+                task=task,
+                fallback_total=int(metrics["tasks"][task]["image"]["samples"]),
+            )
+            for task in TASKS
+        ]
+        total_samples = sum(row["total_samples"] for row in task_health)
+        invalid_predictions = sum(
+            row["invalid_predictions"] for row in task_health
+        )
         rows.append(
             {
                 "step": evaluation["step"],
+                "total_samples": total_samples,
+                "invalid_predictions": invalid_predictions,
+                "invalid_prediction_rate": (
+                    invalid_predictions / total_samples if total_samples else 0.0
+                ),
                 **{
                     f"{granularity}_{aggregation}_{name}": metrics[aggregation][
                         granularity
@@ -888,6 +975,13 @@ def _by_task_rows(state: Mapping[str, Any]) -> list[dict[str, Any]]:
         for task in TASKS:
             for granularity in GRANULARITIES:
                 values = evaluation["metrics"]["tasks"][task][granularity]
+                health = _normalize_task_health(
+                    evaluation["metrics"]["tasks"][task],
+                    task=task,
+                    fallback_total=int(
+                        evaluation["metrics"]["tasks"][task]["image"]["samples"]
+                    ),
+                )
                 rows.append(
                     {
                         "step": evaluation["step"],
@@ -907,6 +1001,7 @@ def _by_task_rows(state: Mapping[str, Any]) -> list[dict[str, Any]]:
                                 "predicted_positive",
                             )
                         },
+                        **health,
                         "candidate_checkpoint": evaluation[
                             "candidate_checkpoint"
                         ],
@@ -975,6 +1070,7 @@ def write_curriculum_workbook(
         "hard_ratio",
         "anchor_ratio",
         "global_replay_ratio",
+        "invalid_prediction_rate",
     }
     for sheet_name in SHEET_ORDER:
         rows, columns = tables[sheet_name]

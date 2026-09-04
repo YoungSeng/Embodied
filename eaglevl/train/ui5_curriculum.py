@@ -190,6 +190,77 @@ def curriculum_artifact_identity(
                 "Curriculum hard-group count mismatch: "
                 f"actual={actual}, declared={declared}, expected={expected}"
             )
+    artifact_schema = int(manifest.get("schema_version", 1))
+    if artifact_schema >= 3:
+        if int(success.get("schema_version", -1)) != artifact_schema:
+            raise RuntimeError(
+                "Curriculum schema version differs between manifest and success marker"
+            )
+        if int(manifest.get("matched_anchor_groups", -1)) != int(
+            manifest.get("hard_groups", -2)
+        ):
+            raise RuntimeError(
+                "Curriculum matched-anchor count differs from hard-group count"
+            )
+        expected_view_policy = {
+            "hard": "all_gt_free_detector_scan_base_tiles",
+            "matched_anchor": "all_gt_free_detector_scan_base_tiles",
+            "content_missing": "full_image_global_view",
+            "global_replay": "full_image_retention",
+            "tile_selection_uses_gt": False,
+            "partial_gt_allowed": False,
+        }
+        if manifest.get("training_view_policy") != expected_view_policy:
+            raise RuntimeError("Curriculum training-view policy is invalid")
+        pools = manifest.get("pools")
+        if not isinstance(pools, Mapping) or set(pools) != set(CURRICULUM_POOLS):
+            raise RuntimeError("Curriculum pool inventory is invalid")
+        for pool in ("hard", "matched_anchor"):
+            state = pools.get(pool)
+            if not isinstance(state, Mapping):
+                raise RuntimeError(f"Curriculum {pool} inventory is invalid")
+            crop_records = int(state.get("crop_training_records", -1))
+            global_records = int(state.get("content_missing_global_records", -1))
+            training_records = int(state.get("training_records", -1))
+            if crop_records <= 0 or global_records < 0 or training_records != (
+                crop_records + global_records
+            ):
+                raise RuntimeError(f"Curriculum {pool} training views are invalid")
+        replay = pools.get("global_replay")
+        if not isinstance(replay, Mapping) or any(
+            (
+                int(replay.get("crop_training_records", -1)) != 0,
+                int(replay.get("content_missing_global_records", -1)) != 0,
+                int(replay.get("retention_full_image_records", -1))
+                != int(replay.get("training_records", -2)),
+                int(replay.get("training_records", 0)) <= 0,
+            )
+        ):
+            raise RuntimeError("Curriculum global-replay retention views are invalid")
+        try:
+            recipe_payload = json.loads(recipe.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Curriculum recipe JSON is invalid: {exc}") from exc
+        expected_recipe_views = {
+            "hard": (True, False),
+            "matched_anchor": (True, False),
+            "global_replay": (False, True),
+        }
+        observed_recipe_views = {}
+        if not isinstance(recipe_payload, Mapping):
+            raise RuntimeError("Curriculum recipe is not an object")
+        for entry in recipe_payload.values():
+            if not isinstance(entry, Mapping):
+                raise RuntimeError("Curriculum recipe entry is not an object")
+            pool = canonical_curriculum_pool(str(entry.get("curriculum_pool") or ""))
+            if pool in observed_recipe_views:
+                raise RuntimeError(f"Curriculum recipe duplicates pool {pool}")
+            observed_recipe_views[pool] = (
+                entry.get("ui5_crop_recipe") is True,
+                entry.get("ui5_retention_recipe") is True,
+            )
+        if observed_recipe_views != expected_recipe_views:
+            raise RuntimeError("Curriculum recipe training-view flags are invalid")
     expected_recipe_hash = str(success.get("recipe_sha256", ""))
     actual_recipe_hash = _sha256_file(recipe)
     if not expected_recipe_hash or expected_recipe_hash != actual_recipe_hash:
@@ -197,15 +268,91 @@ def curriculum_artifact_identity(
     declared_files = success.get("files")
     if not isinstance(declared_files, dict) or not declared_files:
         raise RuntimeError("Curriculum _SUCCESS.json has no file hash inventory")
+    crop_assets: list[Any] | None = None
+    if artifact_schema >= 3:
+        raw_crop_assets = manifest.get("crop_assets")
+        if not isinstance(raw_crop_assets, list) or not raw_crop_assets:
+            raise RuntimeError("Curriculum crop-asset inventory is empty")
+        crop_assets = raw_crop_assets
+        asset_names = {
+            str(row.get("relative_path") or "")
+            for row in crop_assets
+            if isinstance(row, Mapping)
+        }
+        expected_file_names = {
+            "ui5_crop_rollout4_curriculum.json",
+            "hard.jsonl",
+            "matched_anchor.jsonl",
+            "global_replay.jsonl",
+            "hard_groups.jsonl",
+            "matched_anchor_groups.jsonl",
+            "crop_assets.jsonl",
+            *asset_names,
+        }
+        if (
+            len(asset_names) != len(crop_assets)
+            or "" in asset_names
+            or set(declared_files) != expected_file_names
+        ):
+            raise RuntimeError("Curriculum durable file inventory is invalid")
     verified_files = {}
-    for name, expected_hash in sorted(declared_files.items()):
-        path = recipe.parent / str(name)
+    for name, raw_metadata in sorted(declared_files.items()):
+        relative = Path(str(name))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise RuntimeError(f"Curriculum inventory path is unsafe: {name}")
+        path = recipe.parent / relative
         if not path.is_file():
             raise RuntimeError(f"Curriculum inventory file is missing: {path}")
+        if artifact_schema >= 3:
+            if not isinstance(raw_metadata, Mapping):
+                raise RuntimeError(
+                    f"Curriculum inventory metadata is invalid: {path}"
+                )
+            expected_hash = str(raw_metadata.get("sha256") or "")
+            expected_bytes = raw_metadata.get("bytes")
+            if (
+                isinstance(expected_bytes, bool)
+                or not isinstance(expected_bytes, int)
+                or expected_bytes < 0
+                or path.stat().st_size != expected_bytes
+            ):
+                raise RuntimeError(
+                    f"Curriculum artifact byte count mismatch: {path}"
+                )
+        else:
+            expected_hash = str(raw_metadata)
         actual_hash = _sha256_file(path)
-        if actual_hash != str(expected_hash):
+        if not expected_hash or actual_hash != expected_hash:
             raise RuntimeError(f"Curriculum artifact hash mismatch: {path}")
         verified_files[str(name)] = actual_hash
+    if artifact_schema >= 3:
+        assert crop_assets is not None
+        expected_crop_records = sum(
+            int(pools[pool]["crop_training_records"])
+            for pool in ("hard", "matched_anchor")
+        )
+        if len(crop_assets) != expected_crop_records:
+            raise RuntimeError(
+                "Curriculum crop-asset count differs from crop training records"
+            )
+        seen_assets = set()
+        for row in crop_assets:
+            if not isinstance(row, Mapping):
+                raise RuntimeError("Curriculum crop-asset row is invalid")
+            relative = str(row.get("relative_path") or "")
+            if not relative or relative in seen_assets or relative not in declared_files:
+                raise RuntimeError("Curriculum crop-asset path inventory is invalid")
+            seen_assets.add(relative)
+            metadata = declared_files[relative]
+            if not isinstance(metadata, Mapping) or any(
+                (
+                    metadata.get("bytes") != row.get("bytes"),
+                    metadata.get("sha256") != row.get("sha256"),
+                )
+            ):
+                raise RuntimeError(
+                    f"Curriculum crop-asset manifest differs from success inventory: {relative}"
+                )
     return {
         "identity_digest": str(manifest.get("identity_digest", "")),
         "recipe_sha256": actual_recipe_hash,

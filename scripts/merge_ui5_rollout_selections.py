@@ -25,6 +25,13 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Sequence
 
+try:
+    from ui5_metric_matching import threshold_aware_linear_sum_assignment
+except ModuleNotFoundError as exc:  # imported as ``scripts.merge_ui5_rollout_selections``
+    if exc.name != "ui5_metric_matching":
+        raise
+    from scripts.ui5_metric_matching import threshold_aware_linear_sum_assignment
+
 
 SCHEMA_VERSION = 1
 SNAPSHOT_SCHEMA_VERSION = 4
@@ -76,6 +83,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         required=True,
         help="New immutable output directory; an existing path is rejected.",
+    )
+    parser.add_argument(
+        "--iou-threshold",
+        type=float,
+        default=0.1,
+        help=(
+            "IoU threshold used to re-score every frozen route with the current "
+            "cardinality-first matcher (default: 0.1)."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -378,6 +394,20 @@ def _validate_complete8_row(row: Mapping[str, Any], *, source: Path) -> tuple[st
     for key in ("grpo_parse_clean_m31", "grpo_parse_clean_crop"):
         if row.get(key) is not True:
             raise ValueError(f"sample {sample_id} is not parse-clean: {key}")
+    if not isinstance(row.get("grpo_source_eligible"), bool):
+        raise ValueError(f"sample {sample_id} has invalid grpo_source_eligible")
+    anomaly_fields = (
+        "pipeline_coverage_failure",
+        "annotation_anomaly",
+        "coordinate_transform_anomaly",
+    )
+    for key in anomaly_fields:
+        if not isinstance(row.get(key), bool):
+            raise ValueError(f"sample {sample_id} has invalid {key}")
+    if row["grpo_source_eligible"] and any(row[key] for key in anomaly_fields):
+        raise ValueError(
+            f"sample {sample_id} is anomalous but grpo_source_eligible=true"
+        )
     if row.get("runtime_errors") != [] or row.get("exclusion_reason") is not None:
         raise ValueError(f"sample {sample_id} contains a technical exclusion")
     if not _is_empty_issues(row.get("technical_issues")):
@@ -547,9 +577,216 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         os.fsync(handle.fileno())
 
 
-def freeze(inputs: Sequence[Path], output_dir: Path) -> dict[str, Any]:
+def _strict_boxes(value: Any, *, label: str) -> list[list[float]]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list of xyxy boxes")
+    boxes: list[list[float]] = []
+    for index, raw in enumerate(value):
+        if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+            raise ValueError(f"{label}[{index}] is not an xyxy box")
+        box: list[float] = []
+        for coordinate in raw:
+            if isinstance(coordinate, bool) or not isinstance(coordinate, (int, float)):
+                raise ValueError(f"{label}[{index}] contains a non-numeric coordinate")
+            numeric = float(coordinate)
+            if not math.isfinite(numeric):
+                raise ValueError(f"{label}[{index}] contains a non-finite coordinate")
+            box.append(numeric)
+        if box[2] <= box[0] or box[3] <= box[1]:
+            raise ValueError(f"{label}[{index}] has non-positive area")
+        boxes.append(box)
+    return boxes
+
+
+def _iou(left: Sequence[float], right: Sequence[float]) -> float:
+    x1, y1 = max(left[0], right[0]), max(left[1], right[1])
+    x2, y2 = min(left[2], right[2]), min(left[3], right[3])
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    left_area = max(0.0, left[2] - left[0]) * max(0.0, left[3] - left[1])
+    right_area = max(0.0, right[2] - right[0]) * max(0.0, right[3] - right[1])
+    union = left_area + right_area - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _route_error_type(gt_count: int, pred_count: int, tp: int) -> str:
+    fp, fn = pred_count - tp, gt_count - tp
+    if not gt_count and not pred_count:
+        return "TN"
+    if not gt_count:
+        return "FP_ONLY"
+    if not pred_count:
+        return "FN_NO_PRED"
+    if tp == gt_count and fp == 0:
+        return "EXACT_TP"
+    if tp == 0:
+        return "LOC_WRONG"
+    if fn > 0 and fp == 0:
+        return "PARTIAL_MISS"
+    if fn == 0 and fp > 0:
+        return "PARTIAL_EXTRA"
+    return "PARTIAL_BOTH"
+
+
+def _rescore_route(
+    route: Mapping[str, Any],
+    *,
+    gt_boxes: Sequence[Sequence[float]],
+    threshold: float,
+    label: str,
+) -> tuple[dict[str, Any], bool]:
+    pred_boxes = _strict_boxes(route.get("pred_global"), label=f"{label}.pred_global")
+    gt = [list(map(float, box)) for box in gt_boxes]
+    matrix = [[_iou(gt_box, pred_box) for pred_box in pred_boxes] for gt_box in gt]
+    if gt and pred_boxes:
+        gt_indices, pred_indices = threshold_aware_linear_sum_assignment(
+            matrix, threshold
+        )
+    else:
+        gt_indices, pred_indices = (), ()
+    matched_pairs: list[dict[str, Any]] = []
+    tp = 0
+    for raw_gt_index, raw_pred_index in zip(gt_indices, pred_indices):
+        gt_index, pred_index = int(raw_gt_index), int(raw_pred_index)
+        iou = float(matrix[gt_index][pred_index])
+        is_tp = iou >= threshold
+        tp += int(is_tp)
+        matched_pairs.append(
+            {
+                "gt_index": gt_index,
+                "pred_index": pred_index,
+                "gt_bbox": gt[gt_index],
+                "pred_bbox": pred_boxes[pred_index],
+                "iou": iou,
+                "is_tp": is_tp,
+            }
+        )
+    gt_count, pred_count = len(gt), len(pred_boxes)
+    fp, fn = pred_count - tp, gt_count - tp
+    image_confusion = (
+        "TP"
+        if gt_count and pred_count
+        else "FN"
+        if gt_count
+        else "FP"
+        if pred_count
+        else "TN"
+    )
+    exact = bool(
+        (not gt_count and not pred_count)
+        or (gt_count and tp == gt_count and fp == 0)
+    )
+    score = {
+        "reward": exact,
+        "exact_correct": exact,
+        "TP_box": tp,
+        "FP_box": fp,
+        "FN_box": fn,
+        "image_confusion": image_confusion,
+        "error_type": _route_error_type(gt_count, pred_count, tp),
+    }
+    changed = any(route.get(key) != value for key, value in score.items())
+    return {**dict(route), **score, "matched_pairs": matched_pairs}, changed
+
+
+def _rescore_complete8_row(
+    row: Mapping[str, Any], *, threshold: float
+) -> tuple[dict[str, Any], int, bool]:
+    sample_id = str(row.get("sample_id") or "<unknown>")
+    gt = _strict_boxes(row.get("gt_global"), label=f"sample {sample_id}.gt_global")
+    updated = dict(row)
+    # These fields are projections of the cached route scores.  They cannot be
+    # made trustworthy by only replacing the authoritative ``rollouts`` map:
+    # an old matcher may have classified the same serialized predictions
+    # differently.  Frozen artifacts therefore publish no stale secondary
+    # projection; downstream readers must derive one from the rescored routes.
+    for derived_key in (
+        "grpo_m31_group",
+        "grpo_crop_group",
+        "visualization_rollouts",
+    ):
+        updated.pop(derived_key, None)
+    raw_rollouts = row.get("rollouts")
+    if not isinstance(raw_rollouts, Mapping) or set(raw_rollouts) != set(MODELS):
+        raise ValueError(f"sample {sample_id} has invalid rollout groups")
+    rollouts: dict[str, list[dict[str, Any]]] = {}
+    changed_routes = 0
+    counts: dict[str, int] = {}
+    for model in MODELS:
+        model_routes = raw_rollouts[model]
+        if not isinstance(model_routes, list):
+            raise ValueError(f"sample {sample_id} {model} rollouts are not a list")
+        rescored: list[dict[str, Any]] = []
+        for route in model_routes:
+            if not isinstance(route, Mapping):
+                raise ValueError(f"sample {sample_id} {model} has a malformed route")
+            route_id = route.get("rollout_id")
+            result, changed = _rescore_route(
+                route,
+                gt_boxes=gt,
+                threshold=threshold,
+                label=f"sample {sample_id} {model}/{route_id}",
+            )
+            rescored.append(result)
+            changed_routes += int(changed)
+        rollouts[model] = rescored
+        counts[model] = sum(route["exact_correct"] is True for route in rescored)
+    total = counts["m31"] + counts["crop"]
+    difficulty = "easy" if total == 8 else "hard" if total == 0 else "medium"
+    old_classification = (
+        row.get("m31_correct_count"),
+        row.get("crop_correct_count"),
+        row.get("total_correct_count"),
+        row.get("difficulty"),
+    )
+    updated.update(
+        {
+            "rollouts": rollouts,
+            "m31_correct_count": counts["m31"],
+            "crop_correct_count": counts["crop"],
+            "total_correct_count": total,
+            "success_rate": total / 8.0,
+            "difficulty": difficulty,
+            "grpo_ready_m31": bool(
+                difficulty == "medium"
+                and 1 <= counts["m31"] <= 3
+                and row.get("grpo_source_eligible") is True
+                and row.get("grpo_parse_clean_m31") is True
+            ),
+            "grpo_ready_crop": bool(
+                difficulty == "medium"
+                and 1 <= counts["crop"] <= 3
+                and row.get("grpo_source_eligible") is True
+                and row.get("grpo_parse_clean_crop") is True
+            ),
+            "scoring_policy": {
+                "matcher": "max_qualified_cardinality_then_iou",
+                "iou_threshold": threshold,
+                "version": 1,
+            },
+        }
+    )
+    new_classification = (
+        updated["m31_correct_count"],
+        updated["crop_correct_count"],
+        updated["total_correct_count"],
+        updated["difficulty"],
+    )
+    return updated, changed_routes, old_classification != new_classification
+
+
+def freeze(
+    inputs: Sequence[Path], output_dir: Path, *, iou_threshold: float = 0.1
+) -> dict[str, Any]:
     if not inputs:
         raise ValueError("at least one input is required")
+    if (
+        isinstance(iou_threshold, bool)
+        or not isinstance(iou_threshold, (int, float))
+        or not math.isfinite(float(iou_threshold))
+        or not 0.0 <= float(iou_threshold) <= 1.0
+    ):
+        raise ValueError(f"iou_threshold must be finite and in [0,1]: {iou_threshold!r}")
+    iou_threshold = float(iou_threshold)
     sources = [path.expanduser().resolve(strict=True) for path in inputs]
     if len(set(sources)) != len(sources):
         raise ValueError("duplicate input directories are forbidden")
@@ -573,8 +810,35 @@ def freeze(inputs: Sequence[Path], output_dir: Path) -> dict[str, Any]:
     provenance: dict[str, list[int]] = {}
     source_metadata: list[dict[str, Any]] = []
     input_rows = 0
+    rescored_routes = 0
+    changed_route_scores = 0
+    changed_sample_classifications = 0
     for source_index, source in enumerate(sources):
         rows, metadata = _load_source(source)
+        rescored_rows: list[dict[str, Any]] = []
+        source_changed_routes = 0
+        source_changed_samples = 0
+        for row in rows:
+            rescored, route_changes, sample_changed = _rescore_complete8_row(
+                row, threshold=iou_threshold
+            )
+            # Validate the rewritten aggregate against its rewritten routes.
+            _validate_complete8_row(rescored, source=source)
+            rescored_rows.append(rescored)
+            source_changed_routes += route_changes
+            source_changed_samples += int(sample_changed)
+        rows = rescored_rows
+        route_count = len(rows) * len(MODELS) * len(ROLLOUT_IDS)
+        rescored_routes += route_count
+        changed_route_scores += source_changed_routes
+        changed_sample_classifications += source_changed_samples
+        metadata["rescoring"] = {
+            "matcher": "max_qualified_cardinality_then_iou",
+            "iou_threshold": iou_threshold,
+            "routes": route_count,
+            "changed_route_scores": source_changed_routes,
+            "changed_sample_classifications": source_changed_samples,
+        }
         source_metadata.append(metadata)
         input_rows += len(rows)
         for row in rows:
@@ -614,6 +878,14 @@ def freeze(inputs: Sequence[Path], output_dir: Path) -> dict[str, Any]:
             "input_rows": input_rows,
             "unique_complete8_samples": len(ordered),
             "deduplicated_rows": input_rows - len(ordered),
+            "rescored_routes": rescored_routes,
+            "changed_route_scores": changed_route_scores,
+            "changed_sample_classifications": changed_sample_classifications,
+            "scoring_policy": {
+                "matcher": "max_qualified_cardinality_then_iou",
+                "iou_threshold": iou_threshold,
+                "version": 1,
+            },
             "source_set_sha256": source_set_sha256,
             "task_counts": {
                 task: sum(row["task"] == task for row in ordered) for task in TASKS
@@ -622,6 +894,33 @@ def freeze(inputs: Sequence[Path], output_dir: Path) -> dict[str, Any]:
                 difficulty: sum(row["difficulty"] == difficulty for row in ordered)
                 for difficulty in ("easy", "medium", "hard")
             },
+            "crop_correct_count_distribution": {
+                str(count): sum(
+                    int(row["crop_correct_count"]) == count for row in ordered
+                )
+                for count in range(5)
+            },
+            "formal_eligible_groups": sum(
+                row.get("grpo_source_eligible") is True
+                and not row.get("pipeline_coverage_failure")
+                and not row.get("annotation_anomaly")
+                and not row.get("coordinate_transform_anomaly")
+                for row in ordered
+            ),
+            "formal_crop_hard_groups": sum(
+                int(row["crop_correct_count"]) == 0
+                and row.get("grpo_source_eligible") is True
+                and not row.get("pipeline_coverage_failure")
+                and not row.get("annotation_anomaly")
+                and not row.get("coordinate_transform_anomaly")
+                for row in ordered
+            ),
+            "structural_anomaly_groups": sum(
+                row.get("pipeline_coverage_failure") is True
+                or row.get("annotation_anomaly") is True
+                or row.get("coordinate_transform_anomaly") is True
+                for row in ordered
+            ),
         }
         _atomic_json(temporary / "summary.json", summary)
         files = []
@@ -644,6 +943,7 @@ def freeze(inputs: Sequence[Path], output_dir: Path) -> dict[str, Any]:
             "success_marker": "_SUCCESS",
             "training_input_policy": "resolve_once_at_run_start_no_hot_reload",
             "technical_policy": "complete8_and_error_free_routes_only",
+            "scoring_policy": summary["scoring_policy"],
             "conflict_policy": "identical_sample_rows_deduplicate_otherwise_fail",
             "source_set_sha256": source_set_sha256,
             "sources": source_metadata,
@@ -668,7 +968,7 @@ def freeze(inputs: Sequence[Path], output_dir: Path) -> dict[str, Any]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    freeze(args.inputs, args.output_dir)
+    freeze(args.inputs, args.output_dir, iou_threshold=args.iou_threshold)
     return 0
 
 

@@ -42,6 +42,13 @@ SCORER_SCRIPT="${SCORER_SCRIPT:-${PROJECT_ROOT}/qwen3vl_merge_and_score_fixed_5t
 EXPECTED_HARD_GROUPS="${EXPECTED_HARD_GROUPS:-72}"
 SEED="${SEED:-42}"
 ROLLING_CHECKPOINT_DIR="${ROLLING_CHECKPOINT_DIR:-resume/latest}"
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+
+[[ "${NNODES}" == 1 ]] || \
+  locany_die 2 "Formal H20x2 launch requires NNODES=1; got ${NNODES}"
+[[ "${NODE_RANK}" == 0 ]] || \
+  locany_die 2 "Formal H20x2 launch requires NODE_RANK=0; got ${NODE_RANK}"
 
 if [[ "${ROLLING_CHECKPOINT_DIR}" = /* ]]; then
   ROLLING_CHECKPOINT_PATH="${ROLLING_CHECKPOINT_DIR}"
@@ -106,6 +113,7 @@ export PROJECT_ROOT WORKSPACE ENV_DIR PYTHON_BIN MODEL_PATH BASE_MODEL PROCESSOR
 export OUTPUT_DIR ROLLOUT_BUNDLE_ROOT ROLLOUT_DIFFICULTY CURRICULUM_SOURCE_RECIPE
 export EVAL_INPUT_DIR EVAL_DETECTOR_MANIFEST SCORER_SCRIPT EXPECTED_HARD_GROUPS SEED
 export ROLLING_CHECKPOINT_PATH
+export NNODES NODE_RANK
 
 PREFLIGHT_TMP_ROOT="${PREFLIGHT_TMP_ROOT:-${TMPDIR:-/tmp}}"
 [[ -d "${PREFLIGHT_TMP_ROOT}" ]] || locany_die 3 "Temporary root is missing: ${PREFLIGHT_TMP_ROOT}"
@@ -236,6 +244,8 @@ required_files = {
     "EVAL_DETECTOR_MANIFEST": detector_manifest,
     "SCORER_SCRIPT": scorer,
     "bundle_manifest": bundle / "bundle_manifest.json",
+    "bundle_crop_samples": bundle / "manifest" / "crop_samples.jsonl",
+    "bundle_base_scan_plans": bundle / "base_scan_plans.json",
 }
 if source_recipe is not None:
     required_files["CURRICULUM_SOURCE_RECIPE"] = source_recipe
@@ -278,6 +288,10 @@ for label, path in (
 bundle_state = json.loads((bundle / "bundle_manifest.json").read_text(encoding="utf-8"))
 if not isinstance(bundle_state, dict) or bundle_state.get("complete") is not True:
     raise SystemExit("rollout bundle manifest is not complete")
+declared_bundle_files = bundle_state.get("files")
+for relative in ("manifest/crop_samples.jsonl", "base_scan_plans.json"):
+    if not isinstance(declared_bundle_files, dict) or relative not in declared_bundle_files:
+        raise SystemExit(f"rollout bundle manifest does not declare {relative}")
 print(f"formal_inputs=ok eval_task_files={len(task_files)}")
 for label, path in required_dirs.items():
     print(f"{label}={path.resolve()}")
@@ -371,15 +385,101 @@ if manifest.get("matched_anchor_groups") != expected_hard:
     raise SystemExit("dry-run matched-anchor count does not equal hard-group count")
 if set(manifest.get("pools", {})) != {"hard", "matched_anchor", "global_replay"}:
     raise SystemExit("dry-run curriculum does not contain exactly three pools")
+expected_policy = {
+    "hard": "all_gt_free_detector_scan_base_tiles",
+    "matched_anchor": "all_gt_free_detector_scan_base_tiles",
+    "content_missing": "full_image_global_view",
+    "global_replay": "full_image_retention",
+    "tile_selection_uses_gt": False,
+    "partial_gt_allowed": False,
+}
+if manifest.get("training_view_policy") != expected_policy:
+    raise SystemExit(
+        f"dry-run curriculum training-view policy differs: "
+        f"{manifest.get('training_view_policy')!r}"
+    )
 for filename in success.get("files", {}):
     path = root / filename
     if not path.is_file() or path.stat().st_size <= 0:
         raise SystemExit(f"dry-run artifact is missing or empty: {path}")
+
+records = {}
+for pool in ("hard", "matched_anchor", "global_replay"):
+    records[pool] = [
+        json.loads(line)
+        for line in (root / f"{pool}.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+for pool in ("hard", "matched_anchor"):
+    by_sample = {}
+    for row in records[pool]:
+        by_sample.setdefault(str(row["_ui5_sample_id"]), []).append(row)
+        task = str(row["_ui5_task"]).removeprefix("ui_")
+        kind = row.get("_ui5_record_kind")
+        if task == "content_missing":
+            if kind != "global_view" or row.get("_ui5_crop_source") != "content_missing_global":
+                raise SystemExit(f"{pool} content_missing is not a global view")
+        elif (
+            kind != "crop"
+            or row.get("_ui5_crop_source") != "gt_free_detector_scan_base_tile"
+            or row.get("_ui5_gt_used_for_geometry") is not False
+            or row.get("_ui5_partial_gt_indices") != []
+        ):
+            raise SystemExit(f"{pool} region record is not a verified GT-free crop")
+    for sample_id, sample_rows in by_sample.items():
+        task = str(sample_rows[0]["_ui5_task"]).removeprefix("ui_")
+        expected_records = 1 if task == "content_missing" else int(
+            sample_rows[0]["_ui5_base_tile_count"]
+        )
+        if len(sample_rows) != expected_records:
+            raise SystemExit(
+                f"{pool} sample {sample_id} omitted a base tile: "
+                f"expected={expected_records}, observed={len(sample_rows)}"
+            )
+if any(
+    row.get("_ui5_record_kind") != "full_image"
+    or row.get("_ui5_retention_view") is not True
+    or row.get("_ui5_crop_source") != "global_replay_retention"
+    for row in records["global_replay"]
+):
+    raise SystemExit("global replay is not an all-full-image retention pool")
+
+asset_rows = [
+    json.loads(line)
+    for line in (root / "crop_assets.jsonl").read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+crop_records = [
+    row
+    for pool in ("hard", "matched_anchor")
+    for row in records[pool]
+    if row.get("_ui5_record_kind") == "crop"
+]
+if len(asset_rows) != len(crop_records) or len(asset_rows) != len(manifest["crop_assets"]):
+    raise SystemExit("crop asset/record counts differ")
+asset_paths = {str(row["relative_path"]) for row in asset_rows}
+record_paths = {
+    str(Path(row["image"]).resolve().relative_to(root.resolve())).replace("\\", "/")
+    for row in crop_records
+}
+if asset_paths != record_paths:
+    raise SystemExit("crop records do not reference exactly the asset inventory")
+for relative, metadata in success["files"].items():
+    path = root / relative
+    if not isinstance(metadata, dict):
+        raise SystemExit(f"success inventory lacks hash/bytes metadata: {relative}")
+    import hashlib
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if path.stat().st_size != metadata.get("bytes") or digest != metadata.get("sha256"):
+        raise SystemExit(f"success inventory differs: {relative}")
 print(
     "recipe_dry_run=ok "
     f"hard_groups={manifest['hard_groups']} "
     f"matched_anchor_groups={manifest['matched_anchor_groups']} "
-    f"base_sample_groups={manifest['base_sample_groups']}"
+    f"base_sample_groups={manifest['base_sample_groups']} "
+    f"hard_tile_records={manifest['pools']['hard']['crop_training_records']} "
+    f"anchor_tile_records={manifest['pools']['matched_anchor']['crop_training_records']} "
+    f"crop_assets={len(asset_rows)}"
 )
 for pool, state in sorted(manifest["pools"].items()):
     print(
@@ -440,6 +540,8 @@ printf '%-30s %s\n' \
   "MODEL_PATH" "${MODEL_PATH}" \
   "OUTPUT_DIR" "${OUTPUT_DIR}" \
   "ROLLING_CHECKPOINT" "${ROLLING_CHECKPOINT_PATH}" \
+  "NNODES" "${NNODES}" \
+  "NODE_RANK" "${NODE_RANK}" \
   "CUDA_VISIBLE_DEVICES" "<empty>" \
   "DRY_RUN_OUTPUT" "${DRY_RUN_CURRICULUM_DIR}"
 

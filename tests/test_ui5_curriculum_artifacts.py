@@ -15,6 +15,8 @@ from eaglevl.train.ui5_curriculum_artifacts import (
     CHECKPOINT_COLUMNS,
     SHEET_ORDER,
     TASKS,
+    UI5_BY_TASK_COLUMNS,
+    UI5_OVERALL_COLUMNS,
     load_checkpoints_state,
     normalize_scorer_metrics,
     train_curve_rows_from_trainer_state,
@@ -174,6 +176,58 @@ class MetricsTests(unittest.TestCase):
             )
             / 2,
         )
+        # Legacy scorer fixtures did not expose compact runtime health. Their
+        # sample totals remain recoverable from image confusion counts.
+        self.assertEqual(normalized["tasks"]["ui_occlusion"]["total_samples"], 10)
+        self.assertEqual(
+            normalized["tasks"]["ui_occlusion"]["invalid_predictions"], 0
+        )
+
+    def test_preserves_compact_task_health_and_validates_counts(self):
+        metrics = uniform_metrics(0.5, 0.5)
+        expected_total = 0
+        expected_invalid = 0
+        for index, task_metrics in enumerate(metrics["tasks"].values()):
+            image = task_metrics["image"]
+            sample_total = sum(image[key] for key in ("tp", "fp", "fn", "tn"))
+            task_metrics["total_samples"] = sample_total
+            task_metrics[
+                "invalid_predictions" if index == 0 else "invalid_pred"
+            ] = index
+            task_metrics["scored_sample_ids"] = [f"large-id-{index}"] * 100
+            expected_total += sample_total
+            expected_invalid += index
+
+        normalized = normalize_scorer_metrics(metrics)
+        first = normalized["tasks"]["ui_occlusion"]
+        self.assertEqual(first["total_samples"], 13)
+        self.assertEqual(first["invalid_predictions"], 0)
+        self.assertEqual(first["invalid_prediction_rate"], 0.0)
+        self.assertNotIn("scored_sample_ids", first)
+        self.assertEqual(normalized["overall"]["total_samples"], expected_total)
+        self.assertEqual(
+            normalized["overall"]["invalid_predictions"], expected_invalid
+        )
+        self.assertAlmostEqual(
+            normalized["overall"]["invalid_prediction_rate"],
+            expected_invalid / expected_total,
+        )
+
+        invalid = uniform_metrics(0.5, 0.5)
+        invalid["tasks"]["occlusion"]["total_samples"] = 13
+        invalid["tasks"]["occlusion"]["invalid_pred"] = 14
+        with self.assertRaisesRegex(ValueError, "must not exceed total_samples"):
+            normalize_scorer_metrics(invalid)
+
+        invalid = uniform_metrics(0.5, 0.5)
+        invalid["tasks"]["occlusion"]["total_samples"] = -1
+        with self.assertRaisesRegex(ValueError, "non-negative integer"):
+            normalize_scorer_metrics(invalid)
+
+        invalid = uniform_metrics(0.5, 0.5)
+        invalid["tasks"]["occlusion"]["total_samples"] = 9
+        with self.assertRaisesRegex(ValueError, "must equal image confusion total"):
+            normalize_scorer_metrics(invalid)
 
     def test_rejects_missing_task_and_inconsistent_reported_f1(self):
         metrics = uniform_metrics(0.5, 0.5)
@@ -405,6 +459,83 @@ class ArtifactTests(unittest.TestCase):
                         for cell in row:
                             self.assertNotEqual(cell.data_type, "f")
                             self.assertNotEqual(cell.data_type, "e")
+            finally:
+                workbook.close()
+
+    def test_workbook_and_json_include_compact_runtime_health(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = make_checkpoint(root / "source_crop", 0)
+            metrics = uniform_metrics(0.5, 0.5)
+            expected_total = 0
+            expected_invalid = 0
+            for index, task_metrics in enumerate(metrics["tasks"].values()):
+                image = task_metrics["image"]
+                sample_total = sum(
+                    image[key] for key in ("tp", "fp", "fn", "tn")
+                )
+                task_metrics["total_samples"] = sample_total
+                task_metrics["invalid_pred"] = index
+                task_metrics["scored_sample_ids"] = [f"sample-{index}"] * 100
+                task_metrics["skipped_sample_ids"] = [f"skipped-{index}"] * 100
+                expected_total += sample_total
+                expected_invalid += index
+
+            self.update(
+                root,
+                step=0,
+                metrics=metrics,
+                checkpoint=baseline,
+            )
+
+            state_path = root / "checkpoints.json"
+            state = load_checkpoints_state(state_path)
+            normalized = state["evaluations"][0]["metrics"]
+            self.assertEqual(normalized["overall"]["total_samples"], expected_total)
+            self.assertEqual(
+                normalized["overall"]["invalid_predictions"], expected_invalid
+            )
+            state_text = state_path.read_text(encoding="utf-8")
+            self.assertNotIn("scored_sample_ids", state_text)
+            self.assertNotIn("skipped_sample_ids", state_text)
+
+            workbook_path = (
+                root
+                / "diagnostics"
+                / "ui5_crop_rollout4_curriculum_evaluation.xlsx"
+            )
+            workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+            try:
+                overall_sheet = workbook["ui5_overall"]
+                overall_header = tuple(cell.value for cell in overall_sheet[1])
+                self.assertEqual(overall_header, UI5_OVERALL_COLUMNS)
+                overall = dict(
+                    zip(overall_header, next(overall_sheet.iter_rows(min_row=2, values_only=True)))
+                )
+                self.assertEqual(overall["total_samples"], expected_total)
+                self.assertEqual(
+                    overall["invalid_predictions"], expected_invalid
+                )
+                self.assertAlmostEqual(
+                    overall["invalid_prediction_rate"],
+                    expected_invalid / expected_total,
+                )
+
+                by_task_sheet = workbook["ui5_by_task"]
+                by_task_header = tuple(cell.value for cell in by_task_sheet[1])
+                self.assertEqual(by_task_header, UI5_BY_TASK_COLUMNS)
+                rows = [
+                    dict(zip(by_task_header, values))
+                    for values in by_task_sheet.iter_rows(min_row=2, values_only=True)
+                ]
+                cropping_rows = [
+                    row for row in rows if row["task"] == "ui_cropping"
+                ]
+                self.assertEqual(len(cropping_rows), 2)
+                for row in cropping_rows:
+                    self.assertEqual(row["total_samples"], 13)
+                    self.assertEqual(row["invalid_predictions"], 1)
+                    self.assertAlmostEqual(row["invalid_prediction_rate"], 1 / 13)
             finally:
                 workbook.close()
 

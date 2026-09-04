@@ -28,6 +28,11 @@ class CurriculumPipelineContractTests(unittest.TestCase):
             'EXPECTED_HARD_GROUPS="${EXPECTED_HARD_GROUPS:-72}"',
             'SEED="${SEED:-42}"',
             'ROLLOUT_DIFFICULTY="${ROLLOUT_DIFFICULTY:-${ROLLOUT_ROOT}/selection/complete8.jsonl}"',
+            'NNODES="${NNODES:-1}"',
+            'NODE_RANK="${NODE_RANK:-0}"',
+            'require_equal NNODES "${NNODES}" 1',
+            'require_equal NODE_RANK "${NODE_RANK}" 0',
+            'export NNODES NODE_RANK',
         ):
             self.assertIn(contract, source)
         self.assertIn("evaluate_and_register 0", source)
@@ -78,6 +83,11 @@ class CurriculumPipelineContractTests(unittest.TestCase):
 
         preflight = PREFLIGHT.read_text(encoding="utf-8")
         self.assertIn('export CUDA_VISIBLE_DEVICES=""', preflight)
+        self.assertIn('NNODES="${NNODES:-1}"', preflight)
+        self.assertIn('NODE_RANK="${NODE_RANK:-0}"', preflight)
+        self.assertIn('requires NNODES=1', preflight)
+        self.assertIn('requires NODE_RANK=0', preflight)
+        self.assertIn('export NNODES NODE_RANK', preflight)
         self.assertIn('PREFLIGHT_MODE="${PREFLIGHT_MODE:-fast}"', preflight)
         self.assertIn("--full", preflight)
         self.assertIn("build_ui5_curriculum_recipe.py", preflight)

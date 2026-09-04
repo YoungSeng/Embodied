@@ -60,6 +60,7 @@ CURRICULUM_PHASES = (
     (0.45, 0.35, 0.20, 7.0e-7),
     (0.30, 0.30, 0.40, 5.0e-7),
 )
+FORMAL_ROLLOUT_SEEDS = (20260903, 20260917, 20260931, 20260947)
 
 
 def utc_now() -> str:
@@ -393,6 +394,62 @@ def resolve_hard_groups(
     return resolved_rows, counts, plan_path
 
 
+def paired_crop_rollout_seeds(rows: Sequence[Mapping[str, Any]]) -> tuple[int, ...]:
+    """Recover the frozen crop-rollout seeds used to define the hard groups.
+
+    Hard-transition measurements must be paired with the baseline attempts.  A
+    fresh ``SEED + rollout_id`` sequence measures a mixture of checkpoint change
+    and sampling noise, so it is not a valid transition for a 0/4 group.
+    """
+
+    if not rows:
+        raise ValueError("cannot derive paired rollout seeds from zero hard groups")
+    observed: tuple[int, ...] | None = None
+    for row in rows:
+        record_id = str(row.get("record_id") or "<unknown>")
+        rollouts = row.get("rollouts")
+        crop = rollouts.get("crop") if isinstance(rollouts, Mapping) else None
+        if not isinstance(crop, list) or len(crop) != 4:
+            raise ValueError(
+                f"hard group {record_id} lacks its four frozen crop rollouts"
+            )
+        by_id: dict[int, Mapping[str, Any]] = {}
+        for route in crop:
+            if not isinstance(route, Mapping):
+                raise ValueError(f"hard group {record_id} has a malformed crop rollout")
+            rollout_id = route.get("rollout_id")
+            seed = route.get("seed")
+            if (
+                isinstance(rollout_id, bool)
+                or not isinstance(rollout_id, int)
+                or rollout_id not in range(4)
+                or rollout_id in by_id
+                or isinstance(seed, bool)
+                or not isinstance(seed, int)
+                or route.get("model_id") != "crop"
+            ):
+                raise ValueError(
+                    f"hard group {record_id} has an invalid crop rollout identity"
+                )
+            by_id[rollout_id] = route
+        if set(by_id) != set(range(4)):
+            raise ValueError(f"hard group {record_id} has incomplete crop rollout IDs")
+        seeds = tuple(int(by_id[index]["seed"]) for index in range(4))
+        if observed is None:
+            observed = seeds
+        elif seeds != observed:
+            raise ValueError(
+                f"hard group {record_id} uses different crop rollout seeds: "
+                f"expected={observed}, observed={seeds}"
+            )
+    if observed != FORMAL_ROLLOUT_SEEDS:
+        raise ValueError(
+            "frozen crop rollout seeds do not match the formal baseline identity: "
+            f"expected={FORMAL_ROLLOUT_SEEDS}, observed={observed}"
+        )
+    return observed
+
+
 def parse_gpu_devices(value: str) -> tuple[str, str]:
     devices = tuple(item.strip() for item in value.split(",") if item.strip())
     if len(devices) != 2 or len(set(devices)) != 2:
@@ -497,7 +554,13 @@ def build_worker_specs(
     hard_counts: Mapping[str, int],
     resolved_hard_path: Path,
     identity_path: Path,
+    hard_rollout_seeds: Sequence[int] = FORMAL_ROLLOUT_SEEDS,
 ) -> list[WorkerSpec]:
+    if tuple(hard_rollout_seeds) != FORMAL_ROLLOUT_SEEDS:
+        raise ValueError(
+            "hard rollout workers must reuse the four formal baseline seeds: "
+            f"{FORMAL_ROLLOUT_SEEDS}"
+        )
     specs: list[WorkerSpec] = []
     for task in TASKS:
         gpu = devices[TASK_GPU_SLOT[task]]
@@ -568,7 +631,7 @@ def build_worker_specs(
             "--rollout-bundle-root",
             str(args.rollout_bundle_root),
             "--hard-rollout-seeds",
-            *(str(args.seed + index) for index in range(4)),
+            *(str(seed) for seed in hard_rollout_seeds),
             "--hard-rollout-output-dir",
             str(task_output / "rollout4"),
             "--expected-hard-task-count",
@@ -921,6 +984,11 @@ def validate_identity_unchanged(args: argparse.Namespace, identity: Mapping[str,
             identity["crop_and_merge"]["implementation_sha256"],
             "crop/remap/NMS implementation",
         ),
+        (
+            Path(identity["evaluator"]["matching_implementation_path"]),
+            identity["evaluator"]["matching_implementation_sha256"],
+            "metric matching implementation",
+        ),
         (args.scorer_script, identity["evaluator"]["sha256"], "evaluator"),
         (
             args.hard_groups_jsonl,
@@ -1116,7 +1184,11 @@ def enrich_metrics(raw: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def evaluation_status_payload(
-    *, args: argparse.Namespace, metrics: Mapping[str, Any], evaluation_seconds: float
+    *,
+    args: argparse.Namespace,
+    metrics: Mapping[str, Any],
+    evaluation_seconds: float,
+    hard_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     step = args.step
     if step == 0:
@@ -1140,18 +1212,47 @@ def evaluation_status_payload(
         if profile is not None
         else None
     )
+    task_status: dict[str, dict[str, Any]] = {}
+    for task in TASKS:
+        task_metrics = metrics["tasks"][task]
+        image = task_metrics["image"]
+        bbox = task_metrics["bbox"]
+        task_status[f"ui_{task}"] = {
+            "samples": int(
+                task_metrics.get(
+                    "total_samples",
+                    sum(int(image[key]) for key in ("tp", "fp", "fn", "tn")),
+                )
+            ),
+            "invalid_predictions": int(task_metrics.get("invalid_pred", 0)),
+            "image_f1": float(image["f1"]),
+            "image_tp": int(image["tp"]),
+            "image_fp": int(image["fp"]),
+            "image_fn": int(image["fn"]),
+            "image_tn": int(image["tn"]),
+            "bbox_f1": float(bbox["f1"]),
+            "bbox_tp": int(bbox["tp"]),
+            "bbox_fp": int(bbox["fp"]),
+            "bbox_fn": int(bbox["fn"]),
+        }
+    hard_transition = (
+        {
+            "groups": int(hard_summary.get("group_count", 0)),
+            "improved": int(hard_summary.get("groups_improved", 0)),
+            "still_hard": int(hard_summary.get("groups_still_hard", 0)),
+            "parse_errors": int(hard_summary.get("parse_error_count", 0)),
+            "runtime_errors": int(hard_summary.get("runtime_error_count", 0)),
+            "comparison": "paired_frozen_crop_baseline_to_candidate",
+        }
+        if hard_summary is not None
+        else None
+    )
     return {
         "event": "ui5_evaluation_complete",
         "step": step,
         "phase": phase,
         "curriculum_target": curriculum_target,
-        "tasks": {
-            f"ui_{task}": {
-                "image_f1": float(metrics["tasks"][task]["image"]["f1"]),
-                "bbox_f1": float(metrics["tasks"][task]["bbox"]["f1"]),
-            }
-            for task in TASKS
-        },
+        "tasks": task_status,
         "macro": {
             "image_f1": float(metrics["macro"]["image"]["f1"]),
             "bbox_f1": float(metrics["macro"]["bbox"]["f1"]),
@@ -1161,6 +1262,13 @@ def evaluation_status_payload(
             "bbox_f1": float(metrics["micro"]["bbox"]["f1"]),
         },
         "joint_score": float(metrics["overall"]["joint_score"]),
+        "health": {
+            "samples": sum(row["samples"] for row in task_status.values()),
+            "invalid_predictions": sum(
+                row["invalid_predictions"] for row in task_status.values()
+            ),
+        },
+        "hard_transition": hard_transition,
         "evaluation_seconds": float(evaluation_seconds),
         "next_action": "register_metrics_update_excel_and_best_checkpoint",
     }
@@ -1170,7 +1278,23 @@ def print_evaluation_status(payload: Mapping[str, Any]) -> None:
     for task, values in payload["tasks"].items():
         print(
             f"[UI5 TASK METRICS] step={payload['step']} task={task} "
-            f"image_f1={values['image_f1']:.8f} bbox_f1={values['bbox_f1']:.8f}",
+            f"samples={values['samples']} invalid={values['invalid_predictions']} "
+            f"image_f1={values['image_f1']:.8f} "
+            f"image_tp/fp/fn/tn={values['image_tp']}/{values['image_fp']}/"
+            f"{values['image_fn']}/{values['image_tn']} "
+            f"bbox_f1={values['bbox_f1']:.8f} "
+            f"bbox_tp/fp/fn={values['bbox_tp']}/{values['bbox_fp']}/"
+            f"{values['bbox_fn']}",
+            flush=True,
+        )
+    if payload.get("hard_transition") is not None:
+        hard = payload["hard_transition"]
+        print(
+            f"[UI5 HARD TRANSITION] step={payload['step']} groups={hard['groups']} "
+            f"improved={hard['improved']} still_hard={hard['still_hard']} "
+            f"parse_errors={hard['parse_errors']} "
+            f"runtime_errors={hard['runtime_errors']} "
+            f"comparison={hard['comparison']}",
             flush=True,
         )
     print(
@@ -1180,6 +1304,8 @@ def print_evaluation_status(payload: Mapping[str, Any]) -> None:
         f"image_micro_f1={payload['micro']['image_f1']:.8f} "
         f"bbox_micro_f1={payload['micro']['bbox_f1']:.8f} "
         f"joint_score={payload['joint_score']:.8f} "
+        f"samples={payload['health']['samples']} "
+        f"invalid={payload['health']['invalid_predictions']} "
         f"evaluation_seconds={payload['evaluation_seconds']:.1f} "
         f"next={payload['next_action']}",
         flush=True,
@@ -1191,7 +1317,77 @@ def print_evaluation_status(payload: Mapping[str, Any]) -> None:
     )
 
 
-def run_scorer(args: argparse.Namespace) -> tuple[Path, dict[str, Any], list[str]]:
+def validate_scored_sample_coverage(
+    raw: Mapping[str, Any],
+    *,
+    expected_images: Mapping[str, int],
+    expected_stems: Mapping[str, set[str]],
+) -> None:
+    """Fail closed unless the scorer consumed exactly the worker input set."""
+
+    tasks = raw.get("tasks")
+    if not isinstance(tasks, Mapping) or set(tasks) != set(TASKS):
+        raise RuntimeError("canonical evaluator did not return all five task summaries")
+    for task in TASKS:
+        summary = tasks[task]
+        if not isinstance(summary, Mapping):
+            raise RuntimeError(f"canonical evaluator returned invalid task summary: {task}")
+        raw_ids = summary.get("scored_sample_ids")
+        if not isinstance(raw_ids, list) or any(
+            not isinstance(sample_id, str) or not sample_id for sample_id in raw_ids
+        ):
+            raise RuntimeError(
+                f"canonical evaluator omitted valid scored_sample_ids for {task}"
+            )
+        observed_ids = set(raw_ids)
+        expected_ids = set(expected_stems[task])
+        duplicate_count = len(raw_ids) - len(observed_ids)
+        reported_total = summary.get("total_samples")
+        reported_scored = summary.get("scored_sample_count")
+        reported_skipped = summary.get("skipped_sample_count")
+        image = summary.get("image")
+        image_count = (
+            sum(int(image[key]) for key in ("tp", "fp", "fn", "tn"))
+            if isinstance(image, Mapping)
+            and all(key in image for key in ("tp", "fp", "fn", "tn"))
+            else -1
+        )
+        missing = sorted(expected_ids - observed_ids)
+        unexpected = sorted(observed_ids - expected_ids)
+        expected_count = int(expected_images[task])
+        if (
+            len(expected_ids) != expected_count
+            or duplicate_count
+            or len(raw_ids) != expected_count
+            or reported_total != expected_count
+            or reported_scored != expected_count
+            or reported_skipped != 0
+            or image_count != expected_count
+            or missing
+            or unexpected
+        ):
+            raise RuntimeError(
+                f"canonical evaluator scored sample mismatch for {task}: "
+                f"expected_count={expected_count}, expected_unique={len(expected_ids)}, "
+                f"scored_ids={len(raw_ids)}, scored_unique={len(observed_ids)}, "
+                f"duplicates={duplicate_count}, total_samples={reported_total!r}, "
+                f"scored_sample_count={reported_scored!r}, "
+                f"skipped_sample_count={reported_skipped!r}, image_count={image_count}, "
+                f"missing={missing[:10]}, unexpected={unexpected[:10]}"
+            )
+        print(
+            f"[UI5 SCORE COVERAGE] task={task} expected={expected_count} "
+            f"scored={len(raw_ids)} unique={len(observed_ids)} skipped=0",
+            flush=True,
+        )
+
+
+def run_scorer(
+    args: argparse.Namespace,
+    *,
+    expected_images: Mapping[str, int],
+    expected_stems: Mapping[str, set[str]],
+) -> tuple[Path, dict[str, Any], list[str]]:
     score_root = args.output_dir / args.score_run_name
     if score_root.exists():
         raise FileExistsError(f"score output already exists: {score_root}")
@@ -1232,6 +1428,11 @@ def run_scorer(args: argparse.Namespace) -> tuple[Path, dict[str, Any], list[str
     if not metrics_path.is_file():
         raise RuntimeError(f"canonical evaluator metrics are missing: {metrics_path}")
     raw = json.loads(metrics_path.read_text(encoding="utf-8"))
+    validate_scored_sample_coverage(
+        raw,
+        expected_images=expected_images,
+        expected_stems=expected_stems,
+    )
     enriched = enrich_metrics(raw)
     final_path = args.output_dir / "ui5_metrics.json"
     atomic_write_json(final_path, enriched)
@@ -1316,7 +1517,9 @@ def run(args: argparse.Namespace) -> int:
         if expected_images[task] <= 0:
             raise ValueError(f"UI5 task {task} has no valid evaluation images")
 
-    rollout_seeds = [args.seed + index for index in range(4)]
+    # Pair candidate hard-group attempts with the exact four baseline attempts
+    # that made each group 0/4.  The ordinary UI5 pass still uses ``args.seed``.
+    rollout_seeds = list(paired_crop_rollout_seeds(resolved_rows))
     expected_hard_ids = {
         task: {
             str(row["record_id"])
@@ -1328,6 +1531,9 @@ def run(args: argparse.Namespace) -> int:
     crop_implementation = Path(__file__).with_name("ui5_lossless_tiling.py").resolve(
         strict=True
     )
+    matching_implementation = Path(__file__).with_name(
+        "ui5_metric_matching.py"
+    ).resolve(strict=True)
     identity = {
         "schema_version": 1,
         "step": args.step,
@@ -1375,6 +1581,11 @@ def run(args: argparse.Namespace) -> int:
         "evaluator": {
             "path": str(args.scorer_script),
             "sha256": file_sha256(args.scorer_script),
+            "matching_implementation_path": str(matching_implementation),
+            "matching_implementation_sha256": file_sha256(
+                matching_implementation
+            ),
+            "matching_objective": "max_qualified_cardinality_then_iou",
             "iou_threshold": args.evaluator_iou_threshold,
             "bbox_format": "xyxy",
             "parse_error_policy": (
@@ -1392,7 +1603,7 @@ def run(args: argparse.Namespace) -> int:
             "expected_groups": args.expected_hard_groups,
             "groups_by_task": hard_counts,
             "rollout_seeds": rollout_seeds,
-            "seed_derivation": "base_seed + rollout_id",
+            "seed_derivation": "paired frozen crop baseline rollout seeds",
             "sample_seed_derivation": (
                 "inference_ui_defect_locany.stable_sample_seed("
                 "rollout_seed, task, record_id)"
@@ -1414,7 +1625,12 @@ def run(args: argparse.Namespace) -> int:
     atomic_write_json(identity_path, identity)
     identity_digest = file_sha256(identity_path)
     specs = build_worker_specs(
-        args, devices, hard_counts, resolved_hard_path, identity_path
+        args,
+        devices,
+        hard_counts,
+        resolved_hard_path,
+        identity_path,
+        rollout_seeds,
     )
     status_path = args.output_dir / "evaluation_status.json"
     status: dict[str, Any] = {
@@ -1483,12 +1699,17 @@ def run(args: argparse.Namespace) -> int:
     status["status"] = "hard_rollouts_merged"
     status["hard_rollout"] = hard_summary
     atomic_write_json(status_path, status)
-    metrics_path, metrics, score_command = run_scorer(args)
+    metrics_path, metrics, score_command = run_scorer(
+        args,
+        expected_images=expected_images,
+        expected_stems=expected_stems,
+    )
     evaluation_seconds = round(time.monotonic() - started, 6)
     evaluation_status = evaluation_status_payload(
         args=args,
         metrics=metrics,
         evaluation_seconds=evaluation_seconds,
+        hard_summary=hard_summary,
     )
     status.update(
         {

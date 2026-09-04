@@ -29,7 +29,7 @@ Qwen3-VL 输出示例：
 """
 from datetime import datetime
 import argparse
-import glob
+import hashlib
 import json
 import os
 import re
@@ -40,7 +40,8 @@ from typing import Any
 
 import numpy as np
 from PIL import Image, ImageOps
-from scipy.optimize import linear_sum_assignment
+
+from scripts.ui5_metric_matching import threshold_aware_linear_sum_assignment
 
 
 TASK_CONFIG = {
@@ -98,6 +99,8 @@ COUNT_PATTERN = re.compile(r"(\d+)\s*个问题")
 
 
 SCRIPT_VERSION = "2026-07-16-fix-images-list-v2"
+# Keep this identical to ``inference_ui_defect_locany.result_candidates``.
+PREDICTION_FILE_SUFFIXES = ("", "_defect", "_ok", "_parse_error")
 
 
 def strip_file_uri(path: str) -> str:
@@ -284,15 +287,106 @@ def parse_qwen3vl_response(
     return pred_ans, parse_meta
 
 
-def find_prediction_file(pred_dir: str, file_id: str) -> str | None:
-    """
-    优先匹配 file_id.json，同时兼容 _ok、_defect、_error 等后缀。
-    """
-    exact_path = os.path.join(pred_dir, f"{file_id}.json")
-    if os.path.isfile(exact_path):
-        return exact_path
+def legacy_output_stem(image_path: str) -> str:
+    """Match ``inference_ui_defect_locany.legacy_output_stem`` exactly."""
 
-    candidates = sorted(glob.glob(os.path.join(pred_dir, f"{file_id}*.json")))
+    return Path(image_path).stem.replace(":", "_")
+
+
+def build_output_stems(image_paths: list[str]) -> dict[str, str]:
+    """Match the worker's collision-safe output naming exactly.
+
+    The hash is intentionally computed from the fully resolved path string.  A
+    basename by itself is not an image identity: two dataset shards can both
+    contain (for example) ``12.png``.
+    """
+
+    grouped: dict[str, list[str]] = {}
+    for image_path in image_paths:
+        grouped.setdefault(legacy_output_stem(image_path), []).append(image_path)
+
+    result: dict[str, str] = {}
+    for base, paths in grouped.items():
+        if len(paths) == 1:
+            result[paths[0]] = base
+            continue
+        for image_path in paths:
+            digest = hashlib.blake2b(
+                image_path.encode("utf-8"), digest_size=5
+            ).hexdigest()
+            result[image_path] = f"{base}__{digest}"
+    return result
+
+
+def resolve_gt_image_path(image_path: str, gt_path: str) -> str:
+    """Resolve paths with the same rules used by the inference worker."""
+
+    path = Path(image_path).expanduser()
+    if not path.is_absolute():
+        path = Path(gt_path).parent / path
+    return str(path.resolve(strict=False))
+
+
+def worker_image_paths_from_sample(sample: Any, gt_path: str) -> list[str]:
+    """Mirror the worker's ``extract_image_paths_from_sample`` conventions."""
+
+    if not isinstance(sample, dict):
+        return []
+    images = sample.get("images", sample.get("image"))
+    if images is None:
+        return []
+    if isinstance(images, (str, dict)):
+        images = [images]
+    if not isinstance(images, list):
+        return []
+
+    resolved: list[str] = []
+    for image in images:
+        raw_path = (
+            image
+            if isinstance(image, str)
+            else image.get("path") if isinstance(image, dict) else None
+        )
+        if isinstance(raw_path, str) and raw_path:
+            resolved.append(resolve_gt_image_path(raw_path, gt_path))
+    return resolved
+
+
+def build_gt_prediction_stems(gt_path: str) -> dict[str, str]:
+    """Build the exact resolved-image -> output-stem map used by the worker."""
+
+    image_paths: list[str] = []
+    with open(gt_path, "r", encoding="utf-8") as gt_file:
+        for line in gt_file:
+            if not line.strip():
+                continue
+            sample = json.loads(line)
+            for image_path in worker_image_paths_from_sample(sample, gt_path):
+                # ``--skip-figma`` in the worker is strictly a basename-colon
+                # filter.  Do not treat a parent directory containing "figma"
+                # as an excluded sample.
+                if Path(image_path).is_file() and ":" not in Path(image_path).name:
+                    image_paths.append(image_path)
+
+    return build_output_stems(list(dict.fromkeys(image_paths)))
+
+
+def find_prediction_file(pred_dir: str, file_id: str) -> str | None:
+    """Find one exact worker filename, never a basename-prefix match.
+
+    In particular, looking up ``12`` must not return ``123.json``.  Known
+    status suffixes remain supported for legacy tagged worker output.
+    """
+
+    candidates = [
+        os.path.join(pred_dir, f"{file_id}{suffix}.json")
+        for suffix in PREDICTION_FILE_SUFFIXES
+        if os.path.isfile(os.path.join(pred_dir, f"{file_id}{suffix}.json"))
+    ]
+    if len(candidates) > 1:
+        raise RuntimeError(
+            f"预测 stem {file_id!r} 匹配到多个精确状态文件: {candidates}"
+        )
     return candidates[0] if candidates else None
 
 
@@ -667,6 +761,7 @@ def merge_gt_and_yolo_dir_preds(
     print(f"GT 文件: {gt_path}")
     print(f"预测目录: {pred_dir}")
     print(f"bbox 格式: {bbox_format}")
+    prediction_stems = build_gt_prediction_stems(gt_path)
 
     with open(gt_path, "r", encoding="utf-8") as f_gt, open(
         output_path,
@@ -682,9 +777,9 @@ def merge_gt_and_yolo_dir_preds(
 
             # 使用已有的统一图片路径读取函数，
             # 兼容 image 和 images 两种 GT。
-            image_path = extract_image_path(data)
+            raw_image_path = extract_image_path(data)
 
-            if not image_path:
+            if not raw_image_path:
                 parse_errors += 1
                 data["pred_ans"] = None
                 data["pred_parse_info"] = {
@@ -696,10 +791,11 @@ def merge_gt_and_yolo_dir_preds(
                 )
                 continue
 
-            file_id = (
-                os.path.splitext(os.path.basename(image_path))[0]
-                .replace(":", "_")
+            image_path = resolve_gt_image_path(raw_image_path, gt_path)
+            file_id = prediction_stems.get(
+                image_path, legacy_output_stem(image_path)
             )
+            data["_ui5_prediction_stem"] = file_id
 
             # 复用已有函数，兼容：
             # 155329.json
@@ -800,6 +896,7 @@ def merge_gt_and_qwen3vl_preds(
         f"坐标基准: 0~{coord_base:g}\n"
         f"脚本版本: {SCRIPT_VERSION}"
     )
+    prediction_stems = build_gt_prediction_stems(gt_path)
 
     with open(gt_path, "r", encoding="utf-8") as f_gt, open(
         output_path, "w", encoding="utf-8"
@@ -812,17 +909,17 @@ def merge_gt_and_qwen3vl_preds(
             total_lines += 1
             data = json.loads(line)
 
-            gt_image_path = extract_image_path(data)
+            raw_gt_image_path = extract_image_path(data)
 
             if total_lines <= 3:
                 print(
                     f"[DEBUG GT {total_lines}] "
                     f"images={data.get('images')!r}, "
                     f"image={data.get('image')!r}, "
-                    f"resolved_path={gt_image_path!r}"
+                    f"resolved_path={raw_gt_image_path!r}"
                 )
 
-            if not gt_image_path:
+            if not raw_gt_image_path:
                 data["pred_ans"] = None
                 data["pred_raw_response"] = ""
                 data["pred_parse_info"] = {
@@ -836,8 +933,11 @@ def merge_gt_and_qwen3vl_preds(
                 f_out.write(json.dumps(data, ensure_ascii=False) + "\n")
                 continue
 
-            filename_with_ext = os.path.basename(gt_image_path)
-            file_id = os.path.splitext(filename_with_ext)[0].replace(":", "_")
+            gt_image_path = resolve_gt_image_path(raw_gt_image_path, gt_path)
+            file_id = prediction_stems.get(
+                gt_image_path, legacy_output_stem(gt_image_path)
+            )
+            data["_ui5_prediction_stem"] = file_id
             pred_file_path = find_prediction_file(pred_dir, file_id)
 
             if pred_file_path is None:
@@ -1085,7 +1185,22 @@ def get_sample_image_id(sample: dict[str, Any]) -> str:
 def is_figma_sample(sample: dict[str, Any]) -> bool:
     image_id = get_sample_image_id(sample)
     basename = os.path.basename(image_id)
-    return "figma" in image_id.lower() or ":" in basename
+    # Match the inference worker's ``--skip-figma`` rule.  The five formal GT
+    # files are already pre-filtered; a harmless parent directory such as
+    # ``ui5_no_figma/`` must never make a sample disappear from scoring.
+    return ":" in basename
+
+
+def get_scored_sample_id(sample: dict[str, Any], line_number: int) -> str:
+    """Return the worker output stem attached during the GT/prediction join."""
+
+    prediction_stem = sample.get("_ui5_prediction_stem")
+    if isinstance(prediction_stem, str) and prediction_stem:
+        return prediction_stem
+    image_id = get_sample_image_id(sample)
+    if image_id != "unknown":
+        return legacy_output_stem(image_id)
+    return f"missing-image-line-{line_number}"
 
 
 def get_gt_payload(sample: dict[str, Any]) -> Any:
@@ -1114,7 +1229,7 @@ def evaluate_merged_file(
     target_issue: str,
     iou_thresh: float,
     include_figma: bool,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     metrics = {
         "tp": 0,
         "fp": 0,
@@ -1127,18 +1242,23 @@ def evaluate_merged_file(
         "count_match": 0,
         "total_samples": 0,
         "invalid_pred": 0,
+        "scored_sample_ids": [],
+        "skipped_sample_ids": [],
     }
 
     with open(merged_path, "r", encoding="utf-8") as f:
-        for line in f:
+        for line_number, line in enumerate(f, start=1):
             if not line.strip():
                 continue
 
             sample = json.loads(line)
+            sample_id = get_scored_sample_id(sample, line_number)
 
             if not include_figma and is_figma_sample(sample):
+                metrics["skipped_sample_ids"].append(sample_id)
                 continue
 
+            metrics["scored_sample_ids"].append(sample_id)
             gt_payload = get_gt_payload(sample)
             gt_bboxes = extract_bboxes_for_issue(gt_payload, target_issue)
             gt_count = len(gt_bboxes)
@@ -1188,7 +1308,9 @@ def evaluate_merged_file(
                         gt_box, pred_box
                     )
 
-            row_indices, col_indices = linear_sum_assignment(-iou_matrix)
+            row_indices, col_indices = threshold_aware_linear_sum_assignment(
+                iou_matrix, iou_thresh
+            )
             matched_tp = sum(
                 1
                 for row_index, col_index in zip(row_indices, col_indices)
@@ -1213,7 +1335,7 @@ def safe_prf(tp: int, fp: int, fn: int) -> tuple[float, float, float]:
     return precision, recall, f1
 
 
-def build_metrics_summary(metrics: dict[str, int]) -> dict[str, Any]:
+def build_metrics_summary(metrics: dict[str, Any]) -> dict[str, Any]:
     bbox_precision, bbox_recall, bbox_f1 = safe_prf(
         metrics["tp"], metrics["fp"], metrics["fn"]
     )
@@ -1260,6 +1382,10 @@ def build_metrics_summary(metrics: dict[str, int]) -> dict[str, Any]:
         },
         "total_samples": metrics["total_samples"],
         "invalid_pred": metrics["invalid_pred"],
+        "scored_sample_count": len(metrics["scored_sample_ids"]),
+        "scored_sample_ids": list(metrics["scored_sample_ids"]),
+        "skipped_sample_count": len(metrics["skipped_sample_ids"]),
+        "skipped_sample_ids": list(metrics["skipped_sample_ids"]),
     }
 
 
@@ -1674,6 +1800,12 @@ def write_all_tasks_summary(
         "tasks": {
             task_key: {
                 "issue_name": TASK_CONFIG[task_key]["issue_name"],
+                "total_samples": int(summary["total_samples"]),
+                "invalid_pred": int(summary["invalid_pred"]),
+                "scored_sample_count": int(summary["scored_sample_count"]),
+                "scored_sample_ids": list(summary["scored_sample_ids"]),
+                "skipped_sample_count": int(summary["skipped_sample_count"]),
+                "skipped_sample_ids": list(summary["skipped_sample_ids"]),
                 "bbox": {
                     key: (float(value) if isinstance(value, (float, np.floating)) else int(value))
                     for key, value in summary["bbox"].items()

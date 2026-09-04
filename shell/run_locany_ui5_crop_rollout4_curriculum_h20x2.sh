@@ -62,6 +62,8 @@ LLM_LRS="${LLM_LRS:-1e-6,7e-7,5e-7}"
 EXPECTED_HARD_GROUPS="${EXPECTED_HARD_GROUPS:-72}"
 SEED="${SEED:-42}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
 
 if [[ "${ROLLING_CHECKPOINT_DIR}" = /* ]]; then
   ROLLING_CHECKPOINT_PATH="${ROLLING_CHECKPOINT_DIR}"
@@ -92,6 +94,8 @@ require_equal LLM_LRS "${LLM_LRS}" 1e-6,7e-7,5e-7
 require_equal EXPECTED_HARD_GROUPS "${EXPECTED_HARD_GROUPS}" 72
 require_equal SEED "${SEED}" 42
 require_equal CUDA_VISIBLE_DEVICES "${CUDA_VISIBLE_DEVICES}" 0,1
+require_equal NNODES "${NNODES}" 1
+require_equal NODE_RANK "${NODE_RANK}" 0
 
 [[ -x "${PYTHON_BIN}" ]] || locany_die 21 "Python is missing: ${PYTHON_BIN}"
 [[ -d "${MODEL_PATH}" ]] || locany_die 22 "Original crop checkpoint is missing: ${MODEL_PATH}"
@@ -112,6 +116,7 @@ export PATH="${ENV_DIR}/bin:${PATH}"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 export PROJECT_ROOT WORKSPACE ENV_DIR MODEL_PATH BASE_MODEL PROCESSOR_PATH
 export OUTPUT_DIR RUN_NAME META_PATH CUDA_VISIBLE_DEVICES
+export NNODES NODE_RANK
 export CURRICULUM_MODE TOTAL_STEPS EVAL_INTERVAL_STEPS ROLLING_CHECKPOINT_DIR
 export CHECKPOINT_SAVE_POLICY UI5_GPU0_WORKERS UI5_GPU1_WORKERS
 export UI5_EVAL_HEARTBEAT_SECONDS
@@ -131,8 +136,12 @@ export ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-magi}"
 export MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-8192}"
 export MAX_NUM_TOKENS_PER_SAMPLE="${MAX_NUM_TOKENS_PER_SAMPLE:-8192}"
 export MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-12800}"
+# Crop images are already materialized and digest-bound by the curriculum
+# builder.  Keep the legacy on-the-fly crop-audit switch disabled (it would
+# reject the intentional full-image replay dataset), but report the actual
+# mixed training view correctly.
 export UI5_USE_DETECTION_CROPS=0
-export UI5_CROP_TRAIN_MODE=full_only
+export UI5_CROP_TRAIN_MODE=full_plus_crop
 export UI5_UI_SAMPLING_MODE=fixed_ratio
 export BALANCE_UI_DEFECTS=False
 export OVERWRITE_OUTPUT_DIR=False
@@ -155,7 +164,9 @@ printf '%-30s %s\n' \
   "ROLLING_CHECKPOINT" "${ROLLING_CHECKPOINT_PATH}" \
   "ROLLOUT_DIFFICULTY" "${ROLLOUT_DIFFICULTY}" \
   "EVAL_DETECTOR_MANIFEST" "${EVAL_DETECTOR_MANIFEST}" \
-  "CUDA_VISIBLE_DEVICES" "${CUDA_VISIBLE_DEVICES}"
+  "CUDA_VISIBLE_DEVICES" "${CUDA_VISIBLE_DEVICES}" \
+  "NNODES" "${NNODES}" \
+  "NODE_RANK" "${NODE_RANK}"
 
 recipe_command=(
   "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/build_ui5_curriculum_recipe.py"
@@ -173,6 +184,29 @@ fi
 "${recipe_command[@]}"
 [[ -s "${META_PATH}" && -s "${HARD_GROUPS_JSONL}" ]] || \
   locany_die 30 "Curriculum recipe publication is incomplete"
+"${PYTHON_BIN}" - "${CURRICULUM_DATA_DIR}/curriculum_manifest.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+pools = state["pools"]
+policy = state.get("training_view_policy", {})
+if policy.get("tile_selection_uses_gt") is not False:
+    raise SystemExit("curriculum crop geometry is not explicitly GT-free")
+print(
+    "[CURRICULUM TRAIN VIEWS] "
+    f"hard_groups={state['hard_groups']} "
+    f"hard_tile_records={pools['hard']['crop_training_records']} "
+    f"hard_content_missing_global={pools['hard']['content_missing_global_records']} "
+    f"anchor_groups={state['matched_anchor_groups']} "
+    f"anchor_tile_records={pools['matched_anchor']['crop_training_records']} "
+    f"anchor_content_missing_global={pools['matched_anchor']['content_missing_global_records']} "
+    f"replay_full_image_records={pools['global_replay']['retention_full_image_records']} "
+    f"crop_assets={len(state['crop_assets'])}",
+    flush=True,
+)
+PY
 
 "${PYTHON_BIN}" -c \
   'import openpyxl; assert tuple(map(int, openpyxl.__version__.split(".")[:2])) >= (3, 1)' \

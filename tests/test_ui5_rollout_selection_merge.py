@@ -51,6 +51,9 @@ def complete_row(sample_id: str, *, task: str = "occlusion", correct: int = 0) -
                     "TP" if route_correct[model_index * 4 + rollout_id] else "FN"
                 ),
                 "gt_global": gt,
+                "pred_global": (
+                    gt if route_correct[model_index * 4 + rollout_id] else []
+                ),
             }
             for rollout_id in merge.ROLLOUT_IDS
         ]
@@ -74,6 +77,9 @@ def complete_row(sample_id: str, *, task: str = "occlusion", correct: int = 0) -
         "grpo_ready_m31": False,
         "grpo_ready_crop": False,
         "grpo_source_eligible": True,
+        "pipeline_coverage_failure": False,
+        "annotation_anomaly": False,
+        "coordinate_transform_anomaly": False,
         "grpo_parse_clean_m31": True,
         "grpo_parse_clean_crop": True,
         "m31_complete4": True,
@@ -197,6 +203,50 @@ class RolloutSelectionMergeTests(unittest.TestCase):
             source = selection(root / "selection", [row])
             with self.assertRaisesRegex(ValueError, "identity mismatch"):
                 merge.freeze([source], root / "frozen")
+
+    def test_freeze_rescores_stale_route_rewards_before_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            row = complete_row("stale", correct=0)
+            # Simulate an hour_006 artifact scored by the old matcher: the
+            # serialized prediction is exact, but all cached rewards/counts
+            # still say 0/8 hard.  Freezing must derive labels from boxes.
+            for model in merge.MODELS:
+                for route in row["rollouts"][model]:
+                    route["pred_global"] = row["gt_global"]
+            row["grpo_m31_group"] = {"rewards_exact": [False] * 4}
+            row["grpo_crop_group"] = {"rewards_exact": [False] * 4}
+            row["visualization_rollouts"] = {
+                "crop": [{"exact_correct": False}]
+            }
+            source = selection(root / "selection", [row])
+            output = root / "frozen"
+
+            summary = merge.freeze([source], output)
+
+            frozen = json.loads(
+                (output / "complete8.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertEqual(frozen["m31_correct_count"], 4)
+            self.assertEqual(frozen["crop_correct_count"], 4)
+            self.assertEqual(frozen["difficulty"], "easy")
+            self.assertEqual(summary["changed_route_scores"], 8)
+            self.assertEqual(summary["changed_sample_classifications"], 1)
+            self.assertEqual(summary["formal_crop_hard_groups"], 0)
+            self.assertEqual(
+                summary["crop_correct_count_distribution"],
+                {"0": 0, "1": 0, "2": 0, "3": 0, "4": 1},
+            )
+            self.assertEqual(
+                frozen["scoring_policy"]["matcher"],
+                "max_qualified_cardinality_then_iou",
+            )
+            for derived_key in (
+                "grpo_m31_group",
+                "grpo_crop_group",
+                "visualization_rollouts",
+            ):
+                self.assertNotIn(derived_key, frozen)
 
     def test_projected_index_must_exactly_match_authoritative_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

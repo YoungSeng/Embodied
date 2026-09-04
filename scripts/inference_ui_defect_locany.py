@@ -98,6 +98,7 @@ from ui5_lossless_tiling import (
     generate_lossless_tiles,
     merge_tile_predictions,
 )
+from ui5_metric_matching import threshold_aware_linear_sum_assignment
 
 
 PROMPT_TEMPLATE = (
@@ -1995,6 +1996,7 @@ def load_hard_task_rows(
                 row.get("crop_correct_count", -1)
             ) != 0:
                 raise ValueError(f"hard group {record_id} is not an authoritative crop 0/4 group")
+            _paired_baseline_crop_rollouts(row, args.hard_rollout_seeds)
             image_path = Path(str(row.get("_resolved_image_path") or "")).resolve(
                 strict=True
             )
@@ -2041,7 +2043,9 @@ def _score_hard_prediction(
         for gt_index, gt_box in enumerate(gt):
             for pred_index, pred_box in enumerate(pred):
                 matrix[gt_index, pred_index] = scorer.calculate_iou(gt_box, pred_box)
-        gt_indices, pred_indices = scorer.linear_sum_assignment(-matrix)
+        gt_indices, pred_indices = threshold_aware_linear_sum_assignment(
+            matrix, threshold
+        )
     else:
         matrix = None
         gt_indices, pred_indices = [], []
@@ -2119,6 +2123,62 @@ def _score_hard_prediction(
     }
 
 
+def _paired_baseline_crop_rollouts(
+    row: Mapping[str, Any], rollout_seeds: Sequence[int]
+) -> list[Mapping[str, Any]]:
+    """Validate and return the exact frozen crop attempts paired to a candidate."""
+
+    record_id = str(row.get("record_id") or "<unknown>")
+    rollouts = row.get("rollouts")
+    crop = rollouts.get("crop") if isinstance(rollouts, Mapping) else None
+    if not isinstance(crop, list) or len(crop) != len(rollout_seeds):
+        raise ValueError(
+            f"hard group {record_id} lacks {len(rollout_seeds)} frozen crop rollouts"
+        )
+    by_id: dict[int, Mapping[str, Any]] = {}
+    for baseline in crop:
+        if not isinstance(baseline, Mapping):
+            raise ValueError(f"hard group {record_id} has a malformed crop rollout")
+        rollout_id = baseline.get("rollout_id")
+        if (
+            isinstance(rollout_id, bool)
+            or not isinstance(rollout_id, int)
+            or rollout_id not in range(len(rollout_seeds))
+            or rollout_id in by_id
+            or baseline.get("model_id") != "crop"
+        ):
+            raise ValueError(
+                f"hard group {record_id} has an invalid baseline crop rollout identity"
+            )
+        by_id[rollout_id] = baseline
+
+    paired: list[Mapping[str, Any]] = []
+    for rollout_id, candidate_seed in enumerate(rollout_seeds):
+        baseline = by_id.get(rollout_id)
+        if baseline is None:
+            raise ValueError(
+                f"hard group {record_id} lacks baseline crop rollout {rollout_id}"
+            )
+        baseline_seed = baseline.get("seed")
+        if (
+            isinstance(baseline_seed, bool)
+            or not isinstance(baseline_seed, int)
+            or baseline_seed != int(candidate_seed)
+        ):
+            raise ValueError(
+                f"hard group {record_id} rollout {rollout_id} seed is not paired: "
+                f"baseline={baseline_seed!r}, candidate={int(candidate_seed)}"
+            )
+        if baseline.get("exact_correct") is not False:
+            raise ValueError(
+                f"hard group {record_id} rollout {rollout_id} baseline exact_correct "
+                f"must be false for a crop 0/4 group; got "
+                f"{baseline.get('exact_correct')!r}"
+            )
+        paired.append(baseline)
+    return paired
+
+
 def run_hard_rollouts(
     args: argparse.Namespace,
     inferencer: "LocateAnythingInferencer",
@@ -2140,6 +2200,9 @@ def run_hard_rollouts(
     wall_start = time.time()
     for group_index, row in enumerate(rows, start=1):
         record_id = str(row["record_id"])
+        baseline_rollouts = _paired_baseline_crop_rollouts(
+            row, args.hard_rollout_seeds
+        )
         image_path = Path(str(row["_resolved_image_path"]))
         prompt = str(row["prompt"])
         gt_global = row.get("gt_global") or []
@@ -2173,6 +2236,7 @@ def run_hard_rollouts(
                 # content_missing intentionally bypasses all crop/merge code.
                 base_tiles = None
             for rollout_id, rollout_seed in enumerate(args.hard_rollout_seeds):
+                baseline = baseline_rollouts[rollout_id]
                 sample_seed = stable_sample_seed(
                     int(rollout_seed), config.task_name, record_id
                 )
@@ -2233,6 +2297,7 @@ def run_hard_rollouts(
                     "image_relpath": row.get("image_relpath"),
                     "rollout_id": rollout_id,
                     "rollout_seed": int(rollout_seed),
+                    "baseline_exact_correct": False,
                     "sample_seed": sample_seed,
                     "prompt": prompt,
                     "gt_global": gt_global,
@@ -2257,6 +2322,12 @@ def run_hard_rollouts(
                     "latency_seconds": round(time.time() - inference_start, 6),
                     **score,
                 }
+                result["candidate_exact_correct"] = result["exact_correct"]
+                result["attempt_transition"] = (
+                    "incorrect_to_correct"
+                    if result["exact_correct"] is True
+                    else "incorrect_to_incorrect"
+                )
                 rollout_rows[rollout_id].append(result)
                 per_group.append(result)
         finally:
@@ -2267,6 +2338,8 @@ def run_hard_rollouts(
                 "record_id": record_id,
                 "sample_id": row.get("sample_id"),
                 "task": config.task_name,
+                "baseline_correct_count": 0,
+                "baseline_success_rate": 0.0,
                 "previous_crop_correct_count": 0,
                 "candidate_correct_count": correct_count,
                 "candidate_success_rate": correct_count / 4.0,
@@ -2277,6 +2350,19 @@ def run_hard_rollouts(
                         "seed": item["rollout_seed"],
                         "exact_correct": item["exact_correct"],
                         "error_type": item["error_type"],
+                        "transition": item["attempt_transition"],
+                        "baseline": {
+                            "seed": item["rollout_seed"],
+                            "exact_correct": False,
+                            "error_type": baseline_rollouts[item["rollout_id"]].get(
+                                "error_type"
+                            ),
+                        },
+                        "candidate": {
+                            "seed": item["rollout_seed"],
+                            "exact_correct": item["exact_correct"],
+                            "error_type": item["error_type"],
+                        },
                     }
                     for item in per_group
                 ],
@@ -2308,6 +2394,11 @@ def run_hard_rollouts(
         "runtime_error_count": 0,
         "parse_error_count": parse_error_count,
         "rollout_seeds": list(map(int, args.hard_rollout_seeds)),
+        "comparison": "paired_frozen_crop_baseline_to_candidate",
+        "baseline_correct_count": 0,
+        "candidate_correct_count": sum(
+            int(row["candidate_correct_count"]) for row in group_rows
+        ),
         "groups_improved": sum(row["transition"] == "improved" for row in group_rows),
         "groups_still_hard": sum(
             row["transition"] == "still_hard" for row in group_rows

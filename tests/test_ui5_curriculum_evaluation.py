@@ -31,6 +31,18 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
     )
 
 
+def frozen_crop_rollouts() -> list[dict]:
+    return [
+        {
+            "model_id": "crop",
+            "rollout_id": rollout_id,
+            "seed": seed,
+            "exact_correct": False,
+        }
+        for rollout_id, seed in enumerate(evaluation.FORMAL_ROLLOUT_SEEDS)
+    ]
+
+
 def load_inference_module(module_name: str):
     """Import the inference worker without requiring the GPU test environment."""
 
@@ -147,7 +159,10 @@ class CurriculumEvaluationTopologyTest(unittest.TestCase):
                     command[command.index("--processor-path") + 1], str(args.processor_path)
                 )
                 seed_index = command.index("--hard-rollout-seeds")
-                self.assertEqual(command[seed_index + 1 : seed_index + 5], ["42", "43", "44", "45"])
+                self.assertEqual(
+                    command[seed_index + 1 : seed_index + 5],
+                    [str(seed) for seed in evaluation.FORMAL_ROLLOUT_SEEDS],
+                )
                 for explicit in (
                     "--dtype",
                     "--attn-implementation",
@@ -164,6 +179,65 @@ class CurriculumEvaluationTopologyTest(unittest.TestCase):
                     "--evaluation-identity-file",
                 ):
                     self.assertIn(explicit, command)
+
+    def test_identity_guard_rejects_matcher_change_after_worker_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "checkpoint"
+            processor = root / "processor"
+            bundle = root / "bundle"
+            checkpoint.mkdir()
+            processor.mkdir()
+            bundle.mkdir()
+            (checkpoint / "weights.bin").write_bytes(b"weights")
+            (processor / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+            worker = root / "worker.py"
+            crop = root / "tiling.py"
+            matcher = root / "matching.py"
+            scorer = root / "scorer.py"
+            hard = root / "hard.jsonl"
+            resolved = root / "resolved.jsonl"
+            detector = root / "detector.jsonl"
+            plans = bundle / "base_scan_plans.json"
+            for path in (worker, crop, matcher, scorer, hard, resolved, detector, plans):
+                path.write_text(path.name, encoding="utf-8")
+
+            args = SimpleNamespace(
+                checkpoint=checkpoint,
+                processor_path=processor,
+                worker_script=worker,
+                scorer_script=scorer,
+                hard_groups_jsonl=hard,
+                rollout_bundle_root=bundle,
+                detector_crop_manifest=detector,
+            )
+            identity = {
+                "candidate": evaluation.directory_inventory(checkpoint),
+                "processor": evaluation.directory_inventory(processor),
+                "worker_script": {"sha256": evaluation.file_sha256(worker)},
+                "crop_and_merge": {
+                    "implementation_path": str(crop),
+                    "implementation_sha256": evaluation.file_sha256(crop),
+                    "detector_crop_manifest_sha256": evaluation.file_sha256(detector),
+                },
+                "evaluator": {
+                    "sha256": evaluation.file_sha256(scorer),
+                    "matching_implementation_path": str(matcher),
+                    "matching_implementation_sha256": evaluation.file_sha256(matcher),
+                },
+                "hard_rollout": {
+                    "source_sha256": evaluation.file_sha256(hard),
+                    "resolved_source": str(resolved),
+                    "resolved_source_sha256": evaluation.file_sha256(resolved),
+                    "base_scan_plans_sha256": evaluation.file_sha256(plans),
+                },
+            }
+
+            evaluation.validate_identity_unchanged(args, identity)
+            matcher.write_text("changed", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "metric matching implementation"):
+                evaluation.validate_identity_unchanged(args, identity)
 
     def test_launcher_starts_all_five_before_first_wait(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -256,7 +330,10 @@ class CurriculumEvaluationTopologyTest(unittest.TestCase):
                     specs,
                     project_root=root,
                     popen_factory=SlowFakeProcess,
-                    heartbeat_seconds=0.001,
+                    # The CLI enforces a positive production interval.  Use a
+                    # deliberately elapsed deadline in this direct unit call
+                    # so the assertion is independent of Windows timer ticks.
+                    heartbeat_seconds=-1.0,
                 )
             heartbeat_lines = [
                 line
@@ -331,6 +408,67 @@ class HardGroupValidationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not a crop 0/4"):
                 evaluation.resolve_hard_groups(manifest, bundle, 1)
 
+    def test_hard_transition_reuses_exact_frozen_crop_rollout_seeds(self) -> None:
+        rows = [
+            {
+                "record_id": "hard-1",
+                "rollouts": {
+                    "crop": [
+                        {
+                            "model_id": "crop",
+                            "rollout_id": rollout_id,
+                            "seed": seed,
+                        }
+                        for rollout_id, seed in enumerate(
+                            evaluation.FORMAL_ROLLOUT_SEEDS
+                        )
+                    ]
+                },
+            },
+            {
+                "record_id": "hard-2",
+                "rollouts": {
+                    "crop": [
+                        {
+                            "model_id": "crop",
+                            "rollout_id": rollout_id,
+                            "seed": seed,
+                        }
+                        for rollout_id, seed in enumerate(
+                            evaluation.FORMAL_ROLLOUT_SEEDS
+                        )
+                    ]
+                },
+            },
+        ]
+        self.assertEqual(
+            evaluation.paired_crop_rollout_seeds(rows),
+            evaluation.FORMAL_ROLLOUT_SEEDS,
+        )
+
+        rows[1]["rollouts"]["crop"][3]["seed"] = 45
+        with self.assertRaisesRegex(ValueError, "different crop rollout seeds"):
+            evaluation.paired_crop_rollout_seeds(rows)
+
+    def test_hard_transition_rejects_unpaired_seed_identity(self) -> None:
+        rows = [
+            {
+                "record_id": "hard-1",
+                "rollouts": {
+                    "crop": [
+                        {
+                            "model_id": "crop",
+                            "rollout_id": rollout_id,
+                            "seed": 42 + rollout_id,
+                        }
+                        for rollout_id in range(4)
+                    ]
+                },
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "formal baseline identity"):
+            evaluation.paired_crop_rollout_seeds(rows)
+
     def test_content_missing_never_requires_a_crop_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -349,6 +487,7 @@ class HardGroupValidationTest(unittest.TestCase):
                         "positive": False,
                         "crop_correct_count": 0,
                         "crop_complete4": True,
+                        "rollouts": {"crop": frozen_crop_rollouts()},
                     }
                 ],
             )
@@ -370,7 +509,7 @@ class HardGroupValidationTest(unittest.TestCase):
                 hard_groups_jsonl=str(root / "resolved.jsonl"),
                 rollout_scorer_script=str(root / "scorer.py"),
                 hard_rollout_output_dir=str(root / "rollout4"),
-                hard_rollout_seeds=[42, 43, 44, 45],
+                hard_rollout_seeds=list(evaluation.FORMAL_ROLLOUT_SEEDS),
                 evaluation_identity_digest="identity",
                 inference_crop_mode="detector_scan",
                 compat_confidence=None,
@@ -390,6 +529,7 @@ class HardGroupValidationTest(unittest.TestCase):
                     "_resolved_image_path": str(image_path),
                     "prompt": "Locate missing content.",
                     "gt_global": [],
+                    "rollouts": {"crop": frozen_crop_rollouts()},
                     "_base_tiles": None,
                     "_base_plan_digest": None,
                 }
@@ -435,6 +575,12 @@ class HardGroupValidationTest(unittest.TestCase):
             )
             self.assertEqual(summary["attempt_count"], 4)
             self.assertEqual(summary["groups_improved"], 1)
+            self.assertEqual(summary["baseline_correct_count"], 0)
+            self.assertEqual(summary["candidate_correct_count"], 4)
+            self.assertEqual(
+                summary["comparison"],
+                "paired_frozen_crop_baseline_to_candidate",
+            )
             for rollout_id in range(4):
                 rollout_path = root / "rollout4" / f"rollout_{rollout_id}.jsonl"
                 self.assertTrue(rollout_path.is_file())
@@ -442,6 +588,22 @@ class HardGroupValidationTest(unittest.TestCase):
                 self.assertEqual(row["crop_mode"], "content_missing_direct_full_image")
                 self.assertEqual(row["tiles"], [])
                 self.assertEqual(row["tile_count"], 1)
+                self.assertFalse(row["baseline_exact_correct"])
+                self.assertTrue(row["candidate_exact_correct"])
+                self.assertEqual(row["attempt_transition"], "incorrect_to_correct")
+            group = json.loads(
+                (root / "rollout4" / "groups.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertEqual(group["baseline_correct_count"], 0)
+            self.assertEqual(group["candidate_correct_count"], 4)
+            self.assertTrue(
+                all(
+                    item["transition"] == "incorrect_to_correct"
+                    and item["baseline"]["exact_correct"] is False
+                    and item["candidate"]["exact_correct"] is True
+                    for item in group["rollout_results"]
+                )
+            )
 
     def test_content_missing_main_ui5_pass_bypasses_detector_tiles(self) -> None:
         module = load_inference_module("ui5_curriculum_inference_main_direct_test")
@@ -509,7 +671,7 @@ class HardGroupValidationTest(unittest.TestCase):
                 hard_groups_jsonl=str(root / "resolved.jsonl"),
                 rollout_scorer_script=str(root / "scorer.py"),
                 hard_rollout_output_dir=str(root / "rollout4"),
-                hard_rollout_seeds=[42, 43, 44, 45],
+                hard_rollout_seeds=list(evaluation.FORMAL_ROLLOUT_SEEDS),
                 evaluation_identity_digest="identity",
                 inference_crop_mode="detector_scan",
                 compat_confidence=None,
@@ -529,6 +691,7 @@ class HardGroupValidationTest(unittest.TestCase):
                     "_resolved_image_path": str(image_path),
                     "prompt": "Locate missing content.",
                     "gt_global": [],
+                    "rollouts": {"crop": frozen_crop_rollouts()},
                     "_base_tiles": None,
                     "_base_plan_digest": None,
                 }
@@ -563,6 +726,9 @@ class HardGroupValidationTest(unittest.TestCase):
                 self.assertEqual(row["parse_status"], "parse_error")
                 self.assertFalse(row["exact_correct"])
                 self.assertIsNone(row["runtime_error"])
+                self.assertEqual(
+                    row["attempt_transition"], "incorrect_to_incorrect"
+                )
 
 
 class EvaluationBarrierAndMetricsTest(unittest.TestCase):
@@ -603,6 +769,7 @@ class EvaluationBarrierAndMetricsTest(unittest.TestCase):
                         "positive": False,
                         "crop_correct_count": 0,
                         "crop_complete4": True,
+                        "rollouts": {"crop": frozen_crop_rollouts()},
                     }
                 ],
             )
@@ -683,7 +850,16 @@ class EvaluationBarrierAndMetricsTest(unittest.TestCase):
 
         args = SimpleNamespace(step=200, total_steps=1200)
         status = evaluation.evaluation_status_payload(
-            args=args, metrics=result, evaluation_seconds=12.5
+            args=args,
+            metrics=result,
+            evaluation_seconds=12.5,
+            hard_summary={
+                "group_count": 72,
+                "groups_improved": 9,
+                "groups_still_hard": 63,
+                "parse_error_count": 2,
+                "runtime_error_count": 0,
+            },
         )
         self.assertEqual(status["phase"], 1)
         self.assertEqual(status["curriculum_target"]["hard_ratio"], 0.60)
@@ -692,6 +868,13 @@ class EvaluationBarrierAndMetricsTest(unittest.TestCase):
         with redirect_stdout(output):
             evaluation.print_evaluation_status(status)
         self.assertEqual(output.getvalue().count("[UI5 TASK METRICS]"), 5)
+        self.assertIn("samples=4 invalid=0", output.getvalue())
+        self.assertIn(
+            "[UI5 HARD TRANSITION] step=200 groups=72 improved=9 "
+            "still_hard=63 parse_errors=2 runtime_errors=0",
+            output.getvalue(),
+        )
+        self.assertIn("samples=20 invalid=0", output.getvalue())
         structured = next(
             line.split(" ", 2)[2]
             for line in output.getvalue().splitlines()
@@ -740,6 +923,7 @@ class EvaluationBarrierAndMetricsTest(unittest.TestCase):
                         "positive": False,
                         "crop_correct_count": 0,
                         "crop_complete4": True,
+                        "rollouts": {"crop": frozen_crop_rollouts()},
                     }
                 )
             (bundle / "base_scan_plans.json").write_text(
@@ -792,11 +976,14 @@ from pathlib import Path
 p=argparse.ArgumentParser(); p.add_argument('--pred_root'); p.add_argument('--output_root'); p.add_argument('--run_name'); p.add_argument('--all_tasks', action='store_true'); p.add_argument('--input_mode'); p.add_argument('--gt_dir'); p.add_argument('--yolo_bbox_format'); p.add_argument('--iou_thresh')
 a=p.parse_args()
 tasks=('occlusion','cropping','text_overflow','text_ellipsis','content_missing')
+sample_ids={}
 for task in tasks:
-    assert len(list((Path(a.pred_root)/task).glob('*.json'))) == 1
+    files=list((Path(a.pred_root)/task).glob('*.json'))
+    assert len(files) == 1
+    sample_ids[task]=[files[0].stem]
 metric={'precision':1.0,'recall':1.0,'f1':1.0,'tp':1,'fp':0,'fn':0}
 image={**metric,'tn':0,'accuracy':1.0}; bbox={**metric,'count_accuracy':1.0}
-payload={'schema_version':1,'tasks':{task:{'image':image,'bbox':bbox} for task in tasks},'macro':{'image':{'precision':1.0,'recall':1.0,'f1':1.0},'bbox':{'precision':1.0,'recall':1.0,'f1':1.0}}}
+payload={'schema_version':1,'tasks':{task:{'image':image,'bbox':bbox,'total_samples':1,'scored_sample_count':1,'scored_sample_ids':sample_ids[task],'skipped_sample_count':0,'skipped_sample_ids':[]} for task in tasks},'macro':{'image':{'precision':1.0,'recall':1.0,'f1':1.0},'bbox':{'precision':1.0,'recall':1.0,'f1':1.0}}}
 out=Path(a.output_root)/a.run_name; out.mkdir(parents=True)
 (out/'all_tasks_evaluation.json').write_text(json.dumps(payload), encoding='utf-8')
 """.lstrip(),

@@ -24,6 +24,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 
+from ui5_metric_matching import threshold_aware_linear_sum_assignment
+
 
 SCHEMA_VERSION = 6
 BASE_COMMITS = {"m31": "5d7a313", "crop": "945ce39"}
@@ -391,7 +393,9 @@ def score_prediction(
         for gt_index, gt_box in enumerate(gt):
             for pred_index, pred_box in enumerate(pred):
                 matrix[gt_index, pred_index] = scorer.calculate_iou(gt_box, pred_box)
-        gt_indices, pred_indices = scorer.linear_sum_assignment(-matrix)
+        gt_indices, pred_indices = threshold_aware_linear_sum_assignment(
+            matrix, threshold
+        )
     else:
         matrix = None
         gt_indices, pred_indices = [], []
