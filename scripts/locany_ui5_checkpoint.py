@@ -14,8 +14,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from eaglevl.train.ui5_checkpoint_utils import (  # noqa: E402
+    atomic_promote_checkpoint,
     list_checkpoints,
     list_training_checkpoints,
+    recover_atomic_promotion,
     safe_remove_checkpoint,
     validate_checkpoint,
 )
@@ -29,6 +31,20 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--checkpoint", type=Path, required=True)
     validate.add_argument("--mode", choices=("eval", "resume"), default="eval")
     validate.add_argument("--expected-ranks", type=int, default=None)
+    validate.add_argument("--strict", action="store_true")
+
+    promote = subparsers.add_parser("promote")
+    promote.add_argument("--source", type=Path, required=True)
+    promote.add_argument("--destination", type=Path, required=True)
+    promote.add_argument("--expected-ranks", type=int, default=None)
+    promote.add_argument("--strict", action="store_true")
+    promote.add_argument("--move-source", action="store_true")
+
+    recover = subparsers.add_parser("recover")
+    recover.add_argument("--destination", type=Path, required=True)
+    recover.add_argument("--expected-ranks", type=int, default=None)
+    recover.add_argument("--strict", action="store_true")
+    recover.add_argument("--expected-step-delta", type=int, default=None)
 
     latest = subparsers.add_parser("latest")
     latest.add_argument("--output-dir", type=Path, required=True)
@@ -55,10 +71,34 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.command == "validate":
         report = validate_checkpoint(
-            args.checkpoint, mode=args.mode, expected_ranks=args.expected_ranks
+            args.checkpoint,
+            mode=args.mode,
+            expected_ranks=args.expected_ranks,
+            strict=args.strict,
         )
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0 if report["valid"] else 1
+
+    if args.command == "promote":
+        report = atomic_promote_checkpoint(
+            args.source,
+            args.destination,
+            expected_ranks=args.expected_ranks,
+            strict=args.strict,
+            move_source=args.move_source,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "recover":
+        report = recover_atomic_promotion(
+            args.destination,
+            expected_ranks=args.expected_ranks,
+            strict=args.strict,
+            expected_step_delta=args.expected_step_delta,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
 
     if args.command == "latest":
         candidates = list_checkpoints(args.output_dir)

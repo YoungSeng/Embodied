@@ -17,6 +17,7 @@ UI5_CROP_AUDIT_DIR="${UI5_CROP_AUDIT_DIR:-}"
 UI5_CROP_TRAIN_MODE="${UI5_CROP_TRAIN_MODE:-}"
 UI5_CROP_META_PATH="${UI5_CROP_META_PATH:-}"
 UI5_UI_SAMPLING_MODE="${UI5_UI_SAMPLING_MODE:-}"
+CURRICULUM_MODE="${CURRICULUM_MODE:-none}"
 
 OUTPUT_BASE="${OUTPUT_BASE:-${PROJECT_ROOT}/work_dirs}"
 RUN_NAME="${RUN_NAME:-locateanything-3b-ui-defect-5class-full}"
@@ -71,7 +72,17 @@ if [[ "${UI5_USE_DETECTION_CROPS}" == "1" && "${UI5_CROP_TRAIN_MODE}" == "full_o
   echo "[ERROR] UI5_USE_DETECTION_CROPS=1 requires a crop-bearing train mode." >&2
   exit 1
 fi
-if [[ -z "${UI5_UI_SAMPLING_MODE}" ]]; then
+if [[ "${CURRICULUM_MODE}" == "scheduled" ]]; then
+  if [[ -n "${UI5_UI_SAMPLING_MODE}" && "${UI5_UI_SAMPLING_MODE}" != "fixed_ratio" ]]; then
+    echo "[ERROR] CURRICULUM_MODE=scheduled requires UI5_UI_SAMPLING_MODE=fixed_ratio." >&2
+    exit 1
+  fi
+  UI5_UI_SAMPLING_MODE="fixed_ratio"
+  BALANCE_UI_DEFECTS="False"
+elif [[ "${CURRICULUM_MODE}" != "none" && "${CURRICULUM_MODE}" != "off" && "${CURRICULUM_MODE}" != "disabled" ]]; then
+  echo "[ERROR] CURRICULUM_MODE must be scheduled or none." >&2
+  exit 1
+elif [[ -z "${UI5_UI_SAMPLING_MODE}" ]]; then
   if [[ "${UI5_CROP_TRAIN_MODE}" == "crop_only" ]]; then
     UI5_UI_SAMPLING_MODE="task_balanced_all_records"
   else
@@ -84,13 +95,19 @@ if [[ "${UI5_UI_SAMPLING_MODE}" != "fixed_ratio" && \
   echo "[ERROR] UI5_UI_SAMPLING_MODE must be fixed_ratio, task_balanced_all_records, or task_source_balanced_rotating." >&2
   exit 1
 fi
-if [[ "${UI5_CROP_TRAIN_MODE}" == "crop_only" && \
+if [[ "${CURRICULUM_MODE}" != "scheduled" && \
+      "${UI5_CROP_TRAIN_MODE}" == "crop_only" && \
       "${UI5_UI_SAMPLING_MODE}" != "task_balanced_all_records" && \
       "${UI5_UI_SAMPLING_MODE}" != "task_source_balanced_rotating" ]]; then
   echo "[ERROR] crop_only requires an all-record sampling mode." >&2
   exit 1
 fi
-if [[ "${UI5_USE_DETECTION_CROPS}" == "1" || -n "${UI5_CROP_AUDIT_DIR}" ]]; then
+if [[ "${CURRICULUM_MODE}" == "scheduled" ]]; then
+  # The curriculum builder emits a new three-entry recipe.  Its entries retain
+  # their per-pool ui5_crop_recipe metadata, but the combined meta is not the
+  # digest-bound single-recipe path produced by the older crop audit.
+  :
+elif [[ "${UI5_USE_DETECTION_CROPS}" == "1" || -n "${UI5_CROP_AUDIT_DIR}" ]]; then
   if [[ -z "${UI5_CROP_AUDIT_DIR}" ]]; then
     echo "[ERROR] UI5_USE_DETECTION_CROPS=1 requires UI5_CROP_AUDIT_DIR." >&2
     exit 1
@@ -127,6 +144,7 @@ if [[ ! -s "${META_PATH}" ]]; then
 fi
 export UI5_USE_DETECTION_CROPS UI5_CROP_AUDIT_DIR UI5_CROP_TRAIN_MODE UI5_UI_SAMPLING_MODE
 export UI5_CROP_META_PATH META_PATH
+export CURRICULUM_MODE BALANCE_UI_DEFECTS
 
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-deepspeed_configs/zero_stage2_config.json}"
 if [[ ! -f "${DEEPSPEED_CONFIG}" ]]; then
@@ -232,9 +250,23 @@ if [[ -z "${GRADIENT_ACCUMULATION_STEPS:-}" ]]; then
   fi
 fi
 
-MAX_STEPS="${MAX_STEPS:-25000}"
-LEARNING_RATE="${LEARNING_RATE:-2e-5}"
-WARMUP_STEPS="${WARMUP_STEPS:-500}"
+MAX_STEPS="${MAX_STEPS:-${TOTAL_STEPS:-25000}}"
+TOTAL_STEPS="${TOTAL_STEPS:-${MAX_STEPS}}"
+LLM_LRS="${LLM_LRS:-1e-6,7e-7,5e-7}"
+if [[ "${CURRICULUM_MODE}" == "scheduled" ]]; then
+  SCHEDULE_INITIAL_LR="${LLM_LRS%%,*}"
+  if [[ -n "${LEARNING_RATE:-}" && "${LEARNING_RATE}" != "${SCHEDULE_INITIAL_LR}" ]]; then
+    echo "[WARN] Ignoring LEARNING_RATE=${LEARNING_RATE}; scheduled LLM_LRS starts at ${SCHEDULE_INITIAL_LR}."
+  fi
+  LEARNING_RATE="${SCHEDULE_INITIAL_LR}"
+  WARMUP_STEPS=0
+  LR_SCHEDULER_TYPE="constant"
+else
+  LEARNING_RATE="${LEARNING_RATE:-2e-5}"
+  WARMUP_STEPS="${WARMUP_STEPS:-500}"
+  LR_SCHEDULER_TYPE="${LR_SCHEDULER_TYPE:-cosine}"
+fi
+SEED="${SEED:-42}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 SAVE_STRATEGY="${SAVE_STRATEGY:-steps}"
 SAVE_STEPS="${SAVE_STEPS:-500}"
@@ -256,6 +288,28 @@ with socket.socket() as sock:
     print(sock.getsockname()[1])
 PY
 )}"
+export TOTAL_STEPS LLM_LRS SEED
+
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+ROLLING_CHECKPOINT_PATH=""
+if [[ -n "${ROLLING_CHECKPOINT_DIR:-}" ]]; then
+  if [[ "${ROLLING_CHECKPOINT_DIR}" = /* ]]; then
+    ROLLING_CHECKPOINT_PATH="${ROLLING_CHECKPOINT_DIR}"
+  else
+    ROLLING_CHECKPOINT_PATH="${OUTPUT_DIR}/${ROLLING_CHECKPOINT_DIR}"
+  fi
+fi
+if [[ -z "${RESUME_FROM_CHECKPOINT}" && -n "${ROLLING_CHECKPOINT_PATH}" && -d "${ROLLING_CHECKPOINT_PATH}" ]]; then
+  RESUME_FROM_CHECKPOINT="${ROLLING_CHECKPOINT_PATH}"
+fi
+TRAIN_RESUME_ARGS=()
+if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
+  if [[ ! -d "${RESUME_FROM_CHECKPOINT}" ]]; then
+    echo "[ERROR] RESUME_FROM_CHECKPOINT does not exist: ${RESUME_FROM_CHECKPOINT}" >&2
+    exit 1
+  fi
+  TRAIN_RESUME_ARGS+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
+fi
 
 export WANDB_PROJECT="${WANDB_PROJECT:-locateanything-ui-defect}"
 export WANDB_RUN_NAME="${WANDB_RUN_NAME:-${RUN_NAME}}"
@@ -406,6 +460,11 @@ echo "RELATION_GATE_LOSS_WEIGHT     : ${RELATION_GATE_LOSS_WEIGHT:-1.0}"
 echo "RELATION_SLOT_GATE_LOSS_WEIGHT: ${RELATION_SLOT_GATE_LOSS_WEIGHT:-0.1}"
 echo "RELATION_ATTENTION_LOSS_WEIGHT: ${RELATION_ATTENTION_LOSS_WEIGHT:-0.1}"
 echo "LEARNING_RATE                 : ${LEARNING_RATE}"
+echo "LLM_LRS                      : ${LLM_LRS}"
+echo "CURRICULUM_MODE               : ${CURRICULUM_MODE}"
+echo "TOTAL_STEPS                  : ${TOTAL_STEPS}"
+echo "SEED                         : ${SEED}"
+echo "RESUME_FROM_CHECKPOINT       : ${RESUME_FROM_CHECKPOINT:-<none>}"
 echo "MAX_STEPS                     : ${MAX_STEPS}"
 echo "SAVE_EVERY_N_HOURS            : ${SAVE_EVERY_N_HOURS:-0}"
 echo "FREEZE_LLM                    : ${FREEZE_LLM}"
@@ -476,7 +535,7 @@ if torchrun \
   --learning_rate "${LEARNING_RATE}" \
   --weight_decay "${WEIGHT_DECAY}" \
   --warmup_steps "${WARMUP_STEPS}" \
-  --lr_scheduler_type cosine \
+  --lr_scheduler_type "${LR_SCHEDULER_TYPE}" \
   --max_grad_norm 1.0 \
   --dataloader_num_workers "${DATALOADER_NUM_WORKERS}" \
   --packing_buffer_size "${PACKING_BUFFER_SIZE}" \
@@ -495,6 +554,8 @@ if torchrun \
   --report_to "${REPORT_TO}" \
   --run_name "${RUN_NAME}" \
   --save_every_n_hours "${SAVE_EVERY_N_HOURS:-0}" \
+  --seed "${SEED}" \
+  "${TRAIN_RESUME_ARGS[@]}" \
   2>&1 | tee -a "${LOG_FILE}"; then
   TRAIN_PIPESTATUS=("${PIPESTATUS[@]}")
 else

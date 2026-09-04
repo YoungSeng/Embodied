@@ -13,7 +13,9 @@ Key Features:
 import os
 import os.path as osp
 import copy
+import hashlib
 import logging
+import math
 import random
 import sys
 import warnings
@@ -90,6 +92,16 @@ from eaglevl.train.ui_defect_data import (
 )
 from eaglevl.train.ui5_excel_logger import UI5ExcelLogger, TRAIN_TASKS
 from eaglevl.train.ui5_checkpoint_utils import atomic_save_with_fsync, validate_checkpoint
+from eaglevl.train.ui5_curriculum import (
+    UI5CurriculumSchedule,
+    canonical_curriculum_pool,
+    curriculum_artifact_identity,
+    curriculum_pool_draw_counts,
+    prepare_worker_states_for_resume,
+    should_export_model_at_training_end,
+    should_write_training_done_marker,
+    training_continuity_config,
+)
 from eaglevl.train.ui5_sampling_coverage import (
     is_monotonic_coverage,
     write_sampling_coverage_atomic,
@@ -1359,6 +1371,9 @@ class StreamPackedDatasetMTP(IterableDataset):
         log_freq: int = 10000,
         base_seed: int = 42,
         buffer_size: int = 32,
+        curriculum_schedule: Optional[UI5CurriculumSchedule] = None,
+        dataset_pools: Optional[List[str]] = None,
+        curriculum_identity: Optional[dict] = None,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -1374,7 +1389,36 @@ class StreamPackedDatasetMTP(IterableDataset):
         if dataset_weight is None:
             dataset_weight = [1] * len(datasets)
         total_weight = sum(dataset_weight)
-        self.dataset_weight = [w / total_weight for w in dataset_weight]
+        if total_weight <= 0:
+            raise ValueError("dataset weights must sum to a positive value")
+        self.base_dataset_weight = [float(w) / total_weight for w in dataset_weight]
+        self.curriculum_schedule = curriculum_schedule
+        self.curriculum_identity = copy.deepcopy(curriculum_identity)
+        self.dataset_pools = (
+            [canonical_curriculum_pool(pool) for pool in dataset_pools]
+            if dataset_pools is not None
+            else None
+        )
+        if self.curriculum_schedule is not None:
+            if self.dataset_pools is None or len(self.dataset_pools) != len(self.datasets):
+                raise ValueError(
+                    "Scheduled curriculum requires one curriculum_pool per dataset"
+                )
+            self._curriculum_completed_global_step = 0
+            self._curriculum_stage_index = 0
+            self.dataset_weight = self.curriculum_schedule.effective_dataset_weights(
+                dataset_pools=self.dataset_pools,
+                base_weights=self.base_dataset_weight,
+                completed_global_step=0,
+            )
+        else:
+            self._curriculum_completed_global_step = 0
+            self._curriculum_stage_index = None
+            self.dataset_weight = list(self.base_dataset_weight)
+        self._configured_num_workers: Optional[int] = None
+        self._saved_num_workers: Optional[int] = None
+        self._strict_resume = self.curriculum_schedule is not None
+        self._resume_loaded = False
         
         self._worker_states: Dict[str, dict] = {}
         self._resume_states: Dict[str, dict] = {}
@@ -1390,22 +1434,167 @@ class StreamPackedDatasetMTP(IterableDataset):
                        f'  data_rank={data_rank}, data_world_size={data_world_size}\n'
                        f'Datasets:\n{ds_info}')
 
-    def state_dict(self) -> dict:
+    def configure_num_workers(self, num_workers: int) -> None:
+        configured = int(num_workers)
+        if configured < 0:
+            raise ValueError("dataloader_num_workers must be non-negative")
+        # IterableDataset uses the main process as one logical worker when
+        # DataLoader workers are disabled.
+        self._configured_num_workers = max(configured, 1)
+
+    def _stream_resume_config(self) -> dict:
         return {
+            "base_seed": int(self.base_seed),
+            "data_world_size": int(self.data_world_size),
+            "max_num_tokens_per_sample": int(self.max_num_tokens_per_sample),
+            "max_num_tokens": int(self.max_num_tokens),
+            "buffer_size": int(self.buffer_size),
+            "datasets": [
+                {
+                    "name": dataset.ds_name,
+                    "rows": len(dataset),
+                    "base_probability": float(probability),
+                    "curriculum_pool": (
+                        self.dataset_pools[index]
+                        if self.dataset_pools is not None
+                        else None
+                    ),
+                }
+                for index, (dataset, probability) in enumerate(
+                    zip(self.datasets, self.base_dataset_weight)
+                )
+            ],
+            "curriculum_schedule": (
+                self.curriculum_schedule.to_dict()
+                if self.curriculum_schedule is not None
+                else None
+            ),
+            "curriculum_artifact_identity": copy.deepcopy(
+                self.curriculum_identity
+            ),
+        }
+
+    def state_dict(self, *, completed_global_step: Optional[int] = None) -> dict:
+        if completed_global_step is not None:
+            self._curriculum_completed_global_step = int(completed_global_step)
+        state = {
             'worker_states': copy.deepcopy(self._worker_states),
             'base_seed': self.base_seed,
-            'version': 4,
+            'stream_resume_config': self._stream_resume_config(),
+            'num_workers': self._configured_num_workers,
+            'version': 7,
         }
-    
-    def load_state_dict(self, state: dict):
+        if self.curriculum_schedule is not None:
+            state["curriculum_sampler"] = self.curriculum_schedule.sampler_state(
+                completed_global_step=self._curriculum_completed_global_step,
+                sampling_stage_index=int(self._curriculum_stage_index),
+            )
+        return state
+
+    def load_state_dict(self, state: dict, *, expected_global_step: Optional[int] = None):
         version = state.get('version', 1)
+        if self._strict_resume and version < 7:
+            raise RuntimeError(
+                "Scheduled UI5 curriculum requires dataloader state version >= 7; "
+                f"checkpoint has version={version}"
+            )
         if version < 3:
             logger.warning(f"Loading old state version {version}, perfect resume not available.")
-        
-        if 'worker_states' in state:
-            self._resume_states = copy.deepcopy(state['worker_states'])
-            if get_rank() == 0:
-                logger.info(f"Loaded resume states for {len(self._resume_states)} workers")
+
+        saved_config = state.get("stream_resume_config")
+        current_config = self._stream_resume_config()
+        if self._strict_resume and saved_config != current_config:
+            raise RuntimeError(
+                "UI5 stream configuration changed across resume: "
+                f"saved={saved_config}, current={current_config}"
+            )
+        saved_num_workers = state.get("num_workers")
+        self._saved_num_workers = (
+            int(saved_num_workers) if saved_num_workers is not None else None
+        )
+        if (
+            self._strict_resume
+            and self._configured_num_workers is not None
+            and self._saved_num_workers != self._configured_num_workers
+        ):
+            raise RuntimeError(
+                "dataloader worker count changed across resume: "
+                f"saved={self._saved_num_workers}, current={self._configured_num_workers}"
+            )
+
+        worker_states = state.get('worker_states')
+        if not isinstance(worker_states, dict) or not worker_states:
+            if self._strict_resume:
+                raise RuntimeError("Scheduled UI5 checkpoint has no worker_states")
+            return
+        if (
+            self._strict_resume
+            and self._configured_num_workers is not None
+            and len(worker_states) != self._configured_num_workers
+        ):
+            raise RuntimeError(
+                "worker state count does not match dataloader_num_workers: "
+                f"saved={len(worker_states)}, current={self._configured_num_workers}"
+            )
+        for worker_key, worker_state in worker_states.items():
+            if not isinstance(worker_state, dict):
+                raise RuntimeError(f"Invalid state for {worker_key}: expected a mapping")
+            iterator_states = worker_state.get("iterator_states")
+            if not isinstance(iterator_states, list) or len(iterator_states) != len(
+                self.datasets
+            ):
+                raise RuntimeError(
+                    f"Invalid iterator state count for {worker_key}: "
+                    f"saved={len(iterator_states) if isinstance(iterator_states, list) else None}, "
+                    f"datasets={len(self.datasets)}"
+                )
+            if "sample_rng_state" not in worker_state:
+                raise RuntimeError(f"Missing sample_rng_state for {worker_key}")
+
+        if self.curriculum_schedule is not None:
+            if expected_global_step is None:
+                raise RuntimeError(
+                    "expected_global_step is required for scheduled curriculum resume"
+                )
+            curriculum_state = state.get("curriculum_sampler")
+            if not isinstance(curriculum_state, dict):
+                raise RuntimeError("Scheduled UI5 checkpoint lacks curriculum_sampler state")
+            self.curriculum_schedule.validate_sampler_state(
+                curriculum_state, expected_global_step=int(expected_global_step)
+            )
+            saved_stage = int(curriculum_state["sampling_stage_index"])
+            resume_stage = self.curriculum_schedule.stage_after_completed_step(
+                int(expected_global_step)
+            ).index
+            worker_states, transition = prepare_worker_states_for_resume(
+                worker_states,
+                saved_sampling_stage=saved_stage,
+                resume_sampling_stage=resume_stage,
+            )
+            if saved_stage != resume_stage:
+                logger.warning(
+                    "[UI5 curriculum] stage transition %s -> %s at global_step=%s; "
+                    "discarded pending current_batch=%s buffer=%s while preserving "
+                    "iterator and RNG state",
+                    saved_stage,
+                    resume_stage,
+                    expected_global_step,
+                    transition["current_batch_samples"],
+                    transition["buffer_samples"],
+                )
+            self._curriculum_completed_global_step = int(expected_global_step)
+            self._curriculum_stage_index = resume_stage
+            self.dataset_weight = self.curriculum_schedule.effective_dataset_weights(
+                dataset_pools=self.dataset_pools,
+                base_weights=self.base_dataset_weight,
+                completed_global_step=int(expected_global_step),
+            )
+
+        self._resume_states = copy.deepcopy(worker_states)
+        self._worker_states = copy.deepcopy(worker_states)
+        self._resume_loaded = True
+        if get_rank() == 0:
+            logger.info(f"Loaded resume states for {len(self._resume_states)} workers")
 
     def _get_sample_length(self, sample: Optional[dict]) -> int:
         if sample is None:
@@ -1483,6 +1672,10 @@ class StreamPackedDatasetMTP(IterableDataset):
         buffer: List[Tuple[dict, int, int]] = []
         
         # Resume handling
+        if self._strict_resume and self._resume_loaded and worker_key not in self._resume_states:
+            raise RuntimeError(
+                f"No restored state for {worker_key}; refusing non-continuous resume"
+            )
         if worker_key in self._resume_states:
             saved = self._resume_states.pop(worker_key)
             try:
@@ -1511,6 +1704,10 @@ class StreamPackedDatasetMTP(IterableDataset):
                                 current_batch = self._merge_samples(current_batch, sample)
                                 current_batch_locations.append(loc)
                         except Exception as e:
+                            if self._strict_resume:
+                                raise RuntimeError(
+                                    f"[{worker_key}] failed to restore batch sample {loc}"
+                                ) from e
                             logger.warning(f'[{worker_key}] Failed to restore batch sample {loc}: {e}')
 
                 if ws.buffer_locations:
@@ -1523,6 +1720,10 @@ class StreamPackedDatasetMTP(IterableDataset):
                             if self._get_sample_length(sample) <= self.max_num_tokens_per_sample:
                                 buffer.append((sample, ds_idx, global_idx))
                         except Exception as e:
+                            if self._strict_resume:
+                                raise RuntimeError(
+                                    f"[{worker_key}] failed to restore buffer sample {loc}"
+                                ) from e
                             logger.warning(f'[{worker_key}] Failed to restore buffer sample {loc}: {e}')
                 
                 if is_main_log:
@@ -1531,6 +1732,10 @@ class StreamPackedDatasetMTP(IterableDataset):
             except Exception as e:
                 logger.error(f'[{worker_key}] Failed to resume: {e}')
                 traceback.print_exc()
+                if self._strict_resume:
+                    raise RuntimeError(
+                        f"[{worker_key}] strict dataloader resume failed"
+                    ) from e
                 current_batch = None
                 current_batch_locations = []
                 buffer = []
@@ -1734,15 +1939,17 @@ class DataloaderStateCallback(TrainerCallback):
     def on_save(self, args, state, control, **kwargs):
         if not hasattr(self.train_dataset, 'state_dict'):
             return control
+        self.train_dataset._dataloader_checkpoint_error = None
         
         checkpoint_folder = f"checkpoint-{state.global_step}"
         output_dir = os.path.join(args.output_dir, checkpoint_folder)
         rank = get_rank()
         state_path = os.path.join(output_dir, f"dataloader_state_rank{rank}.pt")
-        temp_path = state_path + ".tmp"
-        
+
         try:
-            ds_state = self.train_dataset.state_dict()
+            ds_state = self.train_dataset.state_dict(
+                completed_global_step=int(state.global_step)
+            )
             
             if rank == 0:
                 total_batches = sum(
@@ -1755,8 +1962,7 @@ class DataloaderStateCallback(TrainerCallback):
                 )
                 logger.info(f"Saving dataloader state: total_batches={total_batches}")
             
-            torch.save(ds_state, temp_path)
-            os.replace(temp_path, state_path)
+            atomic_save_with_fsync(torch.save, ds_state, state_path)
             
             if rank == 0:
                 logger.info(f"Saved dataloader state to {state_path}")
@@ -1764,11 +1970,13 @@ class DataloaderStateCallback(TrainerCallback):
         except Exception as e:
             logger.error(f"Rank {rank}: Failed to save dataloader state: {e}")
             traceback.print_exc()
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except:
-                    pass
+            # Do not raise before the completion callback's distributed
+            # collective: another rank could already be waiting there forever.
+            # Completion gathers these local errors and raises synchronously on
+            # every rank before it can publish checkpoint_complete.json.
+            self.train_dataset._dataloader_checkpoint_error = (
+                f"rank {rank}: {type(e).__name__}: {e}"
+            )
         return control
 
 
@@ -1869,66 +2077,216 @@ class SamplingCoverageCallback(TrainerCallback):
 class CheckpointCompletionCallback(TrainerCallback):
     """Validate every rank's resume state before declaring a save complete."""
 
+    def __init__(self, train_dataset: StreamPackedDatasetMTP):
+        self.train_dataset = train_dataset
+        self._segment_source_global_step: Optional[int] = None
+        self._segment_target_global_step: Optional[int] = None
+
+    def set_segment_bounds(self, *, source_global_step: int, target_global_step: int):
+        source = int(source_global_step)
+        target = int(target_global_step)
+        if source < 0 or target <= source:
+            raise ValueError(
+                "Invalid checkpoint segment bounds: "
+                f"source={source}, target={target}"
+            )
+        self._segment_source_global_step = source
+        self._segment_target_global_step = target
+
+    def _write_continuity_manifest(self, checkpoint_dir, args, state) -> dict:
+        schedule = getattr(self.train_dataset, "curriculum_schedule", None)
+        stream_config = self.train_dataset._stream_resume_config()
+        stream_digest = hashlib.sha256(
+            json.dumps(
+                stream_config,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        fp16 = bool(getattr(args, "fp16", False))
+        bf16 = bool(getattr(args, "bf16", False))
+        deepspeed_enabled = bool(getattr(args, "deepspeed", None))
+        segment_source = (
+            self._segment_source_global_step
+            if self._segment_source_global_step is not None
+            else int(os.environ.get("CURRICULUM_START_STEP", "0"))
+        )
+        segment_target = (
+            self._segment_target_global_step
+            if self._segment_target_global_step is not None
+            else int(
+                os.environ.get(
+                    "LOCANY_STOP_AFTER_STEP", getattr(args, "max_steps", 0)
+                )
+            )
+        )
+        optimizer_config = (
+            training_continuity_config(args, schedule)
+            if schedule is not None
+            else None
+        )
+        optimizer_config_digest = (
+            hashlib.sha256(
+                json.dumps(
+                    optimizer_config,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if optimizer_config is not None
+            else None
+        )
+        payload = {
+            "schema_version": 1,
+            "global_step": int(state.global_step),
+            "source_global_step": int(segment_source),
+            "segment_target_global_step": segment_target,
+            "target_total_steps": (
+                int(schedule.total_steps)
+                if schedule is not None
+                else int(getattr(args, "max_steps", 0))
+            ),
+            "world_size": dist.get_world_size() if dist.is_initialized() else 1,
+            "precision": "fp16" if fp16 else ("bf16" if bf16 else "fp32"),
+            "gradient_scaler": {
+                "applicable": fp16,
+                "storage": (
+                    "deepspeed_optimizer_state"
+                    if fp16 and deepspeed_enabled
+                    else ("scaler.pt" if fp16 else "not_applicable")
+                ),
+            },
+            "optimizer_state": (
+                "deepspeed_optimizer_state" if deepspeed_enabled else "optimizer.pt"
+            ),
+            "scheduler_state": (
+                "deepspeed_model_state" if deepspeed_enabled else "scheduler.pt"
+            ),
+            "rng_state_pattern": "rng_state*.pth",
+            "cuda_rng_required": bool(torch.cuda.is_available()),
+            "dataloader_state_pattern": "dataloader_state_rank*.pt",
+            "dataloader_state_version": 7,
+            "curriculum_mode": "scheduled" if schedule is not None else "none",
+            "curriculum_schedule_fingerprint": (
+                schedule.fingerprint if schedule is not None else None
+            ),
+            "stream_resume_config_digest": stream_digest,
+            "training_continuity_config": optimizer_config,
+            "training_continuity_config_digest": optimizer_config_digest,
+        }
+        manifest = osp.join(checkpoint_dir, "continuity_state.json")
+        temporary = f"{manifest}.tmp-{os.getpid()}"
+        try:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, manifest)
+        finally:
+            if osp.exists(temporary):
+                os.remove(temporary)
+        return payload
+
     def on_save(self, args, state, control, **kwargs):
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
         rank = get_rank()
         checkpoint_dir = osp.join(args.output_dir, f"checkpoint-{state.global_step}")
         validation_error = None
+        local_state_error = getattr(
+            self.train_dataset, "_dataloader_checkpoint_error", None
+        )
+        if dist.is_available() and dist.is_initialized():
+            state_errors = [None] * dist.get_world_size()
+            dist.all_gather_object(state_errors, local_state_error)
+        else:
+            state_errors = [local_state_error]
         if rank == 0:
-            try:
-                report = validate_checkpoint(
-                    Path(checkpoint_dir),
-                    mode="resume",
-                    expected_ranks=(dist.get_world_size() if dist.is_initialized() else 1),
+            failed_rank_states = [error for error in state_errors if error is not None]
+            if failed_rank_states:
+                validation_error = (
+                    "Dataloader checkpoint state failed on one or more ranks: "
+                    + "; ".join(failed_rank_states)
                 )
-                if not report["valid"]:
-                    validation_error = (
-                        "Checkpoint save returned but resume validation failed: "
-                        f"checkpoint={checkpoint_dir}; errors={'; '.join(report['errors'])}"
+            else:
+                temporary = None
+                try:
+                    continuity = self._write_continuity_manifest(
+                        checkpoint_dir, args, state
                     )
-                else:
-                    marker = osp.join(checkpoint_dir, "checkpoint_complete.json")
-                    temporary = f"{marker}.tmp-{os.getpid()}"
-                    payload = {
-                        "schema_version": 1,
-                        "global_step": int(state.global_step),
-                        "completed_at_unix": time.time(),
-                        "hostname": socket.gethostname(),
-                        "world_size": (
+                    strict = continuity["curriculum_mode"] == "scheduled"
+                    report = validate_checkpoint(
+                        Path(checkpoint_dir),
+                        mode="resume",
+                        expected_ranks=(
                             dist.get_world_size() if dist.is_initialized() else 1
                         ),
-                        "validation": report,
-                    }
-                    with open(temporary, "w", encoding="utf-8") as handle:
-                        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-                        handle.write("\n")
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    os.replace(temporary, marker)
-                    logger.info(
-                        "[Checkpoint] COMPLETE step=%s path=%s details=%s warnings=%s",
-                        state.global_step,
-                        checkpoint_dir,
-                        report["details"],
-                        report["warnings"],
+                        strict=strict,
+                        scaler_required=bool(getattr(args, "fp16", False)),
+                        expected_curriculum_fingerprint=continuity[
+                            "curriculum_schedule_fingerprint"
+                        ],
+                        require_completion_marker=False,
                     )
-            except BaseException as exc:
-                validation_error = (
-                    "Checkpoint completion validation/marker failed: "
-                    f"checkpoint={checkpoint_dir}; {type(exc).__name__}: {exc}"
-                )
-                logger.exception("[Checkpoint] completion FAILED")
-            finally:
-                temporary_path = locals().get("temporary")
-                if temporary_path and osp.exists(temporary_path):
-                    try:
-                        os.remove(temporary_path)
-                    except OSError:
-                        logger.exception(
-                            "[Checkpoint] could not remove marker temporary file %s",
-                            temporary_path,
+                    if not report["valid"]:
+                        validation_error = (
+                            "Checkpoint save returned but resume validation failed: "
+                            f"checkpoint={checkpoint_dir}; "
+                            f"errors={'; '.join(report['errors'])}"
                         )
+                    else:
+                        marker = osp.join(
+                            checkpoint_dir, "checkpoint_complete.json"
+                        )
+                        temporary = f"{marker}.tmp-{os.getpid()}"
+                        payload = {
+                            "schema_version": 1,
+                            "global_step": int(state.global_step),
+                            "completed_at_unix": time.time(),
+                            "hostname": socket.gethostname(),
+                            "world_size": (
+                                dist.get_world_size()
+                                if dist.is_initialized()
+                                else 1
+                            ),
+                            "validation": report,
+                        }
+                        with open(temporary, "w", encoding="utf-8") as handle:
+                            json.dump(
+                                payload,
+                                handle,
+                                ensure_ascii=False,
+                                indent=2,
+                                sort_keys=True,
+                            )
+                            handle.write("\n")
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        os.replace(temporary, marker)
+                        logger.info(
+                            "[Checkpoint] COMPLETE step=%s path=%s details=%s "
+                            "warnings=%s",
+                            state.global_step,
+                            checkpoint_dir,
+                            report["details"],
+                            report["warnings"],
+                        )
+                except BaseException as exc:
+                    validation_error = (
+                        "Checkpoint completion validation/marker failed: "
+                        f"checkpoint={checkpoint_dir}; {type(exc).__name__}: {exc}"
+                    )
+                    logger.exception("[Checkpoint] completion FAILED")
+                finally:
+                    if temporary and osp.exists(temporary):
+                        try:
+                            os.remove(temporary)
+                        except OSError:
+                            logger.exception(
+                                "[Checkpoint] could not remove marker temporary file %s",
+                                temporary,
+                            )
         if dist.is_available() and dist.is_initialized():
             message = [validation_error]
             dist.broadcast_object_list(message, src=0)
@@ -2071,6 +2429,55 @@ class StreamPackingMTPTrainer(Trainer):
             self._snapshot_ui5_parameters()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
+
+    def create_scheduler(self, num_training_steps: int, optimizer=None):
+        """Create one absolute-step LR schedule shared by all eval segments."""
+
+        schedule = getattr(self.train_dataset, "curriculum_schedule", None)
+        if schedule is None:
+            return super().create_scheduler(
+                num_training_steps=num_training_steps,
+                optimizer=optimizer,
+            )
+        if self.lr_scheduler is not None:
+            return self.lr_scheduler
+        reference_lr = float(schedule.stages[0].llm_lr)
+        configured_lr = float(self.args.learning_rate)
+        if not math.isclose(
+            configured_lr, reference_lr, rel_tol=1.0e-12, abs_tol=0.0
+        ):
+            raise ValueError(
+                "Scheduled curriculum requires --learning_rate to equal the first "
+                f"LLM_LRS value: learning_rate={configured_lr}, expected={reference_lr}"
+            )
+        target_optimizer = optimizer if optimizer is not None else self.optimizer
+        if target_optimizer is None:
+            raise RuntimeError("optimizer must exist before the curriculum scheduler")
+
+        def lr_lambda(completed_optimizer_steps: int) -> float:
+            return schedule.lr_multiplier_for_completed_steps(
+                int(completed_optimizer_steps), reference_lr=reference_lr
+            )
+
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            target_optimizer,
+            lr_lambda=lr_lambda,
+        )
+        if self.is_world_process_zero():
+            logger.warning(
+                "[UI5 curriculum LR] full_horizon=%s segment_target=%s "
+                "boundaries=%s",
+                schedule.total_steps,
+                num_training_steps,
+                [
+                    {
+                        "steps": [stage.first_optimizer_step, stage.last_optimizer_step],
+                        "llm_lr": stage.llm_lr,
+                    }
+                    for stage in schedule.stages
+                ],
+            )
+        return self.lr_scheduler
 
     def _checkpoint_trace(self, output_dir, stage, event, **details):
         """Fsync a compact breadcrumb before/after every checkpoint phase."""
@@ -2936,6 +3343,63 @@ class StreamPackingMTPTrainer(Trainer):
             cursor += len(task_keys)
         return reduced_scalars, reduced_tasks, values[-1], task_pr_auc
 
+    def _reduce_curriculum_pool_draw_counts(self):
+        """Return globally summed, resume-stable sampler draws by pool."""
+
+        schedule = getattr(self.train_dataset, "curriculum_schedule", None)
+        dataset_pools = getattr(self.train_dataset, "dataset_pools", None)
+        if schedule is None or dataset_pools is None:
+            return None
+        worker_states = getattr(self.train_dataset, "_worker_states", {})
+        configured_workers = getattr(
+            self.train_dataset, "_configured_num_workers", None
+        )
+        local_available = bool(worker_states) and (
+            configured_workers is None or len(worker_states) == configured_workers
+        )
+        try:
+            local_counts = (
+                curriculum_pool_draw_counts(worker_states, dataset_pools)
+                if local_available
+                else {"hard": 0, "matched_anchor": 0, "global_replay": 0}
+            )
+        except ValueError as exc:
+            # Every rank must still enter the same collective.  Report N/A
+            # globally instead of letting one malformed local snapshot strand
+            # its peers inside all_reduce.
+            logger.warning("Curriculum pool draw snapshot is unavailable: %s", exc)
+            local_available = False
+            local_counts = {"hard": 0, "matched_anchor": 0, "global_replay": 0}
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        count_tensor = torch.tensor(
+            [
+                local_counts[pool]
+                for pool in ("hard", "matched_anchor", "global_replay")
+            ]
+            + [int(local_available)],
+            dtype=torch.int64,
+            device=device,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+        values = count_tensor.cpu().tolist()
+        expected_available_ranks = (
+            dist.get_world_size()
+            if dist.is_available() and dist.is_initialized()
+            else 1
+        )
+        if int(values[3]) != expected_available_ranks:
+            return None
+        return {
+            "hard": int(values[0]),
+            "matched_anchor": int(values[1]),
+            "global_replay": int(values[2]),
+        }
+
     @staticmethod
     def _average_precision(scores, labels):
         """Exact average precision over one complete diagnostic window."""
@@ -2964,6 +3428,7 @@ class StreamPackingMTPTrainer(Trainer):
 
     def _flush_ui5_excel(self, step, logs):
         scalars, tasks, peak_memory, task_pr_auc = self._reduce_ui5_window()
+        curriculum_pool_counts = self._reduce_curriculum_pool_draw_counts()
         config = self.model.config
         def global_grad_rms(group):
             state = scalars[f"{group}_grad_norm"]
@@ -3051,6 +3516,16 @@ class StreamPackingMTPTrainer(Trainer):
             "pbd_grad_norm": pbd_grad_norm,
             "tasks": {},
         }
+        if curriculum_pool_counts is not None:
+            metrics.update(
+                {
+                    "curriculum_hard_samples": curriculum_pool_counts["hard"],
+                    "curriculum_anchor_samples": curriculum_pool_counts["matched_anchor"],
+                    "curriculum_global_replay_samples": curriculum_pool_counts[
+                        "global_replay"
+                    ],
+                }
+            )
         for group in ("relation", "image_gate", "slot_gate", "pbd"):
             metrics[f"{group}_grad_seen_steps"] = scalars[f"{group}_grad_seen_steps"]["sum"]
             for suffix in (
@@ -3109,6 +3584,35 @@ class StreamPackingMTPTrainer(Trainer):
                     if values["detail_weight_count"] else None
                 ),
             }
+        schedule = getattr(self.train_dataset, "curriculum_schedule", None)
+        if schedule is not None:
+            stage = schedule.stage_for_optimizer_step(int(step))
+            target = stage.to_dict()["pool_weights"]
+            curriculum_log = {
+                "curriculum_phase": stage.index + 1,
+                "hard_ratio": target["hard"],
+                "anchor_ratio": target["matched_anchor"],
+                "global_replay_ratio": target["global_replay"],
+                "curriculum_target_llm_lr": stage.llm_lr,
+            }
+            for name in (
+                "curriculum_hard_samples",
+                "curriculum_anchor_samples",
+                "curriculum_global_replay_samples",
+            ):
+                if name in metrics:
+                    curriculum_log[name] = metrics[name]
+            metrics.update(curriculum_log)
+            logs.update(curriculum_log)
+            for history_row in reversed(self.state.log_history):
+                try:
+                    history_step = int(history_row.get("step", -1))
+                except (TypeError, ValueError):
+                    continue
+                if history_step == int(step):
+                    history_row.update(curriculum_log)
+                    break
+
         if self.is_world_process_zero():
             written = self._ui5_excel.update_train(step, metrics)
             logger.info(
@@ -3117,6 +3621,66 @@ class StreamPackingMTPTrainer(Trainer):
                 written,
                 self._ui5_excel.path,
             )
+            if schedule is not None:
+                segment_target = int(
+                    os.environ.get("LOCANY_STOP_AFTER_STEP", schedule.total_steps)
+                )
+                pool_counts = {
+                    "hard": metrics.get("curriculum_hard_samples"),
+                    "anchor": metrics.get("curriculum_anchor_samples"),
+                    "global_replay": metrics.get(
+                        "curriculum_global_replay_samples"
+                    ),
+                }
+                status = {
+                    "event": "train_progress",
+                    "step": int(step),
+                    "phase": stage.index + 1,
+                    "curriculum_target": {
+                        "hard_ratio": target["hard"],
+                        "anchor_ratio": target["matched_anchor"],
+                        "global_replay_ratio": target["global_replay"],
+                        "llm_lr": stage.llm_lr,
+                    },
+                    "training": {
+                        "learning_rate": metrics["learning_rate"],
+                        "loss_total": metrics["loss_total"],
+                        "loss_lm": metrics["loss_lm"],
+                        "grad_norm": metrics["grad_norm"],
+                        "window_samples": int(metrics["samples"]),
+                        "pool_samples_cumulative": pool_counts,
+                        "pool_sample_count_status": (
+                            "available"
+                            if curriculum_pool_counts is not None
+                            else "N/A: incomplete worker iterator snapshots"
+                        ),
+                    },
+                    "next_action": (
+                        f"continue_training_to_step_{segment_target}"
+                        if int(step) < segment_target
+                        else f"exit_training_segment_for_evaluation_step_{step}"
+                    ),
+                }
+                logger.info(
+                    "[TRAIN SNAPSHOT] step=%s phase=%s lr=%s target_lr=%s "
+                    "loss=%s loss_lm=%s grad_norm=%s window_samples=%s "
+                    "pool_cumulative=hard:%s,anchor:%s,global_replay:%s",
+                    step,
+                    stage.index + 1,
+                    metrics["learning_rate"] if metrics["learning_rate"] is not None else "N/A",
+                    stage.llm_lr,
+                    metrics["loss_total"] if metrics["loss_total"] is not None else "N/A",
+                    metrics["loss_lm"] if metrics["loss_lm"] is not None else "N/A",
+                    metrics["grad_norm"] if metrics["grad_norm"] is not None else "N/A",
+                    int(metrics["samples"]),
+                    pool_counts["hard"] if pool_counts["hard"] is not None else "N/A",
+                    pool_counts["anchor"] if pool_counts["anchor"] is not None else "N/A",
+                    pool_counts["global_replay"] if pool_counts["global_replay"] is not None else "N/A",
+                )
+                logger.info(
+                    "[CURRICULUM STATUS] %s",
+                    json.dumps(status, ensure_ascii=False, separators=(",", ":")),
+                )
         self._reset_ui5_window()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
@@ -3185,16 +3749,59 @@ def build_stream_packed_dataset_mtp(
     model_args,
     data_args, 
     processor, 
-    base_seed: int = 42
+    base_seed: int = 42,
+    total_steps: int = 0,
 ) -> StreamPackedDatasetMTP:
     """Build StreamPackedDatasetMTP."""
     ds_collections = json.loads(open(data_args.meta_path).read())
+    curriculum_schedule = UI5CurriculumSchedule.from_environment(
+        os.environ,
+        default_total_steps=int(total_steps),
+    )
+    scheduled_curriculum = curriculum_schedule is not None
+    if scheduled_curriculum and curriculum_schedule.total_steps != int(total_steps):
+        raise ValueError(
+            "Scheduled TOTAL_STEPS must equal Trainer --max_steps: "
+            f"TOTAL_STEPS={curriculum_schedule.total_steps}, max_steps={total_steps}"
+        )
+    curriculum_identity = None
+    if scheduled_curriculum:
+        curriculum_identity = curriculum_artifact_identity(
+            data_args.meta_path, curriculum_schedule
+        )
+        runtime_sampling_mode = os.environ.get("UI5_UI_SAMPLING_MODE", "fixed_ratio")
+        if runtime_sampling_mode != "fixed_ratio":
+            raise ValueError(
+                "CURRICULUM_MODE=scheduled requires UI5_UI_SAMPLING_MODE=fixed_ratio; "
+                "the outer curriculum sampler owns all three pool weights"
+            )
+        logger.warning(
+            "[UI5 curriculum] enabled schedule=%s fingerprint=%s",
+            curriculum_schedule.to_dict(),
+            curriculum_schedule.fingerprint,
+        )
     
     datasets = []
     dataset_weights = []
+    dataset_pools = []
     
     for ds_name, meta in ds_collections.items():
         meta = resolve_recipe_entry_paths(meta, data_args.meta_path)
+        curriculum_pool = None
+        if scheduled_curriculum:
+            if "curriculum_pool" not in meta:
+                raise ValueError(
+                    f"Dataset {ds_name!r} lacks required curriculum_pool; expected "
+                    "hard, matched_anchor, or global_replay"
+                )
+            curriculum_pool = canonical_curriculum_pool(meta["curriculum_pool"])
+            # The three exported pools need not each contain all five tasks.
+            # Retain every legal record and let only the outer sampler apply the
+            # requested stage ratios.
+            meta = dict(meta)
+            meta["curriculum_pool"] = curriculum_pool
+            meta["balance_ui_defects"] = False
+            meta["ui_sampling_mode"] = "fixed_ratio"
         repeat_time = meta.get('repeat_time', 1)
         try:
             ds = LazySupervisedDatasetMTP(
@@ -3204,7 +3811,7 @@ def build_stream_packed_dataset_mtp(
                 target_fps=data_args.target_fps,
                 max_frames=data_args.max_frames,
                 video_total_pixels=data_args.video_total_pixels,
-                balance_ui_defects=data_args.balance_ui_defects,
+                balance_ui_defects=(False if scheduled_curriculum else data_args.balance_ui_defects),
                 ui_records_per_class=data_args.ui_records_per_class,
                 ui_negative_to_positive_ratio=data_args.ui_negative_to_positive_ratio,
                 ui_sampling_mode=data_args.ui_sampling_mode,
@@ -3218,6 +3825,8 @@ def build_stream_packed_dataset_mtp(
             
             weight = resolve_dataset_sampling_weight(meta, len(ds))
             dataset_weights.append(weight)
+            if scheduled_curriculum:
+                dataset_pools.append(curriculum_pool)
             
             logger.info(
                 f'Added dataset: {ds_name}, length={len(ds)}, '
@@ -3246,6 +3855,9 @@ def build_stream_packed_dataset_mtp(
         log_freq=10000,
         base_seed=base_seed,
         buffer_size=buffer_size,
+        curriculum_schedule=curriculum_schedule,
+        dataset_pools=(dataset_pools if scheduled_curriculum else None),
+        curriculum_identity=curriculum_identity,
     )
 
 
@@ -3507,7 +4119,14 @@ def main():
     # Build dataset
     logger.info("Building stream packed MTP dataset...")
     t_start = time.time()
-    train_dataset = build_stream_packed_dataset_mtp(model_args, data_args, processor, base_seed=training_args.seed)
+    train_dataset = build_stream_packed_dataset_mtp(
+        model_args,
+        data_args,
+        processor,
+        base_seed=training_args.seed,
+        total_steps=training_args.max_steps,
+    )
+    train_dataset.configure_num_workers(training_args.dataloader_num_workers)
     logger.info(f"Dataset built in {time.time() - t_start:.2f}s")
 
     # Freeze params
@@ -3584,7 +4203,8 @@ def main():
     my_callbacks.append(MemoryLoggerCallback())
     my_callbacks.append(DataloaderStateCallback(train_dataset))
     my_callbacks.append(SamplingCoverageCallback(train_dataset, interval=1000))
-    my_callbacks.append(CheckpointCompletionCallback())
+    checkpoint_completion_callback = CheckpointCompletionCallback(train_dataset)
+    my_callbacks.append(checkpoint_completion_callback)
     stop_after_step = int(os.environ.get("LOCANY_STOP_AFTER_STEP", "0"))
     if stop_after_step:
         if stop_after_step > training_args.max_steps:
@@ -3619,8 +4239,44 @@ def main():
     # Training
     if training_args.do_train:
         checkpoint = training_args.resume_from_checkpoint or last_checkpoint
-        
+        completed_global_step = 0
+
         if checkpoint is not None:
+            checkpoint = osp.abspath(osp.expanduser(os.fspath(checkpoint)))
+            curriculum_schedule = train_dataset.curriculum_schedule
+            resume_report = validate_checkpoint(
+                Path(checkpoint),
+                mode="resume",
+                expected_ranks=(dist.get_world_size() if dist.is_initialized() else 1),
+                strict=curriculum_schedule is not None,
+                scaler_required=bool(training_args.fp16),
+                expected_curriculum_fingerprint=(
+                    curriculum_schedule.fingerprint
+                    if curriculum_schedule is not None
+                    else None
+                ),
+                require_completion_marker=curriculum_schedule is not None,
+            )
+            if not resume_report["valid"]:
+                raise RuntimeError(
+                    "Refusing unsafe checkpoint resume: "
+                    f"checkpoint={checkpoint}; "
+                    f"errors={'; '.join(resume_report['errors'])}"
+                )
+            completed_global_step = int(resume_report["details"]["global_step"])
+            if curriculum_schedule is not None:
+                saved_training_config = resume_report["details"][
+                    "continuity_manifest"
+                ].get("training_continuity_config")
+                current_training_config = training_continuity_config(
+                    training_args, curriculum_schedule
+                )
+                if saved_training_config != current_training_config:
+                    raise RuntimeError(
+                        "Training/optimizer configuration changed across curriculum "
+                        f"resume: saved={saved_training_config}, "
+                        f"current={current_training_config}"
+                    )
             training_args.ignore_data_skip = True
             logger.info("Enabled ignore_data_skip=True for stateful dataloader resume.")
             
@@ -3630,22 +4286,67 @@ def main():
             if os.path.exists(dataloader_state_path):
                 try:
                     dataloader_state = torch.load(dataloader_state_path, weights_only=False)
-                    train_dataset.load_state_dict(dataloader_state)
+                    train_dataset.load_state_dict(
+                        dataloader_state,
+                        expected_global_step=completed_global_step,
+                    )
                     logger.info(f"Rank {rank}: Loaded dataloader state from {dataloader_state_path}")
                 except Exception as e:
-                    logger.warning(f"Rank {rank}: Failed to load dataloader state: {e}")
+                    logger.error(f"Rank {rank}: Failed to load dataloader state: {e}")
                     traceback.print_exc()
+                    if train_dataset.curriculum_schedule is not None:
+                        raise RuntimeError(
+                            f"Rank {rank}: strict curriculum state restore failed"
+                        ) from e
             else:
-                logger.warning(f"Rank {rank}: No dataloader state found at {dataloader_state_path}")
+                message = f"Rank {rank}: No dataloader state found at {dataloader_state_path}"
+                if train_dataset.curriculum_schedule is not None:
+                    raise RuntimeError(message)
+                logger.warning(message)
+
+        if train_dataset.curriculum_schedule is not None:
+            declared_start = os.environ.get("CURRICULUM_START_STEP")
+            if (
+                declared_start is not None
+                and int(declared_start) != completed_global_step
+            ):
+                raise RuntimeError(
+                    "CURRICULUM_START_STEP does not match the restored trainer state: "
+                    f"declared={declared_start}, restored={completed_global_step}"
+                )
+            segment_target = int(
+                os.environ.get("LOCANY_STOP_AFTER_STEP", training_args.max_steps)
+            )
+            train_dataset.curriculum_schedule.validate_segment(
+                completed_global_step, segment_target
+            )
+            checkpoint_completion_callback.set_segment_bounds(
+                source_global_step=completed_global_step,
+                target_global_step=segment_target,
+            )
+            active_stage = train_dataset.curriculum_schedule.stage_after_completed_step(
+                completed_global_step
+            )
+            logger.warning(
+                "[UI5 curriculum] segment completed=%s target=%s active_stage=%s "
+                "optimizer_steps=%s-%s dataset_weights=%s llm_lr=%s",
+                completed_global_step,
+                segment_target,
+                active_stage.index,
+                active_stage.first_optimizer_step,
+                active_stage.last_optimizer_step,
+                train_dataset.dataset_weight,
+                active_stage.llm_lr,
+            )
 
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         segment_mode = _env_flag("LOCANY_SEGMENT_MODE", default=False)
-        final_segment = trainer.state.global_step >= training_args.max_steps
-        if not segment_mode or final_segment:
+        if should_export_model_at_training_end(segment_mode=segment_mode):
             trainer.save_model()
         elif get_rank() == 0:
             logger.info(
-                "Segment mode stopped at step %s; skipped duplicate model export to output root",
+                "Segment mode stopped at step %s; skipped duplicate model export to "
+                "output root (including the final segment)",
                 trainer.state.global_step,
             )
 
@@ -3696,14 +4397,14 @@ def main():
         trainer.save_state()
         
     segment_mode = _env_flag("LOCANY_SEGMENT_MODE", default=False)
-    training_complete = (not training_args.do_train) or (
-        'trainer' in locals() and trainer.state.global_step >= training_args.max_steps
-    )
-    if not segment_mode or training_complete:
+    if should_write_training_done_marker(segment_mode=segment_mode):
         with open(osp.join(training_args.output_dir, 'done.txt'), 'w') as f:
             f.write('done: ' + time.ctime())
     elif get_rank() == 0:
-        logger.info("Segment is resumable but not final; done.txt was not written")
+        logger.info(
+            "Segment mode never writes training done.txt; the orchestrator must "
+            "publish completion only after final evaluation and artifact updates"
+        )
 
 
 if __name__ == '__main__':

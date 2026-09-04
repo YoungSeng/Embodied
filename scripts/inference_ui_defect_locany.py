@@ -3,8 +3,10 @@
 """Batch inference for five UI-defect tasks with a full LocateAnything checkpoint.
 
 The parsed per-image JSON keeps the same top-level structure as the previous
-YOLO script: a list of detections. LocateAnything does not expose a calibrated
-per-box confidence, so ``confidence`` is ``null`` unless
+YOLO script: a list of detections.  A malformed model response is deliberately
+serialized as JSON ``null`` so the canonical evaluator scores it as an invalid
+prediction instead of a valid empty detection list. LocateAnything does not
+expose a calibrated per-box confidence, so ``confidence`` is ``null`` unless
 ``--compat-confidence`` is explicitly supplied.
 
 Example:
@@ -72,7 +74,9 @@ _bootstrap_cuda_visible_devices()
 
 
 import hashlib
+import importlib.util
 import json
+import math
 import random
 import re
 import time
@@ -81,7 +85,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 from PIL import Image, ImageDraw, ImageFont
@@ -397,6 +401,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tile-overlap-ratio", type=float, default=0.10)
     parser.add_argument("--tile-nms-iou", type=float, default=0.50)
     parser.add_argument(
+        "--single-task-output-dir",
+        default=None,
+        help=(
+            "单任务 worker 的精确输出目录；不再自动追加 task_name。仅允许与一个"
+            "具体 --tasks 项一起使用"
+        ),
+    )
+    parser.add_argument(
+        "--hard-groups-jsonl",
+        default=None,
+        help="课程评测父进程预校验并解析后的 0/4 hard group JSONL",
+    )
+    parser.add_argument(
+        "--rollout-bundle-root",
+        default=None,
+        help="hard group 图片与 GT-free base scan plan 所在 bundle 根目录",
+    )
+    parser.add_argument(
+        "--hard-rollout-seeds",
+        nargs=4,
+        type=int,
+        default=None,
+        metavar=("SEED0", "SEED1", "SEED2", "SEED3"),
+    )
+    parser.add_argument("--hard-rollout-output-dir", default=None)
+    parser.add_argument("--expected-hard-task-count", type=int, default=None)
+    parser.add_argument("--rollout-scorer-script", default=None)
+    parser.add_argument("--hard-rollout-iou-threshold", type=float, default=0.10)
+    parser.add_argument(
+        "--evaluation-identity-file",
+        default=None,
+        help="父评测器生成的不可变 candidate/processor/generation/crop/evaluator 身份清单",
+    )
+    parser.add_argument(
         "--local-files-only",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -509,12 +547,40 @@ def parse_args() -> argparse.Namespace:
         parser.error("--tile-overlap-ratio 必须位于 (0, 1)")
     if not 0 <= args.tile_nms_iou <= 1:
         parser.error("--tile-nms-iou 必须位于 [0, 1]")
+    if not 0 <= args.hard_rollout_iou_threshold <= 1:
+        parser.error("--hard-rollout-iou-threshold 必须位于 [0, 1]")
     if args.compat_confidence is not None and not 0 <= args.compat_confidence <= 1:
         parser.error("--compat-confidence 必须位于 [0, 1]")
     if args.relation_gate_threshold is not None and not 0 <= args.relation_gate_threshold <= 1:
         parser.error("--relation-gate-threshold 必须位于 [0, 1]")
     if args.preflight_forward and not args.load_only:
         parser.error("--preflight-forward 必须与 --load-only 一起使用")
+    if args.single_task_output_dir is not None and (
+        len(args.tasks) != 1 or args.tasks == ["all"]
+    ):
+        parser.error("--single-task-output-dir 只允许一个具体 --tasks 项")
+    hard_values = (
+        args.hard_groups_jsonl,
+        args.rollout_bundle_root,
+        args.hard_rollout_seeds,
+        args.hard_rollout_output_dir,
+        args.expected_hard_task_count,
+        args.rollout_scorer_script,
+    )
+    if any(value is not None for value in hard_values) and not all(
+        value is not None for value in hard_values
+    ):
+        parser.error(
+            "hard rollout 需要同时提供 --hard-groups-jsonl、--rollout-bundle-root、"
+            "--hard-rollout-seeds、--hard-rollout-output-dir、"
+            "--expected-hard-task-count 和 --rollout-scorer-script"
+        )
+    if args.hard_groups_jsonl is not None and (
+        len(args.tasks) != 1 or args.tasks == ["all"]
+    ):
+        parser.error("hard rollout worker 必须只运行一个具体任务")
+    if args.expected_hard_task_count is not None and args.expected_hard_task_count < 0:
+        parser.error("--expected-hard-task-count 不能小于 0")
 
     return args
 
@@ -738,7 +804,12 @@ def prepare_work(args: argparse.Namespace) -> list[TaskWork]:
         if args.max_images_per_task:
             image_paths = image_paths[: args.max_images_per_task]
 
-        output_dir = args.output_dir / config.task_name
+        single_task_output_dir = getattr(args, "single_task_output_dir", None)
+        output_dir = (
+            Path(single_task_output_dir)
+            if single_task_output_dir is not None
+            else args.output_dir / config.task_name
+        )
         output_dir.mkdir(parents=True, exist_ok=True)
         stems = build_output_stems(image_paths)
 
@@ -1485,6 +1556,9 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         },
         "inference_crop": {
             "mode": args.inference_crop_mode,
+            "content_missing_path": (
+                "predict_with_direct_full_image:predict_parse_build_detections"
+            ),
             "max_tiles": args.tile_max_count,
             "target_long_side": args.tile_target_long_side,
             "overlap_ratio": args.tile_overlap_ratio,
@@ -1501,6 +1575,10 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "save_raw_answer": args.save_raw_answer,
             "save_visualization": args.save_visualization,
         },
+        "evaluation_identity_digest": getattr(
+            args, "evaluation_identity_digest", None
+        ),
+        "hard_rollout": getattr(args, "hard_rollout_identity", None),
         "created_or_updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1518,6 +1596,8 @@ def manifest_identity(manifest: dict[str, Any]) -> dict[str, Any]:
             "generation",
             "inference_crop",
             "output",
+            "evaluation_identity_digest",
+            "hard_rollout",
         )
     }
 
@@ -1653,6 +1733,45 @@ def _pixels_to_normalized_1000(
     ]
 
 
+def predict_with_direct_full_image(
+    *,
+    args: argparse.Namespace,
+    inferencer: "LocateAnythingInferencer",
+    image: Image.Image,
+    task: TaskConfig,
+    sample_seed: int,
+    question: str | None = None,
+) -> tuple[
+    str,
+    ParsedAnswer,
+    list[dict[str, Any]],
+    list[list[int]],
+    dict[str, Any],
+    list[dict[str, Any]],
+]:
+    """Run the legacy one-shot full-image predict/parse/detection path.
+
+    This does not crop the image or route a synthetic full-image tile through
+    coordinate remapping and NMS.  The helper keeps the UI5 pass and the four
+    hard rollouts on the same direct path for ``content_missing``.
+    """
+
+    set_sample_seed(sample_seed)
+    answer = inferencer.predict(
+        image=image, question=question if question is not None else task.prompt
+    )
+    gate_diagnostics = dict(inferencer.last_ui_diagnostics)
+    parsed = parse_locateanything_answer(answer)
+    detections, pixel_boxes = build_yolo_compatible_detections(
+        parsed=parsed,
+        task=task,
+        width=image.width,
+        height=image.height,
+        compat_confidence=args.compat_confidence,
+    )
+    return answer, parsed, detections, pixel_boxes, gate_diagnostics, []
+
+
 def predict_with_lossless_tiles(
     *,
     args: argparse.Namespace,
@@ -1662,6 +1781,7 @@ def predict_with_lossless_tiles(
     sample_seed: int,
     tiles_override: Sequence[Sequence[int]] | None = None,
     crop_mode: str = "lossless_tiling",
+    question: str | None = None,
 ) -> tuple[str, ParsedAnswer, list[dict[str, Any]], list[list[int]], dict[str, Any], list[dict[str, Any]]]:
     """Run GT-free tiled inference and merge only after global coordinate mapping."""
 
@@ -1687,7 +1807,9 @@ def predict_with_lossless_tiles(
         tile_image = image.crop(tuple(tile))
         try:
             set_sample_seed(sample_seed + tile_index)
-            answer = inferencer.predict(image=tile_image, question=task.prompt)
+            answer = inferencer.predict(
+                image=tile_image, question=question if question is not None else task.prompt
+            )
             gate = dict(inferencer.last_ui_diagnostics)
             parsed = parse_locateanything_answer(answer)
             local_detections, local_boxes = build_yolo_compatible_detections(
@@ -1815,6 +1937,394 @@ def load_detector_scan_index(path: Path) -> tuple[dict[str, dict[str, Any]], str
     return index, digest
 
 
+def _atomic_write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(
+                    json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _load_python_module(path: Path, name: str) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot import Python module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_hard_task_rows(
+    args: argparse.Namespace, config: TaskConfig
+) -> list[dict[str, Any]]:
+    if args.hard_groups_jsonl is None:
+        return []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    with Path(args.hard_groups_jsonl).open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"invalid resolved hard-group JSON at line {line_number}: {exc}"
+                ) from exc
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"resolved hard-group line {line_number} must contain an object"
+                )
+            if str(row.get("task")) != config.task_name:
+                continue
+            record_id = str(row.get("record_id") or "").strip()
+            if not record_id or record_id in seen:
+                raise ValueError(
+                    f"invalid/duplicate hard-group record_id={record_id!r} for {config.task_name}"
+                )
+            seen.add(record_id)
+            if row.get("crop_complete4") is not True or int(
+                row.get("crop_correct_count", -1)
+            ) != 0:
+                raise ValueError(f"hard group {record_id} is not an authoritative crop 0/4 group")
+            image_path = Path(str(row.get("_resolved_image_path") or "")).resolve(
+                strict=True
+            )
+            try:
+                image_path.relative_to(Path(args.rollout_bundle_root))
+            except ValueError as exc:
+                raise ValueError(
+                    f"hard group {record_id} image escapes rollout bundle"
+                ) from exc
+            row["_resolved_image_path"] = str(image_path)
+            rows.append(row)
+    rows.sort(key=lambda row: str(row["record_id"]))
+    if len(rows) != args.expected_hard_task_count:
+        raise ValueError(
+            f"hard group count changed for {config.task_name}: "
+            f"expected {args.expected_hard_task_count}, got {len(rows)}"
+        )
+    return rows
+
+
+def _score_hard_prediction(
+    scorer: Any,
+    gt_boxes: Sequence[Sequence[float]],
+    pred_boxes: Sequence[Sequence[float]],
+    parse_status: str,
+    threshold: float,
+    image_size: tuple[int, int],
+) -> dict[str, Any]:
+    gt = [list(map(float, box)) for box in gt_boxes]
+    pred = [list(map(float, box)) for box in pred_boxes]
+    gt_count, pred_count = len(gt), len(pred)
+    if parse_status == "parse_error":
+        return {
+            "matched_pairs": [],
+            "TP_box": 0,
+            "FP_box": 0 if gt_count else 1,
+            "FN_box": gt_count,
+            "image_confusion": "FN" if gt_count else "FP",
+            "error_type": "PARSE_ERROR",
+            "exact_correct": False,
+        }
+    if gt_count and pred_count:
+        matrix = scorer.np.zeros((gt_count, pred_count), dtype=scorer.np.float64)
+        for gt_index, gt_box in enumerate(gt):
+            for pred_index, pred_box in enumerate(pred):
+                matrix[gt_index, pred_index] = scorer.calculate_iou(gt_box, pred_box)
+        gt_indices, pred_indices = scorer.linear_sum_assignment(-matrix)
+    else:
+        matrix = None
+        gt_indices, pred_indices = [], []
+    diagonal = max(1e-12, math.hypot(*image_size))
+    matched_pairs: list[dict[str, Any]] = []
+    matched_gt: set[int] = set()
+    matched_pred: set[int] = set()
+    for raw_gt_index, raw_pred_index in zip(gt_indices, pred_indices):
+        gt_index, pred_index = int(raw_gt_index), int(raw_pred_index)
+        iou = float(matrix[gt_index, pred_index])
+        gt_box, pred_box = gt[gt_index], pred[pred_index]
+        gt_center = ((gt_box[0] + gt_box[2]) / 2, (gt_box[1] + gt_box[3]) / 2)
+        pred_center = (
+            (pred_box[0] + pred_box[2]) / 2,
+            (pred_box[1] + pred_box[3]) / 2,
+        )
+        center_distance = math.hypot(
+            pred_center[0] - gt_center[0], pred_center[1] - gt_center[1]
+        )
+        is_tp = iou >= threshold
+        matched_pairs.append(
+            {
+                "gt_index": gt_index,
+                "pred_index": pred_index,
+                "gt_bbox": gt_box,
+                "pred_bbox": pred_box,
+                "iou": iou,
+                "is_tp": is_tp,
+                "center_distance_px": center_distance,
+                "center_distance_normalized": center_distance / diagonal,
+            }
+        )
+        if is_tp:
+            matched_gt.add(gt_index)
+            matched_pred.add(pred_index)
+    tp = len(matched_gt)
+    fp = pred_count - tp
+    fn = gt_count - tp
+    if gt_count and pred_count:
+        image_confusion = "TP"
+    elif gt_count:
+        image_confusion = "FN"
+    elif pred_count:
+        image_confusion = "FP"
+    else:
+        image_confusion = "TN"
+    if not gt_count and not pred_count:
+        error_type = "TN"
+    elif not gt_count:
+        error_type = "FP_ONLY"
+    elif not pred_count:
+        error_type = "FN_NO_PRED"
+    elif tp == gt_count and fp == 0:
+        error_type = "EXACT_TP"
+    elif tp == 0:
+        error_type = "LOC_WRONG"
+    elif fn > 0 and fp == 0:
+        error_type = "PARTIAL_MISS"
+    elif fn == 0 and fp > 0:
+        error_type = "PARTIAL_EXTRA"
+    else:
+        error_type = "PARTIAL_BOTH"
+    exact = bool(
+        (not gt_count and not pred_count)
+        or (gt_count and tp == gt_count and fp == 0)
+    )
+    return {
+        "matched_pairs": matched_pairs,
+        "TP_box": tp,
+        "FP_box": fp,
+        "FN_box": fn,
+        "image_confusion": image_confusion,
+        "error_type": error_type,
+        "exact_correct": exact,
+    }
+
+
+def run_hard_rollouts(
+    args: argparse.Namespace,
+    inferencer: "LocateAnythingInferencer",
+    config: TaskConfig,
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    if args.hard_groups_jsonl is None:
+        return {}
+    scorer = _load_python_module(
+        Path(args.rollout_scorer_script),
+        f"ui5_curriculum_rollout_scorer_{os.getpid()}",
+    )
+    output_dir = Path(args.hard_rollout_output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rollout_rows: dict[int, list[dict[str, Any]]] = {
+        rollout_id: [] for rollout_id in range(4)
+    }
+    group_rows: list[dict[str, Any]] = []
+    wall_start = time.time()
+    for group_index, row in enumerate(rows, start=1):
+        record_id = str(row["record_id"])
+        image_path = Path(str(row["_resolved_image_path"]))
+        prompt = str(row["prompt"])
+        gt_global = row.get("gt_global") or []
+        per_group: list[dict[str, Any]] = []
+        with Image.open(image_path) as opened:
+            image = opened.convert("RGB")
+        try:
+            for gt_box in gt_global:
+                x1, y1, x2, y2 = map(float, gt_box)
+                if not (
+                    0 <= x1 < x2 <= image.width
+                    and 0 <= y1 < y2 <= image.height
+                ):
+                    raise ValueError(
+                        f"hard group {record_id} has out-of-bounds GT box {gt_box} "
+                        f"for image {image.size}"
+                    )
+            if config.task_name != "content_missing":
+                plan_width = int(row.get("_base_plan_width") or 0)
+                plan_height = int(row.get("_base_plan_height") or 0)
+                if (plan_width, plan_height) != image.size:
+                    raise ValueError(
+                        f"hard group {record_id} image/base-plan dimensions differ: "
+                        f"image={image.size}, plan={(plan_width, plan_height)}"
+                    )
+                base_tiles = row.get("_base_tiles")
+                if not isinstance(base_tiles, list) or not base_tiles:
+                    raise ValueError(f"hard group {record_id} has no GT-free base tiles")
+                assert_lossless_coverage(image.width, image.height, base_tiles)
+            else:
+                # content_missing intentionally bypasses all crop/merge code.
+                base_tiles = None
+            for rollout_id, rollout_seed in enumerate(args.hard_rollout_seeds):
+                sample_seed = stable_sample_seed(
+                    int(rollout_seed), config.task_name, record_id
+                )
+                set_sample_seed(sample_seed)
+                inference_start = time.time()
+                if (
+                    config.task_name == "content_missing"
+                    or args.inference_crop_mode == "full_image"
+                ):
+                    (
+                        answer,
+                        parsed,
+                        detections,
+                        pixel_boxes,
+                        gate_diagnostics,
+                        tile_records,
+                    ) = predict_with_direct_full_image(
+                        args=args,
+                        inferencer=inferencer,
+                        image=image,
+                        task=config,
+                        sample_seed=sample_seed,
+                        question=prompt,
+                    )
+                else:
+                    (
+                        answer,
+                        parsed,
+                        detections,
+                        pixel_boxes,
+                        gate_diagnostics,
+                        tile_records,
+                    ) = predict_with_lossless_tiles(
+                        args=args,
+                        inferencer=inferencer,
+                        image=image,
+                        task=config,
+                        sample_seed=sample_seed,
+                        tiles_override=base_tiles,
+                        crop_mode="hard_rollout_base_scan",
+                        question=prompt,
+                    )
+                score = _score_hard_prediction(
+                    scorer,
+                    gt_global,
+                    pixel_boxes,
+                    parsed.status,
+                    args.hard_rollout_iou_threshold,
+                    image.size,
+                )
+                result = {
+                    "schema_version": 1,
+                    "evaluation_identity_digest": args.evaluation_identity_digest,
+                    "task": config.task_name,
+                    "record_id": record_id,
+                    "sample_id": row.get("sample_id"),
+                    "source_image_id": row.get("source_image_id"),
+                    "image_relpath": row.get("image_relpath"),
+                    "rollout_id": rollout_id,
+                    "rollout_seed": int(rollout_seed),
+                    "sample_seed": sample_seed,
+                    "prompt": prompt,
+                    "gt_global": gt_global,
+                    "pred_global": pixel_boxes,
+                    "raw_output": answer,
+                    "parse_status": parsed.status,
+                    "parse_warnings": parsed.warnings,
+                    "runtime_error": None,
+                    "gate_diagnostics": gate_diagnostics,
+                    "crop_mode": (
+                        "content_missing_direct_full_image"
+                        if config.task_name == "content_missing"
+                        else (
+                            "full_image"
+                            if args.inference_crop_mode == "full_image"
+                            else "hard_rollout_base_scan"
+                        )
+                    ),
+                    "base_plan_digest": row.get("_base_plan_digest"),
+                    "tile_count": len(tile_records) if tile_records else 1,
+                    "tiles": tile_records,
+                    "latency_seconds": round(time.time() - inference_start, 6),
+                    **score,
+                }
+                rollout_rows[rollout_id].append(result)
+                per_group.append(result)
+        finally:
+            image.close()
+        correct_count = sum(item["exact_correct"] is True for item in per_group)
+        group_rows.append(
+            {
+                "record_id": record_id,
+                "sample_id": row.get("sample_id"),
+                "task": config.task_name,
+                "previous_crop_correct_count": 0,
+                "candidate_correct_count": correct_count,
+                "candidate_success_rate": correct_count / 4.0,
+                "transition": "still_hard" if correct_count == 0 else "improved",
+                "rollout_results": [
+                    {
+                        "rollout_id": item["rollout_id"],
+                        "seed": item["rollout_seed"],
+                        "exact_correct": item["exact_correct"],
+                        "error_type": item["error_type"],
+                    }
+                    for item in per_group
+                ],
+            }
+        )
+        print(
+            f"[HARD ROLLOUT] task={config.task_name} group={group_index}/{len(rows)} "
+            f"record_id={record_id} correct={correct_count}/4",
+            flush=True,
+        )
+    for rollout_id, values in rollout_rows.items():
+        _atomic_write_jsonl(output_dir / f"rollout_{rollout_id}.jsonl", values)
+    _atomic_write_jsonl(output_dir / "groups.jsonl", group_rows)
+    parse_error_count = sum(
+        row.get("parse_status") == "parse_error"
+        for values in rollout_rows.values()
+        for row in values
+    )
+    summary = {
+        "schema_version": 1,
+        "evaluation_identity_digest": args.evaluation_identity_digest,
+        "task": config.task_name,
+        "group_count": len(rows),
+        "rollout_count": 4,
+        "attempt_count": len(rows) * 4,
+        # error_count is reserved for execution/runtime failures.  A parse
+        # error is a valid model outcome that the scorer counts as incorrect.
+        "error_count": 0,
+        "runtime_error_count": 0,
+        "parse_error_count": parse_error_count,
+        "rollout_seeds": list(map(int, args.hard_rollout_seeds)),
+        "groups_improved": sum(row["transition"] == "improved" for row in group_rows),
+        "groups_still_hard": sum(
+            row["transition"] == "still_hard" for row in group_rows
+        ),
+        "correct_count_distribution": {
+            str(count): sum(
+                int(row["candidate_correct_count"]) == count for row in group_rows
+            )
+            for count in range(5)
+        },
+        "elapsed_seconds": round(time.time() - wall_start, 6),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }
+    atomic_write_json(output_dir / "rollout4_summary.json", summary)
+    return summary
+
+
 def save_error_record(
     work: TaskWork,
     stem: str,
@@ -1896,26 +2406,39 @@ def run_one_task(
             set_sample_seed(sample_seed)
 
             inference_start = time.time()
-            if args.inference_crop_mode in {"lossless_tiling", "detector_scan"}:
+            if (
+                config.task_name == "content_missing"
+                or args.inference_crop_mode == "full_image"
+            ):
+                (
+                    answer,
+                    parsed,
+                    detections,
+                    pixel_boxes,
+                    gate_diagnostics,
+                    tile_records,
+                ) = predict_with_direct_full_image(
+                    args=args,
+                    inferencer=inferencer,
+                    image=image,
+                    task=config,
+                    sample_seed=sample_seed,
+                )
+            elif args.inference_crop_mode in {"lossless_tiling", "detector_scan"}:
                 tiles_override = None
                 if args.inference_crop_mode == "detector_scan":
-                    if config.task_name == "content_missing":
-                        # The global task keeps one complete view; it still uses
-                        # no GT and shares the same detector cache validation.
-                        tiles_override = [[0, 0, width, height]]
-                    else:
-                        key = str(Path(image_path).expanduser().resolve(strict=False))
-                        scan = args.detector_scan_index.get(key)
-                        if scan is None:
-                            raise KeyError(
-                                f"test image is absent from detector crop manifest: {key}"
-                            )
-                        if (int(scan["width"]), int(scan["height"])) != (width, height):
-                            raise ValueError(
-                                f"detector crop dimensions changed for {key}: "
-                                f"manifest={scan['width']}x{scan['height']}, image={width}x{height}"
-                            )
-                        tiles_override = scan["tiles"]
+                    key = str(Path(image_path).expanduser().resolve(strict=False))
+                    scan = args.detector_scan_index.get(key)
+                    if scan is None:
+                        raise KeyError(
+                            f"test image is absent from detector crop manifest: {key}"
+                        )
+                    if (int(scan["width"]), int(scan["height"])) != (width, height):
+                        raise ValueError(
+                            f"detector crop dimensions changed for {key}: "
+                            f"manifest={scan['width']}x{scan['height']}, image={width}x{height}"
+                        )
+                    tiles_override = scan["tiles"]
                 (
                     answer,
                     parsed,
@@ -1932,18 +2455,8 @@ def run_one_task(
                     tiles_override=tiles_override,
                     crop_mode=args.inference_crop_mode,
                 )
-            else:
-                answer = inferencer.predict(image=image, question=config.prompt)
-                gate_diagnostics = dict(inferencer.last_ui_diagnostics)
-                parsed = parse_locateanything_answer(answer)
-                detections, pixel_boxes = build_yolo_compatible_detections(
-                    parsed=parsed,
-                    task=config,
-                    width=width,
-                    height=height,
-                    compat_confidence=args.compat_confidence,
-                )
-                tile_records = []
+            else:  # Defensive: argparse currently restricts this to the modes above.
+                raise ValueError(f"unsupported inference crop mode: {args.inference_crop_mode}")
             inference_elapsed = time.time() - inference_start
 
             if args.print_raw_answer:
@@ -2026,7 +2539,13 @@ def run_one_task(
                         file=sys.stderr,
                     )
 
-            atomic_write_json(output_path, detections)
+            # Preserve malformed model output as an invalid prediction for the
+            # canonical evaluator.  Serializing [] here would silently turn a
+            # parse failure on a negative sample into a true negative.
+            atomic_write_json(
+                output_path,
+                None if parsed.status == "parse_error" else detections,
+            )
             (work.output_dir / "errors" / f"{stem}_error.json").unlink(missing_ok=True)
 
             counts["processed"] += 1
@@ -2123,6 +2642,18 @@ def main() -> int:
         args.processor_path = normalize_local_or_hub_path(args.processor_path)
     args.input_dir = Path(args.input_dir).expanduser().resolve()
     args.output_dir = Path(args.output_dir).expanduser().resolve()
+    args.single_task_output_dir = (
+        Path(args.single_task_output_dir).expanduser().resolve()
+        if args.single_task_output_dir is not None
+        else None
+    )
+    if args.single_task_output_dir is not None:
+        try:
+            args.single_task_output_dir.relative_to(args.output_dir)
+        except ValueError as exc:
+            raise ValueError(
+                "--single-task-output-dir must stay inside --output-dir"
+            ) from exc
     args.summary_path = (
         Path(args.summary_path).expanduser().resolve()
         if args.summary_path
@@ -2130,6 +2661,65 @@ def main() -> int:
     )
     args.detector_scan_index = {}
     args.detector_crop_manifest_digest = None
+    args.evaluation_identity_digest = None
+    if args.evaluation_identity_file is not None:
+        identity_path = Path(args.evaluation_identity_file).expanduser().resolve(
+            strict=True
+        )
+        args.evaluation_identity_file = str(identity_path)
+        args.evaluation_identity_digest = hashlib.sha256(
+            identity_path.read_bytes()
+        ).hexdigest()
+    args.hard_rollout_identity = None
+    if args.hard_groups_jsonl is not None:
+        hard_groups_path = Path(args.hard_groups_jsonl).expanduser().resolve(strict=True)
+        rollout_bundle_root = Path(args.rollout_bundle_root).expanduser().resolve(
+            strict=True
+        )
+        hard_output_dir = Path(args.hard_rollout_output_dir).expanduser().resolve()
+        rollout_scorer = Path(args.rollout_scorer_script).expanduser().resolve(
+            strict=True
+        )
+        if not rollout_bundle_root.is_dir():
+            raise ValueError("--rollout-bundle-root must be a directory")
+        if not rollout_scorer.is_file():
+            raise ValueError("--rollout-scorer-script must be a file")
+        if args.single_task_output_dir is None:
+            raise ValueError("hard rollout requires --single-task-output-dir")
+        try:
+            hard_output_dir.relative_to(args.single_task_output_dir)
+        except ValueError as exc:
+            raise ValueError(
+                "--hard-rollout-output-dir must stay inside the task output directory"
+            ) from exc
+        args.hard_groups_jsonl = str(hard_groups_path)
+        args.rollout_bundle_root = str(rollout_bundle_root)
+        args.hard_rollout_output_dir = str(hard_output_dir)
+        args.rollout_scorer_script = str(rollout_scorer)
+        base_plans = rollout_bundle_root / "base_scan_plans.json"
+        if not base_plans.is_file():
+            raise FileNotFoundError(
+                f"rollout base scan plans do not exist: {base_plans}"
+            )
+        args.hard_rollout_identity = {
+            "groups_jsonl": str(hard_groups_path),
+            "groups_sha256": hashlib.sha256(hard_groups_path.read_bytes()).hexdigest(),
+            "bundle_root": str(rollout_bundle_root),
+            "base_scan_plans": str(base_plans),
+            "base_scan_plans_sha256": hashlib.sha256(
+                base_plans.read_bytes()
+            ).hexdigest(),
+            "rollout_seeds": list(map(int, args.hard_rollout_seeds)),
+            "seed_derivation": "base_seed + rollout_id",
+            "sample_seed_derivation": (
+                "stable_sample_seed(rollout_seed, task, record_id)"
+            ),
+            "evaluator": str(rollout_scorer),
+            "evaluator_sha256": hashlib.sha256(
+                rollout_scorer.read_bytes()
+            ).hexdigest(),
+            "iou_threshold": args.hard_rollout_iou_threshold,
+        }
     if args.inference_crop_mode == "detector_scan":
         if not args.detector_crop_manifest:
             raise ValueError("detector_scan requires --detector-crop-manifest")
@@ -2145,6 +2735,13 @@ def main() -> int:
         raise FileNotFoundError(f"输入目录不存在：{args.input_dir}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     validate_local_checkpoint(args.checkpoint)
+    if args.hard_groups_jsonl is not None and torch.cuda.is_available():
+        if torch.cuda.device_count() != 1:
+            raise RuntimeError(
+                "curriculum task worker must see exactly one GPU; "
+                f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}, "
+                f"device_count={torch.cuda.device_count()}"
+            )
 
     if args.load_only:
         print("[MODEL LOAD PREFLIGHT] 开始单进程模型加载检查", flush=True)
@@ -2173,6 +2770,11 @@ def main() -> int:
         return 0
 
     works = prepare_work(args)
+    hard_rows = (
+        load_hard_task_rows(args, works[0].config)
+        if args.hard_groups_jsonl is not None and works
+        else []
+    )
     print_preflight(args, works)
     if not works:
         return 1
@@ -2182,7 +2784,7 @@ def main() -> int:
 
     check_and_write_manifest(args)
     total_pending = sum(len(work.pending_paths) for work in works)
-    if total_pending == 0:
+    if total_pending == 0 and args.hard_groups_jsonl is None:
         print("[DONE] 所选任务均已有结果，未加载模型")
         return 0
 
@@ -2191,12 +2793,19 @@ def main() -> int:
     wall_start = time.time()
     for work in works:
         all_stats.append(run_one_task(args, inferencer, work))
+    hard_summary = (
+        run_hard_rollouts(args, inferencer, works[0].config, hard_rows)
+        if args.hard_groups_jsonl is not None
+        else {}
+    )
 
     summary = {
         "checkpoint": args.checkpoint,
         "input_dir": str(args.input_dir),
         "output_dir": str(args.output_dir),
+        "evaluation_identity_digest": args.evaluation_identity_digest,
         "tasks": all_stats,
+        "hard_rollout": hard_summary,
         "totals": {
             key: sum(int(stats[key]) for stats in all_stats)
             for key in (
