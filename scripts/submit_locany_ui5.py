@@ -66,6 +66,68 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Smoke evaluation limit per UI5 task; omitted/0 keeps the full set",
     )
+    parser.add_argument("--eval-input-dir", default=None)
+    parser.add_argument("--eval-data-split", choices=("test",), default="test")
+    parser.add_argument("--frozen-gate-thresholds", default=None)
+    parser.add_argument(
+        "--eval-inference-crop-mode",
+        choices=("full_image", "lossless_tiling", "detector_scan"),
+        default="detector_scan",
+    )
+    parser.add_argument("--eval-parser-root", default=None)
+    parser.add_argument("--eval-detector-cache", default=None)
+    parser.add_argument(
+        "--eval-detector-cache-mode", choices=("readonly",), default="readonly"
+    )
+    parser.add_argument(
+        "--eval-scan-name", default="horizontal_scan_v5_raw_detector_edge_aligned"
+    )
+    parser.add_argument(
+        "--require-cache-scope",
+        choices=("full_test",),
+        default="full_test",
+    )
+    parser.add_argument(
+        "--require-strict-nonoverlap",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--require-raw-detector-edge-alignment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--require-detector-unique-containment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--eval-expected-unique-images",
+        type=int,
+        default=None,
+        help=(
+            "Expected content-unique evaluation images; full test defaults to 1555"
+        ),
+    )
+    parser.add_argument("--eval-text-python", default=None)
+    parser.add_argument("--eval-icon-python", default=None)
+    parser.add_argument("--eval-text-model-dir", default=None)
+    parser.add_argument("--eval-icon-model", default=None)
+    parser.add_argument("--eval-detector-workers-per-gpu", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--eval-tile-max-count", type=int, default=10)
+    parser.add_argument("--eval-tile-target-long-side", type=int, default=1600)
+    parser.add_argument("--eval-tile-overlap-ratio", type=float, default=0.10)
+    parser.add_argument("--eval-tile-nms-iou", type=float, default=0.50)
+    parser.add_argument("--eval-scan-target-height", type=int, default=960)
+    parser.add_argument("--eval-scan-target-guard-ratio", type=float, default=0.0)
+    parser.add_argument("--eval-scan-target-guard-min-pixels", type=int, default=0)
+    parser.add_argument("--eval-scan-target-guard-max-pixels", type=int, default=0)
+    parser.add_argument("--eval-scan-vertical-link-ratio", type=float, default=0.025)
+    parser.add_argument("--eval-scan-context-ratio", type=float, default=0.20)
+    parser.add_argument("--eval-scan-min-context-image-ratio", type=float, default=0.015)
+    parser.add_argument("--eval-scan-dense-band-ratio", type=float, default=0.80)
+    parser.add_argument("--eval-scan-visualization-samples", type=int, default=20)
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--learning-rate", default="2e-5")
     parser.add_argument(
@@ -114,6 +176,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--eval-fail-policy", choices=("stop", "warn"), default="stop")
     parser.add_argument(
+        "--no-validation-early-stop",
+        dest="validation_early_stop",
+        action="store_false",
+        default=False,
+        help="Compatibility flag; formal UI5 training never uses validation early stop",
+    )
+    parser.add_argument(
         "--relation-gate-mode", choices=("observe", "hard", "soft"), default=None
     )
     parser.add_argument("--relation-gate-threshold", type=float, default=None)
@@ -126,6 +195,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--eval-disable-pbd", dest="eval_enable_pbd", action="store_false"
     )
     parser.set_defaults(eval_enable_pbd=True)
+    parser.add_argument(
+        "--use-detection-crops",
+        action="store_true",
+        help="Train from an audited crop recipe (requires --crop-audit-dir)",
+    )
+    parser.add_argument("--crop-audit-dir", default=None)
+    parser.add_argument(
+        "--crop-train-mode",
+        choices=("full_only", "crop_only"),
+        default=None,
+    )
+    parser.add_argument("--crop-meta-path", default=None)
+    parser.add_argument(
+        "--ui-sampling-mode",
+        choices=(
+            "fixed_ratio",
+            "task_source_balanced_rotating",
+        ),
+        default=None,
+    )
+    parser.add_argument(
+        "--ui-negative-to-positive-ratio",
+        type=float,
+        default=2.0,
+        help="Effective negative:positive draws inside each UI task",
+    )
     runtime_deps_group = parser.add_mutually_exclusive_group()
     runtime_deps_group.add_argument(
         "--install-system-runtime-deps",
@@ -147,7 +242,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start_group = parser.add_mutually_exclusive_group()
     start_group.add_argument("--eval-at-start", dest="eval_at_start", action="store_true")
     start_group.add_argument("--no-eval-at-start", dest="eval_at_start", action="store_false")
-    parser.set_defaults(eval_at_start=True)
+    parser.set_defaults(eval_at_start=False)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--template", type=Path, default=TEMPLATE_PATH)
     parser.add_argument("--output-yaml", type=Path, default=None)
@@ -175,6 +270,10 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
     env = dict(os.environ)
     resource_group = str(getattr(args, "resource_group", "default"))
     tc_msed_stage = str(getattr(args, "tc_msed_stage", "v4"))
+    use_detection_crops = bool(getattr(args, "use_detection_crops", False))
+    crop_train_mode = getattr(args, "crop_train_mode", None) or (
+        "crop_only" if use_detection_crops else "full_only"
+    )
     cuda_devices = args.cuda_devices or ",".join(
         str(index) for index in range(args.gpus)
     )
@@ -206,8 +305,88 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
             getattr(args, "relation_gate_mode", None)
             or ("soft" if tc_msed_stage in {"m4", "m5"} else "observe")
         ),
+        "EVAL_VALIDATION_EARLY_STOP": (
+            "1" if getattr(args, "validation_early_stop", False) else "0"
+        ),
+        "EVAL_DATA_SPLIT": getattr(args, "eval_data_split", "test"),
+        "EVAL_INFERENCE_CROP_MODE": getattr(
+            args, "eval_inference_crop_mode", "detector_scan"
+        ),
+        "EVAL_DETECTOR_WORKERS_PER_GPU": str(
+            getattr(args, "eval_detector_workers_per_gpu", 1)
+        ),
+        "EVAL_DETECTOR_CACHE_MODE": str(
+            getattr(args, "eval_detector_cache_mode", "readonly")
+        ),
+        "EVAL_SCAN_NAME": str(
+            getattr(
+                args,
+                "eval_scan_name",
+                "horizontal_scan_v5_raw_detector_edge_aligned",
+            )
+        ),
+        "EVAL_REQUIRE_CACHE_SCOPE": str(
+            getattr(args, "require_cache_scope", "full_test")
+        ),
+        "EVAL_REQUIRE_STRICT_NONOVERLAP": (
+            "1" if getattr(args, "require_strict_nonoverlap", True) else "0"
+        ),
+        "EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT": (
+            "1"
+            if getattr(args, "require_raw_detector_edge_alignment", True)
+            else "0"
+        ),
+        "EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT": (
+            "1"
+            if getattr(args, "require_detector_unique_containment", True)
+            else "0"
+        ),
+        "EVAL_TILE_MAX_COUNT": str(getattr(args, "eval_tile_max_count", 10)),
+        "EVAL_TILE_TARGET_LONG_SIDE": str(
+            getattr(args, "eval_tile_target_long_side", 1600)
+        ),
+        "EVAL_TILE_OVERLAP_RATIO": str(
+            getattr(args, "eval_tile_overlap_ratio", 0.10)
+        ),
+        "EVAL_TILE_NMS_IOU": str(getattr(args, "eval_tile_nms_iou", 0.50)),
+        "EVAL_SCAN_TARGET_HEIGHT": str(getattr(args, "eval_scan_target_height", 960)),
+        "EVAL_SCAN_TARGET_GUARD_RATIO": str(
+            getattr(args, "eval_scan_target_guard_ratio", 0.0)
+        ),
+        "EVAL_SCAN_TARGET_GUARD_MIN_PIXELS": str(
+            getattr(args, "eval_scan_target_guard_min_pixels", 0)
+        ),
+        "EVAL_SCAN_TARGET_GUARD_MAX_PIXELS": str(
+            getattr(args, "eval_scan_target_guard_max_pixels", 0)
+        ),
+        "EVAL_SCAN_VERTICAL_LINK_RATIO": str(
+            getattr(args, "eval_scan_vertical_link_ratio", 0.025)
+        ),
+        "EVAL_SCAN_CONTEXT_RATIO": str(
+            getattr(args, "eval_scan_context_ratio", 0.20)
+        ),
+        "EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO": str(
+            getattr(args, "eval_scan_min_context_image_ratio", 0.015)
+        ),
+        "EVAL_SCAN_DENSE_BAND_RATIO": str(
+            getattr(args, "eval_scan_dense_band_ratio", 0.80)
+        ),
+        "EVAL_SCAN_VISUALIZATION_SAMPLES": str(
+            getattr(args, "eval_scan_visualization_samples", 20)
+        ),
         "INSTALL_SYSTEM_RUNTIME_DEPS": (
             "1" if getattr(args, "install_system_runtime_deps", True) else "0"
+        ),
+        "UI5_USE_DETECTION_CROPS": "1" if use_detection_crops else "0",
+        "UI5_CROP_TRAIN_MODE": crop_train_mode,
+        "UI5_UI_SAMPLING_MODE": getattr(args, "ui_sampling_mode", None)
+        or (
+            "task_source_balanced_rotating"
+            if crop_train_mode == "crop_only"
+            else "fixed_ratio"
+        ),
+        "UI_NEGATIVE_TO_POSITIVE_RATIO": str(
+            getattr(args, "ui_negative_to_positive_ratio", 2.0)
         ),
     }
     optional = {
@@ -230,6 +409,19 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "RELATION_AUX_BUDGET_RATIO": getattr(args, "relation_aux_budget_ratio", None),
         "TRAINING_DATA_SOURCE_DIR": args.training_data_source_dir,
         "TRAINING_DATA_DIR": args.training_data_dir,
+        "UI5_CROP_AUDIT_DIR": getattr(args, "crop_audit_dir", None),
+        "UI5_CROP_META_PATH": getattr(args, "crop_meta_path", None),
+        "EVAL_PARSER_ROOT": getattr(args, "eval_parser_root", None),
+        "EVAL_INPUT_DIR": getattr(args, "eval_input_dir", None),
+        "EVAL_FROZEN_GATE_THRESHOLDS": getattr(args, "frozen_gate_thresholds", None),
+        "EVAL_DETECTOR_CACHE": getattr(args, "eval_detector_cache", None),
+        "EVAL_EXPECTED_UNIQUE_IMAGES": getattr(
+            args, "eval_expected_unique_images", None
+        ),
+        "EVAL_TEXT_PYTHON": getattr(args, "eval_text_python", None),
+        "EVAL_ICON_PYTHON": getattr(args, "eval_icon_python", None),
+        "EVAL_TEXT_MODEL_DIR": getattr(args, "eval_text_model_dir", None),
+        "EVAL_ICON_MODEL": getattr(args, "eval_icon_model", None),
     }
     env.update(explicit)
     if tc_msed_stage in {"m31", "m32"}:
@@ -289,12 +481,14 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         parity_base.pop(key, None)
     four_env = {
         **parity_base,
+        "UI5_GPU_PARITY_PROBE": "1",
         "GPU_COUNT": "4",
         "CUDA_DEVICES": "0,1,2,3",
         "EVAL_GPU_DEVICES": "0,1,2,3",
     }
     eight_env = {
         **parity_base,
+        "UI5_GPU_PARITY_PROBE": "1",
         "GPU_COUNT": "8",
         "CUDA_DEVICES": "0,1,2,3,4,5,6,7",
         "EVAL_GPU_DEVICES": "0,1,2,3",
@@ -376,7 +570,45 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "EVAL_INTERVAL_STEPS",
         "EVAL_MAX_IMAGES_PER_TASK",
         "EVAL_FAIL_POLICY",
+        "EVAL_VALIDATION_EARLY_STOP",
+        "EVAL_DATA_SPLIT",
+        "EVAL_FROZEN_GATE_THRESHOLDS",
+        "EVAL_INFERENCE_CROP_MODE",
+        "EVAL_INPUT_DIR",
+        "EVAL_PARSER_ROOT",
+        "EVAL_DETECTOR_CACHE",
+        "EVAL_DETECTOR_CACHE_MODE",
+        "EVAL_SCAN_NAME",
+        "EVAL_REQUIRE_CACHE_SCOPE",
+        "EVAL_REQUIRE_STRICT_NONOVERLAP",
+        "EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT",
+        "EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT",
+        "EVAL_EXPECTED_UNIQUE_IMAGES",
+        "EVAL_TEXT_PYTHON",
+        "EVAL_ICON_PYTHON",
+        "EVAL_TEXT_MODEL_DIR",
+        "EVAL_ICON_MODEL",
+        "EVAL_DETECTOR_WORKERS_PER_GPU",
+        "EVAL_TILE_MAX_COUNT",
+        "EVAL_TILE_TARGET_LONG_SIDE",
+        "EVAL_TILE_OVERLAP_RATIO",
+        "EVAL_TILE_NMS_IOU",
+        "EVAL_SCAN_TARGET_HEIGHT",
+        "EVAL_SCAN_TARGET_GUARD_RATIO",
+        "EVAL_SCAN_TARGET_GUARD_MIN_PIXELS",
+        "EVAL_SCAN_TARGET_GUARD_MAX_PIXELS",
+        "EVAL_SCAN_VERTICAL_LINK_RATIO",
+        "EVAL_SCAN_CONTEXT_RATIO",
+        "EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO",
+        "EVAL_SCAN_DENSE_BAND_RATIO",
+        "EVAL_SCAN_VISUALIZATION_SAMPLES",
         "INSTALL_SYSTEM_RUNTIME_DEPS",
+        "UI5_USE_DETECTION_CROPS",
+        "UI5_CROP_AUDIT_DIR",
+        "UI5_CROP_TRAIN_MODE",
+        "UI5_CROP_META_PATH",
+        "UI5_UI_SAMPLING_MODE",
+        "UI_NEGATIVE_TO_POSITIVE_RATIO",
         "RUN_NAME",
         "PIPELINE_MODE",
     )
@@ -494,7 +726,46 @@ def main() -> int:
         "EVAL_AT_START",
         "EVAL_INTERVAL_STEPS",
         "EVAL_MAX_IMAGES_PER_TASK",
+        "EVAL_VALIDATION_EARLY_STOP",
+        "EVAL_DATA_SPLIT",
+        "EVAL_FROZEN_GATE_THRESHOLDS",
+        "EVAL_INFERENCE_CROP_MODE",
+        "EVAL_INPUT_DIR",
+        "EVAL_PARSER_ROOT",
+        "EVAL_DETECTOR_CACHE",
+        "EVAL_DETECTOR_CACHE_MODE",
+        "EVAL_SCAN_NAME",
+        "EVAL_REQUIRE_CACHE_SCOPE",
+        "EVAL_REQUIRE_STRICT_NONOVERLAP",
+        "EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT",
+        "EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT",
+        "EVAL_EXPECTED_UNIQUE_IMAGES",
+        "EVAL_TEXT_PYTHON",
+        "EVAL_ICON_PYTHON",
+        "EVAL_TEXT_MODEL_DIR",
+        "EVAL_ICON_MODEL",
+        "EVAL_DETECTOR_WORKERS_PER_GPU",
+        "EVAL_TILE_MAX_COUNT",
+        "EVAL_TILE_TARGET_LONG_SIDE",
+        "EVAL_TILE_OVERLAP_RATIO",
+        "EVAL_TILE_NMS_IOU",
+        "EVAL_SCAN_TARGET_HEIGHT",
+        "EVAL_SCAN_TARGET_GUARD_RATIO",
+        "EVAL_SCAN_TARGET_GUARD_MIN_PIXELS",
+        "EVAL_SCAN_TARGET_GUARD_MAX_PIXELS",
+        "EVAL_SCAN_VERTICAL_LINK_RATIO",
+        "EVAL_SCAN_CONTEXT_RATIO",
+        "EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO",
+        "EVAL_SCAN_DENSE_BAND_RATIO",
+        "EVAL_SCAN_VISUALIZATION_SAMPLES",
         "INSTALL_SYSTEM_RUNTIME_DEPS",
+        "UI5_USE_DETECTION_CROPS",
+        "UI5_CROP_AUDIT_DIR",
+        "UI5_CROP_TRAIN_MODE",
+        "UI5_CROP_META_PATH",
+        "UI5_UI_SAMPLING_MODE",
+        "UI_NEGATIVE_TO_POSITIVE_RATIO",
+        "META_PATH",
     ):
         print(f"{key:28s}: {runtime[key]}")
     print(f"rendered_yaml               : {output_yaml}")

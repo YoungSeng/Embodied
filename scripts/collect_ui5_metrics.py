@@ -9,10 +9,18 @@ import hashlib
 import importlib.util
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
-from locany_ui5_common import TASK_ISSUE_NAMES, TASKS
+# Direct invocations use ``scripts/`` as sys.path[0].  Put this checkout first
+# so the history repair command cannot accidentally import an older installed
+# ``eaglevl`` package that lacks the UI5 Excel logger.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from locany_ui5_common import TASK_ISSUE_NAMES, TASKS, image_gate_probability
 from eaglevl.train.ui5_excel_logger import (
     UI5ExcelLogger,
     build_eval_rows,
@@ -26,6 +34,13 @@ BASE_COLUMNS = [
     "max_num_tokens",
     "max_num_tokens_scope",
     "relation_gate_mode",
+    "evaluation_split",
+    "cache_scope",
+    "development_test_reuse",
+    "git_sha",
+    "git_dirty",
+    "recipe_digest",
+    "cache_digest",
     "ui_model_signature",
     "git_commit",
     "config_hash",
@@ -441,6 +456,9 @@ def collect_gate_metrics(
         predicted_center_diversity_values: list[float] = []
         attention_diversity_values: list[float] = []
         slot_usage_histogram: list[int] = []
+        p_defect_sources: dict[str, int] = {}
+        missing_p_defect = 0
+        missing_label = 0
         labels = ground_truth.get(task, {})
         task_boxes = ground_truth_boxes.get(task, {})
 
@@ -455,10 +473,15 @@ def collect_gate_metrics(
                 return None
 
         for record in records:
-            p_defect = record.get("p_defect")
+            p_defect, p_defect_source = image_gate_probability(record)
+            p_defect_sources[p_defect_source] = (
+                p_defect_sources.get(p_defect_source, 0) + 1
+            )
             image_path = str(record.get("image_path", ""))
             label = labels.get(image_path, labels.get(Path(image_path).name))
-            if isinstance(p_defect, (int, float)) and label is not None:
+            missing_p_defect += int(p_defect is None)
+            missing_label += int(label is None)
+            if p_defect is not None and label is not None:
                 (positives if label else negatives).append(float(p_defect))
                 predicted = bool(record.get("would_pass", record.get("gate_passed")))
                 gate_tp += int(label and predicted)
@@ -545,7 +568,9 @@ def collect_gate_metrics(
         if records and len(sweep_samples) != len(records):
             raise RuntimeError(
                 f"Gate sidecars are incomplete for task={task}: "
-                f"labeled_p_defect={len(sweep_samples)}, records={len(records)}"
+                f"labeled_p_defect={len(sweep_samples)}, records={len(records)}, "
+                f"missing_p_defect={missing_p_defect}, missing_label={missing_label}, "
+                f"p_defect_sources={p_defect_sources}"
             )
         result[task] = {
             "samples": len(records),
@@ -571,6 +596,10 @@ def collect_gate_metrics(
             "gate_precision": gate_precision,
             "gate_recall": gate_recall,
             "gate_f1": gate_f1,
+            "p_defect_sources": p_defect_sources,
+            "legacy_tile_gate_recovered": p_defect_sources.get(
+                "legacy_tile_gates_max", 0
+            ),
             "_sweep_samples": sweep_samples,
             "gt_average_box_count": gt_box_sum / len(records) if records else None,
             "pred_average_box_count": pred_box_sum / len(records) if records else None,
@@ -689,6 +718,53 @@ def build_gate_threshold_sweep(
     return output
 
 
+def score_gate_samples(samples: list[dict[str, Any]], threshold: float) -> dict[str, Any]:
+    tp = fp = fn = tn = predicted_positive = 0
+    for sample in samples:
+        predicted = bool(sample["raw_positive"]) and (
+            threshold <= 0.0 or float(sample["p_defect"]) >= threshold
+        )
+        label = bool(sample["label"])
+        tp += int(label and predicted)
+        fp += int(not label and predicted)
+        fn += int(label and not predicted)
+        tn += int(not label and not predicted)
+        predicted_positive += int(predicted)
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    return {
+        "threshold": threshold,
+        "precision": precision,
+        "recall": recall,
+        "f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
+        "predicted_positive": predicted_positive,
+    }
+
+
+def apply_frozen_gate_thresholds(
+    gate_metrics: dict[str, dict[str, Any]], thresholds: dict[str, float]
+) -> dict[str, Any]:
+    if set(thresholds) != set(TASKS):
+        raise ValueError(
+            f"frozen gate thresholds must contain exactly five tasks: {sorted(thresholds)}"
+        )
+    output = {"schema_version": 1, "selection": "frozen_external", "tasks": {}}
+    for task in TASKS:
+        samples = list(gate_metrics.get(task, {}).get("_sweep_samples", []))
+        threshold = float(thresholds[task])
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError(f"invalid frozen gate threshold for {task}: {threshold}")
+        output["tasks"][task] = {
+            "raw": score_gate_samples(samples, 0.0),
+            "selected": score_gate_samples(samples, threshold),
+        }
+    return output
+
+
 def write_gate_threshold_sweep(prediction_dir: Path, sweep: dict[str, Any]) -> None:
     atomic_write_text(
         prediction_dir / "gate_threshold_sweep.json",
@@ -782,6 +858,15 @@ def build_row(args: argparse.Namespace) -> dict[str, Any]:
         "max_num_tokens": args.max_num_tokens,
         "max_num_tokens_scope": args.max_num_tokens_scope,
         "relation_gate_mode": getattr(args, "relation_gate_mode", "observe"),
+        "evaluation_split": getattr(args, "evaluation_split", "test"),
+        "cache_scope": getattr(args, "cache_scope", "full_test"),
+        "development_test_reuse": bool(
+            getattr(args, "development_test_reuse", False)
+        ),
+        "git_sha": getattr(args, "git_sha", ""),
+        "git_dirty": str(getattr(args, "git_dirty", "0")) == "1",
+        "recipe_digest": getattr(args, "recipe_digest", ""),
+        "cache_digest": getattr(args, "cache_digest", ""),
         "ui_model_signature": ui_model_signature(args.checkpoint),
         "git_commit": os.environ.get("GIT_COMMIT", ""),
         "config_hash": os.environ.get("UI5_CONFIG_HASH", ""),
@@ -846,15 +931,42 @@ def append_excel_evaluation(
     gate_metrics = collect_gate_metrics(
         gate_prediction_dir, args.gt_dir, args.scorer_root
     )
-    sweep = build_gate_threshold_sweep(gate_metrics)
-    if args.prediction_dir is not None:
-        write_gate_threshold_sweep(args.prediction_dir, sweep)
-    if args.evaluation_run_dir is not None:
-        write_gate_threshold_sweep(args.evaluation_run_dir, sweep)
+    genuinely_rescored_metrics = (
+        load_metrics(args.gated_metrics_json)
+        if getattr(args, "gated_metrics_json", None) is not None
+        else None
+    )
+    if args.frozen_gate_thresholds is not None:
+        frozen_path = args.frozen_gate_thresholds.expanduser().resolve(strict=True)
+        frozen_value = json.loads(frozen_path.read_text(encoding="utf-8"))
+        thresholds = frozen_value.get("thresholds", frozen_value)
+        sweep = apply_frozen_gate_thresholds(gate_metrics, thresholds)
+    else:
+        # Test metrics remain raw unless an explicit frozen threshold file is supplied.
+        # In particular, do not manufacture "gated" Image/BBox values by copying
+        # the raw metrics when no gated prediction set was actually rescored.
+        sweep = {
+            "schema_version": 1,
+            "selection": "raw_only_no_frozen_gate_thresholds",
+            "tasks": {
+                task: {
+                    "raw": score_gate_samples(
+                        list(gate_metrics.get(task, {}).get("_sweep_samples", [])), 0.0
+                    ),
+                    "selected": {},
+                }
+                for task in TASKS
+            },
+        }
     for task in TASKS:
         task_sweep = sweep.get("tasks", {}).get(task, {})
         raw = task_sweep.get("raw", {})
         selected = task_sweep.get("selected", {})
+        genuine_task_metrics = (
+            genuinely_rescored_metrics.get("tasks", {}).get(task, {})
+            if genuinely_rescored_metrics is not None
+            else {}
+        )
         gate_metrics.setdefault(task, {}).update(
             {
                 "raw_precision": raw.get("precision"),
@@ -867,11 +979,20 @@ def append_excel_evaluation(
                 "gated_recall": selected.get("recall"),
                 "gated_f1": selected.get("f1"),
                 "gated_predicted_positive": selected.get("predicted_positive"),
+                "gated_tp": selected.get("tp"),
                 "gated_fp": selected.get("fp"),
+                "gated_fn": selected.get("fn"),
+                "gated_tn": selected.get("tn"),
                 "gate_filter_rate": (
                     1.0
                     - float(selected.get("predicted_positive", 0))
                     / max(1, int(raw.get("predicted_positive", 0)))
+                    if selected.get("predicted_positive") is not None
+                    else None
+                ),
+                "gated_metrics_by_granularity": genuine_task_metrics,
+                "bbox_metrics_genuinely_rescored": bool(
+                    genuine_task_metrics.get("bbox")
                 ),
             }
         )
@@ -931,6 +1052,25 @@ def append_excel_evaluation(
             "is_best_bbox": retention["is_best_bbox"],
             "is_4000_milestone": retention["is_4000_milestone"],
             "checkpoint_kept": retention["checkpoint_kept"],
+        },
+        audit_context={
+            "evaluation_split": getattr(args, "evaluation_split", "test"),
+            "cache_scope": getattr(args, "cache_scope", "full_test"),
+            "development_test_reuse": bool(
+                getattr(args, "development_test_reuse", False)
+            ),
+            "git_sha": getattr(args, "git_sha", ""),
+            "git_dirty": str(getattr(args, "git_dirty", "0")) == "1",
+            "recipe_digest": getattr(args, "recipe_digest", ""),
+            "cache_digest": getattr(args, "cache_digest", ""),
+            "code_digest": getattr(args, "git_sha", "")
+            or os.environ.get("GIT_COMMIT", ""),
+            "crop_train_mode": os.environ.get("UI5_CROP_TRAIN_MODE", ""),
+            "ui_sampling_mode": os.environ.get("UI5_UI_SAMPLING_MODE", ""),
+            "eval_inference_crop_mode": os.environ.get(
+                "EVAL_INFERENCE_CROP_MODE", ""
+            ),
+            "scan_name": os.environ.get("EVAL_SCAN_NAME", ""),
         },
     )
     excel = UI5ExcelLogger(diagnostics_path)
@@ -1033,22 +1173,47 @@ def print_metric_summary(
     retention: dict[str, Any],
     diagnostics_xlsx: Path,
 ) -> None:
-    def triple(values: dict[str, Any]) -> str:
-        return "P={:.6f} R={:.6f} F1={:.6f}".format(
+    def metric_line(
+        values: dict[str, Any],
+        *,
+        count_rows: list[dict[str, Any]] | None = None,
+    ) -> str:
+        def count(name: str) -> int:
+            value = values.get(name)
+            if value is not None:
+                return int(value)
+            return sum(int(row.get(name) or 0) for row in (count_rows or []))
+
+        return "P={:.6f} R={:.6f} F1={:.6f} TP={} FP={} FN={}".format(
             float(values.get("precision") or 0.0),
             float(values.get("recall") or 0.0),
             float(values.get("f1") or 0.0),
+            count("tp"),
+            count("fp"),
+            count("fn"),
         )
 
     print(f"===== UI5 full-test scorer metrics: SFT step {step} =====")
     for task in TASKS:
         values = metrics.get("tasks", {}).get(task, {})
         issue = TASK_ISSUE_NAMES[task]
-        print(f"{issue} Image {triple(values.get('image', {}))}")
-        print(f"{issue} Bbox@0.1 {triple(values.get('bbox', {}))}")
+        print(f"{issue} Image {metric_line(values.get('image', {}))}")
+        print(f"{issue} BBox@0.1 {metric_line(values.get('bbox', {}))}")
     macro = metrics.get("macro", {})
-    print(f"Image Macro {triple(macro.get('image', {}))}")
-    print(f"Bbox Macro@0.1 {triple(macro.get('bbox', {}))}")
+    image_task_rows = [
+        metrics.get("tasks", {}).get(task, {}).get("image", {}) for task in TASKS
+    ]
+    bbox_task_rows = [
+        metrics.get("tasks", {}).get(task, {}).get("bbox", {}) for task in TASKS
+    ]
+    print(
+        "five_task_macro Image "
+        + metric_line(macro.get("image", {}), count_rows=image_task_rows)
+    )
+    print(
+        "five_task_macro BBox@0.1 "
+        + metric_line(macro.get("bbox", {}), count_rows=bbox_task_rows)
+    )
     print(
         "checkpoint 是否永久保留及原因: "
         f"{'是' if retention['checkpoint_kept'] else '否'}; "
@@ -1101,9 +1266,22 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument(
         "--relation-gate-mode", choices=("observe", "hard", "soft"), default="observe"
     )
+    record.add_argument("--evaluation-split", choices=("test",), default="test")
+    record.add_argument(
+        "--cache-scope",
+        choices=("full_test",),
+        default="full_test",
+    )
+    record.add_argument("--development-test-reuse", action="store_true")
+    record.add_argument("--git-sha", default="")
+    record.add_argument("--git-dirty", choices=("0", "1"), default="0")
+    record.add_argument("--recipe-digest", default="")
+    record.add_argument("--cache-digest", default="")
+    record.add_argument("--frozen-gate-thresholds", type=Path, default=None)
     record.add_argument("--checkpoint", type=Path, required=True)
     record.add_argument("--metrics-json", type=Path, default=None)
     record.add_argument("--raw-metrics-json", type=Path, default=None)
+    record.add_argument("--gated-metrics-json", type=Path, default=None)
     record.add_argument("--start-time", required=True)
     record.add_argument("--end-time", required=True)
     record.add_argument("--status", choices=("success", "failed"), required=True)

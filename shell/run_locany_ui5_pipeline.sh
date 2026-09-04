@@ -32,6 +32,20 @@ export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
 export GPUS="${GPU_COUNT}"
 export MODEL_PATH BASE_MODEL INIT_CHECKPOINT INIT_CPT_STEP META_PATH OUTPUT_BASE OUTPUT_DIR RUN_NAME
+export UI5_USE_DETECTION_CROPS UI5_CROP_AUDIT_DIR UI5_CROP_TRAIN_MODE UI5_CROP_META_PATH UI5_UI_SAMPLING_MODE
+export EVAL_INFERENCE_CROP_MODE EVAL_TILE_MAX_COUNT EVAL_TILE_TARGET_LONG_SIDE
+export EVAL_TILE_OVERLAP_RATIO EVAL_TILE_NMS_IOU
+export EVAL_PARSER_ROOT EVAL_DETECTOR_CACHE EVAL_TEXT_PYTHON EVAL_ICON_PYTHON
+export EVAL_DETECTOR_CACHE_MODE EVAL_SCAN_NAME EVAL_EXPECTED_UNIQUE_IMAGES
+export EVAL_REQUIRE_CACHE_SCOPE EVAL_REQUIRE_STRICT_NONOVERLAP
+export EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT
+export EVAL_TEXT_MODEL_DIR EVAL_ICON_MODEL EVAL_DETECTOR_WORKERS_PER_GPU
+export EVAL_SCAN_TARGET_HEIGHT EVAL_SCAN_VERTICAL_LINK_RATIO EVAL_SCAN_CONTEXT_RATIO
+export EVAL_SCAN_TARGET_GUARD_RATIO EVAL_SCAN_TARGET_GUARD_MIN_PIXELS
+export EVAL_SCAN_TARGET_GUARD_MAX_PIXELS
+export EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO EVAL_SCAN_DENSE_BAND_RATIO
+export EVAL_SCAN_VISUALIZATION_SAMPLES
+export EVAL_DATA_SPLIT EVAL_FROZEN_GATE_THRESHOLDS EVAL_VALIDATION_EARLY_STOP
 export ATTN_IMPLEMENTATION MAX_SEQ_LENGTH MAX_NUM_TOKENS_PER_SAMPLE MAX_NUM_TOKENS
 export MAX_STEPS SEED WARMUP_STEPS LEARNING_RATE UI_RELATION_LEARNING_RATE SAVE_STEPS
 export WEIGHT_DECAY MAX_GRAD_NORM LR_SCHEDULER_TYPE BF16 PER_DEVICE_TRAIN_BATCH_SIZE
@@ -121,6 +135,13 @@ export FREEZE_MLP="${FREEZE_MLP:-False}"
 export BALANCE_UI_DEFECTS="${BALANCE_UI_DEFECTS:-True}"
 export UI_RECORDS_PER_CLASS="${UI_RECORDS_PER_CLASS:-17604}"
 export UI_NEGATIVE_TO_POSITIVE_RATIO="${UI_NEGATIVE_TO_POSITIVE_RATIO:-2.0}"
+if [[ -z "${UI5_UI_SAMPLING_MODE:-}" ]]; then
+  if [[ "${UI5_CROP_TRAIN_MODE}" == "crop_only" ]]; then
+    export UI5_UI_SAMPLING_MODE="task_source_balanced_rotating"
+  else
+    export UI5_UI_SAMPLING_MODE="fixed_ratio"
+  fi
+fi
 export ENABLE_UI_RELATION="${ENABLE_UI_RELATION:-True}"
 export RELATION_DETAIL_HIDDEN_SIZE="${RELATION_DETAIL_HIDDEN_SIZE:-256}"
 export RELATION_NUM_SLOTS="${RELATION_NUM_SLOTS:-8}"
@@ -204,7 +225,13 @@ printf '%-28s: %s\n' \
   "TRAINING_DATA_DIR" "${TRAINING_DATA_DIR}" \
   "TRAINING_DATA_SOURCE_DIR" "${TRAINING_DATA_SOURCE_DIR}" \
   "META_PATH" "${META_PATH}" \
+  "UI5_USE_DETECTION_CROPS" "${UI5_USE_DETECTION_CROPS}" \
+  "UI5_CROP_AUDIT_DIR" "${UI5_CROP_AUDIT_DIR:-<none>}" \
+  "UI5_CROP_TRAIN_MODE" "${UI5_CROP_TRAIN_MODE}" \
+  "UI5_UI_SAMPLING_MODE" "${UI5_UI_SAMPLING_MODE}" \
+  "UI5_CROP_META_PATH" "${UI5_CROP_META_PATH:-<none>}" \
   "EVAL_INPUT_DIR" "${EVAL_INPUT_DIR}" \
+  "EVAL_DATA_SPLIT" "${EVAL_DATA_SPLIT}" \
   "OUTPUT_DIR" "${OUTPUT_DIR}" \
   "SCORER_ROOT" "${SCORER_ROOT}" \
   "CPU_COUNT (nproc)" "$(nproc)" \
@@ -247,6 +274,32 @@ printf '%-28s: %s\n' \
   "ENABLE_EVAL" "${ENABLE_EVAL}" \
   "EVAL_AT_START" "${EVAL_AT_START}" \
   "EVAL_INTERVAL_STEPS" "${EVAL_INTERVAL_STEPS}" \
+  "EVAL_VALIDATION_EARLY_STOP" "${EVAL_VALIDATION_EARLY_STOP}" \
+  "EVAL_INFERENCE_CROP_MODE" "${EVAL_INFERENCE_CROP_MODE}" \
+  "EVAL_PARSER_ROOT" "${EVAL_PARSER_ROOT}" \
+  "EVAL_DETECTOR_CACHE" "${EVAL_DETECTOR_CACHE}" \
+  "EVAL_CACHE_MODE" "${EVAL_DETECTOR_CACHE_MODE}" \
+  "EVAL_SCAN_NAME" "${EVAL_SCAN_NAME}" \
+  "EVAL_CACHE_SCOPE" "${EVAL_REQUIRE_CACHE_SCOPE}" \
+  "EVAL_STRICT_NONOVERLAP" "${EVAL_REQUIRE_STRICT_NONOVERLAP}" \
+  "EVAL_RAW_EDGE_ALIGNMENT" "${EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT}" \
+  "EVAL_DETECTOR_UNIQUE" "${EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT}" \
+  "EVAL_TEXT_PYTHON" "${EVAL_TEXT_PYTHON:-<pipeline python>}" \
+  "EVAL_ICON_PYTHON" "${EVAL_ICON_PYTHON:-<pipeline python>}" \
+  "EVAL_ICON_MODEL" "${EVAL_ICON_MODEL}" \
+  "EVAL_DETECTOR_WORKERS/GPU" "${EVAL_DETECTOR_WORKERS_PER_GPU}" \
+  "EVAL_TILE_MAX_COUNT" "${EVAL_TILE_MAX_COUNT}" \
+  "EVAL_TILE_TARGET_LONG_SIDE" "${EVAL_TILE_TARGET_LONG_SIDE}" \
+  "EVAL_TILE_OVERLAP_RATIO" "${EVAL_TILE_OVERLAP_RATIO}" \
+  "EVAL_TILE_NMS_IOU" "${EVAL_TILE_NMS_IOU}" \
+  "EVAL_SCAN_TARGET_HEIGHT" "${EVAL_SCAN_TARGET_HEIGHT}" \
+  "EVAL_SCAN_TARGET_GUARD" "${EVAL_SCAN_TARGET_GUARD_RATIO}" \
+  "EVAL_SCAN_GUARD_MIN_PX" "${EVAL_SCAN_TARGET_GUARD_MIN_PIXELS}" \
+  "EVAL_SCAN_GUARD_MAX_PX" "${EVAL_SCAN_TARGET_GUARD_MAX_PIXELS}" \
+  "EVAL_SCAN_VERTICAL_LINK" "${EVAL_SCAN_VERTICAL_LINK_RATIO}" \
+  "EVAL_SCAN_CONTEXT_RATIO" "${EVAL_SCAN_CONTEXT_RATIO}" \
+  "EVAL_SCAN_MIN_IMAGE_CTX" "${EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO}" \
+  "EVAL_SCAN_DENSE_BAND" "${EVAL_SCAN_DENSE_BAND_RATIO}" \
   "EVAL_FAIL_POLICY" "${EVAL_FAIL_POLICY}" \
   "INSTALL_SYSTEM_RUNTIME_DEPS" "${INSTALL_SYSTEM_RUNTIME_DEPS}" \
   "PIPELINE_MODE" "${PIPELINE_MODE}" \
@@ -366,11 +419,68 @@ run_evaluation() {
     --project-root "${PROJECT_ROOT}"
     --relation-gate-mode "${RELATION_GATE_MODE}"
     --relation-gate-threshold "${RELATION_GATE_THRESHOLD}"
+    --evaluation-split "${EVAL_DATA_SPLIT}"
+    --recipe-path "${META_PATH}"
+    --inference-crop-mode "${EVAL_INFERENCE_CROP_MODE}"
+    --eval-parser-root "${EVAL_PARSER_ROOT}"
+    --eval-detector-cache "${EVAL_DETECTOR_CACHE}"
+    --eval-detector-cache-mode "${EVAL_DETECTOR_CACHE_MODE}"
+    --eval-scan-name "${EVAL_SCAN_NAME}"
+    --require-cache-scope "${EVAL_REQUIRE_CACHE_SCOPE}"
+    --eval-expected-unique-images "${EVAL_EXPECTED_UNIQUE_IMAGES}"
+    --eval-icon-model "${EVAL_ICON_MODEL}"
+    --eval-detector-workers-per-gpu "${EVAL_DETECTOR_WORKERS_PER_GPU}"
+    --tile-max-count "${EVAL_TILE_MAX_COUNT}"
+    --tile-target-long-side "${EVAL_TILE_TARGET_LONG_SIDE}"
+    --tile-overlap-ratio "${EVAL_TILE_OVERLAP_RATIO}"
+    --tile-nms-iou "${EVAL_TILE_NMS_IOU}"
+    --scan-target-height "${EVAL_SCAN_TARGET_HEIGHT}"
+    --scan-target-guard-ratio "${EVAL_SCAN_TARGET_GUARD_RATIO}"
+    --scan-target-guard-min-pixels "${EVAL_SCAN_TARGET_GUARD_MIN_PIXELS}"
+    --scan-target-guard-max-pixels "${EVAL_SCAN_TARGET_GUARD_MAX_PIXELS}"
+    --scan-vertical-link-ratio "${EVAL_SCAN_VERTICAL_LINK_RATIO}"
+    --scan-context-ratio "${EVAL_SCAN_CONTEXT_RATIO}"
+    --scan-min-context-image-ratio "${EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO}"
+    --scan-dense-band-ratio "${EVAL_SCAN_DENSE_BAND_RATIO}"
+    --scan-visualization-samples "${EVAL_SCAN_VISUALIZATION_SAMPLES}"
   )
   if [[ "${EVAL_ENABLE_PBD}" == "1" ]]; then
     command+=(--enable-pbd)
   else
     command+=(--no-enable-pbd)
+  fi
+  if [[ "${PIPELINE_MODE}" != "eval" \
+        && "${EVAL_DATA_SPLIT}" == "test" \
+        && "${EVAL_REQUIRE_CACHE_SCOPE}" == "full_test" ]]; then
+    command+=(--development-test-reuse)
+    echo "[EVAL WARNING] development_test_reuse=true: periodic training evaluation is using full_test" >&2
+  fi
+  if [[ -n "${EVAL_FROZEN_GATE_THRESHOLDS:-}" ]]; then
+    command+=(--frozen-gate-thresholds "${EVAL_FROZEN_GATE_THRESHOLDS}")
+  fi
+  if [[ "${EVAL_REQUIRE_STRICT_NONOVERLAP}" == "1" ]]; then
+    command+=(--require-strict-nonoverlap)
+  else
+    command+=(--no-require-strict-nonoverlap)
+  fi
+  if [[ "${EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT}" == "1" ]]; then
+    command+=(--require-raw-detector-edge-alignment)
+  else
+    command+=(--no-require-raw-detector-edge-alignment)
+  fi
+  if [[ "${EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT}" == "1" ]]; then
+    command+=(--require-detector-unique-containment)
+  else
+    command+=(--no-require-detector-unique-containment)
+  fi
+  if [[ -n "${EVAL_TEXT_PYTHON:-}" ]]; then
+    command+=(--eval-text-python "${EVAL_TEXT_PYTHON}")
+  fi
+  if [[ -n "${EVAL_ICON_PYTHON:-}" ]]; then
+    command+=(--eval-icon-python "${EVAL_ICON_PYTHON}")
+  fi
+  if [[ -n "${EVAL_TEXT_MODEL_DIR:-}" ]]; then
+    command+=(--eval-text-model-dir "${EVAL_TEXT_MODEL_DIR}")
   fi
   if [[ "${skip_patch}" == "1" ]]; then
     command+=(--skip-patch)
@@ -410,6 +520,11 @@ if [[ "${PIPELINE_MODE}" == "eval" ]]; then
   : "${EVAL_STEP:?PIPELINE_MODE=eval requires EVAL_STEP}"
   run_evaluation "${EVAL_STEP}" "${EVAL_CHECKPOINT}" "${EVAL_SKIP_PATCH:-0}"
   exit $?
+fi
+
+if [[ -n "${UI5_CROP_AUDIT_DIR:-}" && ! -s "${META_PATH}" ]]; then
+  locany_die 26 \
+    "Audited crop recipe is missing or empty; refusing fallback/copy: ${META_PATH}"
 fi
 
 if [[ ! -f "${META_PATH}" ]]; then

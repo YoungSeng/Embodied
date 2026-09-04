@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from locany_ui5_common import TASK_JSONL, TASKS, parse_gpu_devices
+from ui5_eval_detector_cache import validate_eval_detector_cache
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,7 +38,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tasks", nargs="+", choices=TASKS, default=list(TASKS))
     parser.add_argument("--max-images-per-task", type=int, default=0)
     parser.add_argument(
-        "--relation-gate-mode", choices=("observe", "hard", "soft"), default="observe"
+        "--expected-images-per-task",
+        type=int,
+        default=0,
+        help=(
+            "Fail before workers unless every selected task JSONL has this many rows. "
+            "A validated adjacent full_test detector-cache marker supplies this value "
+            "automatically for detector_scan."
+        ),
+    )
+    parser.add_argument(
+        "--inference-crop-mode",
+        choices=("full_image", "lossless_tiling", "detector_scan"),
+        default="full_image",
+    )
+    parser.add_argument("--detector-crop-manifest", type=Path, default=None)
+    parser.add_argument("--tile-max-count", type=int, default=10)
+    parser.add_argument("--tile-target-long-side", type=int, default=1600)
+    parser.add_argument("--tile-overlap-ratio", type=float, default=0.10)
+    parser.add_argument("--tile-nms-iou", type=float, default=0.50)
+    parser.add_argument(
+        "--save-raw-answer",
+        action="store_true",
+        help="Persist per-image raw/tile sidecars required by detector-scan diagnostics",
+    )
+    parser.add_argument(
+        "--relation-gate-mode",
+        choices=("observe", "hard", "soft"),
+        default="observe",
     )
     parser.add_argument("--relation-gate-threshold", type=float, default=None)
     parser.add_argument(
@@ -73,6 +101,66 @@ def count_jsonl_records(path: Path) -> int:
             if line.strip():
                 count += 1
     return count
+
+
+def validated_full_test_expected_images_per_task(
+    detector_crop_manifest: Path,
+    *,
+    input_dir: Path,
+) -> int | None:
+    """Return the fail-closed per-task count bound by an adjacent full-test marker.
+
+    Preview/legacy detector manifests remain usable without a per-task count contract.
+    A full-test marker, however, is revalidated here before any inference worker starts.
+    """
+
+    scan_root = detector_crop_manifest.parent
+    ready_path = scan_root / "eval_detector_cache_ready.json"
+    if not ready_path.is_file():
+        return None
+    try:
+        recorded = json.loads(ready_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid detector cache ready marker: {ready_path}") from exc
+    if str(recorded.get("cache_scope", "")) != "full_test":
+        return None
+    try:
+        expected = int(recorded.get("expected_unique_images", 0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"full_test detector cache marker has invalid expected_unique_images: {ready_path}"
+        ) from exc
+    if expected <= 0:
+        raise RuntimeError(
+            f"full_test detector cache marker requires positive expected_unique_images: {ready_path}"
+        )
+    scan_name = str(recorded.get("scan_name", ""))
+    if scan_name != scan_root.name:
+        raise RuntimeError(
+            "detector cache marker scan_name does not match detector manifest directory: "
+            f"{scan_name!r} != {scan_root.name!r}"
+        )
+    marker = validate_eval_detector_cache(
+        scan_root.parent,
+        scan_name=scan_name,
+        expected_unique_images=expected,
+        require_ready=True,
+        input_dir=input_dir,
+        required_cache_scope="full_test",
+        require_strict_nonoverlap=True,
+        require_raw_detector_edge_alignment=True,
+        require_detector_unique_containment=True,
+    )
+    manifest_record = (marker.get("geometry") or {}).get("scan_manifest") or {}
+    recorded_manifest = Path(str(manifest_record.get("path", "")))
+    if not recorded_manifest.is_absolute():
+        recorded_manifest = scan_root.parent / recorded_manifest
+    if recorded_manifest.resolve(strict=True) != detector_crop_manifest.resolve(strict=True):
+        raise RuntimeError(
+            "validated detector cache marker is bound to a different scan manifest: "
+            f"{recorded_manifest} != {detector_crop_manifest}"
+        )
+    return expected
 
 
 def load_runtime_profile(path: Path | None) -> dict[str, Any]:
@@ -135,12 +223,30 @@ def build_command(
         "--fail-fast",
         "--relation-gate-mode",
         args.relation_gate_mode,
+        "--inference-crop-mode",
+        args.inference_crop_mode,
+        "--tile-max-count",
+        str(args.tile_max_count),
+        "--tile-target-long-side",
+        str(args.tile_target_long_side),
+        "--tile-overlap-ratio",
+        str(args.tile_overlap_ratio),
+        "--tile-nms-iou",
+        str(args.tile_nms_iou),
     ]
-    command.append("--enable-pbd" if args.enable_pbd else "--no-enable-pbd")
+    enable_pbd = bool(getattr(args, "enable_pbd", True))
+    command.append("--enable-pbd" if enable_pbd else "--no-enable-pbd")
+    detector_crop_manifest = getattr(args, "detector_crop_manifest", None)
+    if detector_crop_manifest is not None:
+        command.extend(
+            ["--detector-crop-manifest", str(detector_crop_manifest)]
+        )
     if args.relation_gate_threshold is not None:
         command.extend(
             ["--relation-gate-threshold", str(args.relation_gate_threshold)]
         )
+    if getattr(args, "save_raw_answer", False):
+        command.append("--save-raw-answer")
     if args.overwrite:
         command.append("--overwrite")
     if load_only:
@@ -181,13 +287,36 @@ def main() -> int:
     args = parse_args()
     if args.max_images_per_task < 0:
         raise ValueError("--max-images-per-task cannot be negative")
+    if args.expected_images_per_task < 0:
+        raise ValueError("--expected-images-per-task cannot be negative")
     if args.failure_log_lines < 0:
         raise ValueError("--failure-log-lines cannot be negative")
+    if not 1 <= args.tile_max_count <= 10:
+        raise ValueError("--tile-max-count must be in [1, 10]")
+    if args.tile_target_long_side <= 0:
+        raise ValueError("--tile-target-long-side must be positive")
+    if not 0 < args.tile_overlap_ratio < 1:
+        raise ValueError("--tile-overlap-ratio must be in (0, 1)")
+    if not 0 <= args.tile_nms_iou <= 1:
+        raise ValueError("--tile-nms-iou must be in [0, 1]")
     args.checkpoint = args.checkpoint.expanduser().resolve()
     args.processor_path = args.processor_path.expanduser().resolve()
     args.input_dir = args.input_dir.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
     args.inference_script = args.inference_script.expanduser().resolve()
+    if args.inference_crop_mode == "detector_scan":
+        if not getattr(args, "save_raw_answer", False):
+            raise ValueError(
+                "detector_scan requires --save-raw-answer so tile diagnostics cannot "
+                "silently report zero raw records"
+            )
+        if args.detector_crop_manifest is None:
+            raise ValueError("detector_scan requires --detector-crop-manifest")
+        args.detector_crop_manifest = args.detector_crop_manifest.expanduser().resolve(
+            strict=True
+        )
+    elif args.detector_crop_manifest is not None:
+        raise ValueError("--detector-crop-manifest is only valid with detector_scan")
     if args.runtime_profile is not None:
         args.runtime_profile = args.runtime_profile.expanduser().resolve()
     for path, label in (
@@ -199,6 +328,19 @@ def main() -> int:
             raise FileNotFoundError(f"{label} does not exist: {path}")
     if not args.inference_script.is_file():
         raise FileNotFoundError(f"inference script does not exist: {args.inference_script}")
+    expected_images_per_task = int(args.expected_images_per_task)
+    if args.inference_crop_mode == "detector_scan":
+        marker_expected = validated_full_test_expected_images_per_task(
+            args.detector_crop_manifest,
+            input_dir=args.input_dir,
+        )
+        if marker_expected is not None:
+            if expected_images_per_task not in {0, marker_expected}:
+                raise RuntimeError(
+                    "explicit per-task image count conflicts with validated full_test cache: "
+                    f"{expected_images_per_task} != {marker_expected}"
+                )
+            expected_images_per_task = marker_expected
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.overwrite and not args.dry_run:
         removed = 0
@@ -225,6 +367,11 @@ def main() -> int:
         counts[task] = count_jsonl_records(jsonl_path)
         if counts[task] <= 0:
             raise RuntimeError(f"Test JSONL is empty for {task}: {jsonl_path}")
+        if expected_images_per_task and counts[task] != expected_images_per_task:
+            raise RuntimeError(
+                "UI5 task JSONL row count mismatch before worker launch for "
+                f"{task}: {counts[task]} != {expected_images_per_task}"
+            )
 
     previous_profile = load_runtime_profile(args.runtime_profile)
     estimates: dict[str, float] = {}
@@ -244,6 +391,12 @@ def main() -> int:
     print("===== UI5 parallel inference scheduler =====")
     print(f"physical GPUs       : {','.join(gpus)}")
     print(f"logical device      : cuda:0 in every subprocess")
+    print(
+        "inference crop     : "
+        f"{args.inference_crop_mode} (max={args.tile_max_count}, "
+        f"long_side={args.tile_target_long_side}, overlap={args.tile_overlap_ratio}, "
+        f"nms={args.tile_nms_iou}, GT repair=disabled)"
+    )
     for task in ordered:
         source = "runtime profile" if previous_profile.get("tasks", {}).get(task) else "sample count"
         print(

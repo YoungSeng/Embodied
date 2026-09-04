@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import math
 import os
 import json
@@ -23,6 +24,8 @@ TRAIN_BASE_COLUMNS = (
     "task_id",
     "tc_msed_stage",
     "epoch",
+    "segment_epoch",
+    "global_epoch",
     "gpu_num",
     "max_num_tokens",
     "learning_rate",
@@ -194,6 +197,12 @@ TRAIN_COLUMNS = (
         for suffix in TRAIN_TASK_SUFFIXES
     ),
     *TRAIN_MODULE_COLUMNS,
+    "crop_train_mode",
+    "ui_sampling_mode",
+    "eval_inference_crop_mode",
+    "scan_name",
+    "recipe_digest",
+    "code_digest",
     "git_commit",
     "run_name",
     "config_hash",
@@ -211,6 +220,18 @@ TRAIN_COLUMNS = (
 EVAL_COLUMNS = (
     "step",
     "checkpoint",
+    "evaluation_split",
+    "cache_scope",
+    "development_test_reuse",
+    "git_sha",
+    "git_dirty",
+    "recipe_digest",
+    "cache_digest",
+    "code_digest",
+    "crop_train_mode",
+    "ui_sampling_mode",
+    "eval_inference_crop_mode",
+    "scan_name",
     "task",
     "granularity",
     "precision",
@@ -240,6 +261,8 @@ EVAL_COLUMNS = (
     "gated_f1",
     "gated_predicted_positive",
     "gate_filter_rate",
+    "bbox_metrics_genuinely_rescored",
+    "gate_metric_status",
     "soft_precision",
     "soft_recall",
     "soft_f1",
@@ -335,6 +358,49 @@ def _flatten_train_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _first_environment_value(*names: str) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
+def _training_audit_context() -> dict[str, str | None]:
+    """Capture the immutable crop recipe/code identity on every train row."""
+
+    recipe_digest = _first_environment_value(
+        "UI5_RECIPE_DIGEST",
+        "UI5_CROP_RECIPE_DIGEST",
+        "RECIPE_DIGEST",
+    )
+    if recipe_digest is None:
+        recipe_path = _first_environment_value("UI5_CROP_META_PATH")
+        if recipe_path:
+            try:
+                digest = hashlib.sha256()
+                with Path(recipe_path).expanduser().open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                recipe_digest = digest.hexdigest()
+            except OSError:
+                # Diagnostics must not abort training solely because an optional
+                # audit path disappeared after dataset construction.
+                recipe_digest = None
+    return {
+        "crop_train_mode": _first_environment_value("UI5_CROP_TRAIN_MODE"),
+        "ui_sampling_mode": _first_environment_value("UI5_UI_SAMPLING_MODE"),
+        "eval_inference_crop_mode": _first_environment_value(
+            "EVAL_INFERENCE_CROP_MODE"
+        ),
+        "scan_name": _first_environment_value("EVAL_SCAN_NAME"),
+        "recipe_digest": recipe_digest,
+        "code_digest": _first_environment_value(
+            "UI5_CODE_DIGEST", "CODE_DIGEST", "GIT_COMMIT"
+        ),
+    }
+
+
 @dataclass
 class UI5ExcelLogger:
     """Append-only, resume-safe writer for the requested two diagnostic sheets."""
@@ -386,7 +452,12 @@ class UI5ExcelLogger:
             sheet = workbook[sheet_name]
             current = tuple(cell.value for cell in sheet[1])
             if current != expected:
-                if not set(current).issubset(set(expected)):
+                legacy_columns = (
+                    {"epoch"}
+                    if sheet_name == SHEET_TRAIN
+                    else {"inference_crop_mode"}
+                )
+                if not set(current).issubset(set(expected) | legacy_columns):
                     workbook.close()
                     raise ValueError(
                         f"Cannot migrate {sheet_name} header: current={current}"
@@ -395,6 +466,17 @@ class UI5ExcelLogger:
                     dict(zip(current, values))
                     for values in sheet.iter_rows(min_row=2, values_only=True)
                 ]
+                if sheet_name == SHEET_TRAIN and "epoch" in current:
+                    for row in rows:
+                        legacy_epoch = row.get("epoch")
+                        row.setdefault("segment_epoch", legacy_epoch)
+                        row.setdefault("global_epoch", legacy_epoch)
+                if sheet_name == SHEET_EVAL and "inference_crop_mode" in current:
+                    for row in rows:
+                        row.setdefault(
+                            "eval_inference_crop_mode",
+                            row.get("inference_crop_mode"),
+                        )
                 sheet.delete_rows(1, sheet.max_row)
                 sheet.append(list(expected))
                 for row in rows:
@@ -457,14 +539,47 @@ class UI5ExcelLogger:
             return False
         workbook = self._load_or_create()
         try:
+            sheet = workbook[SHEET_EVAL]
+            headers = [cell.value for cell in sheet[1]]
             rows = [
-                row
+                dict(zip(headers, row))
                 for row in workbook[SHEET_EVAL].iter_rows(
                     min_row=2, values_only=True
                 )
                 if row[0] is not None and int(row[0]) == int(step)
             ]
-            return len(rows) == 12
+            expected_pairs = {
+                (task, granularity)
+                for task in (*TRAIN_TASKS, "five_task_macro", "five_task_micro")
+                for granularity in ("image", "bbox")
+            }
+            return len(rows) == 14 and {
+                (row.get("task"), row.get("granularity")) for row in rows
+            } == expected_pairs
+        finally:
+            workbook.close()
+
+    def latest_train_global_epoch(self) -> float:
+        """Return the last cumulative epoch recorded before a new segment starts."""
+        if not self.path.is_file():
+            return 0.0
+        workbook = self._load_or_create()
+        try:
+            sheet = workbook[SHEET_TRAIN]
+            headers = [cell.value for cell in sheet[1]]
+            rows = [
+                dict(zip(headers, values))
+                for values in sheet.iter_rows(min_row=2, values_only=True)
+            ]
+            valid = [
+                row
+                for row in rows
+                if row.get("step") is not None and row.get("global_epoch") is not None
+            ]
+            if not valid:
+                return 0.0
+            latest = max(valid, key=lambda row: int(row["step"]))
+            return float(latest["global_epoch"])
         finally:
             workbook.close()
 
@@ -478,6 +593,8 @@ class UI5ExcelLogger:
             workbook.close()
             return False
         values = _flatten_train_metrics(window_metrics)
+        for name, value in _training_audit_context().items():
+            values.setdefault(name, value)
         values["step"] = step
         sheet.append([values.get(column) for column in TRAIN_COLUMNS])
         sheet.auto_filter.ref = sheet.dimensions
@@ -520,13 +637,13 @@ class UI5ExcelLogger:
             row["step"] = step
         expected_pairs = {
             (task, granularity)
-            for task in (*TRAIN_TASKS, "five_task_macro")
+            for task in (*TRAIN_TASKS, "five_task_macro", "five_task_micro")
             for granularity in ("image", "bbox")
         }
         actual_pairs = {(row.get("task"), row.get("granularity")) for row in rows}
-        if len(rows) != 12 or actual_pairs != expected_pairs:
+        if len(rows) != 14 or actual_pairs != expected_pairs:
             raise ValueError(
-                "eval_1000steps requires exactly five tasks plus macro, each at image/bbox; "
+                "eval_1000steps requires exactly five tasks plus macro/micro, each at image/bbox; "
                 f"found={sorted(actual_pairs)}"
             )
 
@@ -537,10 +654,36 @@ class UI5ExcelLogger:
         existing_for_step = [
             row for row in existing if int(row.get("step", -1)) == step
         ]
-        if len(existing_for_step) == 12:
-            identity_columns = ("git_commit", "config_hash", "model_signature")
-            new_identity = tuple(rows[0].get(column) for column in identity_columns)
-            if all(
+        identity_columns = (
+            "git_sha",
+            "git_commit",
+            "config_hash",
+            "model_signature",
+            "evaluation_split",
+            "cache_scope",
+            "recipe_digest",
+            "cache_digest",
+            "code_digest",
+            "crop_train_mode",
+            "ui_sampling_mode",
+            "eval_inference_crop_mode",
+            "scan_name",
+        )
+        new_identity = tuple(rows[0].get(column) for column in identity_columns)
+        if any(
+            tuple(row.get(column) for column in identity_columns) != new_identity
+            for row in rows[1:]
+        ):
+            workbook.close()
+            raise ValueError(
+                "All 14 eval rows for one step must share the same audit identity"
+            )
+        if len(existing_for_step) == 14:
+            existing_pairs = {
+                (row.get("task"), row.get("granularity"))
+                for row in existing_for_step
+            }
+            if existing_pairs == expected_pairs and all(
                 tuple(row.get(column) for column in identity_columns) == new_identity
                 for row in existing_for_step
             ):
@@ -612,8 +755,14 @@ def build_eval_rows(
     gate_metrics: Mapping[str, Mapping[str, Any]] | None = None,
     raw_metrics: Mapping[str, Any] | None = None,
     metadata: Mapping[str, Any] | None = None,
+    audit_context: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Convert scorer JSON plus gate summaries into the 12 requested rows."""
+    """Convert scorer and Gate summaries into task, macro, and micro rows.
+
+    Macro rows contain only task-averaged metrics.  Micro rows contain summed
+    confusion counts and metrics recomputed from those counts.  BBox Gate
+    metrics never fall back to image-Gate metrics.
+    """
 
     scorer_to_diagnostic = {
         "text_overflow": "text_overflow",
@@ -623,9 +772,146 @@ def build_eval_rows(
         "content_missing": "content_missing",
     }
     gate_metrics = gate_metrics or {}
-    metadata = metadata or {}
+    metadata = dict(metadata or {})
     if raw_metrics is None:
         raw_metrics = metrics
+    audit_context = dict(audit_context or {})
+    context_columns = {
+        key: audit_context.get(key)
+        for key in (
+            "evaluation_split",
+            "cache_scope",
+            "development_test_reuse",
+            "git_sha",
+            "git_dirty",
+            "recipe_digest",
+            "cache_digest",
+            "code_digest",
+            "crop_train_mode",
+            "ui_sampling_mode",
+        )
+    }
+    context_columns["eval_inference_crop_mode"] = audit_context.get(
+        "eval_inference_crop_mode", audit_context.get("inference_crop_mode")
+    )
+    context_columns["scan_name"] = audit_context.get(
+        "scan_name", audit_context.get("eval_scan_name")
+    )
+
+    def mean(values: Sequence[Any]) -> float | None:
+        numeric = [float(value) for value in values if value is not None]
+        return sum(numeric) / len(numeric) if numeric else None
+
+    def sum_present(source_rows: Sequence[Mapping[str, Any]], name: str) -> int | None:
+        values = [row.get(name) for row in source_rows]
+        present = [int(value) for value in values if value is not None]
+        return sum(present) if present else None
+
+    def metrics_from_counts(
+        *,
+        tp: int,
+        fp: int,
+        fn: int,
+        tn: int | None,
+        granularity: str,
+    ) -> dict[str, Any]:
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = (
+            2.0 * precision * recall / (precision + recall)
+            if precision + recall
+            else 0.0
+        )
+        if granularity == "image":
+            denominator = tp + fp + fn + int(tn or 0)
+            accuracy = (tp + int(tn or 0)) / denominator if denominator else 0.0
+        else:
+            denominator = tp + fp + fn
+            accuracy = tp / denominator if denominator else 0.0
+        return {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "accuracy": accuracy,
+        }
+
+    def aggregate_gate_status(source_rows: Sequence[Mapping[str, Any]]) -> str:
+        statuses = {str(row.get("gate_metric_status")) for row in source_rows}
+        if "not_rescored" in statuses:
+            return "not_rescored"
+        if len(statuses) == 1:
+            return next(iter(statuses))
+        return "mixed"
+
+    def aggregate_diagnostics(
+        source_rows: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        mean_columns = (
+            "soft_precision",
+            "soft_recall",
+            "soft_f1",
+            "diagnostic_upper_bound_f1",
+            "gt_average_box_count",
+            "pred_average_box_count",
+            "count_mae",
+            "coarse_recall_03",
+            "coarse_recall_05",
+            "selected_slot_iou",
+            "oracle_8slot_iou",
+            "route_top1_match_accuracy",
+            "pre_mask_route_top1_accuracy",
+            "oracle_slot_hit_rate",
+            "selected_oracle_iou_ratio",
+            "predicted_center_diversity",
+            "attention_diversity",
+            "duplicate_slot_rate",
+        )
+        result = {
+            name: mean([row.get(name) for row in source_rows])
+            for name in mean_columns
+        }
+        histograms = [
+            row.get("per_slot_usage_histogram")
+            for row in source_rows
+            if isinstance(row.get("per_slot_usage_histogram"), (list, tuple))
+        ]
+        result["per_slot_usage_histogram"] = (
+            [
+                sum(
+                    int(histogram[slot]) if slot < len(histogram) else 0
+                    for histogram in histograms
+                )
+                for slot in range(8)
+            ]
+            if histograms
+            else None
+        )
+        for name in (
+            "pbd_enabled",
+            "coordinate_bridge_enabled",
+            "slot_routing_enabled",
+        ):
+            result[name] = next(
+                (row.get(name) for row in source_rows if row.get(name) is not None),
+                None,
+            )
+        return result
+
+    row_metadata = {
+        "git_commit": metadata.get("git_commit"),
+        "run_name": metadata.get("run_name"),
+        "tc_msed_stage": metadata.get("tc_msed_stage"),
+        "config_hash": metadata.get("config_hash"),
+        "model_signature": metadata.get("model_signature"),
+        "init_checkpoint": metadata.get("init_checkpoint"),
+        "init_cpt_step": metadata.get("init_cpt_step"),
+        "sft_step": step,
+        "is_best_image": metadata.get("is_best_image", False),
+        "is_best_bbox": metadata.get("is_best_bbox", False),
+        "is_4000_milestone": metadata.get("is_4000_milestone", False),
+        "checkpoint_kept": metadata.get("checkpoint_kept", False),
+    }
+
     rows: list[dict[str, Any]] = []
     for scorer_task, diagnostic_task in scorer_to_diagnostic.items():
         task_values = metrics.get("tasks", {}).get(scorer_task, {})
@@ -637,10 +923,93 @@ def build_eval_rows(
                 .get(scorer_task, {})
                 .get(granularity, {})
             )
+            rescored_by_granularity = gate.get(
+                "gated_metrics_by_granularity", {}
+            )
+            rescored_candidate = (
+                rescored_by_granularity.get(granularity, {})
+                if isinstance(rescored_by_granularity, Mapping)
+                else {}
+            )
+            rescored = (
+                rescored_candidate
+                if isinstance(rescored_candidate, Mapping)
+                and any(
+                    rescored_candidate.get(name) is not None
+                    for name in (
+                        "precision",
+                        "recall",
+                        "f1",
+                        "tp",
+                        "fp",
+                        "fn",
+                        "tn",
+                        "predicted_positive",
+                    )
+                )
+                and not (
+                    granularity == "bbox"
+                    and gate.get("bbox_metrics_genuinely_rescored") is False
+                )
+                else {}
+            )
+            if rescored:
+                gated = dict(rescored)
+                gate_metric_status = "genuinely_rescored"
+            elif granularity == "image" and any(
+                gate.get(name) is not None
+                for name in (
+                    "gated_precision",
+                    "gated_recall",
+                    "gated_f1",
+                    "gated_tp",
+                    "gated_fp",
+                    "gated_fn",
+                    "gated_tn",
+                )
+            ):
+                # The image-Gate sidecar sweep is a real image-level rescore.
+                # It is not a localization scorer and must never populate BBox.
+                gated = {
+                    "precision": gate.get("gated_precision"),
+                    "recall": gate.get("gated_recall"),
+                    "f1": gate.get("gated_f1"),
+                    "tp": gate.get("gated_tp"),
+                    "fp": gate.get("gated_fp"),
+                    "fn": gate.get("gated_fn"),
+                    "tn": gate.get("gated_tn"),
+                    "predicted_positive": gate.get("gated_predicted_positive"),
+                }
+                gate_metric_status = "image_gate_sidecar_rescored"
+            else:
+                gated = {}
+                gate_metric_status = "not_rescored"
             tp = values.get("tp")
             fp = values.get("fp")
+            primary_predicted_positive = (
+                int(tp) + int(fp)
+                if tp is not None and fp is not None
+                else None
+            )
+            raw_tp = raw_values.get("tp")
+            raw_fp = raw_values.get("fp")
+            raw_predicted_positive = (
+                int(raw_tp) + int(raw_fp)
+                if raw_tp is not None and raw_fp is not None
+                else None
+            )
+            gated_tp = gated.get("tp")
+            gated_fp = gated.get("fp")
+            gated_fn = gated.get("fn")
+            gated_tn = gated.get("tn") if granularity == "image" else None
+            gated_predicted_positive = (
+                int(gated_tp) + int(gated_fp)
+                if gated_tp is not None and gated_fp is not None
+                else gated.get("predicted_positive")
+            )
             rows.append(
                 {
+                    **context_columns,
                     "step": step,
                     "git_commit": metadata.get("git_commit"),
                     "run_name": metadata.get("run_name"),
@@ -677,11 +1046,7 @@ def build_eval_rows(
                     "accuracy": values.get(
                         "accuracy" if granularity == "image" else "count_accuracy"
                     ),
-                    "predicted_positive": (
-                        int(tp) + int(fp)
-                        if tp is not None and fp is not None
-                        else None
-                    ),
+                    "predicted_positive": primary_predicted_positive,
                     "gate_positive": gate.get("gate_positive"),
                     "gate_filtered": gate.get("gate_filtered"),
                     "p_defect_pos": gate.get("p_defect_pos"),
@@ -690,35 +1055,26 @@ def build_eval_rows(
                     "raw_precision": raw_values.get("precision"),
                     "raw_recall": raw_values.get("recall"),
                     "raw_f1": raw_values.get("f1"),
-                    "raw_predicted_positive": (
-                        int(raw_values.get("tp")) + int(raw_values.get("fp"))
-                        if raw_values.get("tp") is not None
-                        and raw_values.get("fp") is not None
+                    "raw_predicted_positive": raw_predicted_positive,
+                    "selected_gate_threshold": (
+                        gate.get("selected_gate_threshold") if gated else None
+                    ),
+                    "gated_precision": gated.get("precision"),
+                    "gated_recall": gated.get("recall"),
+                    "gated_f1": gated.get("f1"),
+                    "gated_predicted_positive": gated_predicted_positive,
+                    "gate_filter_rate": (
+                        1.0
+                        - int(gated_predicted_positive)
+                        / max(1, int(raw_predicted_positive))
+                        if gated_predicted_positive is not None
+                        and raw_predicted_positive is not None
                         else None
                     ),
-                    # The offline threshold sweep filters whole-image raw
-                    # predictions.  It is not a bbox matcher and must never be
-                    # copied into bbox rows as if it were a localization score.
-                    "selected_gate_threshold": (
-                        gate.get("selected_gate_threshold")
-                        if granularity == "image" else None
+                    "bbox_metrics_genuinely_rescored": (
+                        bool(rescored) if granularity == "bbox" else None
                     ),
-                    "gated_precision": (
-                        gate.get("gated_precision") if granularity == "image" else None
-                    ),
-                    "gated_recall": (
-                        gate.get("gated_recall") if granularity == "image" else None
-                    ),
-                    "gated_f1": (
-                        gate.get("gated_f1") if granularity == "image" else None
-                    ),
-                    "gated_predicted_positive": (
-                        gate.get("gated_predicted_positive")
-                        if granularity == "image" else None
-                    ),
-                    "gate_filter_rate": (
-                        gate.get("gate_filter_rate") if granularity == "image" else None
-                    ),
+                    "gate_metric_status": gate_metric_status,
                     "soft_precision": (
                         values.get("precision") if gate.get("relation_gate_mode") == "soft" else None
                     ),
@@ -749,6 +1105,18 @@ def build_eval_rows(
                     "pbd_enabled": gate.get("pbd_enabled"),
                     "coordinate_bridge_enabled": gate.get("coordinate_bridge_enabled"),
                     "slot_routing_enabled": gate.get("slot_routing_enabled"),
+                    "_primary_tp": values.get("tp"),
+                    "_primary_fp": values.get("fp"),
+                    "_primary_fn": values.get("fn"),
+                    "_primary_tn": values.get("tn") if granularity == "image" else None,
+                    "_raw_tp": raw_values.get("tp"),
+                    "_raw_fp": raw_values.get("fp"),
+                    "_raw_fn": raw_values.get("fn"),
+                    "_raw_tn": raw_values.get("tn") if granularity == "image" else None,
+                    "_gated_tp": gated_tp,
+                    "_gated_fp": gated_fp,
+                    "_gated_fn": gated_fn,
+                    "_gated_tn": gated_tn,
                 }
             )
 
@@ -759,9 +1127,6 @@ def build_eval_rows(
             for row in rows
             if row["granularity"] == granularity
         ]
-        summed = lambda name: sum(
-            int(row[name]) for row in source_rows if row.get(name) is not None
-        )
         positive_count = sum(
             int(gate_metrics.get(task, {}).get("positive_count", 0))
             for task in scorer_to_diagnostic
@@ -790,44 +1155,121 @@ def build_eval_rows(
             if negative_count
             else None
         )
+        all_gated = all(row.get("gated_f1") is not None for row in source_rows)
+        macro_row = {
+            **context_columns,
+            **row_metadata,
+            "step": step,
+            "checkpoint": checkpoint,
+            "task": "five_task_macro",
+            "task_name": "five_task_macro",
+            "defect_type": None,
+            "granularity": granularity,
+            "precision": values.get("precision", mean([row.get("precision") for row in source_rows])),
+            "recall": values.get("recall", mean([row.get("recall") for row in source_rows])),
+            "f1": values.get("f1", mean([row.get("f1") for row in source_rows])),
+            # Macro is a mean-of-tasks row.  Counts intentionally remain empty.
+            "tp": None,
+            "fp": None,
+            "fn": None,
+            "tn": None,
+            "accuracy": mean([row.get("accuracy") for row in source_rows]),
+            "predicted_positive": None,
+            "gate_positive": None,
+            "gate_filtered": None,
+            "p_defect_pos": p_defect_pos,
+            "p_defect_neg": p_defect_neg,
+            "parse_error": None,
+            "raw_precision": mean([row.get("raw_precision") for row in source_rows]),
+            "raw_recall": mean([row.get("raw_recall") for row in source_rows]),
+            "raw_f1": mean([row.get("raw_f1") for row in source_rows]),
+            "raw_predicted_positive": None,
+            "selected_gate_threshold": (
+                mean([row.get("selected_gate_threshold") for row in source_rows])
+                if all_gated
+                else None
+            ),
+            "gated_precision": mean([row.get("gated_precision") for row in source_rows]) if all_gated else None,
+            "gated_recall": mean([row.get("gated_recall") for row in source_rows]) if all_gated else None,
+            "gated_f1": mean([row.get("gated_f1") for row in source_rows]) if all_gated else None,
+            "gated_predicted_positive": None,
+            "gate_filter_rate": mean([row.get("gate_filter_rate") for row in source_rows]) if all_gated else None,
+            "bbox_metrics_genuinely_rescored": (
+                all(bool(row.get("bbox_metrics_genuinely_rescored")) for row in source_rows)
+                if granularity == "bbox"
+                else None
+            ),
+            "gate_metric_status": aggregate_gate_status(source_rows),
+            **aggregate_diagnostics(source_rows),
+        }
+        rows.append(macro_row)
+
+        primary_tp = int(sum_present(source_rows, "_primary_tp") or 0)
+        primary_fp = int(sum_present(source_rows, "_primary_fp") or 0)
+        primary_fn = int(sum_present(source_rows, "_primary_fn") or 0)
+        primary_tn = (
+            int(sum_present(source_rows, "_primary_tn") or 0)
+            if granularity == "image"
+            else None
+        )
+        primary_micro = metrics_from_counts(
+            tp=primary_tp,
+            fp=primary_fp,
+            fn=primary_fn,
+            tn=primary_tn,
+            granularity=granularity,
+        )
+        raw_tp = int(sum_present(source_rows, "_raw_tp") or 0)
+        raw_fp = int(sum_present(source_rows, "_raw_fp") or 0)
+        raw_fn = int(sum_present(source_rows, "_raw_fn") or 0)
+        raw_tn = (
+            int(sum_present(source_rows, "_raw_tn") or 0)
+            if granularity == "image"
+            else None
+        )
+        raw_micro = metrics_from_counts(
+            tp=raw_tp, fp=raw_fp, fn=raw_fn, tn=raw_tn, granularity=granularity
+        )
+        all_gated_counts = all(
+            row.get("_gated_tp") is not None
+            and row.get("_gated_fp") is not None
+            and row.get("_gated_fn") is not None
+            for row in source_rows
+        )
+        gated_micro: dict[str, Any] | None = None
+        gated_tp = gated_fp = gated_fn = gated_tn = None
+        if all_gated_counts:
+            gated_tp = int(sum_present(source_rows, "_gated_tp") or 0)
+            gated_fp = int(sum_present(source_rows, "_gated_fp") or 0)
+            gated_fn = int(sum_present(source_rows, "_gated_fn") or 0)
+            gated_tn = (
+                int(sum_present(source_rows, "_gated_tn") or 0)
+                if granularity == "image"
+                else None
+            )
+            gated_micro = metrics_from_counts(
+                tp=gated_tp,
+                fp=gated_fp,
+                fn=gated_fn,
+                tn=gated_tn,
+                granularity=granularity,
+            )
         rows.append(
             {
+                **context_columns,
+                **row_metadata,
                 "step": step,
-                "git_commit": metadata.get("git_commit"),
-                "run_name": metadata.get("run_name"),
-                "tc_msed_stage": metadata.get("tc_msed_stage"),
-                "config_hash": metadata.get("config_hash"),
-                "model_signature": metadata.get("model_signature"),
-                "init_checkpoint": metadata.get("init_checkpoint"),
-                "init_cpt_step": metadata.get("init_cpt_step"),
-                "sft_step": step,
-                "is_best_image": metadata.get("is_best_image", False),
-                "is_best_bbox": metadata.get("is_best_bbox", False),
-                "is_4000_milestone": metadata.get(
-                    "is_4000_milestone", False
-                ),
-                "checkpoint_kept": metadata.get("checkpoint_kept", False),
                 "checkpoint": checkpoint,
-                "task": "five_task_macro",
-                "task_name": "five_task_macro",
+                "task": "five_task_micro",
+                "task_name": "five_task_micro",
                 "defect_type": None,
                 "granularity": granularity,
-                "precision": values.get("precision"),
-                "recall": values.get("recall"),
-                "f1": values.get("f1"),
-                "tp": summed("tp"),
-                "fp": summed("fp"),
-                "fn": summed("fn"),
-                "tn": summed("tn") if granularity == "image" else None,
-                "accuracy": (
-                    sum(
-                        float(row["accuracy"])
-                        for row in source_rows
-                        if row.get("accuracy") is not None
-                    )
-                    / max(1, sum(row.get("accuracy") is not None for row in source_rows))
-                ),
-                "predicted_positive": summed("predicted_positive"),
+                **primary_micro,
+                "tp": primary_tp,
+                "fp": primary_fp,
+                "fn": primary_fn,
+                "tn": primary_tn,
+                "predicted_positive": primary_tp + primary_fp,
                 "gate_positive": sum(
                     int(gate_metrics.get(task, {}).get("gate_positive", 0))
                     for task in scorer_to_diagnostic
@@ -842,55 +1284,33 @@ def build_eval_rows(
                     int(gate_metrics.get(task, {}).get("parse_error", 0))
                     for task in scorer_to_diagnostic
                 ),
-                "raw_precision": (
-                    sum(float(row.get("raw_precision") or 0.0) for row in source_rows)
-                    / len(source_rows)
-                ),
-                "raw_recall": (
-                    sum(float(row.get("raw_recall") or 0.0) for row in source_rows)
-                    / len(source_rows)
-                ),
-                "raw_f1": (
-                    sum(float(row.get("raw_f1") or 0.0) for row in source_rows)
-                    / len(source_rows)
-                ),
-                "raw_predicted_positive": summed("raw_predicted_positive"),
-                "selected_gate_threshold": (
-                    sum(float(row.get("selected_gate_threshold") or 0.0) for row in source_rows)
-                    / len(source_rows)
-                    if any(row.get("selected_gate_threshold") is not None for row in source_rows)
-                    else None
-                ),
-                "gated_precision": (
-                    sum(float(row.get("gated_precision") or 0.0) for row in source_rows)
-                    / len(source_rows)
-                    if any(row.get("gated_precision") is not None for row in source_rows)
-                    else None
-                ),
-                "gated_recall": (
-                    sum(float(row.get("gated_recall") or 0.0) for row in source_rows)
-                    / len(source_rows)
-                    if any(row.get("gated_recall") is not None for row in source_rows)
-                    else None
-                ),
-                "gated_f1": (
-                    sum(float(row.get("gated_f1") or 0.0) for row in source_rows)
-                    / len(source_rows)
-                    if any(row.get("gated_f1") is not None for row in source_rows)
-                    else None
-                ),
+                "raw_precision": raw_micro["precision"],
+                "raw_recall": raw_micro["recall"],
+                "raw_f1": raw_micro["f1"],
+                "raw_predicted_positive": raw_tp + raw_fp,
+                "selected_gate_threshold": mean([row.get("selected_gate_threshold") for row in source_rows]),
+                "gated_precision": gated_micro["precision"] if gated_micro else None,
+                "gated_recall": gated_micro["recall"] if gated_micro else None,
+                "gated_f1": gated_micro["f1"] if gated_micro else None,
                 "gated_predicted_positive": (
-                    summed("gated_predicted_positive")
-                    if any(row.get("gated_predicted_positive") is not None for row in source_rows)
-                    else None
+                    int(gated_tp) + int(gated_fp) if gated_micro else None
                 ),
                 "gate_filter_rate": (
                     1.0
-                    - summed("gated_predicted_positive")
-                    / max(1, summed("raw_predicted_positive"))
-                    if any(row.get("gate_filter_rate") is not None for row in source_rows)
+                    - (int(gated_tp) + int(gated_fp))
+                    / max(1, raw_tp + raw_fp)
+                    if gated_micro
                     else None
                 ),
+                "bbox_metrics_genuinely_rescored": (
+                    all(
+                        bool(row.get("bbox_metrics_genuinely_rescored"))
+                        for row in source_rows
+                    )
+                    if granularity == "bbox"
+                    else None
+                ),
+                "gate_metric_status": aggregate_gate_status(source_rows),
                 "soft_precision": (
                     sum(float(row.get("soft_precision") or 0.0) for row in source_rows)
                     / len(source_rows)

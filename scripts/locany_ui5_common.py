@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import posixpath
 import re
@@ -34,6 +35,77 @@ TASK_ISSUE_NAMES = {
     "text_ellipsis": "文字省略异常",
     "content_missing": "内容未展示",
 }
+
+# The five production evaluation JSONL files share one pool of 1,555
+# content-unique images.  Keep this separate from the 17,281-image training
+# pool used by crop_audit_v4_gt_repair.
+DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES = 1555
+
+
+def _finite_gate_probability(value: Any) -> float | None:
+    """Return a finite Gate probability without accepting booleans as numbers."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    return numeric if math.isfinite(numeric) else None
+
+
+def aggregate_tiled_gate_diagnostics(
+    tile_gates: list[dict[str, Any]],
+    *,
+    crop_mode: str,
+) -> dict[str, Any]:
+    """Aggregate per-tile image-Gate diagnostics into one source-image record.
+
+    Detector-scan inference evaluates several non-overlapping views for one
+    source image.  The source image is positive when any view is positive, so
+    its image-level Gate score is the maximum finite per-view ``p_defect``.
+    Keeping the original tile diagnostics makes the aggregation auditable and
+    lets historical runs created before the top-level score was added recover
+    without repeating model inference.
+    """
+
+    scores = [
+        score
+        for row in tile_gates
+        if (score := _finite_gate_probability(row.get("p_defect"))) is not None
+    ]
+    available_count = sum(bool(row.get("available")) for row in tile_gates)
+    return {
+        "available": available_count > 0,
+        "available_tile_count": available_count,
+        "p_defect": max(scores) if scores else None,
+        "p_defect_tile_count": len(scores),
+        "p_defect_aggregation": "max_tile",
+        "would_pass": any(bool(row.get("would_pass")) for row in tile_gates),
+        "gate_filtered": bool(tile_gates)
+        and all(bool(row.get("gate_filtered")) for row in tile_gates),
+        "mode": crop_mode,
+        "tile_count": len(tile_gates),
+        "tile_union_full_image": True,
+        "gt_repair_used": False,
+        "tile_gates": tile_gates,
+    }
+
+
+def image_gate_probability(record: Mapping[str, Any]) -> tuple[float | None, str]:
+    """Read an image Gate score, recovering legacy tiled sidecars when needed."""
+
+    top_level = _finite_gate_probability(record.get("p_defect"))
+    if top_level is not None:
+        return top_level, "top_level"
+    tile_gates = record.get("tile_gates")
+    if isinstance(tile_gates, list):
+        scores = [
+            score
+            for row in tile_gates
+            if isinstance(row, dict)
+            and (score := _finite_gate_probability(row.get("p_defect"))) is not None
+        ]
+        if scores:
+            return max(scores), "legacy_tile_gates_max"
+    return None, "missing"
 
 
 def parse_bool(value: Any, *, name: str = "value") -> bool:
@@ -170,11 +242,80 @@ def resolve_runtime_config(
             join_runtime_path(training_data_dir, "recipe", "ui_defect_5class_train.json"),
         )
     )
+    use_detection_crops = parse_bool(
+        _env_value(env, "UI5_USE_DETECTION_CROPS", "0"),
+        name="UI5_USE_DETECTION_CROPS",
+    )
+    crop_audit_dir = str(_env_value(env, "UI5_CROP_AUDIT_DIR", ""))
+    crop_train_mode = str(
+        _env_value(
+            env,
+            "UI5_CROP_TRAIN_MODE",
+            "crop_only" if use_detection_crops else "full_only",
+        )
+    )
+    if crop_train_mode not in {"full_only", "crop_only"}:
+        raise ValueError(
+            "UI5_CROP_TRAIN_MODE must be full_only or crop_only"
+        )
+    if use_detection_crops and crop_train_mode != "crop_only":
+        raise ValueError("UI5_USE_DETECTION_CROPS=1 requires crop_only")
+    ui_sampling_mode = str(
+        _env_value(
+            env,
+            "UI5_UI_SAMPLING_MODE",
+            (
+                "task_source_balanced_rotating"
+                if crop_train_mode == "crop_only"
+                else "fixed_ratio"
+            ),
+        )
+    )
+    if ui_sampling_mode not in {
+        "fixed_ratio",
+        "task_source_balanced_rotating",
+    }:
+        raise ValueError(
+            "UI5_UI_SAMPLING_MODE must be fixed_ratio or "
+            "task_source_balanced_rotating"
+        )
+    if crop_train_mode == "crop_only" and ui_sampling_mode != "task_source_balanced_rotating":
+        raise ValueError(
+            "crop_only requires UI5_UI_SAMPLING_MODE=task_source_balanced_rotating"
+        )
+    ui_negative_to_positive_ratio = float(
+        _env_value(env, "UI_NEGATIVE_TO_POSITIVE_RATIO", 2.0)
+    )
+    if ui_negative_to_positive_ratio <= 0:
+        raise ValueError("UI_NEGATIVE_TO_POSITIVE_RATIO must be positive")
+    if crop_train_mode == "crop_only" and not math.isclose(
+        ui_negative_to_positive_ratio, 2.0, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError("crop_only requires UI_NEGATIVE_TO_POSITIVE_RATIO=2.0")
+    if use_detection_crops and not crop_audit_dir:
+        raise ValueError("UI5_USE_DETECTION_CROPS=1 requires UI5_CROP_AUDIT_DIR")
+    crop_meta_path = str(_env_value(env, "UI5_CROP_META_PATH", ""))
+    if crop_audit_dir:
+        if not crop_meta_path:
+            crop_meta_path = join_runtime_path(
+                crop_audit_dir,
+                "training_recipes",
+                f"ui_defect_5class_train_{crop_train_mode}.json",
+            )
+        meta_path = crop_meta_path
+    elif crop_meta_path:
+        raise ValueError("UI5_CROP_META_PATH requires UI5_CROP_AUDIT_DIR")
+    eval_data_split_hint = str(
+        _env_value(env, "EVAL_DATA_SPLIT", "test")
+    ).lower()
+    eval_input_default = join_runtime_path(
+        workspace, shared["eval_data_relative_path"]
+    )
     eval_input_dir = str(
         _env_value(
             env,
             "EVAL_INPUT_DIR",
-            join_runtime_path(workspace, shared["eval_data_relative_path"]),
+            eval_input_default,
         )
     )
 
@@ -186,11 +327,27 @@ def resolve_runtime_config(
 
     enable_eval = parse_bool(_env_value(env, "ENABLE_EVAL", "1"), name="ENABLE_EVAL")
     eval_at_start = parse_bool(
-        _env_value(env, "EVAL_AT_START", "1"), name="EVAL_AT_START"
+        _env_value(env, "EVAL_AT_START", "0"), name="EVAL_AT_START"
     )
     eval_fail_policy = str(_env_value(env, "EVAL_FAIL_POLICY", "stop")).lower()
     if eval_fail_policy not in {"stop", "warn"}:
         raise ValueError("EVAL_FAIL_POLICY must be 'stop' or 'warn'")
+    eval_validation_early_stop = parse_bool(
+        _env_value(env, "EVAL_VALIDATION_EARLY_STOP", "0"),
+        name="EVAL_VALIDATION_EARLY_STOP",
+    )
+    if eval_validation_early_stop:
+        raise ValueError("validation early stop is disabled for formal UI5 training")
+    eval_data_split = eval_data_split_hint
+    if eval_data_split != "test":
+        raise ValueError("This crop-only formal pipeline requires EVAL_DATA_SPLIT=test")
+    eval_inference_crop_mode = str(
+        _env_value(env, "EVAL_INFERENCE_CROP_MODE", "detector_scan")
+    ).lower()
+    if eval_inference_crop_mode not in {"full_image", "lossless_tiling", "detector_scan"}:
+        raise ValueError(
+            "EVAL_INFERENCE_CROP_MODE must be full_image, lossless_tiling, or detector_scan"
+        )
 
     base_model = str(
         _env_value(
@@ -261,6 +418,12 @@ def resolve_runtime_config(
         "TRAINING_DATA_DIR": training_data_dir,
         "TRAINING_DATA_SOURCE_DIR": training_data_source_dir,
         "META_PATH": meta_path,
+        "UI5_USE_DETECTION_CROPS": int(use_detection_crops),
+        "UI5_CROP_AUDIT_DIR": crop_audit_dir,
+        "UI5_CROP_TRAIN_MODE": crop_train_mode,
+        "UI5_CROP_META_PATH": crop_meta_path,
+        "UI5_UI_SAMPLING_MODE": ui_sampling_mode,
+        "UI_NEGATIVE_TO_POSITIVE_RATIO": ui_negative_to_positive_ratio,
         "EVAL_INPUT_DIR": eval_input_dir,
         "OUTPUT_BASE": output_base,
         "RUN_NAME": run_name,
@@ -367,6 +530,129 @@ def resolve_runtime_config(
         "EVAL_AT_START": int(eval_at_start),
         "EVAL_INTERVAL_STEPS": eval_interval,
         "EVAL_FAIL_POLICY": eval_fail_policy,
+        "EVAL_VALIDATION_EARLY_STOP": int(eval_validation_early_stop),
+        "EVAL_DATA_SPLIT": eval_data_split,
+        "EVAL_FROZEN_GATE_THRESHOLDS": str(
+            _env_value(env, "EVAL_FROZEN_GATE_THRESHOLDS", "")
+        ),
+        "EVAL_INFERENCE_CROP_MODE": eval_inference_crop_mode,
+        "EVAL_PARSER_ROOT": str(
+            _env_value(
+                env,
+                "EVAL_PARSER_ROOT",
+                join_runtime_path(str(Path(project_root).parent), "ui-region-parser")
+                if not project_root.startswith("/")
+                else posixpath.join(posixpath.dirname(project_root), "ui-region-parser"),
+            )
+        ),
+        "EVAL_DETECTOR_CACHE": str(
+            _env_value(
+                env,
+                "EVAL_DETECTOR_CACHE",
+                join_runtime_path(
+                    project_root,
+                    "work_dirs",
+                    "ui5_eval_detector_cache_horizontal_v5",
+                ),
+            )
+        ),
+        "EVAL_DETECTOR_CACHE_MODE": str(
+            _env_value(env, "EVAL_DETECTOR_CACHE_MODE", "readonly")
+        ).lower(),
+        "EVAL_SCAN_NAME": str(
+            _env_value(
+                env,
+                "EVAL_SCAN_NAME",
+                "horizontal_scan_v5_raw_detector_edge_aligned",
+            )
+        ),
+        "EVAL_REQUIRE_CACHE_SCOPE": str(
+            _env_value(
+                env,
+                "EVAL_REQUIRE_CACHE_SCOPE",
+                "full_test",
+            )
+        ).lower(),
+        "EVAL_REQUIRE_STRICT_NONOVERLAP": int(
+            parse_bool(
+                _env_value(env, "EVAL_REQUIRE_STRICT_NONOVERLAP", "1"),
+                name="EVAL_REQUIRE_STRICT_NONOVERLAP",
+            )
+        ),
+        "EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT": int(
+            parse_bool(
+                _env_value(env, "EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT", "1"),
+                name="EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT",
+            )
+        ),
+        "EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT": int(
+            parse_bool(
+                _env_value(
+                    env, "EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT", "1"
+                ),
+                name="EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT",
+            )
+        ),
+        "EVAL_EXPECTED_UNIQUE_IMAGES": int(
+            _env_value(
+                env,
+                "EVAL_EXPECTED_UNIQUE_IMAGES",
+                DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
+            )
+        ),
+        "EVAL_TEXT_PYTHON": str(_env_value(env, "EVAL_TEXT_PYTHON", "")),
+        "EVAL_ICON_PYTHON": str(_env_value(env, "EVAL_ICON_PYTHON", "")),
+        "EVAL_TEXT_MODEL_DIR": str(_env_value(env, "EVAL_TEXT_MODEL_DIR", "")),
+        "EVAL_ICON_MODEL": str(
+            _env_value(
+                env,
+                "EVAL_ICON_MODEL",
+                join_runtime_path(
+                    str(_env_value(env, "EVAL_PARSER_ROOT", posixpath.join(posixpath.dirname(project_root), "ui-region-parser"))),
+                    "weights",
+                    "icon_detect_v3",
+                    "model.pt",
+                ),
+            )
+        ),
+        "EVAL_DETECTOR_WORKERS_PER_GPU": int(
+            _env_value(env, "EVAL_DETECTOR_WORKERS_PER_GPU", 1)
+        ),
+        "EVAL_TILE_MAX_COUNT": int(_env_value(env, "EVAL_TILE_MAX_COUNT", 10)),
+        "EVAL_TILE_TARGET_LONG_SIDE": int(
+            _env_value(env, "EVAL_TILE_TARGET_LONG_SIDE", 1600)
+        ),
+        "EVAL_TILE_OVERLAP_RATIO": float(
+            _env_value(env, "EVAL_TILE_OVERLAP_RATIO", 0.10)
+        ),
+        "EVAL_TILE_NMS_IOU": float(_env_value(env, "EVAL_TILE_NMS_IOU", 0.50)),
+        "EVAL_SCAN_TARGET_HEIGHT": int(
+            _env_value(env, "EVAL_SCAN_TARGET_HEIGHT", 960)
+        ),
+        "EVAL_SCAN_TARGET_GUARD_RATIO": float(
+            _env_value(env, "EVAL_SCAN_TARGET_GUARD_RATIO", 0.0)
+        ),
+        "EVAL_SCAN_TARGET_GUARD_MIN_PIXELS": int(
+            _env_value(env, "EVAL_SCAN_TARGET_GUARD_MIN_PIXELS", 0)
+        ),
+        "EVAL_SCAN_TARGET_GUARD_MAX_PIXELS": int(
+            _env_value(env, "EVAL_SCAN_TARGET_GUARD_MAX_PIXELS", 0)
+        ),
+        "EVAL_SCAN_VERTICAL_LINK_RATIO": float(
+            _env_value(env, "EVAL_SCAN_VERTICAL_LINK_RATIO", 0.025)
+        ),
+        "EVAL_SCAN_CONTEXT_RATIO": float(
+            _env_value(env, "EVAL_SCAN_CONTEXT_RATIO", 0.20)
+        ),
+        "EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO": float(
+            _env_value(env, "EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO", 0.015)
+        ),
+        "EVAL_SCAN_DENSE_BAND_RATIO": float(
+            _env_value(env, "EVAL_SCAN_DENSE_BAND_RATIO", 0.80)
+        ),
+        "EVAL_SCAN_VISUALIZATION_SAMPLES": int(
+            _env_value(env, "EVAL_SCAN_VISUALIZATION_SAMPLES", 20)
+        ),
         "INSTALL_SYSTEM_RUNTIME_DEPS": int(
             parse_bool(
                 _env_value(env, "INSTALL_SYSTEM_RUNTIME_DEPS", "0"),
@@ -409,6 +695,133 @@ def resolve_runtime_config(
         raise ValueError("RELATION_GATE_THRESHOLD must be in [0, 1]")
     if resolved["RELATION_GATE_MODE"] not in {"observe", "hard", "soft"}:
         raise ValueError("RELATION_GATE_MODE must be observe, hard, or soft")
+
+    if crop_train_mode == "crop_only" and not parse_bool(
+        _env_value(env, "UI5_GPU_PARITY_PROBE", "0"),
+        name="UI5_GPU_PARITY_PROBE",
+    ):
+        formal_exact = {
+            "MACHINE_TYPE": "a800",
+            "GPU_COUNT": 4,
+            "MAX_SEQ_LENGTH": 7268,
+            "MAX_NUM_TOKENS_PER_SAMPLE": 7268,
+            "MAX_NUM_TOKENS": 12800,
+            "MAX_NUM_TOKENS_SCOPE": "per_rank_packed_batch",
+            "MAX_STEPS": 16000,
+            "SEED": 42,
+            "WARMUP_STEPS": 500,
+            "GRADIENT_ACCUMULATION_STEPS": 2,
+            "PER_DEVICE_TRAIN_BATCH_SIZE": 1,
+            "BF16": 1,
+            "SAVE_STEPS": 4000,
+            "ENABLE_EVAL": 1,
+            "EVAL_AT_START": 0,
+            "EVAL_INTERVAL_STEPS": 1000,
+            "EVAL_FAIL_POLICY": "warn",
+            "EVAL_VALIDATION_EARLY_STOP": 0,
+            "EVAL_DATA_SPLIT": "test",
+            "EVAL_INFERENCE_CROP_MODE": "detector_scan",
+            "EVAL_DETECTOR_CACHE_MODE": "readonly",
+            "EVAL_SCAN_NAME": "horizontal_scan_v5_raw_detector_edge_aligned",
+            "EVAL_REQUIRE_CACHE_SCOPE": "full_test",
+            "EVAL_EXPECTED_UNIQUE_IMAGES": 1555,
+            "EVAL_REQUIRE_STRICT_NONOVERLAP": 1,
+            "EVAL_REQUIRE_RAW_DETECTOR_EDGE_ALIGNMENT": 1,
+            "EVAL_REQUIRE_DETECTOR_UNIQUE_CONTAINMENT": 1,
+            "EVAL_MAX_IMAGES_PER_TASK": 0,
+            "TC_MSED_STAGE": "m32",
+            "RELATION_GATE_MODE": "observe",
+            "EVAL_ENABLE_PBD": 1,
+            "INIT_CPT_STEP": 3000,
+            "UI5_USE_DETECTION_CROPS": 1,
+            "UI5_CROP_TRAIN_MODE": "crop_only",
+            "UI5_UI_SAMPLING_MODE": "task_source_balanced_rotating",
+            "INSTALL_SYSTEM_RUNTIME_DEPS": 1,
+        }
+        drift = {
+            name: {"expected": expected, "actual": resolved.get(name)}
+            for name, expected in formal_exact.items()
+            if resolved.get(name) != expected
+        }
+        formal_floats = {
+            "LEARNING_RATE": 1e-5,
+            "UI_RELATION_LEARNING_RATE": 2e-5,
+            "WEIGHT_DECAY": 0.01,
+            "MAX_GRAD_NORM": 1.0,
+            "UI_NEGATIVE_TO_POSITIVE_RATIO": 2.0,
+        }
+        drift.update(
+            {
+                name: {"expected": expected, "actual": resolved.get(name)}
+                for name, expected in formal_floats.items()
+                if not math.isclose(
+                    float(resolved.get(name)),
+                    expected,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            }
+        )
+        if not str(resolved["DEEPSPEED_CONFIG"]).endswith(
+            "deepspeed_configs/zero_stage2_two_lr_config.json"
+        ):
+            drift["DEEPSPEED_CONFIG"] = {
+                "expected": "deepspeed_configs/zero_stage2_two_lr_config.json",
+                "actual": resolved["DEEPSPEED_CONFIG"],
+            }
+        if not (
+            resolved["BASE_MODEL"]
+            == resolved["MODEL_PATH"]
+            == resolved["INIT_CHECKPOINT"]
+        ):
+            drift["CPT_INITIALIZATION_CHAIN"] = {
+                "expected": "BASE_MODEL=MODEL_PATH=INIT_CHECKPOINT",
+                "actual": [
+                    resolved["BASE_MODEL"],
+                    resolved["MODEL_PATH"],
+                    resolved["INIT_CHECKPOINT"],
+                ],
+            }
+        if drift:
+            raise ValueError(
+                "crop-only M32+CPT-3000 formal profile drift: "
+                + json.dumps(drift, ensure_ascii=False, sort_keys=True)
+            )
+    if not 1 <= resolved["EVAL_TILE_MAX_COUNT"] <= 10:
+        raise ValueError("EVAL_TILE_MAX_COUNT must be in [1, 10]")
+    if resolved["EVAL_TILE_TARGET_LONG_SIDE"] <= 0:
+        raise ValueError("EVAL_TILE_TARGET_LONG_SIDE must be positive")
+    if not 0 < resolved["EVAL_TILE_OVERLAP_RATIO"] < 1:
+        raise ValueError("EVAL_TILE_OVERLAP_RATIO must be in (0, 1)")
+    if not 0 <= resolved["EVAL_TILE_NMS_IOU"] <= 1:
+        raise ValueError("EVAL_TILE_NMS_IOU must be in [0, 1]")
+    if resolved["EVAL_DETECTOR_WORKERS_PER_GPU"] not in {1, 2}:
+        raise ValueError("EVAL_DETECTOR_WORKERS_PER_GPU must be 1 or 2")
+    if resolved["EVAL_DETECTOR_CACHE_MODE"] != "readonly":
+        raise ValueError("This formal pipeline requires EVAL_DETECTOR_CACHE_MODE=readonly")
+    if resolved["EVAL_REQUIRE_CACHE_SCOPE"] != "full_test":
+        raise ValueError(
+            "This formal pipeline requires EVAL_REQUIRE_CACHE_SCOPE=full_test"
+        )
+    if resolved["EVAL_EXPECTED_UNIQUE_IMAGES"] < 0:
+        raise ValueError("EVAL_EXPECTED_UNIQUE_IMAGES cannot be negative")
+    if resolved["EVAL_SCAN_TARGET_HEIGHT"] <= 0:
+        raise ValueError("EVAL_SCAN_TARGET_HEIGHT must be positive")
+    if resolved["EVAL_INFERENCE_CROP_MODE"] == "detector_scan" and (
+        resolved["EVAL_SCAN_TARGET_GUARD_RATIO"],
+        resolved["EVAL_SCAN_TARGET_GUARD_MIN_PIXELS"],
+        resolved["EVAL_SCAN_TARGET_GUARD_MAX_PIXELS"],
+    ) != (0.0, 0, 0):
+        raise ValueError("raw detector-edge evaluation requires target guard 0/0/0")
+    for name in (
+        "EVAL_SCAN_VERTICAL_LINK_RATIO",
+        "EVAL_SCAN_CONTEXT_RATIO",
+        "EVAL_SCAN_MIN_CONTEXT_IMAGE_RATIO",
+    ):
+        if resolved[name] < 0:
+            raise ValueError(f"{name} cannot be negative")
+    if not 0 < resolved["EVAL_SCAN_DENSE_BAND_RATIO"] <= 1:
+        raise ValueError("EVAL_SCAN_DENSE_BAND_RATIO must be in (0, 1]")
     if not 0.0 <= resolved["RELATION_FOCAL_BETA"] < 1.0:
         raise ValueError("RELATION_FOCAL_BETA must be in [0, 1)")
     if resolved["RELATION_FOCAL_GAMMA"] < 0.0:
@@ -452,6 +865,7 @@ GPU_PARITY_ALLOWED_DIFFERENCES = frozenset(
         "GRADIENT_ACCUMULATION_STEPS",
         "RUN_NAME",
         "OUTPUT_DIR",
+        "EVAL_DETECTOR_CACHE",
     }
 )
 

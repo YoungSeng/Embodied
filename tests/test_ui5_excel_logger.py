@@ -19,7 +19,8 @@ from eaglevl.train.ui5_excel_logger import (
 
 def training_metrics(step: int) -> dict:
     return {
-        "epoch": step / 1000,
+        "segment_epoch": step / 1000,
+        "global_epoch": step / 1000,
         "gpu_num": 4,
         "max_num_tokens": 12800,
         "learning_rate": 2e-5,
@@ -141,13 +142,14 @@ class UI5ExcelLoggerTest(unittest.TestCase):
                 values = next(train_sheet.iter_rows(min_row=2, values_only=True))
                 row = dict(zip(header, values))
                 self.assertEqual(row["step"], 100)
-                self.assertEqual(row["epoch"], 0.1)
+                self.assertEqual(row["segment_epoch"], 0.1)
+                self.assertEqual(row["global_epoch"], 0.1)
                 self.assertEqual(row["gate_grad_norm"], 0.75)
                 self.assertIsNone(row["image_gate_grad_norm"])
                 self.assertIsNone(row["slot_gate_grad_norm"])
                 self.assertEqual(
                     migrated["eval_1000steps"].max_row - 1,
-                    12,
+                    14,
                 )
             finally:
                 migrated.close()
@@ -159,6 +161,7 @@ class UI5ExcelLoggerTest(unittest.TestCase):
             self.assertTrue(logger.update_train(100, training_metrics(100)))
             self.assertTrue(logger.update_train(200, training_metrics(200)))
             self.assertFalse(logger.update_train(100, training_metrics(100)))
+            self.assertEqual(logger.latest_train_global_epoch(), 0.2)
             workbook = load_workbook(path, read_only=True)
             try:
                 steps_at_250 = [
@@ -260,7 +263,7 @@ class UI5ExcelLoggerTest(unittest.TestCase):
             finally:
                 workbook.close()
 
-    def test_eval_has_five_tasks_and_two_macro_rows_per_step(self):
+    def test_eval_has_five_tasks_and_separate_macro_micro_rows_per_step(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "ui5_training_evaluation.xlsx"
             logger = UI5ExcelLogger(path)
@@ -288,17 +291,46 @@ class UI5ExcelLoggerTest(unittest.TestCase):
                         min_row=2, values_only=True
                     )
                 )
-                self.assertEqual(len(rows), 24)
-                self.assertEqual(sum(row[0] == 0 for row in rows), 12)
-                self.assertEqual(sum(row[0] == 1000 for row in rows), 12)
-                f1_change_index = 18
+                self.assertEqual(len(rows), 28)
+                self.assertEqual(sum(row[0] == 0 for row in rows), 14)
+                self.assertEqual(sum(row[0] == 1000 for row in rows), 14)
+                f1_change_index = EVAL_COLUMNS.index("f1_change_from_previous")
+                task_index = EVAL_COLUMNS.index("task")
                 self.assertTrue(
                     all(
                         abs(row[f1_change_index] - 0.1) < 1e-9
                         for row in rows
                         if row[0] == 1000
+                        and row[task_index] != "five_task_micro"
                     )
                 )
+                self.assertTrue(
+                    all(
+                        abs(row[f1_change_index]) < 1e-9
+                        for row in rows
+                        if row[0] == 1000
+                        and row[task_index] == "five_task_micro"
+                    )
+                )
+                granularity_index = EVAL_COLUMNS.index("granularity")
+                tp_index = EVAL_COLUMNS.index("tp")
+                for granularity in ("image", "bbox"):
+                    macro = next(
+                        row
+                        for row in rows
+                        if row[0] == 1000
+                        and row[task_index] == "five_task_macro"
+                        and row[granularity_index] == granularity
+                    )
+                    micro = next(
+                        row
+                        for row in rows
+                        if row[0] == 1000
+                        and row[task_index] == "five_task_micro"
+                        and row[granularity_index] == granularity
+                    )
+                    self.assertIsNone(macro[tp_index])
+                    self.assertEqual(micro[tp_index], 10)
             finally:
                 workbook.close()
 
@@ -336,7 +368,7 @@ class UI5ExcelLoggerTest(unittest.TestCase):
                     dict(zip(header, values))
                     for values in sheet.iter_rows(min_row=2, values_only=True)
                 ]
-                self.assertEqual(len(rows), 12)
+                self.assertEqual(len(rows), 14)
                 self.assertEqual({row["git_commit"] for row in rows}, {"new"})
                 self.assertEqual(
                     {row["model_signature"] for row in rows}, {"new-model"}

@@ -288,3 +288,14 @@ class DataTrainingArguments:
         default=2.0,
         metadata={'help': 'Effective UI negative:positive sampling ratio.'},
     )
+    ui_sampling_mode: str = field(
+        default='fixed_ratio',
+        metadata={
+            'help': (
+                'UI sampling policy: fixed_ratio keeps the legacy fixed-size subset; '
+                'task_balanced_all_records retains every legal crop and round-robins tasks; '
+                'task_source_balanced_rotating keeps the complete active pool while '
+                'balancing tasks, positive/negative draws, and source images.'
+            )
+        },
+    )

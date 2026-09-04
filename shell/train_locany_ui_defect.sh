@@ -12,6 +12,11 @@ MODEL_PATH="${MODEL_PATH:-nvidia/LocateAnything-3B}"
 DATA_VERSION="${DATA_VERSION:-v3}"
 DATA_DIR="${DATA_DIR:-${PROJECT_ROOT}/data/ui_defect_locany_${DATA_VERSION}}"
 META_PATH="${META_PATH:-${DATA_DIR}/recipe/ui_defect_5class_train.json}"
+UI5_USE_DETECTION_CROPS="${UI5_USE_DETECTION_CROPS:-0}"
+UI5_CROP_AUDIT_DIR="${UI5_CROP_AUDIT_DIR:-}"
+UI5_CROP_TRAIN_MODE="${UI5_CROP_TRAIN_MODE:-}"
+UI5_CROP_META_PATH="${UI5_CROP_META_PATH:-}"
+UI5_UI_SAMPLING_MODE="${UI5_UI_SAMPLING_MODE:-}"
 
 OUTPUT_BASE="${OUTPUT_BASE:-${PROJECT_ROOT}/work_dirs}"
 RUN_NAME="${RUN_NAME:-locateanything-3b-ui-defect-5class-full}"
@@ -45,12 +50,84 @@ else
   echo "[INFO] MODEL_PATH is not a local directory; treating it as a Hub model id: ${MODEL_PATH}"
 fi
 
-if [[ ! -f "${META_PATH}" ]]; then
-  echo "[ERROR] META_PATH does not exist: ${META_PATH}" >&2
+# Resolve crop mode and the final meta before any environment preflight or
+# torchrun.  Crop runs never silently fall back to the default full-image meta.
+if [[ "${UI5_USE_DETECTION_CROPS}" != "0" && "${UI5_USE_DETECTION_CROPS}" != "1" ]]; then
+  echo "[ERROR] UI5_USE_DETECTION_CROPS must be 0 or 1." >&2
   exit 1
 fi
+if [[ -z "${UI5_CROP_TRAIN_MODE}" ]]; then
+  if [[ "${UI5_USE_DETECTION_CROPS}" == "1" ]]; then
+    UI5_CROP_TRAIN_MODE="crop_only"
+  else
+    UI5_CROP_TRAIN_MODE="full_only"
+  fi
+fi
+if [[ "${UI5_CROP_TRAIN_MODE}" != "full_only" && "${UI5_CROP_TRAIN_MODE}" != "crop_only" ]]; then
+  echo "[ERROR] UI5_CROP_TRAIN_MODE must be full_only or crop_only." >&2
+  exit 1
+fi
+if [[ "${UI5_USE_DETECTION_CROPS}" == "1" && "${UI5_CROP_TRAIN_MODE}" == "full_only" ]]; then
+  echo "[ERROR] UI5_USE_DETECTION_CROPS=1 requires a crop-bearing train mode." >&2
+  exit 1
+fi
+if [[ -z "${UI5_UI_SAMPLING_MODE}" ]]; then
+  if [[ "${UI5_CROP_TRAIN_MODE}" == "crop_only" ]]; then
+    UI5_UI_SAMPLING_MODE="task_source_balanced_rotating"
+  else
+    UI5_UI_SAMPLING_MODE="fixed_ratio"
+  fi
+fi
+if [[ "${UI5_UI_SAMPLING_MODE}" != "fixed_ratio" && \
+      "${UI5_UI_SAMPLING_MODE}" != "task_source_balanced_rotating" ]]; then
+  echo "[ERROR] UI5_UI_SAMPLING_MODE must be fixed_ratio or task_source_balanced_rotating." >&2
+  exit 1
+fi
+if [[ "${UI5_CROP_TRAIN_MODE}" == "crop_only" && \
+      "${UI5_UI_SAMPLING_MODE}" != "task_source_balanced_rotating" ]]; then
+  echo "[ERROR] crop_only requires task_source_balanced_rotating." >&2
+  exit 1
+fi
+if [[ "${UI5_USE_DETECTION_CROPS}" == "1" || -n "${UI5_CROP_AUDIT_DIR}" ]]; then
+  if [[ -z "${UI5_CROP_AUDIT_DIR}" ]]; then
+    echo "[ERROR] UI5_USE_DETECTION_CROPS=1 requires UI5_CROP_AUDIT_DIR." >&2
+    exit 1
+  fi
+  if [[ -z "${UI5_CROP_META_PATH}" ]]; then
+    UI5_CROP_META_PATH="${UI5_CROP_AUDIT_DIR}/training_recipes/ui_defect_5class_train_${UI5_CROP_TRAIN_MODE}.json"
+  fi
+  if [[ ! -s "${UI5_CROP_META_PATH}" ]]; then
+    echo "[ERROR] Audited crop recipe is missing or empty: ${UI5_CROP_META_PATH}" >&2
+    exit 1
+  fi
+  UI5_AUDIT_PYTHON="${ENV_DIR:-}/bin/python"
+  if [[ ! -x "${UI5_AUDIT_PYTHON}" ]]; then
+    UI5_AUDIT_PYTHON="$(command -v python || true)"
+  fi
+  if [[ -z "${UI5_AUDIT_PYTHON}" ]]; then
+    echo "[ERROR] Cannot find Python for crop marker validation." >&2
+    exit 1
+  fi
+  "${UI5_AUDIT_PYTHON}" "${PROJECT_ROOT}/scripts/validate_ui5_crop_training_ready.py" \
+    --audit-dir "${UI5_CROP_AUDIT_DIR}" \
+    --recipe "${UI5_CROP_META_PATH}" \
+    --expected-train-mode "${UI5_CROP_TRAIN_MODE}" || {
+      echo "[ERROR] Crop training-ready validation failed; refusing to start training." >&2
+      exit 1
+    }
+  META_PATH="${UI5_CROP_META_PATH}"
+elif [[ -n "${UI5_CROP_META_PATH}" ]]; then
+  echo "[ERROR] UI5_CROP_META_PATH requires UI5_CROP_AUDIT_DIR." >&2
+  exit 1
+fi
+if [[ ! -s "${META_PATH}" ]]; then
+  echo "[ERROR] Final META_PATH does not exist or is empty: ${META_PATH}" >&2
+  exit 1
+fi
+export UI5_USE_DETECTION_CROPS UI5_CROP_AUDIT_DIR UI5_CROP_TRAIN_MODE UI5_UI_SAMPLING_MODE
+export UI5_CROP_META_PATH META_PATH
 
-DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-deepspeed_configs/zero_stage2_config.json}"
+DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-deepspeed_configs/zero_stage2_two_lr_config.json}"
 if [[ ! -f "${DEEPSPEED_CONFIG}" ]]; then
   echo "[ERROR] DeepSpeed config does not exist: ${DEEPSPEED_CONFIG}" >&2
   exit 1
@@ -299,6 +376,11 @@ echo "============================================================"
 echo "PROJECT_ROOT                  : ${PROJECT_ROOT}"
 echo "MODEL_PATH                    : ${MODEL_PATH}"
 echo "META_PATH                     : ${META_PATH}"
+echo "UI5_USE_DETECTION_CROPS       : ${UI5_USE_DETECTION_CROPS}"
+echo "UI5_CROP_AUDIT_DIR            : ${UI5_CROP_AUDIT_DIR:-<none>}"
+echo "UI5_CROP_TRAIN_MODE           : ${UI5_CROP_TRAIN_MODE}"
+echo "UI5_UI_SAMPLING_MODE          : ${UI5_UI_SAMPLING_MODE}"
+echo "UI5_CROP_META_PATH            : ${UI5_CROP_META_PATH:-<none>}"
 echo "OUTPUT_DIR                    : ${OUTPUT_DIR}"
 echo "GPU_NAME                      : ${GPU_NAME}"
 echo "CUDA_VISIBLE_DEVICES          : ${CUDA_VISIBLE_DEVICES}"
@@ -308,8 +390,17 @@ echo "MAX_SEQ_LENGTH                : ${MAX_SEQ_LENGTH}"
 echo "MAX_NUM_TOKENS_PER_SAMPLE     : ${MAX_NUM_TOKENS_PER_SAMPLE}"
 echo "MAX_NUM_TOKENS                : ${MAX_NUM_TOKENS}"
 echo "BALANCE_UI_DEFECTS             : ${BALANCE_UI_DEFECTS:-True}"
-echo "UI_RECORDS_PER_CLASS           : ${UI_RECORDS_PER_CLASS:-17604}"
-echo "UI_NEGATIVE:POSITIVE           : ${UI_NEGATIVE_TO_POSITIVE_RATIO:-2.0}:1"
+if [[ "${UI5_UI_SAMPLING_MODE}" == "task_balanced_all_records" ]]; then
+  echo "UI_RECORDS_PER_CLASS           : inactive (all legal records retained)"
+  echo "UI_NEGATIVE:POSITIVE           : natural recipe distribution"
+elif [[ "${UI5_UI_SAMPLING_MODE}" == "task_source_balanced_rotating" ]]; then
+  echo "UI_RECORDS_PER_CLASS           : inactive (all legal records retained in active pool)"
+  echo "UI_NEGATIVE:POSITIVE           : ${UI_NEGATIVE_TO_POSITIVE_RATIO:-2.0}:1 effective rotating draws"
+  echo "UI_SOURCE_GROUP_WEIGHTING      : uniform within task/polarity; crops rotate before repeat"
+else
+  echo "UI_RECORDS_PER_CLASS           : ${UI_RECORDS_PER_CLASS:-17604}"
+  echo "UI_NEGATIVE:POSITIVE           : ${UI_NEGATIVE_TO_POSITIVE_RATIO:-2.0}:1"
+fi
 echo "PACKING_BUFFER_SIZE           : ${PACKING_BUFFER_SIZE}"
 echo "GRADIENT_ACCUMULATION_STEPS   : ${GRADIENT_ACCUMULATION_STEPS}"
 echo "RELATION_GATE_LOSS_WEIGHT     : ${RELATION_GATE_LOSS_WEIGHT:-1.0}"
@@ -399,6 +490,7 @@ if torchrun \
   --balance_ui_defects "${BALANCE_UI_DEFECTS:-True}" \
   --ui_records_per_class "${UI_RECORDS_PER_CLASS:-17604}" \
   --ui_negative_to_positive_ratio "${UI_NEGATIVE_TO_POSITIVE_RATIO:-2.0}" \
+  --ui_sampling_mode "${UI5_UI_SAMPLING_MODE}" \
   --bf16 "${BF16}" \
   --max_steps "${MAX_STEPS}" \
   --seed "${SEED}" \

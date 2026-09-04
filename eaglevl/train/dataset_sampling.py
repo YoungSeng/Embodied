@@ -57,4 +57,10 @@ def resolve_recipe_entry_paths(
         root = Path(root_value)
         if not root.is_absolute():
             resolved["root"] = str((base / root).resolve())
+    for key in ("excluded_samples", "recipe_summary"):
+        value = str(resolved.get(key, ""))
+        if value:
+            path = Path(value)
+            if not path.is_absolute():
+                resolved[key] = str((base / path).resolve())
     return resolved

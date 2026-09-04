@@ -357,6 +357,121 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(runtime["DEEPSPEED_CONFIG"], "deepspeed_configs/zero_stage2_two_lr_config.json")
         self.assertEqual(runtime["SEED"], 42)
 
+    def test_exact_crop_only_formal_command_is_fail_closed_and_fully_rendered(self) -> None:
+        project_root = (
+            "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/"
+            "Eagle_LocateUI5_v4/Embodied-m32-cpt-sft-v1"
+        )
+        checkpoint = (
+            "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_models/"
+            "locany-3b-ui-cpt-v4-v3-h20x2-formal-segmented-eval/checkpoint-3000"
+        )
+        crop_audit = (
+            "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/"
+            "Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/"
+            "ui5_crop_audit_20260825/crop_audit_v4_gt_repair"
+        )
+        crop_meta = (
+            f"{crop_audit}/training_recipes/"
+            "ui_defect_5class_train_crop_only.json"
+        )
+        test_cache = (
+            "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/"
+            "Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/"
+            "ui5_eval_detector_cache_horizontal_v5"
+        )
+        args = submit_locany_ui5.parse_args(
+            [
+                "--project-root", project_root,
+                "--base-model", checkpoint,
+                "--machine", "a800",
+                "--resource-group", "aiai_locate",
+                "--gpus", "4",
+                "--cuda-devices", "0,1,2,3",
+                "--eval-gpu-devices", "0,1,2,3",
+                "--max-seq-length", "7268",
+                "--max-num-tokens-per-sample", "7268",
+                "--max-num-tokens", "12800",
+                "--max-steps", "16000",
+                "--save-steps", "4000",
+                "--warmup-steps", "500",
+                "--learning-rate", "1e-5",
+                "--ui-relation-learning-rate", "2e-5",
+                "--tc-msed-stage", "m32",
+                "--relation-gate-mode", "observe",
+                "--eval-enable-pbd",
+                "--install-system-runtime-deps",
+                "--use-detection-crops",
+                "--crop-audit-dir", crop_audit,
+                "--crop-train-mode", "crop_only",
+                "--crop-meta-path", crop_meta,
+                "--ui-sampling-mode", "task_source_balanced_rotating",
+                "--ui-negative-to-positive-ratio", "2.0",
+                "--enable-eval",
+                "--no-eval-at-start",
+                "--eval-interval-steps", "1000",
+                "--eval-fail-policy", "warn",
+                "--eval-input-dir",
+                "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/data",
+                "--eval-data-split", "test",
+                "--no-validation-early-stop",
+                "--eval-inference-crop-mode", "detector_scan",
+                "--eval-detector-cache", test_cache,
+                "--eval-detector-cache-mode", "readonly",
+                "--eval-scan-name",
+                "horizontal_scan_v5_raw_detector_edge_aligned",
+                "--require-cache-scope", "full_test",
+                "--eval-expected-unique-images", "1555",
+                "--require-strict-nonoverlap",
+                "--require-raw-detector-edge-alignment",
+                "--require-detector-unique-containment",
+                "--scorer-root", project_root,
+                "--run-name",
+                "locany-ui5-m32-cpt3000-croponly-sourcebalanced-a800x4-v1",
+                "--render-only",
+            ]
+        )
+        rendered, runtime = submit_locany_ui5.render_job(args)
+        expected = {
+            "BASE_MODEL": checkpoint,
+            "MODEL_PATH": checkpoint,
+            "INIT_CHECKPOINT": checkpoint,
+            "INIT_CPT_STEP": 3000,
+            "MACHINE_TYPE": "a800",
+            "GPU_COUNT": 4,
+            "MAX_SEQ_LENGTH": 7268,
+            "MAX_NUM_TOKENS_PER_SAMPLE": 7268,
+            "MAX_NUM_TOKENS": 12800,
+            "MAX_STEPS": 16000,
+            "SAVE_STEPS": 4000,
+            "WARMUP_STEPS": 500,
+            "GRADIENT_ACCUMULATION_STEPS": 2,
+            "BF16": 1,
+            "TC_MSED_STAGE": "m32",
+            "RELATION_GATE_MODE": "observe",
+            "EVAL_ENABLE_PBD": 1,
+            "UI5_CROP_TRAIN_MODE": "crop_only",
+            "UI5_UI_SAMPLING_MODE": "task_source_balanced_rotating",
+            "EVAL_AT_START": 0,
+            "EVAL_INTERVAL_STEPS": 1000,
+            "EVAL_DATA_SPLIT": "test",
+            "EVAL_INFERENCE_CROP_MODE": "detector_scan",
+            "EVAL_DETECTOR_CACHE_MODE": "readonly",
+            "EVAL_REQUIRE_CACHE_SCOPE": "full_test",
+            "EVAL_EXPECTED_UNIQUE_IMAGES": 1555,
+        }
+        self.assertEqual({key: runtime[key] for key in expected}, expected)
+        self.assertEqual(float(runtime["LEARNING_RATE"]), 1e-5)
+        self.assertEqual(float(runtime["UI_RELATION_LEARNING_RATE"]), 2e-5)
+        self.assertEqual(float(runtime["UI_NEGATIVE_TO_POSITIVE_RATIO"]), 2.0)
+        self.assertEqual(runtime["META_PATH"], crop_meta)
+        self.assertEqual(runtime["EVAL_DETECTOR_CACHE"], test_cache)
+        self.assertNotIn("@@", rendered)
+        drifted = submit_locany_ui5.build_submission_environment(args)
+        drifted["MAX_STEPS"] = "15000"
+        with self.assertRaisesRegex(ValueError, "formal profile drift"):
+            locany_ui5_common.resolve_runtime_config(drifted)
+
     def test_formal_eval_pbd_ablation_is_explicitly_rendered(self) -> None:
         args = submit_locany_ui5.parse_args(
             [

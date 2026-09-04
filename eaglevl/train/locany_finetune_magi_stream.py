@@ -14,6 +14,7 @@ import os
 import os.path as osp
 import errno
 import copy
+import hashlib
 import logging
 import random
 import re
@@ -109,12 +110,19 @@ from eaglevl.train.tools import (SaveCheckpointCallback, MemoryLoggerCallback,
 from eaglevl.train.augmentation import apply_resize_augmentation
 from eaglevl.train.ui_defect_data import (
     build_balanced_ui_indices,
+    build_task_balanced_all_records_indices,
+    build_task_source_balanced_rotating_plan,
     extract_ui_defect_targets,
     identify_ui_defect_task,
     is_positive_ui_defect,
+    materialize_task_source_balanced_rotating_indices,
 )
 from eaglevl.train.ui5_excel_logger import UI5ExcelLogger, TRAIN_TASKS
-from eaglevl.train.ui5_checkpoint_utils import validate_checkpoint
+from eaglevl.train.ui5_checkpoint_utils import atomic_save_with_fsync, validate_checkpoint
+from eaglevl.train.ui5_sampling_coverage import (
+    is_monotonic_coverage,
+    write_sampling_coverage_atomic,
+)
 from dotenv import load_dotenv
 load_dotenv()
 from transformers.trainer_pt_utils import LabelSmoother
@@ -132,6 +140,21 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be a boolean, got {value!r}")
+
+
+def _sha256_if_file(path_value: str | None) -> str:
+    """Return a stable recipe digest without making diagnostics a startup gate."""
+
+    if not path_value:
+        return ""
+    path = Path(path_value).expanduser()
+    if not path.is_file():
+        return ""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 if version.parse(torch.__version__) >= version.parse("2.4.0"):
@@ -327,7 +350,8 @@ class LazySupervisedDatasetMTP(Dataset):
                  video_total_pixels: int = 32000 * 28 * 28 * 0.9,
                  balance_ui_defects: bool = False,
                  ui_records_per_class: int = 17604,
-                 ui_negative_to_positive_ratio: float = 2.0):
+                 ui_negative_to_positive_ratio: float = 2.0,
+                 ui_sampling_mode: str = "fixed_ratio"):
         super().__init__()
         self.ds_name = ds_name
         self.processor = processor
@@ -339,6 +363,7 @@ class LazySupervisedDatasetMTP(Dataset):
         self.block_size = block_size
         self.data_augment = meta.get("data_augment", False)
         self.visual_prompt = bool(meta.get("visual_prompt", False))
+        self.ui5_crop_recipe = bool(meta.get("ui5_crop_recipe", False))
         self.balance_ui_defects = bool(meta.get("balance_ui_defects", balance_ui_defects))
         self.cpt_enabled = _env_flag("LOCANY_CPT_MODE", default=False)
         self.cpt_task = (
@@ -350,6 +375,26 @@ class LazySupervisedDatasetMTP(Dataset):
             raise ValueError(f"Unknown CPT task for {ds_name}: {self.cpt_task!r}")
         self.cpt_task_id = CPT_TASK_TO_ID.get(self.cpt_task, -1)
         self.cpt_dataset_groups = int(meta.get("dataset_groups", 0) or 0)
+        # An explicitly exported runtime mode must override the recipe's
+        # historical default.  This lets a new sampler reuse an already audited
+        # immutable crop recipe without rewriting its digest-bound marker.
+        runtime_sampling_mode = os.environ.get("UI5_UI_SAMPLING_MODE")
+        self.ui_sampling_mode = str(
+            runtime_sampling_mode
+            or (
+                ui_sampling_mode
+                if ui_sampling_mode != "fixed_ratio"
+                else meta.get("ui_sampling_mode", ui_sampling_mode)
+            )
+        )
+        if self.ui_sampling_mode not in {
+            "fixed_ratio",
+            "task_balanced_all_records",
+            "task_source_balanced_rotating",
+        }:
+            raise ValueError(
+                f"[{self.ds_name}] unsupported ui_sampling_mode={self.ui_sampling_mode!r}"
+            )
 
         ann_paths = meta["annotation"]
         if not isinstance(ann_paths, (list, tuple)):
@@ -362,50 +407,322 @@ class LazySupervisedDatasetMTP(Dataset):
         logger.info(f"[Dataset] {self.ds_name} Indexing done in {time.time() - start_time:.2f}s.")
         
         original_num_rows = len(self.lazy_loader)
+        self._raw_recipe_rows = original_num_rows
+        self._raw_manual_repair_indices = {
+            index
+            for index in range(original_num_rows)
+            if self.lazy_loader[index].get("_ui5_crop_source") == "manual_gt_repair"
+        }
         logger.info(
             f"[Dataset] {self.ds_name} Found {original_num_rows} samples. "
             f"visual_prompt={self.visual_prompt}"
         )
         self.active_indices = list(range(original_num_rows))
         self._balanced_logical_buckets = None
+        self._all_records_task_buckets = None
+        self._source_balanced_plan = None
 
-        if self.balance_ui_defects:
+        exclusion_path = str(meta.get("excluded_samples", ""))
+        excluded_pairs = set()
+        excluded_ids = []
+        if exclusion_path:
+            exclusion_file = Path(exclusion_path).expanduser().resolve()
+            if not exclusion_file.is_file():
+                raise FileNotFoundError(
+                    f"[{self.ds_name}] excluded sample manifest is missing: {exclusion_file}"
+                )
+            with exclusion_file.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    exclusion = json.loads(line)
+                    sample_id = str(exclusion["sample_id"])
+                    task = str(exclusion["task"])
+                    excluded_pairs.add((sample_id, task))
+                    excluded_ids.append(sample_id)
+            before_exclusion = len(self.active_indices)
+            self.active_indices = [
+                index
+                for index in self.active_indices
+                if (
+                    str(self.lazy_loader[index].get("_ui5_sample_id", "")),
+                    str(self.lazy_loader[index].get("_ui5_task", "")),
+                )
+                not in excluded_pairs
+            ]
+            logger.info(
+                "[Dataset] %s exclusion manifest=%s before=%s after=%s "
+                "excluded_sample_ids=%s",
+                self.ds_name,
+                exclusion_file,
+                before_exclusion,
+                len(self.active_indices),
+                sorted(set(excluded_ids)),
+            )
+        self._excluded_record_count = original_num_rows - len(self.active_indices)
+        missing_manual_after_exclusion = self._raw_manual_repair_indices - set(
+            self.active_indices
+        )
+        if missing_manual_after_exclusion:
+            raise RuntimeError(
+                f"[{self.ds_name}] exclusion filtering removed manual_gt_repair records: "
+                f"{sorted(missing_manual_after_exclusion)[:20]}"
+            )
+        self._legal_crop_record_count = sum(
+            self.lazy_loader[index].get("_ui5_record_kind") == "crop"
+            for index in self.active_indices
+        )
+
+        crop_mode_enabled = _env_flag("UI5_USE_DETECTION_CROPS", False)
+        if crop_mode_enabled and not self.ui5_crop_recipe:
+            raise RuntimeError(
+                f"[{self.ds_name}] UI5_USE_DETECTION_CROPS=1 but selected dataset "
+                "is not an audited crop recipe"
+            )
+        if self.ui5_crop_recipe:
+            source_counts = defaultdict(int)
+            record_kind_counts = defaultdict(int)
+            examples = defaultdict(list)
+            for index in self.active_indices:
+                record = self.lazy_loader[index]
+                kind = str(record.get("_ui5_record_kind", "unknown"))
+                source = str(record.get("_ui5_crop_source") or "full_image")
+                record_kind_counts[kind] += 1
+                source_counts[source] += 1
+                if kind == "crop" and len(examples[source]) < 3:
+                    examples[source].append(str(record.get("image", "")))
+            crop_count = int(record_kind_counts.get("crop", 0))
+            if crop_count <= 0:
+                raise RuntimeError(
+                    f"[{self.ds_name}] audited crop recipe contains zero crop records"
+                )
+            logger.info(
+                "[Dataset] %s AUDITED CROP RECIPE loaded: record_kinds=%s "
+                "crop_sources=%s examples=%s",
+                self.ds_name,
+                dict(record_kind_counts),
+                dict(source_counts),
+                dict(examples),
+            )
+
+        if self.ui_sampling_mode == "task_source_balanced_rotating":
+            candidate_indices = list(self.active_indices)
+            index_records = [self.lazy_loader[index] for index in candidate_indices]
+            plan = build_task_source_balanced_rotating_plan(
+                index_records,
+                negative_to_positive_ratio=ui_negative_to_positive_ratio,
+            )
+            first_epoch = materialize_task_source_balanced_rotating_indices(
+                plan, seed=202603, epoch_index=0
+            )
+            required_manual = {
+                index
+                for index, record in enumerate(index_records)
+                if record.get("_ui5_crop_source") == "manual_gt_repair"
+            }
+            planned_indices = {
+                index
+                for polarities in plan["buckets"].values()
+                for source_groups in polarities.values()
+                for values in source_groups.values()
+                for index in values
+            }
+            missing_manual = required_manual - planned_indices
+            if missing_manual:
+                raise RuntimeError(
+                    f"[{self.ds_name}] source-balanced sampler dropped manual repairs: "
+                    f"{sorted(missing_manual)[:20]}"
+                )
+            if planned_indices != set(range(len(index_records))):
+                missing = sorted(set(range(len(index_records))) - planned_indices)
+                raise RuntimeError(
+                    f"[{self.ds_name}] source-balanced active plan dropped legal records: "
+                    f"count={len(missing)}, first={missing[:20]}"
+                )
+            if len(first_epoch) != int(plan["epoch_length"]):
+                raise RuntimeError(
+                    f"[{self.ds_name}] source-balanced first epoch is incomplete"
+                )
+            self._source_balanced_plan = plan
+            self._active_pool_length = len(self.active_indices)
+            self._length = int(plan["epoch_length"])
+            logger.info(
+                "[Dataset] %s task_source_balanced_rotating: raw_recipe=%s "
+                "active_pool=%s effective_epoch=%s positive_slots_per_task=%s "
+                "negative_slots_per_task=%s effective_negative:positive=%.6f "
+                "source_groups=%s records=%s never_active=%s "
+                "manual_repair_retention=%s/%s",
+                self.ds_name,
+                original_num_rows,
+                self._active_pool_length,
+                self._length,
+                plan["positive_slots_per_task"],
+                plan["negative_slots_per_task"],
+                plan["negative_to_positive_ratio"],
+                plan["source_groups_by_task"],
+                plan["records_by_task"],
+                max(
+                    0,
+                    original_num_rows
+                    - self._excluded_record_count
+                    - self._active_pool_length,
+                ),
+                len(required_manual),
+                len(required_manual),
+            )
+        elif self.ui_sampling_mode == "task_balanced_all_records":
+            candidate_indices = list(self.active_indices)
+            index_records = [self.lazy_loader[index] for index in candidate_indices]
+            # Validation and the first deterministic epoch are intentionally
+            # performed before training starts so an incomplete recipe fails closed.
+            first_epoch = build_task_balanced_all_records_indices(index_records)
+            buckets = {defect_type: [] for defect_type in range(5)}
+            for logical_index, record in enumerate(index_records):
+                task = identify_ui_defect_task(record)
+                if task is None:
+                    raise RuntimeError(
+                        f"[{self.ds_name}] task_balanced_all_records found a non-UI record"
+                    )
+                buckets[task[1]].append(logical_index)
+            required_manual = {
+                index
+                for index, record in enumerate(index_records)
+                if record.get("_ui5_crop_source") == "manual_gt_repair"
+            }
+            missing_manual = required_manual - set(first_epoch)
+            if missing_manual:
+                raise RuntimeError(
+                    f"[{self.ds_name}] all-record sampler dropped manual repairs: "
+                    f"{sorted(missing_manual)[:20]}"
+                )
+            self._all_records_task_buckets = buckets
+            self._active_pool_length = len(self.active_indices)
+            self._length = max(len(values) for values in buckets.values()) * len(buckets)
+            logger.info(
+                "[Dataset] %s task_balanced_all_records: raw_recipe=%s "
+                "active_pool=%s effective_epoch=%s task_records=%s "
+                "never_active=%s manual_repair_retention=%s/%s",
+                self.ds_name,
+                original_num_rows,
+                self._active_pool_length,
+                self._length,
+                {defect_type: len(values) for defect_type, values in buckets.items()},
+                max(
+                    0,
+                    original_num_rows
+                    - self._excluded_record_count
+                    - self._active_pool_length,
+                ),
+                len(required_manual),
+                len(required_manual),
+            )
+        elif self.balance_ui_defects:
             logger.info(
                 f"[Dataset] {self.ds_name} building balanced UI index: "
                 f"records_per_class={ui_records_per_class}, "
                 f"negative:positive={ui_negative_to_positive_ratio}:1"
             )
-            index_records = [self.lazy_loader[index] for index in range(original_num_rows)]
-            self.active_indices = build_balanced_ui_indices(
+            candidate_indices = list(self.active_indices)
+            index_records = [self.lazy_loader[index] for index in candidate_indices]
+            selected_local_indices = build_balanced_ui_indices(
                 index_records,
                 records_per_class=ui_records_per_class,
                 negative_to_positive_ratio=ui_negative_to_positive_ratio,
             )
+            required_manual_local_indices = {
+                index
+                for index, record in enumerate(index_records)
+                if record.get("_ui5_crop_source") == "manual_gt_repair"
+            }
+            required_manual_gt_keys = set()
+            for index in required_manual_local_indices:
+                record = index_records[index]
+                repair_gt_indices = record.get("_ui5_manual_repair_gt_indices")
+                if not isinstance(repair_gt_indices, list) or not repair_gt_indices:
+                    raise RuntimeError(
+                        f"[Dataset] {self.ds_name} manual_gt_repair record lacks "
+                        f"repair GT mapping: sample_id={record.get('_ui5_sample_id')}"
+                    )
+                required_manual_gt_keys.update(
+                    (str(record.get("_ui5_sample_id")), int(gt_index))
+                    for gt_index in repair_gt_indices
+                )
+            missing_manual_local_indices = required_manual_local_indices - set(
+                selected_local_indices
+            )
+            if missing_manual_local_indices:
+                missing_records = [
+                    {
+                        "sample_id": index_records[index].get("_ui5_sample_id"),
+                        "task": index_records[index].get("_ui5_task"),
+                        "repair_gt_indices": index_records[index].get(
+                            "_ui5_manual_repair_gt_indices", []
+                        ),
+                    }
+                    for index in sorted(missing_manual_local_indices)[:20]
+                ]
+                raise RuntimeError(
+                    f"[Dataset] {self.ds_name} balanced UI index dropped required "
+                    f"manual_gt_repair records: {missing_records}"
+                )
+            selected_manual_gt_keys = {
+                (str(index_records[index].get("_ui5_sample_id")), int(gt_index))
+                for index in selected_local_indices
+                if index_records[index].get("_ui5_crop_source") == "manual_gt_repair"
+                for gt_index in index_records[index]["_ui5_manual_repair_gt_indices"]
+            }
+            missing_manual_gt_keys = required_manual_gt_keys - selected_manual_gt_keys
+            if missing_manual_gt_keys:
+                raise RuntimeError(
+                    f"[Dataset] {self.ds_name} balanced UI index dropped required repair GT "
+                    f"mappings: {sorted(missing_manual_gt_keys)[:20]}"
+                )
+            self.active_indices = [
+                candidate_indices[index] for index in selected_local_indices
+            ]
             logger.info(
                 f"[Dataset] {self.ds_name} balanced to {len(self.active_indices)} records "
                 f"({len(self.active_indices) // 5} per class)."
+            )
+            logger.info(
+                "[Dataset] %s manual_gt_repair retention after balancing: "
+                "records=%s/%s repair_gt_keys=%s/%s",
+                self.ds_name,
+                len(required_manual_local_indices),
+                len(required_manual_local_indices),
+                len(selected_manual_gt_keys),
+                len(required_manual_gt_keys),
             )
             self._balanced_logical_buckets = {
                 defect_type: {"positive": [], "negative": []}
                 for defect_type in range(5)
             }
             for logical_index, raw_index in enumerate(self.active_indices):
-                record = index_records[raw_index]
+                # ``raw_index`` addresses LazyJsonlLoader, not the compact
+                # ``index_records`` list (which may already be exclusion-filtered).
+                record = self.lazy_loader[raw_index]
                 defect_type = identify_ui_defect_task(record)[1]
                 label = "positive" if is_positive_ui_defect(record) else "negative"
                 self._balanced_logical_buckets[defect_type][label].append(logical_index)
         elif repeat_time < 1:
-            if original_num_rows > 0:
-                partial_len = int(original_num_rows * repeat_time)
+            if self.active_indices:
+                partial_len = int(len(self.active_indices) * repeat_time)
                 if partial_len > 0:
                     rnd = random.Random(10086)
-                    sampled_indices = set(rnd.sample(range(original_num_rows), partial_len))
-                    self.active_indices = [i for i in range(original_num_rows) if i in sampled_indices]
+                    sampled_indices = set(rnd.sample(self.active_indices, partial_len))
+                    self.active_indices = [
+                        index for index in self.active_indices if index in sampled_indices
+                    ]
                     logger.info(f"[Dataset] {self.ds_name} Downsampled to {len(self.active_indices)} samples.")
                 else:
                     self.active_indices = []
         
-        self._length = len(self.active_indices)
+        if self.ui_sampling_mode not in {
+            "task_balanced_all_records",
+            "task_source_balanced_rotating",
+        }:
+            self._active_pool_length = len(self.active_indices)
+            self._length = self._active_pool_length
 
     def __len__(self):
         return self._length
@@ -427,8 +744,40 @@ class LazySupervisedDatasetMTP(Dataset):
                 negative_index += 1
         return output
 
-    def get_epoch_indices(self, shuffle_seed: int) -> List[int]:
+    def get_epoch_indices(self, shuffle_seed: int, epoch_index: int = 0) -> List[int]:
         rng = random.Random(shuffle_seed)
+        if self._source_balanced_plan is not None:
+            base_seed = int(shuffle_seed) - int(epoch_index) * 999983
+            return materialize_task_source_balanced_rotating_indices(
+                self._source_balanced_plan,
+                seed=base_seed,
+                epoch_index=epoch_index,
+            )
+        if self._all_records_task_buckets is not None:
+            streams = {}
+            for defect_type, values in self._all_records_task_buckets.items():
+                stream = list(values)
+                rng.shuffle(stream)
+                streams[defect_type] = stream
+            task_order = sorted(streams)
+            rng.shuffle(task_order)
+            longest = max(len(stream) for stream in streams.values())
+            indices = []
+            for position in range(longest):
+                rotated = (
+                    task_order[position % len(task_order):]
+                    + task_order[:position % len(task_order)]
+                )
+                indices.extend(
+                    streams[defect_type][position % len(streams[defect_type])]
+                    for defect_type in rotated
+                )
+            if len(indices) != self._length:
+                raise RuntimeError(
+                    f"[{self.ds_name}] all-record epoch length mismatch: "
+                    f"{len(indices)} != {self._length}"
+                )
+            return indices
         if self._balanced_logical_buckets is None:
             indices = list(range(self._length))
             rng.shuffle(indices)
@@ -452,6 +801,146 @@ class LazySupervisedDatasetMTP(Dataset):
             rotated = class_order[position % len(class_order):] + class_order[:position % len(class_order)]
             indices.extend(class_streams[defect_type][position] for defect_type in rotated)
         return indices
+
+    def seen_raw_indices(self, seed: int, global_idx: int) -> set:
+        """Reconstruct records consumed by one deterministic iterator."""
+        seen = set()
+        remaining = max(0, int(global_idx))
+        epoch = 0
+        while remaining:
+            indices = self.get_epoch_indices(
+                seed + epoch * 999983, epoch_index=epoch
+            )
+            take = min(remaining, len(indices))
+            seen.update(self.active_indices[index] for index in indices[:take])
+            remaining -= take
+            epoch += 1
+        return seen
+
+    def sampling_inventory(self, seen_raw_indices: Optional[set] = None) -> dict:
+        active_raw = set(self.active_indices)
+        seen_raw = set() if seen_raw_indices is None else set(seen_raw_indices)
+        seen_raw &= active_raw
+        record_kinds = defaultdict(int)
+        crop_sources = defaultdict(int)
+        task_counts = defaultdict(lambda: {"positive": 0, "negative": 0})
+        source_crop_counts = defaultdict(int)
+        active_source_ids = set()
+        seen_source_ids = set()
+        active_crop_raw = set()
+        seen_crop_raw = set()
+        manual_active = set()
+        manual_seen = set()
+        for raw_index in active_raw:
+            record = self.lazy_loader[raw_index]
+            kind = str(record.get("_ui5_record_kind", "unknown"))
+            source = str(record.get("_ui5_crop_source") or "full_image")
+            task = identify_ui_defect_task(record)
+            task_name = task[0] if task else "unknown"
+            polarity = "positive" if is_positive_ui_defect(record) else "negative"
+            source_id = str(
+                record.get("_ui5_image_id")
+                or record.get("_ui5_source_image")
+                or record.get("image", "")
+            )
+            record_kinds[kind] += 1
+            crop_sources[source] += 1
+            task_counts[task_name][polarity] += 1
+            active_source_ids.add(source_id)
+            if kind == "crop":
+                active_crop_raw.add(raw_index)
+                source_crop_counts[source_id] += 1
+            if source == "manual_gt_repair":
+                manual_active.add(raw_index)
+            if raw_index in seen_raw:
+                seen_source_ids.add(source_id)
+                if kind == "crop":
+                    seen_crop_raw.add(raw_index)
+                if source == "manual_gt_repair":
+                    manual_seen.add(raw_index)
+        crop_count_values = sorted(source_crop_counts.values())
+        task_inventory = {
+            task: {
+                **dict(values),
+                "negative_to_positive_ratio": (
+                    float(values["negative"]) / float(values["positive"])
+                    if values["positive"]
+                    else None
+                ),
+            }
+            for task, values in sorted(task_counts.items())
+        }
+        never_active = max(
+            0,
+            self._raw_recipe_rows
+            - self._excluded_record_count
+            - len(active_raw),
+        )
+        return {
+            "dataset": self.ds_name,
+            "sampling_mode": self.ui_sampling_mode,
+            "raw_recipe_records": self._raw_recipe_rows,
+            "excluded_records": self._excluded_record_count,
+            "active_pool_records": len(active_raw),
+            "effective_epoch_records": self._length,
+            "never_entered_active_pool_legal_records": never_active,
+            "never_active_legal_records": never_active,
+            "record_kinds": dict(sorted(record_kinds.items())),
+            "crop_sources": dict(sorted(crop_sources.items())),
+            "tasks": task_inventory,
+            "unique_source_images": len(active_source_ids),
+            "source_crop_count": {
+                "min": min(crop_count_values, default=0),
+                "max": max(crop_count_values, default=0),
+                "mean": (
+                    sum(crop_count_values) / len(crop_count_values)
+                    if crop_count_values else 0.0
+                ),
+            },
+            "seen_unique_records": len(seen_raw),
+            "seen_record_coverage": len(seen_raw) / max(1, len(active_raw)),
+            "seen_unique_crops": len(seen_crop_raw),
+            "seen_crop_coverage": len(seen_crop_raw) / max(1, len(active_crop_raw)),
+            "active_crop_retention": (
+                len(active_crop_raw) / self._legal_crop_record_count
+                if self._legal_crop_record_count
+                else 1.0
+            ),
+            "seen_unique_source_images": len(seen_source_ids),
+            "seen_source_image_coverage": len(seen_source_ids) / max(1, len(active_source_ids)),
+            "manual_repair_active": len(manual_active),
+            "manual_repair_seen": len(manual_seen),
+            "manual_repair_required": len(self._raw_manual_repair_indices),
+            "manual_repair_retention": (
+                len(manual_active) / len(self._raw_manual_repair_indices)
+                if self._raw_manual_repair_indices
+                else 1.0
+            ),
+            "source_balanced_rotation": (
+                {
+                    "positive_slots_per_task": self._source_balanced_plan[
+                        "positive_slots_per_task"
+                    ],
+                    "negative_slots_per_task": self._source_balanced_plan[
+                        "negative_slots_per_task"
+                    ],
+                    "effective_negative_to_positive_ratio": self._source_balanced_plan[
+                        "negative_to_positive_ratio"
+                    ],
+                    "source_groups_by_task": self._source_balanced_plan[
+                        "source_groups_by_task"
+                    ],
+                    "records_by_task": self._source_balanced_plan[
+                        "records_by_task"
+                    ],
+                    "source_group_repeat_draws_per_epoch_by_task": self._source_balanced_plan[
+                        "source_group_repeat_draws_per_epoch_by_task"
+                    ],
+                }
+                if self._source_balanced_plan is not None
+                else None
+            ),
+        }
 
     def get_targets_flag_with_mtp(self, input_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Create MTP (Multi-Token Prediction) blocks with proper labels."""
@@ -855,7 +1344,9 @@ class LazySupervisedDatasetMTP(Dataset):
                 ) from exc
         
         while retry_count <= 10:
-            real_idx = self.active_indices[(current_idx + retry_count) % self._length]
+            real_idx = self.active_indices[
+                (current_idx + retry_count) % self._active_pool_length
+            ]
             try:
                 return self._get_item_once(real_idx)
             except Exception as e:
@@ -875,7 +1366,7 @@ class LazySupervisedDatasetMTP(Dataset):
         pos = global_idx % ds_len
         
         shuffle_seed = seed + epoch * 999983
-        indices = self.get_epoch_indices(shuffle_seed)
+        indices = self.get_epoch_indices(shuffle_seed, epoch_index=epoch)
         
         real_idx = indices[pos]
         return self[real_idx]
@@ -913,7 +1404,7 @@ class DeterministicIterator:
             return self._cached_indices
         
         shuffle_seed = self.seed + epoch * 999983
-        indices = self.dataset.get_epoch_indices(shuffle_seed)
+        indices = self.dataset.get_epoch_indices(shuffle_seed, epoch_index=epoch)
         
         self._cached_epoch = epoch
         self._cached_indices = indices
@@ -1756,6 +2247,100 @@ def reconcile_cpt_checkpoint_completion(
         raise RuntimeError(error)
 
 
+class SamplingCoverageCallback(TrainerCallback):
+    """Persist auditable all-record sampling coverage every 1,000 steps."""
+
+    def __init__(self, train_dataset: StreamPackedDatasetMTP, interval: int = 1000):
+        self.train_dataset = train_dataset
+        self.interval = int(interval)
+        self._written_steps = set()
+
+    def _local_seen(self) -> list:
+        seen = [set() for _ in self.train_dataset.datasets]
+        samples_drawn = [0 for _ in self.train_dataset.datasets]
+        for worker in self.train_dataset._worker_states.values():
+            for ds_index, iterator_state in enumerate(worker.get("iterator_states", [])):
+                if ds_index >= len(seen):
+                    continue
+                global_idx = int(iterator_state.get("global_idx", 0))
+                seed = int(iterator_state.get("seed", 0))
+                samples_drawn[ds_index] += global_idx
+                seen[ds_index].update(
+                    self.train_dataset.datasets[ds_index].seen_raw_indices(seed, global_idx)
+                )
+        return [
+            {"seen": sorted(values), "samples_drawn": samples_drawn[index]}
+            for index, values in enumerate(seen)
+        ]
+
+    @staticmethod
+    def _is_monotonic(previous: dict, current: dict) -> bool:
+        return is_monotonic_coverage(previous, current)
+
+    def _write(self, args, state, *, resume_start: bool = False) -> None:
+        step = int(state.global_step)
+        write_key = (step, "resume_start" if resume_start else "periodic")
+        if write_key in self._written_steps:
+            return
+        local = self._local_seen()
+        gathered = None
+        if dist.is_available() and dist.is_initialized():
+            if get_rank() == 0:
+                gathered = [None] * dist.get_world_size()
+            dist.gather_object(local, gathered, dst=0)
+        else:
+            gathered = [local]
+        if get_rank() != 0:
+            self._written_steps.add(write_key)
+            return
+        datasets = []
+        for ds_index, dataset in enumerate(self.train_dataset.datasets):
+            union_seen = set()
+            samples_drawn = 0
+            for rank_payload in gathered:
+                item = rank_payload[ds_index]
+                union_seen.update(item["seen"])
+                samples_drawn += int(item["samples_drawn"])
+            inventory = dataset.sampling_inventory(union_seen)
+            inventory["samples_drawn_with_repetition"] = samples_drawn
+            inventory["repeated_draws"] = max(
+                0, samples_drawn - inventory["seen_unique_records"]
+            )
+            datasets.append(inventory)
+        payload = {
+            "schema_version": 1,
+            "global_step": step,
+            "event": "resume_start" if resume_start else "periodic_coverage",
+            "world_size": dist.get_world_size() if dist.is_initialized() else 1,
+            "datasets": datasets,
+        }
+        output_dir = Path(args.output_dir) / "diagnostics"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        destination = output_dir / (
+            f"sampling_coverage_resume_start_step_{step}.json"
+            if resume_start
+            else f"sampling_coverage_step_{step}.json"
+        )
+        if not write_sampling_coverage_atomic(destination, payload):
+            logger.warning(
+                "[UI5 sampling] refusing non-monotonic overwrite: %s",
+                destination,
+            )
+            self._written_steps.add(write_key)
+            return
+        logger.info("[UI5 sampling] wrote %s: %s", destination, datasets)
+        self._written_steps.add(write_key)
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self._write(args, state, resume_start=int(state.global_step) > 0)
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step and state.global_step % self.interval == 0:
+            self._write(args, state)
+        return control
+
+
 class CheckpointCompletionCallback(TrainerCallback):
     """Validate every rank's resume state before declaring a save complete."""
 
@@ -1982,6 +2567,8 @@ class StreamPackingMTPTrainer(Trainer):
                 "ui5_training_evaluation.xlsx",
             )
         )
+        self._ui5_global_epoch_offset = self._ui5_excel.latest_train_global_epoch()
+        self._ui5_segment_start_epoch = None
         self._ui5_last_flushed_step = 0
         self._reset_ui5_window()
         self._ui5_window_path = osp.join(
@@ -2588,13 +3175,9 @@ class StreamPackingMTPTrainer(Trainer):
             temporary_target = None
             try:
                 if stage == "training_args.bin" and destination_is_path:
-                    temporary_target = f"{target_text}.tmp-{os.getpid()}"
-                    result = original_torch_save(
-                        obj, temporary_target, *args, **kwargs
+                    result = atomic_save_with_fsync(
+                        original_torch_save, obj, target_text, *args, **kwargs
                     )
-                    with open(temporary_target, "rb+") as handle:
-                        os.fsync(handle.fileno())
-                    os.replace(temporary_target, target_text)
                 else:
                     result = original_torch_save(obj, destination, *args, **kwargs)
             except BaseException as exc:
@@ -3502,6 +4085,8 @@ class StreamPackingMTPTrainer(Trainer):
         # 记录开始的step（用于resume时正确计算平均值）
         if self._start_step is None:
             self._start_step = self.state.global_step
+        if self._ui5_segment_start_epoch is None:
+            self._ui5_segment_start_epoch = float(self.state.epoch or 0.0)
         
         # Count samples in current batch (通过 sub_sample_lengths 获取样本数)
         if 'sub_sample_lengths' in inputs:
@@ -3682,14 +4267,33 @@ class StreamPackingMTPTrainer(Trainer):
             else None
         )
         actual_learning_rates = optimizer_learning_rates(self.optimizer)
+        current_epoch = float(self.state.epoch or 0.0)
+        segment_start_epoch = float(self._ui5_segment_start_epoch or 0.0)
+        segment_epoch = max(0.0, current_epoch - segment_start_epoch)
+        global_epoch = self._ui5_global_epoch_offset + segment_epoch
         metrics = {
             "step": step,
             "git_commit": os.environ.get("GIT_COMMIT", ""),
+            "code_digest": os.environ.get("GIT_COMMIT", ""),
             "run_name": os.environ.get("RUN_NAME", self.args.run_name or ""),
             "config_hash": os.environ.get("UI5_CONFIG_HASH", ""),
+            "crop_train_mode": os.environ.get("UI5_CROP_TRAIN_MODE", ""),
+            "ui_sampling_mode": os.environ.get("UI5_UI_SAMPLING_MODE", ""),
+            "eval_inference_crop_mode": os.environ.get(
+                "EVAL_INFERENCE_CROP_MODE", ""
+            ),
+            "scan_name": os.environ.get("EVAL_SCAN_NAME", ""),
+            "recipe_digest": os.environ.get("UI5_CROP_RECIPE_DIGEST", "")
+            or _sha256_if_file(
+                os.environ.get("UI5_CROP_META_PATH")
+                or os.environ.get("META_PATH")
+            ),
+            "cache_digest": os.environ.get("UI5_EVAL_CACHE_DIGEST", ""),
             "task_id": "mixed",
             "tc_msed_stage": str(getattr(config, "tc_msed_stage", "v4")),
             "epoch": self.state.epoch,
+            "segment_epoch": segment_epoch,
+            "global_epoch": global_epoch,
             "gpu_num": self.args.world_size,
             "max_num_tokens": self._max_num_tokens,
             "learning_rate": logs.get("learning_rate"),
@@ -4197,6 +4801,7 @@ def build_stream_packed_dataset_mtp(
                 balance_ui_defects=data_args.balance_ui_defects,
                 ui_records_per_class=data_args.ui_records_per_class,
                 ui_negative_to_positive_ratio=data_args.ui_negative_to_positive_ratio,
+                ui_sampling_mode=data_args.ui_sampling_mode,
             )
             
             if len(ds) == 0:
@@ -4712,6 +5317,7 @@ def main():
         )
     my_callbacks.append(MemoryLoggerCallback())
     my_callbacks.append(DataloaderStateCallback(train_dataset))
+    my_callbacks.append(SamplingCoverageCallback(train_dataset, interval=1000))
     my_callbacks.append(CheckpointCompletionCallback())
     stop_after_step = int(os.environ.get("LOCANY_STOP_AFTER_STEP", "0"))
     if stop_after_step:
