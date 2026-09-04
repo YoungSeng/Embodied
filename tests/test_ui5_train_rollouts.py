@@ -90,21 +90,21 @@ class UI5TrainRolloutTest(unittest.TestCase):
                 "--bundle-root",
                 "bundle",
                 "--rollout-ids",
-                "0,1",
+                "0",
                 "--seeds",
-                "20260903,20260917",
+                "20260903",
                 "--physical-gpu",
                 "0",
                 "--gpu-model-processes",
-                "2",
+                "4",
             ]
         )
         with mock.patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0"}):
             validate_run_args(worker_args)
-            worker_args.gpu_model_processes = 1
-            with self.assertRaisesRegex(ValueError, "two model processes per GPU"):
-                validate_run_args(worker_args)
             worker_args.gpu_model_processes = 2
+            with self.assertRaisesRegex(ValueError, "four model processes per GPU"):
+                validate_run_args(worker_args)
+            worker_args.gpu_model_processes = 4
             worker_args.max_new_tokens = 7268
             with self.assertRaisesRegex(ValueError, "token configuration mismatch"):
                 validate_run_args(worker_args)
@@ -112,26 +112,19 @@ class UI5TrainRolloutTest(unittest.TestCase):
         launcher = (
             PROJECT_ROOT / "shell" / "run_ui5_train_rollouts_h20x2.sh"
         ).read_text(encoding="utf-8")
-        self.assertEqual(launcher.count("launch_worker m31"), 2)
-        self.assertEqual(launcher.count("launch_worker crop"), 2)
+        self.assertEqual(launcher.count("launch_worker m31"), 1)
+        self.assertEqual(launcher.count("launch_worker crop"), 1)
+        self.assertEqual(launcher.count("for rollout_id in 0 1 2 3; do"), 2)
         self.assertIn(
-            'launch_worker m31 0 "0,1" "${SEEDS[0]},${SEEDS[1]}"',
+            'launch_worker m31 0 "${rollout_id}" "${SEEDS[rollout_id]}"',
             launcher,
         )
         self.assertIn(
-            'launch_worker m31 0 "2,3" "${SEEDS[2]},${SEEDS[3]}"',
-            launcher,
-        )
-        self.assertIn(
-            'launch_worker crop 1 "0,1" "${SEEDS[0]},${SEEDS[1]}"',
-            launcher,
-        )
-        self.assertIn(
-            'launch_worker crop 1 "2,3" "${SEEDS[2]},${SEEDS[3]}"',
+            'launch_worker crop 1 "${rollout_id}" "${SEEDS[rollout_id]}"',
             launcher,
         )
         self.assertEqual(tuple(FORMAL_SEEDS.values()), (20260903, 20260917, 20260931, 20260947))
-        self.assertIn("--gpu-model-processes 2", launcher)
+        self.assertIn("--gpu-model-processes 4", launcher)
         self.assertIn('HF_MODULES_CACHE="${hf_modules_cache}"', launcher)
         self.assertIn('PYTHONPYCACHEPREFIX="${python_pycache}"', launcher)
         self.assertIn("PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", launcher)
@@ -151,6 +144,10 @@ class UI5TrainRolloutTest(unittest.TestCase):
             "--n-future-tokens 6",
             "--attn-implementation sdpa",
             "--vision-attn-implementation flash_attention_2",
+            "--temperature 0.7",
+            "--top-p 0.9",
+            "--top-k 0",
+            "--repetition-penalty 1.1",
         ):
             self.assertIn(argument, launcher)
         for backend_status in (
@@ -160,6 +157,11 @@ class UI5TrainRolloutTest(unittest.TestCase):
             "vision_blocks=27/27",
         ):
             self.assertIn(backend_status, launcher)
+        self.assertIn("physical_processes=8", launcher)
+        self.assertIn("unique=8", launcher)
+        self.assertIn("Embodied-rollout8-h20x2-v6", launcher)
+        self.assertIn("ui5-train-rollout8-h20x2-v6-20260904", launcher)
+        self.assertNotIn("ui5-train-rollout8-h20x2-v5-20260904", launcher)
 
     def test_formal_model_load_gate_rejects_ok_log_for_dead_pid(self) -> None:
         launcher = (
@@ -172,79 +174,94 @@ class UI5TrainRolloutTest(unittest.TestCase):
         dead_pid = 99_999_999
         with self.assertRaises(OSError):
             os.kill(dead_pid, 0)
-        alive_pid = os.getpid()
-        workers = (
-            (alive_pid, "m31", "0,1"),
-            (alive_pid, "m31", "2,3"),
-            (alive_pid, "crop", "0,1"),
-            (dead_pid, "crop", "2,3"),
+        ownership = tuple(
+            (model, rollout_id)
+            for model in ("m31", "crop")
+            for rollout_id in range(4)
         )
         required_attention = (
             "text_config=sdpa vision_config=flash_attention_2 "
             "vision_first_layer=flash_attention_2 vision_blocks=27/27"
         )
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "diagnostics").mkdir()
-            arguments: list[str] = [str(root)]
-            for index, (pid, model, rollout_ids) in enumerate(workers):
-                log_path = root / f"worker-{index}.log"
-                log_path.write_text(
-                    f"[MODEL_LOAD_OK] model={model} pid={pid} "
-                    f"rollouts={rollout_ids} {required_attention}\n",
-                    encoding="utf-8",
+        def exercise_gate(pids: list[int]) -> tuple[subprocess.CompletedProcess[str], dict, bool]:
+            self.assertEqual(len(pids), 8)
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "diagnostics").mkdir()
+                arguments: list[str] = [str(root)]
+                for index, ((model, rollout_id), pid) in enumerate(
+                    zip(ownership, pids)
+                ):
+                    gpu = 0 if model == "m31" else 1
+                    log_path = root / f"worker-{index}.log"
+                    log_path.write_text(
+                        f"[MODEL_LOAD_OK] model={model} gpu={gpu} pid={pid} "
+                        f"rollouts={rollout_id} {required_attention}\n",
+                        encoding="utf-8",
+                    )
+                    arguments.extend(
+                        (str(pid), model, str(rollout_id), str(log_path))
+                    )
+                result = subprocess.run(
+                    [sys.executable, "-", *arguments],
+                    input=gate,
+                    text=True,
+                    capture_output=True,
+                    check=False,
                 )
-                arguments.extend((str(pid), model, rollout_ids, str(log_path)))
-            result = subprocess.run(
-                [sys.executable, "-", *arguments],
-                input=gate,
-                text=True,
-                capture_output=True,
-                check=False,
+                status_name = (
+                    "formal_run_valid.json"
+                    if result.returncode == 0
+                    else "formal_run_invalid.json"
+                )
+                payload = json.loads(
+                    (root / "diagnostics" / status_name).read_text(encoding="utf-8")
+                )
+                marker_exists = (
+                    root / "diagnostics" / "_MODEL_LOADS_OK"
+                ).is_file()
+                return result, payload, marker_exists
+
+        children = [
+            subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            for _ in range(7)
+        ]
+        try:
+            live_pids = [os.getpid(), *(process.pid for process in children)]
+            result, invalid, marker_exists = exercise_gate(
+                [*live_pids[:7], dead_pid]
             )
             self.assertNotEqual(result.returncode, 0)
-            invalid = json.loads(
-                (root / "diagnostics" / "formal_run_invalid.json").read_text(
-                    encoding="utf-8"
-                )
-            )
             self.assertFalse(invalid["valid"])
-            self.assertEqual(len(invalid["workers"]), 4)
-            self.assertTrue(all(row["alive"] for row in invalid["workers"][:3]))
-            self.assertFalse(invalid["workers"][3]["alive"])
-            self.assertFalse(invalid["workers"][3]["validated"])
-            self.assertFalse((root / "diagnostics" / "_MODEL_LOADS_OK").exists())
+            self.assertEqual(len(invalid["workers"]), 8)
+            self.assertTrue(all(row["alive"] for row in invalid["workers"][:7]))
+            self.assertFalse(invalid["workers"][7]["alive"])
+            self.assertFalse(invalid["workers"][7]["validated"])
+            self.assertFalse(marker_exists)
 
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "diagnostics").mkdir()
-            arguments = [str(root)]
-            for index, (_, model, rollout_ids) in enumerate(workers):
-                log_path = root / f"worker-{index}.log"
-                log_path.write_text(
-                    f"[MODEL_LOAD_OK] model={model} pid={alive_pid} "
-                    f"rollouts={rollout_ids} {required_attention}\n",
-                    encoding="utf-8",
-                )
-                arguments.extend(
-                    (str(alive_pid), model, rollout_ids, str(log_path))
-                )
-            result = subprocess.run(
-                [sys.executable, "-", *arguments],
-                input=gate,
-                text=True,
-                capture_output=True,
-                check=False,
+            result, duplicate, marker_exists = exercise_gate(
+                [live_pids[0]] * 8
             )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(duplicate["valid"])
+            self.assertEqual(duplicate["unique_pid_count"], 1)
+            self.assertFalse(marker_exists)
+
+            result, valid, marker_exists = exercise_gate(live_pids)
             self.assertEqual(result.returncode, 0, result.stderr)
-            valid = json.loads(
-                (root / "diagnostics" / "formal_run_valid.json").read_text(
-                    encoding="utf-8"
-                )
-            )
             self.assertTrue(valid["valid"])
+            self.assertEqual(valid["unique_pid_count"], 8)
             self.assertTrue(all(row["alive"] for row in valid["workers"]))
-            self.assertTrue((root / "diagnostics" / "_MODEL_LOADS_OK").is_file())
+            self.assertTrue(marker_exists)
+        finally:
+            for process in children:
+                process.terminate()
+            for process in children:
+                process.wait(timeout=10)
 
     def test_model_load_barrier_precedes_resume_completion_and_inference(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -262,7 +279,7 @@ class UI5TrainRolloutTest(unittest.TestCase):
                     output_root,
                     model_id="m31",
                     physical_gpu=0,
-                    rollout_ids=(0, 1),
+                    rollout_ids=(0,),
                 )
             sleep_mock.assert_called_once_with(1.0)
             self.assertEqual(report["marker"], str(marker))
@@ -278,7 +295,9 @@ class UI5TrainRolloutTest(unittest.TestCase):
         load_ok = worker_source.index('"[MODEL_LOAD_OK] "')
         barrier = worker_source.index("wait_for_model_load_barrier(", load_ok)
         resume_completion = worker_source.index("already_complete =", barrier)
-        sample_inference = worker_source.index("# Sample-major execution:", barrier)
+        sample_inference = worker_source.index(
+            'load_stage = "sample_major_inference"', barrier
+        )
         self.assertLess(load_ok, barrier)
         self.assertLess(barrier, resume_completion)
         self.assertLess(barrier, sample_inference)
@@ -816,23 +835,33 @@ class UI5TrainRolloutTest(unittest.TestCase):
                     "--expected-workers",
                     "8",
                     "--physical-worker",
-                    "m31,0,111,0|1",
+                    "m31,0,111,0",
                     "--physical-worker",
-                    "m31,0,112,2|3",
+                    "m31,0,112,1",
                     "--physical-worker",
-                    "crop,1,222,0|1",
+                    "m31,0,113,2",
                     "--physical-worker",
-                    "crop,1,223,2|3",
+                    "m31,0,114,3",
+                    "--physical-worker",
+                    "crop,1,221,0",
+                    "--physical-worker",
+                    "crop,1,222,1",
+                    "--physical-worker",
+                    "crop,1,223,2",
+                    "--physical-worker",
+                    "crop,1,224,3",
                 ]
             )
-            with mock.patch.object(worker, "pid_alive", side_effect=lambda pid: pid != 111):
+            with mock.patch.object(worker, "pid_alive", side_effect=lambda pid: pid != 112):
                 self.assertEqual(worker.progress_snapshot(args), 0)
 
             snapshots = snapshot.read_jsonl(output / "progress" / "total_eta.jsonl")
             self.assertEqual(len(snapshots), 1)
             status = snapshots[0]
-            self.assertEqual(status["physical_processes_expected"], 4)
-            self.assertEqual(len(status["physical_processes"]), 4)
+            self.assertEqual(status["physical_processes_expected"], 8)
+            self.assertEqual(status["physical_processes_seen"], 8)
+            self.assertTrue(status["physical_pids_unique"])
+            self.assertEqual(len(status["physical_processes"]), 8)
             self.assertEqual(status["logical_rollouts_expected"], 8)
             self.assertEqual(len(status["logical_rollouts"]), 8)
             self.assertEqual(status["progress_files_discovered"], 3)
@@ -840,18 +869,20 @@ class UI5TrainRolloutTest(unittest.TestCase):
             self.assertEqual(status["workers_seen"], 3)
 
             by_pid = {row["pid"]: row for row in status["physical_processes"]}
-            self.assertEqual(set(by_pid), {111, 112, 222, 223})
-            self.assertEqual(by_pid[111]["status"], "failed")
-            self.assertFalse(by_pid[111]["alive"])
-            self.assertEqual(by_pid[112]["status"], "alive")
-            self.assertTrue(by_pid[112]["alive"])
-            self.assertEqual(by_pid[222]["status"], "alive")
-            self.assertTrue(by_pid[222]["alive"])
             self.assertEqual(
-                by_pid[111]["logical_rollout_statuses"],
-                {"0": "completed", "1": "failed"},
+                set(by_pid), {111, 112, 113, 114, 221, 222, 223, 224}
             )
-            self.assertEqual(by_pid[222]["logical_rollout_statuses"]["0"], "running")
+            self.assertEqual(by_pid[112]["status"], "failed")
+            self.assertFalse(by_pid[112]["alive"])
+            self.assertEqual(by_pid[111]["status"], "alive")
+            self.assertTrue(by_pid[111]["alive"])
+            self.assertEqual(by_pid[221]["status"], "alive")
+            self.assertTrue(by_pid[221]["alive"])
+            self.assertEqual(
+                by_pid[112]["logical_rollout_statuses"],
+                {"1": "failed"},
+            )
+            self.assertEqual(by_pid[221]["logical_rollout_statuses"]["0"], "running")
             self.assertEqual(status["failed_physical_processes"], 1)
             self.assertEqual(status["failed_logical_rollouts"], 1)
             self.assertFalse(status["eta_valid"])
@@ -861,6 +892,65 @@ class UI5TrainRolloutTest(unittest.TestCase):
             )
             self.assertIsNone(status["total_remaining_seconds"])
             self.assertIsNone(status["total_estimated_completion"])
+
+    def test_progress_snapshot_uses_maximum_of_eight_parallel_etas(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            route_states = {
+                ("m31", 0): (2, 2.0),
+                ("m31", 1): (5, 1.0),
+                ("m31", 2): (9, 0.5),
+                ("m31", 3): (10, 2.0),
+                ("crop", 0): (1, 1.0),
+                ("crop", 1): (6, 2.0),
+                ("crop", 2): (4, 3.0),
+                ("crop", 3): (8, 0.5),
+            }
+            for (model, rollout_id), (attempted, rate) in route_states.items():
+                write_jsonl(
+                    output / "progress" / model / f"rollout_{rollout_id}.jsonl",
+                    [
+                        {
+                            "status": "completed" if attempted == 10 else "running",
+                            "attempted": attempted,
+                            "total": 10,
+                            "throughput_attempted_per_second": rate,
+                        }
+                    ],
+                )
+            mappings = [
+                f"m31,0,{111 + rollout_id},{rollout_id}"
+                for rollout_id in range(4)
+            ] + [
+                f"crop,1,{221 + rollout_id},{rollout_id}"
+                for rollout_id in range(4)
+            ]
+            argv = [
+                "--mode",
+                "progress-snapshot",
+                "--output-root",
+                str(output),
+                "--expected-workers",
+                "8",
+            ]
+            for mapping in mappings:
+                argv.extend(("--physical-worker", mapping))
+            args = parse_worker_args(argv)
+            with mock.patch.object(worker, "pid_alive", return_value=True):
+                self.assertEqual(worker.progress_snapshot(args), 0)
+
+            status = snapshot.read_jsonl(output / "progress" / "total_eta.jsonl")[-1]
+            # crop rollout 0 is the straggler: (10 - 1) / 1.0 = 9 seconds.
+            self.assertTrue(status["eta_valid"])
+            self.assertEqual(status["total_remaining_seconds"], 9.0)
+            self.assertIn("maximum remaining time", status["eta_basis"])
+            per_process = [
+                row["remaining_seconds"] for row in status["physical_processes"]
+            ]
+            self.assertEqual(status["total_remaining_seconds"], max(per_process))
+            self.assertNotEqual(
+                status["total_remaining_seconds"], sum(per_process)
+            )
 
     def test_fixed_interleave_and_effective_generation_budget(self) -> None:
         tasks = (
@@ -1497,12 +1587,17 @@ class UI5TrainRolloutTest(unittest.TestCase):
             self.assertIn("SNAPSHOT_INTERVAL_SECONDS=10800", launcher)
             self.assertIn("NEXT_SNAPSHOT_HOUR=$((NEXT_SNAPSHOT_HOUR + 3))", launcher)
             self.assertNotIn("SNAPSHOT_SAMPLE", launcher)
-            self.assertEqual(launcher.count("launch_worker m31"), 2)
-            self.assertEqual(launcher.count("launch_worker crop"), 2)
-            self.assertIn('launch_worker m31 0 "0,1"', launcher)
-            self.assertIn('launch_worker m31 0 "2,3"', launcher)
-            self.assertIn('launch_worker crop 1 "0,1"', launcher)
-            self.assertIn('launch_worker crop 1 "2,3"', launcher)
+            self.assertEqual(launcher.count("launch_worker m31"), 1)
+            self.assertEqual(launcher.count("launch_worker crop"), 1)
+            self.assertEqual(launcher.count("for rollout_id in 0 1 2 3; do"), 2)
+            self.assertIn(
+                'launch_worker m31 0 "${rollout_id}" "${SEEDS[rollout_id]}"',
+                launcher,
+            )
+            self.assertIn(
+                'launch_worker crop 1 "${rollout_id}" "${SEEDS[rollout_id]}"',
+                launcher,
+            )
             self.assertIn("--max-seq-length 7268", launcher)
             self.assertIn("--max-new-tokens 512", launcher)
             analysis = aggregate.run(
@@ -1547,7 +1642,19 @@ class UI5TrainRolloutTest(unittest.TestCase):
             )
             self.assertEqual(
                 run_config["execution_architecture"]["physical_processes_total"],
+                8,
+            )
+            self.assertEqual(
+                run_config["execution_architecture"]["physical_processes_per_gpu"],
                 4,
+            )
+            self.assertEqual(
+                run_config["execution_architecture"]["rollouts_per_physical_process"],
+                1,
+            )
+            self.assertEqual(
+                run_config["execution_architecture"]["global_eta_reduction"],
+                "maximum_estimated_completion_across_8_processes",
             )
             self.assertEqual(
                 run_config["generation"]["vision_attention"],

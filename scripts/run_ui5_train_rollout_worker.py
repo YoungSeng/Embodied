@@ -2,7 +2,7 @@
 """One persistent UI5 train-rollout worker or a CPU progress snapshot.
 
 Run mode loads exactly one checkpoint once, then processes every portable
-``image_id+task`` sample for its two assigned rollouts in sample-major order.
+``image_id+task`` sample for its one assigned rollout in the common fixed order.
 Crop mode performs in-memory base-tile crops and reuses the tiled-eval branch's
 global mapping plus class-aware greedy NMS.
 """
@@ -25,7 +25,7 @@ from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 BASE_COMMITS = {"m31": "5d7a313", "crop": "945ce39"}
 MODEL_IDS = ("m31", "crop")
 TASKS = ("occlusion", "cropping", "text_overflow", "text_ellipsis", "content_missing")
@@ -63,7 +63,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--physical-worker",
         action="append",
         default=[],
-        help="progress mode: model,gpu,pid,rollout_ids (rollout IDs use |)",
+        help="progress mode: model,gpu,pid,single_rollout_id",
     )
     parser.add_argument("--dtype", choices=("bf16",), default="bf16")
     parser.add_argument("--attn-implementation", choices=("sdpa",), default="sdpa")
@@ -1561,20 +1561,18 @@ def validate_run_args(args: argparse.Namespace) -> None:
         raise ValueError("run mode missing arguments: " + ", ".join(missing))
     rollout_ids = parse_int_csv(args.rollout_ids, "rollout-ids")
     seeds = parse_int_csv(args.seeds, "seeds")
-    if len(rollout_ids) != 2 or len(set(rollout_ids)) != 2:
-        raise ValueError("--rollout-ids must contain exactly two distinct rollout IDs")
+    if len(rollout_ids) != 1:
+        raise ValueError("--rollout-ids must contain exactly one rollout ID")
     if any(rollout_id not in range(4) for rollout_id in rollout_ids):
         raise ValueError("--rollout-ids values must be in 0,1,2,3")
     if len(seeds) != len(rollout_ids):
         raise ValueError("--seeds must have one seed per rollout ID")
-    if tuple(rollout_ids) not in {(0, 1), (2, 3)}:
-        raise ValueError("formal workers must own rollout IDs 0,1 or 2,3 in order")
     if any(FORMAL_SEEDS[rollout_id] != seed for rollout_id, seed in zip(rollout_ids, seeds)):
         raise ValueError(
             f"formal rollout seeds must match {FORMAL_SEEDS}; got {dict(zip(rollout_ids, seeds))}"
         )
-    if args.gpu_model_processes != 2:
-        raise ValueError("formal H20x2 execution requires two model processes per GPU")
+    if args.gpu_model_processes != 4:
+        raise ValueError("formal H20x2 execution requires four model processes per GPU")
     expected_physical_gpu = {"m31": 0, "crop": 1}[str(args.model_id)]
     if args.physical_gpu != expected_physical_gpu:
         raise ValueError(
@@ -1586,6 +1584,27 @@ def validate_run_args(args: argparse.Namespace) -> None:
     if args.vision_attn_implementation != "flash_attention_2":
         raise ValueError(
             "formal rollout vision attention must be flash_attention_2"
+        )
+    generation_values = {
+        "dtype": args.dtype,
+        "generation_mode": args.generation_mode,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "repetition_penalty": args.repetition_penalty,
+    }
+    expected_generation = {
+        "dtype": "bf16",
+        "generation_mode": "hybrid",
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": 0,
+        "repetition_penalty": 1.1,
+    }
+    if generation_values != expected_generation:
+        raise ValueError(
+            "formal rollout generation configuration mismatch: "
+            f"actual={generation_values} expected={expected_generation}"
         )
     token_values = {
         "max_seq_length": args.max_seq_length,
@@ -1628,12 +1647,12 @@ def wait_for_model_load_barrier(
     physical_gpu: int,
     rollout_ids: Sequence[int],
 ) -> dict[str, Any]:
-    """Wait until the launcher validates all four live model processes.
+    """Wait until the launcher validates all eight live model processes.
 
     The launcher removes this marker before spawning workers and publishes it
-    atomically only after all four MODEL_LOAD_OK records pass their PID and
+    atomically only after all eight MODEL_LOAD_OK records pass their PID and
     attention-backend checks.  In particular, no worker starts inference while
-    its same-GPU peer is still allocating model weights.
+    any same-GPU peer is still allocating model weights.
     """
     marker = output_root / "diagnostics" / "_MODEL_LOADS_OK"
     rollout_text = ",".join(str(value) for value in rollout_ids)
@@ -1783,6 +1802,12 @@ def run_worker(args: argparse.Namespace) -> int:
             "record_id_sha256": sample_order_digest,
         },
         "gpu_model_processes": args.gpu_model_processes,
+        "physical_process_topology": {
+            "physical_processes_total": 8,
+            "physical_processes_per_gpu": 4,
+            "logical_rollouts_per_process": 1,
+            "ownership": "one_model_one_rollout",
+        },
         "worker_git_commit": args.worker_git_commit,
         "resume": {
             str(context["args"].rollout_id): {
@@ -1940,8 +1965,8 @@ def run_worker(args: argparse.Namespace) -> int:
                 context["counters"], status, force=True, memory=memory_after
             )
 
-        # Sample-major execution: load one source image, finish both owned
-        # rollout routes in deterministic order, then advance to the next row.
+        # All eight workers use this same deterministic sample order.  This
+        # single-route process finishes its current sample before advancing.
         load_stage = "sample_major_inference"
         for row in samples:
             record_id = str(row["record_id"])
@@ -2222,22 +2247,25 @@ def parse_physical_worker(value: str) -> dict[str, Any]:
     parts = value.split(",", 3)
     if len(parts) != 4:
         raise ValueError(
-            "--physical-worker must be model,gpu,pid,rollout_ids (IDs use |)"
+            "--physical-worker must be model,gpu,pid,single_rollout_id"
         )
     model_id, gpu, pid, rollout_text = parts
     rollout_ids = [int(item) for item in rollout_text.split("|") if item]
     physical_gpu = int(gpu)
+    physical_pid = int(pid)
     expected_gpu = {"m31": 0, "crop": 1}
     if (
         model_id not in MODEL_IDS
         or physical_gpu != expected_gpu.get(model_id)
-        or rollout_ids not in ([0, 1], [2, 3])
+        or len(rollout_ids) != 1
+        or rollout_ids[0] not in range(4)
+        or physical_pid <= 0
     ):
         raise ValueError(f"invalid --physical-worker mapping: {value}")
     return {
         "model_id": model_id,
         "physical_gpu": physical_gpu,
-        "pid": int(pid),
+        "pid": physical_pid,
         "rollout_ids": rollout_ids,
     }
 
@@ -2287,6 +2315,7 @@ def progress_snapshot(args: argparse.Namespace) -> int:
             )
     physical_processes = []
     physical_keys: set[tuple[str, int, tuple[int, ...]]] = set()
+    physical_pids: set[int] = set()
     for value in args.physical_worker:
         physical = parse_physical_worker(value)
         physical_key = (
@@ -2296,7 +2325,14 @@ def progress_snapshot(args: argparse.Namespace) -> int:
         )
         if physical_key in physical_keys:
             raise ValueError(f"duplicate --physical-worker ownership: {value}")
+        physical_pid = int(physical["pid"])
+        if physical_pid in physical_pids:
+            raise ValueError(
+                f"duplicate --physical-worker PID {physical_pid}: all eight "
+                "formal workers must be distinct physical processes"
+            )
         physical_keys.add(physical_key)
+        physical_pids.add(physical_pid)
         owned = [
             row
             for row in logical_rollouts
@@ -2366,35 +2402,45 @@ def progress_snapshot(args: argparse.Namespace) -> int:
             }
         )
     expected_physical_keys = {
-        (model_id, physical_gpu, rollout_pair)
+        (model_id, physical_gpu, (rollout_id,))
         for model_id, physical_gpu in (("m31", 0), ("crop", 1))
-        for rollout_pair in ((0, 1), (2, 3))
+        for rollout_id in range(4)
     }
     if args.physical_worker and physical_keys != expected_physical_keys:
         raise ValueError(
-            "formal progress snapshot requires four physical workers with "
+            "formal progress snapshot requires eight physical workers with "
             f"exact ownership {sorted(expected_physical_keys)}; got "
             f"{sorted(physical_keys)}"
         )
+    if args.physical_worker and args.expected_workers != 8:
+        raise ValueError("formal progress snapshot requires --expected-workers 8")
     failed_physical = [
         row for row in physical_processes if row["status"] == "failed"
     ]
     failed_logical = [row for row in logical_rollouts if row["status"] == "failed"]
     eta_blocked = bool(failed_physical or failed_logical)
+    eta_incomplete = len(physical_processes) != 8 or any(
+        not isinstance(row.get("remaining_seconds"), (int, float))
+        for row in physical_processes
+    )
     physical_remaining_values = [
         float(row["remaining_seconds"])
         for row in physical_processes
         if isinstance(row.get("remaining_seconds"), (int, float))
     ]
     total_remaining = (
-        None if eta_blocked else max(physical_remaining_values, default=None)
+        None
+        if eta_blocked or eta_incomplete
+        else max(physical_remaining_values, default=None)
     )
     snapshot = {
         "timestamp": utc_now(),
         "workers_seen": len(latest),
         "workers_expected": args.expected_workers,
         "workers": latest,
-        "physical_processes_expected": 4,
+        "physical_processes_expected": 8,
+        "physical_processes_seen": len(physical_processes),
+        "physical_pids_unique": len(physical_pids) == len(physical_processes),
         "physical_processes": physical_processes,
         "logical_rollouts_expected": args.expected_workers,
         "logical_rollouts": logical_rollouts,
@@ -2402,13 +2448,21 @@ def progress_snapshot(args: argparse.Namespace) -> int:
         "progress_history_rows_total": history_rows_total,
         "failed_physical_processes": len(failed_physical),
         "failed_logical_rollouts": len(failed_logical),
-        "eta_valid": not eta_blocked and total_remaining is not None,
+        "eta_valid": (
+            not eta_blocked and not eta_incomplete and total_remaining is not None
+        ),
         "eta_unavailable_reason": (
-            "failed physical worker or logical rollout" if eta_blocked else None
+            "failed physical worker or logical rollout"
+            if eta_blocked
+            else (
+                "not all eight physical workers have an attempted-throughput ETA"
+                if eta_incomplete
+                else None
+            )
         ),
         "eta_basis": (
-            "sum of sample-major active rollout attempted throughputs applied "
-            "to remaining physical inference attempts"
+            "maximum remaining time across eight parallel single-rollout "
+            "physical processes using attempted throughput"
         ),
         "total_remaining_seconds": total_remaining,
         "total_estimated_completion": (

@@ -55,10 +55,10 @@ M31_REPO = (
 )
 CROP_REPO = (
     "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/"
-    "Embodied-rollout8-h20x2-v5"
+    "Embodied-rollout8-h20x2-v6"
 )
 M31_ROLLOUT_COMMIT = "6367cc6660f7eb933048b81100915a05f9b49bf4"
-V5_BASE_COMMIT = "29de39933fa12612eeed7d552c5dc7d78bc25211"
+V6_BASE_COMMIT = "54750d140099903386b1f245d764c20b99388567"
 REQUIRED_CHECKPOINT_CODE = (
     "configuration_locateanything.py",
     "modeling_locateanything.py",
@@ -379,7 +379,7 @@ def check_output_root(path: Path) -> dict[str, Any]:
         "resume": False,
     }
     path.mkdir(parents=True, exist_ok=True)
-    # v5 workers can resume from append-only raw/progress streams.  Keep a
+    # v6 workers can resume from append-only raw/progress streams.  Keep a
     # strict allow-list so an unrelated directory still fails preflight while
     # a previous interrupted formal run is accepted without deleting results.
     allowed_entries = {
@@ -747,7 +747,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     )
     crop_repo = git_revision(
         args.crop_repo.expanduser().resolve(strict=False),
-        required_ancestor=V5_BASE_COMMIT,
+        required_ancestor=V6_BASE_COMMIT,
     )
     output_arg = getattr(args, "output_root", None)
     output = (
@@ -792,7 +792,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "repositories_h20": {"m31": M31_REPO, "crop": CROP_REPO},
         "rollout_output_h20": (
             "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/"
-            "gui_rollouts/ui5-train-rollout8-h20x2-v5-20260904"
+            "gui_rollouts/ui5-train-rollout8-h20x2-v6-20260904"
         ),
     }
     atomic_json(diagnostics / "preflight_summary.json", summary)

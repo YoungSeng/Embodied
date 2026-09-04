@@ -2,10 +2,10 @@
 set -Eeuo pipefail
 
 WORKSPACE=${WORKSPACE:-/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace}
-OUTPUT_ROOT=${OUTPUT_ROOT:-${WORKSPACE}/gui_rollouts/ui5-train-rollout8-h20x2-v5-20260904}
+OUTPUT_ROOT=${OUTPUT_ROOT:-${WORKSPACE}/gui_rollouts/ui5-train-rollout8-h20x2-v6-20260904}
 PYTHON_BIN=${PYTHON_BIN:-${WORKSPACE}/conda_envs/LocateAnything/bin/python}
 SNAPSHOT_ROOT=${OUTPUT_ROOT}/snapshots
-A800_DESTINATION=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_rollouts/ui5-train-rollout8-h20x2-v5-20260904/snapshots/
+A800_DESTINATION=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_rollouts/ui5-train-rollout8-h20x2-v6-20260904/snapshots/
 
 test -x "${PYTHON_BIN}" || { echo "ERROR: Python missing: ${PYTHON_BIN}" >&2; exit 2; }
 test -d "${SNAPSHOT_ROOT}" || { echo "ERROR: snapshot directory missing: ${SNAPSHOT_ROOT}" >&2; exit 3; }

@@ -18,9 +18,10 @@ from typing import Any, Iterable, Mapping, Sequence
 from run_ui5_train_rollout_worker import TASKS, fixed_interleaved_samples
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MODELS = ("m31", "crop")
 ROLLOUT_IDS = (0, 1, 2, 3)
+FORMAL_SEEDS = (20260903, 20260917, 20260931, 20260947)
 DIFFICULTIES = ("easy", "medium", "hard")
 CLASSIFICATION_FILES = {
     "easy": "easy.jsonl",
@@ -31,6 +32,44 @@ GRPO_FILES = {
     "m31": "grpo_m31_ready.jsonl",
     "crop": "grpo_crop_ready.jsonl",
 }
+
+
+def execution_architecture() -> dict[str, Any]:
+    """Return the immutable v6 physical-process topology as JSON metadata."""
+    return {
+        "physical_processes_total": 8,
+        "physical_processes_per_gpu": 4,
+        "logical_rollouts_total": 8,
+        "rollouts_per_physical_process": 1,
+        "checkpoint_loads_per_physical_process": 1,
+        "fixed_sample_order_shared_by_all_processes": True,
+        "rollout_execution": "one_rollout_per_physical_process_fixed_sample_order",
+        "global_eta_reduction": "maximum_estimated_completion_across_8_processes",
+        "gpu_0": {
+            "model_id": "m31",
+            "processes": [
+                {
+                    "process_index": rollout_id + 1,
+                    "rollout_id": rollout_id,
+                    "rollout_ids": [rollout_id],
+                    "seed": FORMAL_SEEDS[rollout_id],
+                }
+                for rollout_id in ROLLOUT_IDS
+            ],
+        },
+        "gpu_1": {
+            "model_id": "crop",
+            "processes": [
+                {
+                    "process_index": rollout_id + 1,
+                    "rollout_id": rollout_id,
+                    "rollout_ids": [rollout_id],
+                    "seed": FORMAL_SEEDS[rollout_id],
+                }
+                for rollout_id in ROLLOUT_IDS
+            ],
+        },
+    }
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1324,6 +1363,7 @@ def build_snapshot_manifest(
         "append_only": True,
         "atomic_publish": True,
         "success_marker": "_SUCCESS",
+        "execution_architecture": execution_architecture(),
         "files": files,
     }
 
@@ -1426,6 +1466,7 @@ def create_snapshot(
             "remaining_seconds": processing_status["remaining_seconds"],
             "estimated_completion": processing_status["estimated_completion"],
             "processing_status": processing_status,
+            "execution_architecture": execution_architecture(),
             "classification_policy": {
                 "complete8_required": True,
                 "technical_error_free_required": True,

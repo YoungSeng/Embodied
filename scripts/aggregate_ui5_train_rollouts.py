@@ -29,11 +29,12 @@ from run_ui5_train_rollout_worker import (
 from snapshot_ui5_train_rollouts import (
     DIFFICULTIES,
     build_difficulty_records,
+    execution_architecture,
     write_difficulty_exports,
 )
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 MODELS = ("m31", "crop")
 TASKS = ("occlusion", "cropping", "text_overflow", "text_ellipsis", "content_missing")
 THRESHOLDS = (0.1, 0.3, 0.5)
@@ -484,7 +485,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if model_load_statuses and not bool((formal_run_status or {}).get("valid")):
         raise RuntimeError(
             "model-load diagnostics exist but formal_run_valid.json does not "
-            "confirm MODEL_LOAD_OK for both current physical workers"
+            "confirm MODEL_LOAD_OK for all eight current physical workers"
         )
     oom_summary = read_json_if_present(root / "reports" / "oom_summary.json")
     raw_alignment, expected_total = validate_raw_alignment(root, bundle)
@@ -555,7 +556,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if has_parse_error:
                     for scope in (task, "micro"):
                         execution_counts[(model, rollout_id, scope, "parse_error")] += 1
-                    # Parsing failures are technical failures in v5.  Preserve
+                    # Parsing failures are technical failures in v6.  Preserve
                     # them in execution/error reports, but never manufacture a
                     # TP/FP/FN score or count them as a wrong model answer.
                     continue
@@ -1019,10 +1020,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "dtype": "bf16",
             "text_attention": "sdpa",
             "vision_attention": "flash_attention_2",
+            "vision_blocks": "27/27",
             "mode": "hybrid",
+            "generation_mode": "hybrid",
             "sampling": True,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": 0,
+            "repetition_penalty": 1.1,
             "max_seq_length": MAX_SEQ_LENGTH,
             "max_num_tokens_per_sample": MAX_NUM_TOKENS_PER_SAMPLE,
+            "training_max_num_tokens": TRAINING_MAX_NUM_TOKENS,
             "training_max_num_tokens_record_only": TRAINING_MAX_NUM_TOKENS,
             "processor_in_token_limit": PROCESSOR_IN_TOKEN_LIMIT,
             "max_new_tokens": ROLLOUT_MAX_NEW_TOKENS,
@@ -1033,26 +1041,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "main_iou": 0.1,
             "rescore_iou": [0.3, 0.5],
         },
-        "execution_architecture": {
-            "physical_processes_total": 4,
-            "physical_processes_per_gpu": 2,
-            "gpu_0": {
-                "model_id": "m31",
-                "processes": [
-                    {"rollout_ids": [0, 1]},
-                    {"rollout_ids": [2, 3]},
-                ],
-            },
-            "gpu_1": {
-                "model_id": "crop",
-                "processes": [
-                    {"rollout_ids": [0, 1]},
-                    {"rollout_ids": [2, 3]},
-                ],
-            },
-            "rollout_execution": "sample_major_two_rollouts_after_single_model_load",
-            "checkpoint_loads_per_physical_process": 1,
-        },
+        "execution_architecture": execution_architecture(),
         "sample_order": {
             "policy": "sample_major_fixed_task_polarity_round_robin_v1",
             "task_order": list(TASKS),
