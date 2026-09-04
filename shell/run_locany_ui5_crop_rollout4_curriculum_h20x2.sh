@@ -198,6 +198,14 @@ printf '%-30s %s\n' \
   "NNODES" "${NNODES}" \
   "NODE_RANK" "${NODE_RANK}"
 
+# Reject copied manifests with stale source-machine aliases before any model
+# load. The standalone JSONL contains all coordinates needed by inference;
+# detector-cache sidecars are not required for this content/coverage check.
+CUDA_VISIBLE_DEVICES="" "${PYTHON_BIN}" \
+  "${PROJECT_ROOT}/scripts/relocate_ui5_eval_detector_manifest.py" \
+  --manifest "${EVAL_DETECTOR_MANIFEST}" \
+  --input-dir "${EVAL_INPUT_DIR}"
+
 recipe_command=(
   "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/build_ui5_curriculum_recipe.py"
   --rollout-difficulty "${ROLLOUT_DIFFICULTY}"

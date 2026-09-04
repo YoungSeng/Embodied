@@ -11,6 +11,19 @@ TRAINER = ROOT / "eaglevl" / "train" / "locany_finetune_magi_stream.py"
 
 
 class CurriculumPipelineContractTests(unittest.TestCase):
+    def test_manifest_coverage_is_checked_before_models_and_uses_the_explicit_path(self) -> None:
+        launcher = LAUNCHER.read_text(encoding="utf-8")
+        check = launcher.index("scripts/relocate_ui5_eval_detector_manifest.py")
+        self.assertLess(check, launcher.index("scripts/patch_locany_checkpoint.py"))
+        self.assertLess(check, launcher.index("scripts/run_ui5_curriculum_evaluation.py"))
+        command = launcher[check:launcher.index("recipe_command=(", check)]
+        self.assertIn('--manifest "${EVAL_DETECTOR_MANIFEST}"', command)
+        self.assertIn('--input-dir "${EVAL_INPUT_DIR}"', command)
+        self.assertNotIn("--output-manifest", command)
+        preflight = PREFLIGHT.read_text(encoding="utf-8")
+        self.assertIn("check_eval_manifest_coverage", preflight)
+        self.assertIn("tests.test_ui5_eval_manifest_portability", preflight)
+
     def test_formal_launcher_contains_the_complete_200_step_loop(self) -> None:
         source = LAUNCHER.read_text(encoding="utf-8")
         for contract in (

@@ -352,6 +352,7 @@ relative_paths = (
     "scripts/merge_ui5_rollout_selections.py",
     "scripts/ui5_frozen_selection.py",
     "scripts/report_ui5_training_segment.py",
+    "scripts/relocate_ui5_eval_detector_manifest.py",
     "scripts/run_ui5_curriculum_evaluation.py",
     "scripts/summarize_ui5_curriculum_diagnostics.py",
     "scripts/update_ui5_curriculum_artifacts.py",
@@ -362,6 +363,7 @@ relative_paths = (
     "tests/test_ui5_curriculum_pipeline.py",
     "tests/test_ui5_curriculum_recipe.py",
     "tests/test_ui5_curriculum_status.py",
+    "tests/test_ui5_eval_manifest_portability.py",
     "tests/test_ui5_rollout_selection_merge.py",
 )
 for relative in relative_paths:
@@ -534,6 +536,12 @@ check_eval_checkpoint_contract() {
     --checkpoint "${MODEL_PATH}" --mode eval
 }
 
+check_eval_manifest_coverage() {
+  "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/relocate_ui5_eval_detector_manifest.py" \
+    --manifest "${EVAL_DETECTOR_MANIFEST}" \
+    --input-dir "${EVAL_INPUT_DIR}"
+}
+
 check_resume_checkpoint_contract() {
   if [[ -d "${ROLLING_CHECKPOINT_PATH}" ]]; then
     echo "resume_checkpoint=${ROLLING_CHECKPOINT_PATH}"
@@ -557,6 +565,7 @@ run_lightweight_tests() {
     tests.test_ui5_curriculum_diagnostics \
     tests.test_ui5_curriculum_pipeline \
     tests.test_ui5_curriculum_status \
+    tests.test_ui5_eval_manifest_portability \
     tests.test_ui5_rollout_selection_merge
 }
 
@@ -592,6 +601,7 @@ run_check "Python executable" test -x "${PYTHON_BIN}"
 run_check "Python dependencies and zero visible GPUs" check_python_dependencies
 run_check "immutable frozen selection and derived hard-group count" resolve_frozen_selection
 run_check "formal input paths and lightweight JSON readability" check_formal_inputs
+run_check "UI5 test-image bytes, crop geometry and local path coverage (CPU-only)" check_eval_manifest_coverage
 run_check "Bash static syntax" check_bash_syntax
 run_check "Python static syntax (AST, no imports)" check_python_syntax
 run_check "rollout bundle/difficulty integrity and curriculum recipe dry-run" build_recipe_dry_run
