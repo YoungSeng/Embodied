@@ -2,13 +2,13 @@
 set -Eeuo pipefail
 
 WORKSPACE=${WORKSPACE:-/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace}
-ORCHESTRATOR_REPO=${ORCHESTRATOR_REPO:-${WORKSPACE}/code/Eagle/Embodied-rollout8-h20x2-v2}
+ORCHESTRATOR_REPO=${ORCHESTRATOR_REPO:-${WORKSPACE}/code/Eagle/Embodied-rollout8-h20x2-v3}
 M31_REPO=${M31_REPO:-${WORKSPACE}/code/Eagle/Embodied-ui5-rollout8-m31}
 CROP_REPO=${CROP_REPO:-${ORCHESTRATOR_REPO}}
 BUNDLE_ROOT=${BUNDLE_ROOT:-${WORKSPACE}/gui_data/ui5_train_rollout_bundle_v1}
 M31_CHECKPOINT=${M31_CHECKPOINT:-${WORKSPACE}/gui_models/Embodied/locany-ui5-m31-taskmoe-setdecoder-a800x4-sft-20260830-r2/checkpoint-12000}
 CROP_CHECKPOINT=${CROP_CHECKPOINT:-${WORKSPACE}/gui_models/Embodied-ui5-det-crop/locany-ui5-v5-croponly-sourcebalanced-a800x4-20260830/checkpoint-12000}
-OUTPUT_ROOT=${OUTPUT_ROOT:-${WORKSPACE}/gui_rollouts/ui5-train-rollout8-h20x2-v2-20260903}
+OUTPUT_ROOT=${OUTPUT_ROOT:-${WORKSPACE}/gui_rollouts/ui5-train-rollout8-h20x2-v3-20260904}
 ENV_DIR=${ENV_DIR:-${WORKSPACE}/conda_envs/LocateAnything}
 PYTHON_BIN=${PYTHON_BIN:-${ENV_DIR}/bin/python}
 SEEDS=(20260903 20260917 20260931 20260947)
@@ -35,9 +35,9 @@ test -d "${M31_CHECKPOINT}" || { echo "ERROR: M31 checkpoint missing" >&2; exit 
 test -d "${CROP_CHECKPOINT}" || { echo "ERROR: crop checkpoint missing" >&2; exit 24; }
 test -f "${M31_REPO}/scripts/inference_ui_defect_locany.py" || { echo "ERROR: M31 inference entrypoint missing" >&2; exit 25; }
 test -f "${CROP_REPO}/scripts/inference_ui_defect_locany.py" || { echo "ERROR: crop inference entrypoint missing" >&2; exit 26; }
-test -f "${ORCHESTRATOR_REPO}/scripts/run_ui5_train_rollout_worker.py" || { echo "ERROR: v2 rollout worker missing" >&2; exit 27; }
-test -f "${ORCHESTRATOR_REPO}/scripts/aggregate_ui5_train_rollouts.py" || { echo "ERROR: v2 aggregator missing" >&2; exit 28; }
-test -f "${ORCHESTRATOR_REPO}/scripts/snapshot_ui5_train_rollouts.py" || { echo "ERROR: v2 incremental snapshotter missing" >&2; exit 29; }
+test -f "${ORCHESTRATOR_REPO}/scripts/run_ui5_train_rollout_worker.py" || { echo "ERROR: v3 rollout worker missing" >&2; exit 27; }
+test -f "${ORCHESTRATOR_REPO}/scripts/aggregate_ui5_train_rollouts.py" || { echo "ERROR: v3 aggregator missing" >&2; exit 28; }
+test -f "${ORCHESTRATOR_REPO}/scripts/snapshot_ui5_train_rollouts.py" || { echo "ERROR: v3 incremental snapshotter missing" >&2; exit 29; }
 
 export PATH="${ENV_DIR}/bin:${PATH}"
 export PYTHONUNBUFFERED=1
@@ -62,7 +62,8 @@ CUDA_VISIBLE_DEVICES="" "${PYTHON_BIN}" "${ORCHESTRATOR_REPO}/scripts/preflight_
   --require-runtime
 
 "${PYTHON_BIN}" -c 'import openpyxl, scipy, PIL; assert tuple(map(int, openpyxl.__version__.split(".")[:2])) >= (3, 1)'
-nvidia-smi
+nvidia-smi >"${OUTPUT_ROOT}/diagnostics/nvidia_smi_before_model_load.txt"
+cat "${OUTPUT_ROOT}/diagnostics/nvidia_smi_before_model_load.txt"
 
 RUN_STARTED_EPOCH=$(date +%s)
 NEXT_SNAPSHOT_HOUR=3
@@ -108,7 +109,13 @@ launch_worker() {
       --dtype bf16 \
       --attn-implementation sdpa \
       --vision-attn-implementation sdpa \
-      --generation-mode hybrid
+      --generation-mode hybrid \
+      --max-seq-length 7268 \
+      --max-num-tokens-per-sample 7268 \
+      --training-max-num-tokens 12800 \
+      --processor-in-token-limit 25600 \
+      --max-new-tokens 512 \
+      --n-future-tokens 6
   ) >"${log_path}" 2>&1 &
   PIDS+=("$!")
   NAMES+=("${model_id}/rollouts_${rollout_ids}/gpu_${gpu}")
@@ -121,6 +128,15 @@ launch_worker m31 0 "0,1" "${SEEDS[0]},${SEEDS[1]}"
 launch_worker m31 0 "2,3" "${SEEDS[2]},${SEEDS[3]}"
 launch_worker crop 1 "0,1" "${SEEDS[0]},${SEEDS[1]}"
 launch_worker crop 1 "2,3" "${SEEDS[2]},${SEEDS[3]}"
+
+PROCESS_MAP=${OUTPUT_ROOT}/diagnostics/physical_processes.tsv
+printf 'pid\tmodel_rollouts_gpu\tgpu\tlog\n' >"${PROCESS_MAP}"
+for index in "${!PIDS[@]}"; do
+  printf '%s\t%s\t%s\t%s\n' \
+    "${PIDS[index]}" "${NAMES[index]}" "${GPUS[index]}" "${LOG_PATHS[index]}" \
+    >>"${PROCESS_MAP}"
+done
+cat "${PROCESS_MAP}"
 
 for gpu in 0 1; do
   gpu_pids=()
@@ -152,13 +168,26 @@ while [[ ${load_status_count} -lt 4 && ${SECONDS} -lt ${load_deadline} ]]; do
     sleep 5
   fi
 done
+MODEL_LOAD_STATUS=${OUTPUT_ROOT}/diagnostics/model_load_status.txt
+: >"${MODEL_LOAD_STATUS}"
 for log_path in "${LOG_PATHS[@]}"; do
-  grep -m1 -E '^\[MODEL_LOAD_(OK|FAIL)\]' "${log_path}" || {
-    echo "[MODEL_LOAD_STATUS_MISSING] log=${log_path}"
-  }
+  if status_line=$(grep -m1 -E '^\[MODEL_LOAD_(OK|FAIL)\]' "${log_path}"); then
+    echo "${status_line}"
+    echo "${status_line}" >>"${MODEL_LOAD_STATUS}"
+  else
+    status_line="[MODEL_LOAD_STATUS_MISSING] log=${log_path}"
+    echo "${status_line}"
+    echo "${status_line}" >>"${MODEL_LOAD_STATUS}"
+  fi
 done
-nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader
-nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader || true
+nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader \
+  >"${OUTPUT_ROOT}/diagnostics/gpu_memory_after_model_load.csv"
+cat "${OUTPUT_ROOT}/diagnostics/gpu_memory_after_model_load.csv"
+if ! nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader \
+  >"${OUTPUT_ROOT}/diagnostics/gpu_process_memory_after_model_load.csv"; then
+  :
+fi
+cat "${OUTPUT_ROOT}/diagnostics/gpu_process_memory_after_model_load.csv"
 
 terminate_workers() {
   for pid in "${PIDS[@]}"; do

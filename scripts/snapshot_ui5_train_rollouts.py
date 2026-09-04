@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import shutil
@@ -11,6 +12,8 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+
+from run_ui5_train_rollout_worker import fixed_interleaved_samples
 
 
 SCHEMA_VERSION = 1
@@ -119,7 +122,9 @@ def bundle_samples(bundle_root: Path) -> list[dict[str, Any]]:
     manifest = json.loads(
         (bundle_root / "bundle_manifest.json").read_text(encoding="utf-8")
     )
-    samples = read_jsonl(bundle_root / "manifest" / "task_samples.jsonl")
+    samples = fixed_interleaved_samples(
+        read_jsonl(bundle_root / "manifest" / "task_samples.jsonl")
+    )
     expected_total = int(manifest["rollout_samples"])
     if len(samples) != expected_total:
         raise RuntimeError(
@@ -234,6 +239,18 @@ def cumulative_metrics(
                         "image_TN": counter["image_TN"],
                         "image_FP": counter["image_FP"],
                         "image_FN": counter["image_FN"],
+                        "image_TP_ratio": (
+                            counter["image_TP"] / success if success else 0.0
+                        ),
+                        "image_TN_ratio": (
+                            counter["image_TN"] / success if success else 0.0
+                        ),
+                        "image_FP_ratio": (
+                            counter["image_FP"] / success if success else 0.0
+                        ),
+                        "image_FN_ratio": (
+                            counter["image_FN"] / success if success else 0.0
+                        ),
                         "bbox_TP": counter["bbox_TP"],
                         "bbox_FP": counter["bbox_FP"],
                         "bbox_FN": counter["bbox_FN"],
@@ -354,8 +371,33 @@ def build_difficulty_records(
             "coordinate_transform_anomaly": bool(
                 (first_raw or sample).get("coordinate_transform_anomaly")
             ),
+            "visualization_rollouts": {
+                model: [
+                    {
+                        "model_id": model,
+                        "rollout_id": int(row["rollout_id"]),
+                        "pred_global": row.get("pred_global") or [],
+                        "matched_pairs": row.get("matched_pairs") or [],
+                        "error_type": (
+                            f"{model}:{row.get('error_type') or 'INCOMPLETE'}"
+                        ),
+                        "exact_correct": row.get("exact_correct") is True,
+                        "crop_boundaries": [
+                            item["crop_xyxy"]
+                            for item in row.get("crop_outputs", [])
+                            if item.get("crop_xyxy")
+                        ],
+                    }
+                    for row in sorted(
+                        by_model[model], key=lambda item: int(item["rollout_id"])
+                    )
+                ]
+                for model in MODELS
+            },
         }
-        group_base = dict(base)
+        group_base = {
+            key: value for key, value in base.items() if key != "visualization_rollouts"
+        }
         if grpo_m31:
             base["grpo_m31_group"] = model_group_payload(
                 "m31", by_model["m31"], group_base
@@ -386,7 +428,7 @@ def build_difficulty_records(
 
 
 def classification_projection(row: Mapping[str, Any]) -> dict[str, Any]:
-    excluded = {"grpo_m31_group", "grpo_crop_group"}
+    excluded = {"grpo_m31_group", "grpo_crop_group", "visualization_rollouts"}
     return {key: value for key, value in row.items() if key not in excluded}
 
 
@@ -476,6 +518,238 @@ def previous_snapshot(snapshots_root: Path) -> Path | None:
     if not candidates:
         return None
     return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+
+
+def write_snapshot_workbook(
+    path: Path,
+    summary: Mapping[str, Any],
+) -> None:
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill
+    except ImportError as exc:
+        raise RuntimeError("openpyxl is required for incremental snapshot tables") from exc
+    book = openpyxl.Workbook()
+    book.remove(book.active)
+    tables: dict[str, list[dict[str, Any]]] = {
+        "overview": [
+            {"metric": "snapshot_kind", "value": summary["snapshot_kind"]},
+            {"metric": "scheduled_hour", "value": summary["scheduled_hour"]},
+            {"metric": "started_at", "value": summary["started_at"]},
+            {"metric": "created_at", "value": summary["created_at"]},
+            {"metric": "elapsed_seconds", "value": summary["elapsed_seconds"]},
+            {"metric": "expected_total", "value": summary["expected_total"]},
+            {"metric": "previous_snapshot", "value": summary["previous_snapshot"]},
+        ],
+        "difficulty": [
+            {
+                "difficulty": difficulty,
+                "samples": summary["difficulty_counts"][difficulty],
+                "proportion": summary["difficulty_ratios"][difficulty],
+            }
+            for difficulty in DIFFICULTIES
+        ],
+        "per_task_difficulty": list(summary["per_task_difficulty"]),
+        "raw_streams": list(summary["raw_streams"]),
+        "cumulative_metrics": list(summary["cumulative_metrics"]),
+        "selection_files": [
+            {"file": filename, "records": count}
+            for filename, count in sorted(summary["file_counts"].items())
+        ],
+    }
+    fill = PatternFill("solid", fgColor="1F4E78")
+    font = Font(color="FFFFFF", bold=True)
+    for sheet_name, rows in tables.items():
+        sheet = book.create_sheet(sheet_name[:31])
+        columns = list(rows[0]) if rows else ["note"]
+        sheet.append(columns)
+        for row in rows or [{"note": "no rows"}]:
+            sheet.append(
+                [
+                    json.dumps(row.get(column), ensure_ascii=False, sort_keys=True)
+                    if isinstance(row.get(column), (dict, list))
+                    else row.get(column)
+                    for column in columns
+                ]
+            )
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for cell in sheet[1]:
+            cell.fill = fill
+            cell.font = font
+        for cells in sheet.columns:
+            width = min(48, max(10, max(len(str(cell.value or "")) for cell in cells) + 2))
+            sheet.column_dimensions[cells[0].column_letter].width = width
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}.xlsx")
+    book.save(temporary)
+    verified = openpyxl.load_workbook(temporary, read_only=True, data_only=False)
+    if set(tables) != set(verified.sheetnames):
+        raise RuntimeError("incremental snapshot workbook verification failed")
+    verified.close()
+    os.replace(temporary, path)
+
+
+def render_snapshot_gallery(
+    snapshot_root: Path,
+    bundle_root: Path,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    panel_long_side: int = 420,
+) -> dict[str, Any]:
+    from PIL import Image
+    from render_ui5_train_rollout_gallery import render_panel
+
+    visual_root = snapshot_root / "visualizations"
+    counts: Counter[tuple[str, str]] = Counter()
+    seen_images: dict[tuple[str, str], set[str]] = defaultdict(set)
+    cards: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for record in records:
+        categories = [str(record["difficulty"])]
+        if record.get("grpo_ready_m31"):
+            categories.append("grpo_m31_ready")
+        if record.get("grpo_ready_crop"):
+            categories.append("grpo_crop_ready")
+        for category in categories:
+            task = str(record["task"])
+            key = (category, task)
+            image_id = str(record["source_image_id"])
+            if len(seen_images[key]) >= 10 or image_id in seen_images[key]:
+                continue
+            seen_images[key].add(image_id)
+            model_filter = (
+                "m31" if category == "grpo_m31_ready" else
+                "crop" if category == "grpo_crop_ready" else None
+            )
+            rollout_map = record.get("visualization_rollouts", {})
+            rollouts = [
+                rollout
+                for model in MODELS
+                if model_filter is None or model == model_filter
+                for rollout in rollout_map.get(model, [])
+            ]
+            source_path = bundle_root / str(record["image_relpath"])
+            try:
+                with Image.open(source_path) as opened:
+                    source = opened.convert("RGB")
+                if not rollouts:
+                    rollouts = [
+                        {
+                            "rollout_id": "none",
+                            "pred_global": [],
+                            "matched_pairs": [],
+                            "error_type": "INCOMPLETE",
+                            "exact_correct": False,
+                            "crop_boundaries": [],
+                        }
+                    ]
+                panels = [
+                    render_panel(
+                        source,
+                        record.get("gt_global") or [],
+                        rollout,
+                        panel_long_side,
+                    )
+                    for rollout in rollouts
+                ]
+                source.close()
+                columns = min(4, len(panels))
+                rows = (len(panels) + columns - 1) // columns
+                gap = 10
+                cell_width = max(panel.width for panel in panels)
+                cell_height = max(panel.height for panel in panels)
+                composite = Image.new(
+                    "RGB",
+                    (
+                        columns * cell_width + (columns - 1) * gap,
+                        rows * cell_height + (rows - 1) * gap,
+                    ),
+                    (238, 242, 247),
+                )
+                for index, panel in enumerate(panels):
+                    x = (index % columns) * (cell_width + gap)
+                    y = (index // columns) * (cell_height + gap)
+                    composite.paste(panel, (x, y))
+                    panel.close()
+                relative = (
+                    Path("assets") / category / task / f"{record['record_id']}.jpg"
+                )
+                destination = visual_root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                temporary = destination.with_name(
+                    f".{destination.name}.tmp-{os.getpid()}"
+                )
+                composite.save(temporary, format="JPEG", quality=88, subsampling=0)
+                composite.close()
+                os.replace(temporary, destination)
+                cards.append(
+                    {
+                        "category": category,
+                        "task": task,
+                        "record_id": record["record_id"],
+                        "source_image_id": image_id,
+                        "difficulty": record["difficulty"],
+                        "m31_correct_count": record["m31_correct_count"],
+                        "crop_correct_count": record["crop_correct_count"],
+                        "total_correct_count": record["total_correct_count"],
+                        "visual_relpath": relative.as_posix(),
+                    }
+                )
+                counts[key] += 1
+            except Exception as exc:
+                failures.append(
+                    {
+                        "record_id": record.get("record_id"),
+                        "category": category,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+    sections = []
+    for key in sorted(counts):
+        category, task = key
+        selected = [
+            card
+            for card in cards
+            if card["category"] == category and card["task"] == task
+        ]
+        cards_html = "".join(
+            "<article><img loading='lazy' src='"
+            + html.escape(str(card["visual_relpath"]))
+            + "'><div><code>"
+            + html.escape(str(card["record_id"]))
+            + "</code> m31="
+            + str(card["m31_correct_count"])
+            + "/4 crop="
+            + str(card["crop_correct_count"])
+            + "/4 total="
+            + str(card["total_correct_count"])
+            + "/8</div></article>"
+            for card in selected
+        )
+        sections.append(
+            f"<section><h2>{html.escape(category)} / {html.escape(task)} "
+            f"({len(selected)})</h2><div class='grid'>{cards_html}</div></section>"
+        )
+    document = f"""<!doctype html><html><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>UI5 incremental rollout snapshot</title><style>
+body{{font-family:system-ui,sans-serif;margin:24px;background:#f6f8fb;color:#172033}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:14px}}
+article{{background:white;border:1px solid #dbe2ea;border-radius:8px;padding:9px}}
+img{{width:100%;height:auto}} code{{font-size:12px}}
+</style></head><body><h1>UI5 incremental rollout snapshot</h1>
+<p>Green=GT, blue=matched prediction, red=unmatched prediction, yellow=crop.</p>
+{''.join(sections)}</body></html>"""
+    visual_root.mkdir(parents=True, exist_ok=True)
+    (visual_root / "index.html").write_text(document, encoding="utf-8")
+    result = {
+        "index": "visualizations/index.html",
+        "rendered": len(cards),
+        "failures": failures,
+        "counts": {"|".join(key): value for key, value in sorted(counts.items())},
+    }
+    atomic_json(visual_root / "gallery_summary.json", result)
+    return result
 
 
 def create_snapshot(
@@ -580,6 +854,11 @@ def create_snapshot(
             "file_counts": file_counts,
             **cumulative,
         }
+        summary["visualizations"] = render_snapshot_gallery(
+            temporary, bundle_root, records
+        )
+        summary["statistics_workbook"] = "snapshot_statistics.xlsx"
+        write_snapshot_workbook(temporary / "snapshot_statistics.xlsx", summary)
         atomic_json(temporary / "summary.json", summary)
         os.replace(temporary, destination)
     finally:

@@ -1,11 +1,11 @@
 # Submit: mlx job submitv2 --path jobs/ui5_train_rollouts_h20x2_merlin.yaml
-caption: 'UI5 Train Dual-Model 4+4 Rollouts - H20x2 v2'
+caption: 'UI5 Train Dual-Model 4+4 Rollouts - H20x2 v3'
 
 jobDefVersion:
   entrypointMode: FULL_SCRIPT
 
   gitRepo:
-    mnt: /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-rollout8-h20x2-v2
+    mnt: /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/Embodied-rollout8-h20x2-v3
 
   imageMeta:
     imageSource: url
@@ -13,7 +13,7 @@ jobDefVersion:
     imageVid: d8ap37f1enlcr23291ug
 
   lazyDownloadCode: true
-  name: 'ui5-train-rollout8-h20x2-v2-20260903'
+  name: 'ui5-train-rollout8-h20x2-v3-20260904'
 
   resource:
     arnoldConfig:
@@ -49,14 +49,14 @@ jobRunParams:
   entrypointFullScript: |
     set -Eeuo pipefail
     export WORKSPACE=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace
-    export ORCHESTRATOR_REPO=${WORKSPACE}/code/Eagle/Embodied-rollout8-h20x2-v2
+    export ORCHESTRATOR_REPO=${WORKSPACE}/code/Eagle/Embodied-rollout8-h20x2-v3
     export CROP_REPO=${ORCHESTRATOR_REPO}
     export M31_REPO=${WORKSPACE}/code/Eagle/Embodied-ui5-rollout8-m31
     cd "${ORCHESTRATOR_REPO}"
     exec bash shell/run_ui5_train_rollouts_h20x2.sh
 
   envsList:
-    OUTPUT_ROOT: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_rollouts/ui5-train-rollout8-h20x2-v2-20260903"
+    OUTPUT_ROOT: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_rollouts/ui5-train-rollout8-h20x2-v3-20260904"
     BUNDLE_ROOT: "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_data/ui5_train_rollout_bundle_v1"
 
 namespace: /user/sicheng.yang

@@ -55,10 +55,10 @@ M31_REPO = (
 )
 CROP_REPO = (
     "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/"
-    "Embodied-rollout8-h20x2-v2"
+    "Embodied-rollout8-h20x2-v3"
 )
 M31_ROLLOUT_COMMIT = "6367cc6660f7eb933048b81100915a05f9b49bf4"
-CROP_V2_BASE_COMMIT = "2448006bf6ee44f1dc99d3a9c2faf843b16ddc39"
+V3_BASE_COMMIT = "ff6b3b7507e762012b23c8700f832b05e606dbd4"
 A800_M31_SOURCE = (
     "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/"
     "Eagle_LocateUI5_v4/Embodied/work_dirs/"
@@ -612,7 +612,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     )
     crop_repo = git_revision(
         args.crop_repo.expanduser().resolve(strict=False),
-        required_ancestor=CROP_V2_BASE_COMMIT,
+        required_ancestor=V3_BASE_COMMIT,
     )
     output_arg = getattr(args, "output_root", None)
     output = (
@@ -657,7 +657,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "repositories_h20": {"m31": M31_REPO, "crop": CROP_REPO},
         "rollout_output_h20": (
             "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/"
-            "gui_rollouts/ui5-train-rollout8-h20x2-v2-20260903"
+            "gui_rollouts/ui5-train-rollout8-h20x2-v3-20260904"
         ),
     }
     atomic_json(diagnostics / "preflight_summary.json", summary)

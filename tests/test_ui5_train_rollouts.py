@@ -23,7 +23,17 @@ import preflight_ui5_train_rollouts as preflight
 import prepare_ui5_train_rollout_bundle as prepare
 import render_ui5_train_rollout_gallery as gallery
 import snapshot_ui5_train_rollouts as snapshot
-from run_ui5_train_rollout_worker import load_module, score_prediction
+from run_ui5_train_rollout_worker import (
+    MAX_NUM_TOKENS_PER_SAMPLE,
+    MAX_SEQ_LENGTH,
+    PROCESSOR_IN_TOKEN_LIMIT,
+    ROLLOUT_MAX_NEW_TOKENS,
+    TRAINING_MAX_NUM_TOKENS,
+    fixed_interleaved_samples,
+    install_generation_token_budget,
+    load_module,
+    score_prediction,
+)
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -35,6 +45,67 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 class UI5TrainRolloutTest(unittest.TestCase):
+    def test_fixed_interleave_and_effective_generation_budget(self) -> None:
+        tasks = (
+            "occlusion",
+            "cropping",
+            "text_overflow",
+            "text_ellipsis",
+            "content_missing",
+        )
+        unordered = [
+            {
+                "record_id": f"{task}_{polarity}",
+                "sample_id": f"{task}_{polarity}",
+                "task": task,
+                "positive": polarity == "positive",
+            }
+            for polarity in ("negative", "positive")
+            for task in reversed(tasks)
+        ]
+        ordered = fixed_interleaved_samples(unordered)
+        self.assertEqual(
+            [row["record_id"] for row in ordered],
+            [
+                f"{task}_{polarity}"
+                for task in tasks
+                for polarity in ("positive", "negative")
+            ],
+        )
+
+        class FakeModel:
+            def generate(self, **inputs):
+                return inputs["max_new_tokens"]
+
+        inferencer = SimpleNamespace(
+            processor=SimpleNamespace(in_token_limit=PROCESSOR_IN_TOKEN_LIMIT),
+            model=FakeModel(),
+        )
+        args = SimpleNamespace(
+            processor_in_token_limit=PROCESSOR_IN_TOKEN_LIMIT,
+            max_new_tokens=ROLLOUT_MAX_NEW_TOKENS,
+            max_seq_length=MAX_SEQ_LENGTH,
+        )
+        install_generation_token_budget(inferencer, args)
+        self.assertEqual(
+            inferencer.model.generate(input_ids=np.zeros((1, 100), dtype=np.int64)),
+            512,
+        )
+        self.assertEqual(
+            inferencer.model.generate(input_ids=np.zeros((1, 7000), dtype=np.int64)),
+            268,
+        )
+        self.assertEqual(
+            inferencer.last_rollout_token_usage["input_plus_generation_limit"],
+            MAX_SEQ_LENGTH,
+        )
+        with self.assertRaisesRegex(RuntimeError, "input exceeds MAX_SEQ_LENGTH"):
+            inferencer.model.generate(
+                input_ids=np.zeros((1, MAX_SEQ_LENGTH), dtype=np.int64)
+            )
+        self.assertEqual(MAX_NUM_TOKENS_PER_SAMPLE, 7268)
+        self.assertEqual(TRAINING_MAX_NUM_TOKENS, 12800)
+
     def build_bundle(self, root: Path) -> Path:
         full = root / "full"
         audit = root / "audit"
@@ -245,7 +316,9 @@ class UI5TrainRolloutTest(unittest.TestCase):
 
             output = root / "rollouts"
             output.mkdir()
-            samples = prepare.read_jsonl(bundle / "manifest" / "task_samples.jsonl")
+            samples = fixed_interleaved_samples(
+                prepare.read_jsonl(bundle / "manifest" / "task_samples.jsonl")
+            )
             first_snapshot, first_summary = snapshot.create_snapshot(
                 output,
                 bundle,
@@ -265,6 +338,8 @@ class UI5TrainRolloutTest(unittest.TestCase):
                 },
             )
             self.assertEqual(first_summary["file_counts"]["delta_since_previous"], 5)
+            self.assertTrue((first_snapshot / "snapshot_statistics.xlsx").is_file())
+            self.assertTrue((first_snapshot / "visualizations" / "index.html").is_file())
             for model in ("m31", "crop"):
                 for rollout in range(4):
                     raw_rows = []
@@ -449,6 +524,14 @@ class UI5TrainRolloutTest(unittest.TestCase):
             self.assertIn("SNAPSHOT_INTERVAL_SECONDS=10800", launcher)
             self.assertIn("NEXT_SNAPSHOT_HOUR=$((NEXT_SNAPSHOT_HOUR + 3))", launcher)
             self.assertNotIn("SNAPSHOT_SAMPLE", launcher)
+            self.assertEqual(launcher.count("launch_worker m31"), 2)
+            self.assertEqual(launcher.count("launch_worker crop"), 2)
+            self.assertIn('launch_worker m31 0 "0,1"', launcher)
+            self.assertIn('launch_worker m31 0 "2,3"', launcher)
+            self.assertIn('launch_worker crop 1 "0,1"', launcher)
+            self.assertIn('launch_worker crop 1 "2,3"', launcher)
+            self.assertIn("--max-seq-length 7268", launcher)
+            self.assertIn("--max-new-tokens 512", launcher)
             analysis = aggregate.run(
                 SimpleNamespace(output_root=output, bundle_root=bundle, repo_root=PROJECT_ROOT)
             )
@@ -477,6 +560,28 @@ class UI5TrainRolloutTest(unittest.TestCase):
             self.assertFalse((output / "selection" / "cross_model_complete8.jsonl").exists())
             self.assertTrue((output / "summary.json").is_file())
             self.assertTrue((output / "reports" / "ui5_train_rollout_analysis.xlsx").is_file())
+            run_config = json.loads(
+                (output / "run_config.snapshot.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(run_config["generation"]["max_seq_length"], 7268)
+            self.assertEqual(run_config["generation"]["max_new_tokens"], 512)
+            self.assertEqual(
+                run_config["generation"]["training_max_num_tokens_record_only"],
+                12800,
+            )
+            self.assertEqual(
+                run_config["sample_order"]["policy"],
+                "fixed_task_polarity_round_robin_v1",
+            )
+            for sync_name in (
+                "sync_ui5_train_rollout_latest.sh",
+                "sync_ui5_train_rollout_all_ready.sh",
+            ):
+                sync_script = (PROJECT_ROOT / "shell" / sync_name).read_text(
+                    encoding="utf-8"
+                )
+                self.assertIn("nastk cp -c=32", sync_script)
+                self.assertIn("h20x2-v3-20260904", sync_script)
             rendered = gallery.render(
                 SimpleNamespace(output_root=output, bundle_root=bundle, panel_long_side=160)
             )

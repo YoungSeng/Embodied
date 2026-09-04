@@ -15,7 +15,17 @@ from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
-from run_ui5_train_rollout_worker import last_jsonl_row, load_module, score_prediction
+from run_ui5_train_rollout_worker import (
+    MAX_NUM_TOKENS_PER_SAMPLE,
+    MAX_SEQ_LENGTH,
+    PROCESSOR_IN_TOKEN_LIMIT,
+    ROLLOUT_MAX_NEW_TOKENS,
+    TRAINING_MAX_NUM_TOKENS,
+    fixed_interleaved_samples,
+    last_jsonl_row,
+    load_module,
+    score_prediction,
+)
 from snapshot_ui5_train_rollouts import (
     DIFFICULTIES,
     build_difficulty_records,
@@ -99,14 +109,17 @@ def grouped_rollouts(root: Path, model: str) -> Iterator[list[dict[str, Any]]]:
 def bundle_sample_keys(bundle: Path) -> tuple[list[tuple[str, str]], int]:
     manifest = json.loads((bundle / "bundle_manifest.json").read_text(encoding="utf-8"))
     expected_total = int(manifest["rollout_samples"])
-    keys: list[tuple[str, str]] = []
+    rows: list[dict[str, Any]] = []
     path = bundle / "manifest" / "task_samples.jsonl"
     with path.open("r", encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, 1):
             if not line.strip():
                 continue
-            row = json.loads(line)
-            keys.append((str(row["record_id"]), str(row["sample_id"])))
+            rows.append(json.loads(line))
+    keys = [
+        (str(row["record_id"]), str(row["sample_id"]))
+        for row in fixed_interleaved_samples(rows)
+    ]
     if len(keys) != expected_total:
         raise RuntimeError(
             "bundle expected_total disagrees with task_samples: "
@@ -287,6 +300,7 @@ def compact_rollout(row: Mapping[str, Any]) -> dict[str, Any]:
         "latency_seconds": row["latency_seconds"],
         "inference_success": row.get("inference_success", True),
         "runtime_error": row.get("runtime_error"),
+        "token_usage": row.get("token_usage"),
     }
 
 
@@ -921,8 +935,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "attention": "sdpa",
             "mode": "hybrid",
             "sampling": True,
+            "max_seq_length": MAX_SEQ_LENGTH,
+            "max_num_tokens_per_sample": MAX_NUM_TOKENS_PER_SAMPLE,
+            "training_max_num_tokens_record_only": TRAINING_MAX_NUM_TOKENS,
+            "processor_in_token_limit": PROCESSOR_IN_TOKEN_LIMIT,
+            "max_new_tokens": ROLLOUT_MAX_NEW_TOKENS,
+            "effective_max_new_tokens_rule": (
+                "min(512, 7268 - input_tokens)"
+            ),
+            "n_future_tokens": 6,
             "main_iou": 0.1,
             "rescore_iou": [0.3, 0.5],
+        },
+        "sample_order": {
+            "policy": "fixed_task_polarity_round_robin_v1",
+            "task_order": list(TASKS),
+            "polarity_order": ["positive", "negative"],
+            "within_bucket_order": ["record_id", "sample_id"],
         },
         "bundle_root": str(bundle),
         "output_root": str(root),

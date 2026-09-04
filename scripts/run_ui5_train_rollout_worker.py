@@ -23,9 +23,16 @@ from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 BASE_COMMITS = {"m31": "5d7a313", "crop": "945ce39"}
 MODEL_IDS = ("m31", "crop")
+TASKS = ("occlusion", "cropping", "text_overflow", "text_ellipsis", "content_missing")
+FORMAL_SEEDS = {0: 20260903, 1: 20260917, 2: 20260931, 3: 20260947}
+MAX_SEQ_LENGTH = 7268
+MAX_NUM_TOKENS_PER_SAMPLE = 7268
+TRAINING_MAX_NUM_TOKENS = 12800
+PROCESSOR_IN_TOKEN_LIMIT = 25600
+ROLLOUT_MAX_NEW_TOKENS = 512
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -54,7 +61,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--attn-implementation", choices=("sdpa",), default="sdpa")
     parser.add_argument("--vision-attn-implementation", choices=("sdpa",), default="sdpa")
     parser.add_argument("--generation-mode", choices=("hybrid",), default="hybrid")
-    parser.add_argument("--max-new-tokens", type=int, default=4096)
+    parser.add_argument("--max-seq-length", type=int, default=MAX_SEQ_LENGTH)
+    parser.add_argument(
+        "--max-num-tokens-per-sample", type=int, default=MAX_NUM_TOKENS_PER_SAMPLE
+    )
+    parser.add_argument(
+        "--training-max-num-tokens", type=int, default=TRAINING_MAX_NUM_TOKENS
+    )
+    parser.add_argument(
+        "--processor-in-token-limit", type=int, default=PROCESSOR_IN_TOKEN_LIMIT
+    )
+    parser.add_argument("--max-new-tokens", type=int, default=ROLLOUT_MAX_NEW_TOKENS)
     parser.add_argument("--n-future-tokens", type=int, default=6)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.9)
@@ -65,6 +82,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def stable_seed(base_seed: int, *parts: str) -> int:
@@ -86,6 +116,41 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(f"expected object at {path}:{line_no}")
             rows.append(value)
     return rows
+
+
+def fixed_interleaved_samples(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Round-robin the fixed task/polarity buckets without any randomness."""
+    bucket_order = [(task, polarity) for task in TASKS for polarity in ("positive", "negative")]
+    buckets: dict[tuple[str, str], list[dict[str, Any]]] = {
+        key: [] for key in bucket_order
+    }
+    for raw in rows:
+        row = dict(raw)
+        task = str(row.get("task"))
+        if task not in TASKS:
+            raise ValueError(f"unknown task in rollout bundle: {task}")
+        positive = bool(row.get("positive", bool(row.get("gt_global"))))
+        buckets[(task, "positive" if positive else "negative")].append(row)
+    for bucket in buckets.values():
+        bucket.sort(key=lambda row: (str(row["record_id"]), str(row.get("sample_id", ""))))
+    ordered: list[dict[str, Any]] = []
+    next_index = {key: 0 for key in bucket_order}
+    while len(ordered) < len(rows):
+        added = 0
+        for key in bucket_order:
+            index = next_index[key]
+            if index >= len(buckets[key]):
+                continue
+            ordered.append(buckets[key][index])
+            next_index[key] = index + 1
+            added += 1
+        if not added:
+            raise RuntimeError("fixed interleaving stalled before all samples were emitted")
+    if len({str(row["record_id"]) for row in ordered}) != len(ordered):
+        raise RuntimeError("fixed interleaved sample order contains duplicate record_id")
+    return ordered
 
 
 def load_module(path: Path, name: str):
@@ -173,7 +238,14 @@ def generation_config(args: argparse.Namespace) -> dict[str, Any]:
         "attn_implementation": args.attn_implementation,
         "vision_attn_implementation": args.vision_attn_implementation,
         "generation_mode": args.generation_mode,
+        "max_seq_length": args.max_seq_length,
+        "max_num_tokens_per_sample": args.max_num_tokens_per_sample,
+        "training_max_num_tokens_record_only": args.training_max_num_tokens,
+        "processor_in_token_limit": args.processor_in_token_limit,
         "max_new_tokens": args.max_new_tokens,
+        "effective_max_new_tokens_rule": (
+            "min(max_new_tokens, max_seq_length - input_tokens)"
+        ),
         "n_future_tokens": args.n_future_tokens,
         "do_sample": True,
         "temperature": args.temperature,
@@ -182,6 +254,45 @@ def generation_config(args: argparse.Namespace) -> dict[str, Any]:
         "repetition_penalty": args.repetition_penalty,
         "relation_gate_mode": "observe",
         "tile_nms_iou": args.tile_nms_iou if args.model_id == "crop" else None,
+    }
+
+
+def install_generation_token_budget(
+    inferencer: Any, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Bound every old-policy generate call without editing either inference baseline."""
+    processor = inferencer.processor
+    previous_in_token_limit = getattr(processor, "in_token_limit", None)
+    processor.in_token_limit = int(args.processor_in_token_limit)
+    original_generate = inferencer.model.generate
+    inferencer.last_rollout_token_usage = None
+
+    def bounded_generate(*positional: Any, **inputs: Any) -> Any:
+        if "input_ids" not in inputs:
+            raise KeyError("rollout generation requires keyword input_ids for token budgeting")
+        input_tokens = int(inputs["input_ids"].shape[-1])
+        effective_max_new_tokens = min(
+            int(args.max_new_tokens), int(args.max_seq_length) - input_tokens
+        )
+        if effective_max_new_tokens <= 0:
+            raise RuntimeError(
+                "rollout input exceeds MAX_SEQ_LENGTH: "
+                f"input_tokens={input_tokens} max_seq_length={args.max_seq_length}"
+            )
+        inputs["max_new_tokens"] = effective_max_new_tokens
+        inferencer.last_rollout_token_usage = {
+            "input_tokens": input_tokens,
+            "configured_max_new_tokens": int(args.max_new_tokens),
+            "effective_max_new_tokens": effective_max_new_tokens,
+            "max_seq_length": int(args.max_seq_length),
+            "input_plus_generation_limit": input_tokens + effective_max_new_tokens,
+        }
+        return original_generate(*positional, **inputs)
+
+    inferencer.model.generate = bounded_generate
+    return {
+        "previous_in_token_limit": previous_in_token_limit,
+        "active_in_token_limit": getattr(processor, "in_token_limit", None),
     }
 
 
@@ -344,6 +455,7 @@ class ProgressWriter:
         self.seed = seed
         self.total = total
         self.started = time.monotonic()
+        self.inference_started: float | None = None
         self.last_emit = self.started
 
     def should_emit(self, attempted: int, every: int, seconds: float) -> bool:
@@ -362,10 +474,28 @@ class ProgressWriter:
         attempted = int(counters["attempted"])
         if not force and not self.should_emit(attempted, 100, 60.0):
             return
+        if status == "running" and self.inference_started is None:
+            self.inference_started = now
         elapsed = max(0.0, now - self.started)
+        inference_elapsed = max(
+            0.0,
+            now - (self.inference_started if self.inference_started is not None else now),
+        )
         inference_success = int(counters["inference_success"])
-        throughput = inference_success / elapsed if inference_success and elapsed else 0.0
-        remaining = (self.total - attempted) / throughput if throughput else None
+        attempted_throughput = (
+            attempted / inference_elapsed if attempted and inference_elapsed else 0.0
+        )
+        success_throughput = (
+            inference_success / inference_elapsed
+            if inference_success and inference_elapsed
+            else 0.0
+        )
+        remaining_samples = max(0, self.total - attempted)
+        remaining = (
+            remaining_samples / success_throughput
+            if success_throughput
+            else (0.0 if remaining_samples == 0 else None)
+        )
         eta = (
             datetime.fromtimestamp(time.time() + remaining, timezone.utc).isoformat()
             if remaining is not None
@@ -383,9 +513,12 @@ class ProgressWriter:
             "runtime_error": int(counters["runtime_error"]),
             "parse_error": int(counters["parse_error"]),
             "total": self.total,
-            "throughput_inference_success_per_second": throughput,
-            "throughput_samples_per_second": throughput,
+            "throughput_attempted_per_second": attempted_throughput,
+            "throughput_inference_success_per_second": success_throughput,
+            "throughput_samples_per_second": success_throughput,
             "elapsed_seconds": elapsed,
+            "inference_elapsed_seconds": inference_elapsed,
+            "eta_basis": "inference_success_throughput_excluding_model_load",
             "remaining_seconds": remaining,
             "estimated_completion": eta,
             "gpu_memory": dict(memory or {}),
@@ -400,7 +533,9 @@ class ProgressWriter:
             f"inference_success={inference_success} "
             f"runtime_error={counters['runtime_error']} "
             f"parse_error={counters['parse_error']} "
-            f"throughput={throughput:.6f} elapsed={elapsed:.1f} "
+            f"throughput_attempted={attempted_throughput:.6f} "
+            f"throughput_inference_success={success_throughput:.6f} "
+            f"elapsed={elapsed:.1f} inference_elapsed={inference_elapsed:.1f} "
             f"eta_seconds={remaining} estimated_completion={eta} "
             f"gpu_allocated_gib={(memory or {}).get('allocated_gib')} "
             f"gpu_reserved_gib={(memory or {}).get('reserved_gib')}",
@@ -436,6 +571,7 @@ def full_image_prediction(
     )
     return {
         "sample_seed": sample_seed,
+        "token_usage": dict(inferencer.last_rollout_token_usage or {}),
         "raw_output": answer,
         "parse_status": parsed.status,
         "parse_warnings": parsed.warnings,
@@ -503,6 +639,7 @@ def crop_prediction(
                     "crop_index": int(crop["crop_index"]),
                     "crop_xyxy": crop_box,
                     "sample_seed": crop_seed,
+                    "token_usage": dict(inferencer.last_rollout_token_usage or {}),
                     "prompt": row["prompt"],
                     "gt_local": crop.get("gt_local", []),
                     "gt_global": crop.get("gt_global", []),
@@ -545,6 +682,17 @@ def crop_prediction(
     )
     return {
         "sample_seed": stable_seed(int(args.seed), str(row["record_id"])),
+        "token_usage": {
+            "crop_calls": len(native),
+            "input_tokens_total": sum(
+                int(item["token_usage"].get("input_tokens", 0)) for item in native
+            ),
+            "effective_max_new_tokens_total": sum(
+                int(item["token_usage"].get("effective_max_new_tokens", 0))
+                for item in native
+            ),
+            "per_crop": [item["token_usage"] for item in native],
+        },
         "raw_output": native,
         "parse_status": parse_status,
         "contains_crop_parse_error": any_parse_error,
@@ -618,6 +766,7 @@ def worker_record(
         "coordinate_transform_anomaly": bool(row.get("coordinate_transform_anomaly")),
         "grpo_eligible": bool(row.get("grpo_eligible")),
         "sample_seed": result["sample_seed"],
+        "token_usage": result.get("token_usage"),
         "latency_seconds": result["latency_seconds"],
         "finished_at": utc_now(),
         "inference_success": True,
@@ -676,6 +825,7 @@ def error_record(
         "annotation_anomaly": bool(row.get("annotation_anomaly")),
         "coordinate_transform_anomaly": bool(row.get("coordinate_transform_anomaly")),
         "grpo_eligible": False,
+        "token_usage": None,
         "runtime_error": {
             "type": classify_runtime_error(exc),
             "python_type": type(exc).__name__,
@@ -753,8 +903,35 @@ def validate_run_args(args: argparse.Namespace) -> None:
         raise ValueError("--rollout-ids values must be in 0,1,2,3")
     if len(seeds) != len(rollout_ids):
         raise ValueError("--seeds must have one seed per rollout ID")
+    if tuple(rollout_ids) not in ((0, 1), (2, 3)):
+        raise ValueError("formal workers must own rollout IDs 0,1 or 2,3")
+    if any(FORMAL_SEEDS[rollout_id] != seed for rollout_id, seed in zip(rollout_ids, seeds)):
+        raise ValueError(
+            f"formal rollout seeds must match {FORMAL_SEEDS}; got {dict(zip(rollout_ids, seeds))}"
+        )
     if args.gpu_model_processes != 2:
         raise ValueError("formal H20x2 execution requires two model processes per GPU")
+    token_values = {
+        "max_seq_length": args.max_seq_length,
+        "max_num_tokens_per_sample": args.max_num_tokens_per_sample,
+        "training_max_num_tokens": args.training_max_num_tokens,
+        "processor_in_token_limit": args.processor_in_token_limit,
+        "max_new_tokens": args.max_new_tokens,
+        "n_future_tokens": args.n_future_tokens,
+    }
+    expected_tokens = {
+        "max_seq_length": MAX_SEQ_LENGTH,
+        "max_num_tokens_per_sample": MAX_NUM_TOKENS_PER_SAMPLE,
+        "training_max_num_tokens": TRAINING_MAX_NUM_TOKENS,
+        "processor_in_token_limit": PROCESSOR_IN_TOKEN_LIMIT,
+        "max_new_tokens": ROLLOUT_MAX_NEW_TOKENS,
+        "n_future_tokens": 6,
+    }
+    if token_values != expected_tokens:
+        raise ValueError(
+            f"formal rollout token configuration mismatch: actual={token_values} "
+            f"expected={expected_tokens}"
+        )
     if args.part_size <= 0:
         raise ValueError("--part-size must be positive")
     if args.progress_every <= 0 or args.progress_seconds <= 0:
@@ -773,7 +950,12 @@ def run_worker(args: argparse.Namespace) -> int:
     repo = args.repo_root.expanduser().resolve(strict=True)
     code = verify_code_identity(repo, str(args.model_id))
     bundle = args.bundle_root.expanduser().resolve(strict=True)
-    samples = read_jsonl(bundle / "manifest" / "task_samples.jsonl")
+    samples = fixed_interleaved_samples(
+        read_jsonl(bundle / "manifest" / "task_samples.jsonl")
+    )
+    sample_order_digest = hashlib.sha256(
+        "\n".join(str(row["record_id"]) for row in samples).encode("utf-8")
+    ).hexdigest()
     crop_index: dict[str, list[dict[str, Any]]] = {}
     if args.model_id == "crop":
         for crop in read_jsonl(bundle / "manifest" / "crop_samples.jsonl"):
@@ -854,11 +1036,49 @@ def run_worker(args: argparse.Namespace) -> int:
             }
         )
     rollout_text = ",".join(map(str, rollout_ids))
+    worker_manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "created_at": utc_now(),
+        "model_id": args.model_id,
+        "physical_gpu": args.physical_gpu,
+        "pid": os.getpid(),
+        "rollout_ids": rollout_ids,
+        "seeds": seeds,
+        "checkpoint": str(args.checkpoint),
+        "processor_path": str(args.processor_path),
+        "generation_config": generation_config(args),
+        "sample_order": {
+            "policy": "fixed_round_robin_task_then_positive_negative",
+            "tasks": list(TASKS),
+            "polarity_order": ["positive", "negative"],
+            "records": len(samples),
+            "record_id_sha256": sample_order_digest,
+        },
+        "gpu_model_processes": args.gpu_model_processes,
+    }
+    atomic_json(
+        output_root
+        / "manifests"
+        / f"{args.model_id}_rollouts_{rollout_text.replace(',', '_')}.json",
+        worker_manifest,
+    )
     print(
         "[MODEL_PROCESS_START] "
         f"model={args.model_id} gpu={args.physical_gpu} pid={os.getpid()} "
         f"rollouts={rollout_text} gpu_model_processes={args.gpu_model_processes} "
         f"checkpoint={args.checkpoint} processor={args.processor_path}",
+        flush=True,
+    )
+    print(
+        "[TOKEN_CONFIG] "
+        f"model={args.model_id} gpu={args.physical_gpu} pid={os.getpid()} "
+        f"rollouts={rollout_text} MAX_SEQ_LENGTH={args.max_seq_length} "
+        f"MAX_NUM_TOKENS_PER_SAMPLE={args.max_num_tokens_per_sample} "
+        f"MAX_NUM_TOKENS={args.training_max_num_tokens} "
+        f"processor_in_token_limit={args.processor_in_token_limit} "
+        f"max_new_tokens={args.max_new_tokens} n_future_tokens={args.n_future_tokens} "
+        "effective_rule=min(512,7268-input_tokens) "
+        f"sample_order_sha256={sample_order_digest}",
         flush=True,
     )
     inference_path = (
@@ -898,6 +1118,7 @@ def run_worker(args: argparse.Namespace) -> int:
             )
         model_args = make_generation_args(assigned[0])
         inferencer = module.LocateAnythingInferencer(model_args)
+        processor_limit = install_generation_token_budget(inferencer, assigned[0])
         torch.cuda.synchronize()
         model_loaded = True
         load_seconds = time.monotonic() - load_started
@@ -907,6 +1128,8 @@ def run_worker(args: argparse.Namespace) -> int:
             f"model={args.model_id} gpu={args.physical_gpu} pid={os.getpid()} "
             f"rollouts={rollout_text} checkpoint={args.checkpoint} "
             f"processor={args.processor_path} load_seconds={load_seconds:.3f} "
+            f"token_config={json.dumps(generation_config(args), sort_keys=True)} "
+            f"processor_limit={json.dumps(processor_limit, sort_keys=True)} "
             f"memory_before={json.dumps(memory_before, sort_keys=True)} "
             f"memory_after={json.dumps(memory_after, sort_keys=True)}",
             flush=True,
