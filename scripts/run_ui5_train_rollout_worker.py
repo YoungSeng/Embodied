@@ -2,8 +2,9 @@
 """One persistent UI5 train-rollout worker or a CPU progress snapshot.
 
 Run mode loads exactly one checkpoint once, then processes every portable
-``image_id+task`` sample.  Crop mode performs in-memory base-tile crops and
-reuses the tiled-eval branch's global mapping plus class-aware greedy NMS.
+``image_id+task`` sample for its two assigned rollouts in sample-major order.
+Crop mode performs in-memory base-tile crops and reuses the tiled-eval branch's
+global mapping plus class-aware greedy NMS.
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 BASE_COMMITS = {"m31": "5d7a313", "crop": "945ce39"}
 MODEL_IDS = ("m31", "crop")
 TASKS = ("occlusion", "cropping", "text_overflow", "text_ellipsis", "content_missing")
@@ -66,7 +67,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dtype", choices=("bf16",), default="bf16")
     parser.add_argument("--attn-implementation", choices=("sdpa",), default="sdpa")
-    parser.add_argument("--vision-attn-implementation", choices=("sdpa",), default="sdpa")
+    parser.add_argument(
+        "--vision-attn-implementation",
+        choices=("flash_attention_2",),
+        default="flash_attention_2",
+    )
     parser.add_argument("--generation-mode", choices=("hybrid",), default="hybrid")
     parser.add_argument("--max-seq-length", type=int, default=MAX_SEQ_LENGTH)
     parser.add_argument(
@@ -308,6 +313,51 @@ def install_generation_token_budget(
     }
 
 
+def verify_loaded_attention_backends(
+    inferencer: Any, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Fail closed unless the instantiated text/Vision backends match training."""
+    model = inferencer.model
+    model_config = getattr(model, "config", None)
+    text_config = getattr(model_config, "text_config", None)
+    vision_config = getattr(model_config, "vision_config", None)
+    text_backend = str(getattr(text_config, "_attn_implementation", None))
+    vision_backend = str(getattr(vision_config, "_attn_implementation", None))
+    blocks = list(getattr(getattr(model.vision_model, "encoder", None), "blocks", ()))
+    block_backends = [str(getattr(block, "attn_implementation", None)) for block in blocks]
+    matching_blocks = sum(
+        backend == args.vision_attn_implementation for backend in block_backends
+    )
+    report = {
+        "text_config": text_backend,
+        "vision_config": vision_backend,
+        "vision_first_layer": block_backends[0] if block_backends else "<missing>",
+        "vision_blocks_matching": matching_blocks,
+        "vision_blocks_total": len(blocks),
+        "vision_blocks": f"{matching_blocks}/{len(blocks)}",
+        "vision_block_backends": block_backends,
+    }
+    failures: list[str] = []
+    if text_backend != args.attn_implementation:
+        failures.append(
+            f"text_config={text_backend!r}, expected={args.attn_implementation!r}"
+        )
+    if vision_backend != args.vision_attn_implementation:
+        failures.append(
+            f"vision_config={vision_backend!r}, "
+            f"expected={args.vision_attn_implementation!r}"
+        )
+    if len(blocks) != 27 or matching_blocks != 27:
+        failures.append(
+            "vision_blocks="
+            f"{matching_blocks}/{len(blocks)}, expected=27/27 "
+            f"backends={block_backends}"
+        )
+    if failures:
+        raise RuntimeError("loaded attention backend audit failed: " + "; ".join(failures))
+    return report
+
+
 def area(box: Sequence[float]) -> float:
     return max(0.0, float(box[2]) - float(box[0])) * max(
         0.0, float(box[3]) - float(box[1])
@@ -415,17 +465,344 @@ def score_prediction(
     }
 
 
+def _resume_recovery_path(
+    directory: Path,
+    *,
+    model_id: str,
+    rollout_id: int,
+    kind: str,
+) -> Path:
+    safe_kind = "".join(character if character.isalnum() else "_" for character in kind)
+    return directory / (
+        f"{model_id}_rollout_{rollout_id}_{safe_kind}_"
+        f"{time.time_ns()}_{os.getpid()}.json"
+    )
+
+
+def _write_resume_recovery(
+    directory: Path | None,
+    *,
+    path: Path,
+    model_id: str,
+    rollout_id: int,
+    kind: str,
+    action: str,
+    original_size: int,
+    new_size: int,
+    fragment: bytes,
+) -> None:
+    recovery_directory = directory or (path.parent / "resume_recovery")
+    event = {
+        "schema_version": SCHEMA_VERSION,
+        "timestamp": utc_now(),
+        "action": action,
+        "kind": kind,
+        "model_id": model_id,
+        "rollout_id": int(rollout_id),
+        "path": str(path.resolve(strict=False)),
+        "original_size": int(original_size),
+        "new_size": int(new_size),
+        "removed_bytes": max(0, int(original_size) - int(new_size)),
+        "fragment_bytes": len(fragment),
+        "fragment_sha256": hashlib.sha256(fragment).hexdigest(),
+        "fragment_preview": fragment[:512].decode("utf-8", errors="replace"),
+    }
+    diagnostic_path = _resume_recovery_path(
+        recovery_directory,
+        model_id=model_id,
+        rollout_id=rollout_id,
+        kind=kind,
+    )
+    atomic_json(diagnostic_path, event)
+    print(
+        "[RESUME_RECOVERY] "
+        f"model={model_id} rollout={rollout_id} kind={kind} action={action} "
+        f"path={path} original_size={original_size} new_size={new_size} "
+        f"fragment_sha256={event['fragment_sha256']} "
+        f"diagnostic={diagnostic_path}",
+        flush=True,
+    )
+
+
+def _safe_truncate_eof_fragment(
+    path: Path,
+    *,
+    offset: int,
+    expected_size: int,
+    fragment: bytes,
+    recovery_diagnostics_dir: Path | None,
+    model_id: str,
+    rollout_id: int,
+    kind: str,
+) -> None:
+    current_size = path.stat().st_size
+    if current_size != expected_size or not 0 <= offset < expected_size:
+        raise RuntimeError(
+            "refusing unsafe resume truncation after concurrent file change: "
+            f"path={path} expected_size={expected_size} current_size={current_size} "
+            f"offset={offset}"
+        )
+    with path.open("r+b") as handle:
+        handle.truncate(offset)
+        handle.flush()
+        os.fsync(handle.fileno())
+    _write_resume_recovery(
+        recovery_diagnostics_dir,
+        path=path,
+        model_id=model_id,
+        rollout_id=rollout_id,
+        kind=kind,
+        action="truncate_incomplete_unterminated_eof_fragment",
+        original_size=expected_size,
+        new_size=offset,
+        fragment=fragment,
+    )
+
+
+def _safe_append_missing_newline(
+    path: Path,
+    *,
+    expected_size: int,
+    recovery_diagnostics_dir: Path | None,
+    model_id: str,
+    rollout_id: int,
+    kind: str,
+) -> None:
+    current_size = path.stat().st_size
+    if current_size != expected_size or expected_size <= 0:
+        raise RuntimeError(
+            "refusing unsafe resume newline repair after concurrent file change: "
+            f"path={path} expected_size={expected_size} current_size={current_size}"
+        )
+    with path.open("ab") as handle:
+        handle.write(b"\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    _write_resume_recovery(
+        recovery_diagnostics_dir,
+        path=path,
+        model_id=model_id,
+        rollout_id=rollout_id,
+        kind=kind,
+        action="append_missing_newline_after_valid_eof_record",
+        original_size=expected_size,
+        new_size=expected_size + 1,
+        fragment=b"",
+    )
+
+
+def _iter_jsonl_with_tail_recovery(
+    path: Path,
+    *,
+    allow_incomplete_tail_recovery: bool,
+    normalize_valid_eof_newline: bool,
+    recovery_diagnostics_dir: Path | None,
+    model_id: str,
+    rollout_id: int,
+    kind: str,
+) -> Iterable[tuple[int, dict[str, Any]]]:
+    """Read JSONL, repairing only an unterminated malformed EOF fragment."""
+    file_size = path.stat().st_size
+    repair: tuple[int, bytes] | None = None
+    append_newline = False
+    with path.open("rb") as handle:
+        line_no = 0
+        while True:
+            start = handle.tell()
+            raw_line = handle.readline()
+            if not raw_line:
+                break
+            line_no += 1
+            at_eof = handle.tell() == file_size
+            terminated = raw_line.endswith(b"\n")
+            if not raw_line.strip():
+                if at_eof and not terminated:
+                    if not allow_incomplete_tail_recovery:
+                        raise RuntimeError(
+                            f"unterminated blank JSONL tail is not recoverable at "
+                            f"{path}:{line_no}"
+                        )
+                    repair = (start, raw_line)
+                    break
+                continue
+            try:
+                decoded = raw_line.decode("utf-8")
+                row = json.loads(decoded)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                if at_eof and not terminated and allow_incomplete_tail_recovery:
+                    repair = (start, raw_line)
+                    break
+                raise RuntimeError(
+                    f"invalid JSONL at {path}:{line_no}: {type(exc).__name__}: {exc}"
+                ) from exc
+            if not isinstance(row, dict):
+                raise RuntimeError(f"JSONL row is not an object at {path}:{line_no}")
+            yield line_no, row
+            if at_eof and not terminated and normalize_valid_eof_newline:
+                append_newline = True
+    if repair is not None:
+        _safe_truncate_eof_fragment(
+            path,
+            offset=repair[0],
+            expected_size=file_size,
+            fragment=repair[1],
+            recovery_diagnostics_dir=recovery_diagnostics_dir,
+            model_id=model_id,
+            rollout_id=rollout_id,
+            kind=kind,
+        )
+    elif append_newline:
+        _safe_append_missing_newline(
+            path,
+            expected_size=file_size,
+            recovery_diagnostics_dir=recovery_diagnostics_dir,
+            model_id=model_id,
+            rollout_id=rollout_id,
+            kind=kind,
+        )
+
+
+def resume_route_state(
+    raw_dir: Path,
+    *,
+    model_id: str,
+    rollout_id: int,
+    seed: int,
+    checkpoint: Path,
+    processor_path: Path,
+    generation: Mapping[str, Any],
+    git_commit: str,
+    baseline_git_commit: str,
+    worker_git_commit: str,
+    samples_by_record: Mapping[str, Mapping[str, Any]],
+    recovery_diagnostics_dir: Path | None = None,
+) -> tuple[set[str], dict[str, int]]:
+    """Validate prior JSONL and reconstruct cumulative route counters.
+
+    Presence of one valid raw record means that route/sample attempt is
+    complete, including a persisted technical error.  Resume therefore never
+    silently retries or duplicates a record whose outcome is already auditable.
+    """
+    completed: set[str] = set()
+    counters = {
+        "attempted": 0,
+        "inference_success": 0,
+        "runtime_error": 0,
+        "parse_error": 0,
+        "oom_exception_count": 0,
+        "oom_recovered_samples": 0,
+        "oom_final_failed_samples": 0,
+    }
+    if not raw_dir.exists():
+        return completed, counters
+    indexed_paths: list[tuple[int, Path]] = []
+    for path in raw_dir.glob("part-*.jsonl"):
+        suffix = path.stem.removeprefix("part-")
+        if not suffix.isdigit():
+            raise RuntimeError(f"invalid rollout part filename: {path}")
+        indexed_paths.append((int(suffix), path))
+    indexed_paths.sort()
+    indices = [index for index, _ in indexed_paths]
+    if len(indices) != len(set(indices)):
+        raise RuntimeError(f"duplicate rollout part index in {raw_dir}")
+    highest_index = max(indices, default=None)
+    for part_index, path in indexed_paths:
+        rows = _iter_jsonl_with_tail_recovery(
+            path,
+            allow_incomplete_tail_recovery=part_index == highest_index,
+            normalize_valid_eof_newline=True,
+            recovery_diagnostics_dir=recovery_diagnostics_dir,
+            model_id=model_id,
+            rollout_id=rollout_id,
+            kind=f"raw_part_{part_index:05d}",
+        )
+        for line_no, row in rows:
+            record_id = str(row.get("record_id", ""))
+            expected = samples_by_record.get(record_id)
+            if expected is None:
+                raise RuntimeError(
+                    f"unknown resumed record_id at {path}:{line_no}: {record_id!r}"
+                )
+            if record_id in completed:
+                raise RuntimeError(
+                    f"duplicate resumed record_id at {path}:{line_no}: {record_id}"
+                )
+            expected_sample_id = str(expected.get("sample_id", ""))
+            prior_checkpoint = Path(str(row.get("checkpoint", ""))).expanduser()
+            prior_processor = Path(str(row.get("processor_path", ""))).expanduser()
+            if (
+                int(row.get("schema_version", -1)) != SCHEMA_VERSION
+                or str(row.get("model_id")) != model_id
+                or int(row.get("rollout_id", -1)) != rollout_id
+                or int(row.get("seed", -1)) != seed
+                or str(row.get("sample_id", "")) != expected_sample_id
+                or prior_checkpoint.resolve(strict=False)
+                != checkpoint.expanduser().resolve(strict=False)
+                or prior_processor.resolve(strict=False)
+                != processor_path.expanduser().resolve(strict=False)
+                or row.get("generation_config") != dict(generation)
+                or str(row.get("git_commit")) != git_commit
+                or str(row.get("baseline_git_commit")) != baseline_git_commit
+                or str(row.get("worker_git_commit")) != worker_git_commit
+                or str(row.get("task")) != str(expected.get("task"))
+                or str(row.get("source_image_id"))
+                != str(expected.get("source_image_id"))
+                or str(row.get("image_relpath"))
+                != str(expected.get("image_relpath"))
+            ):
+                raise RuntimeError(
+                    "resumed route identity mismatch at "
+                    f"{path}:{line_no}: schema={row.get('schema_version')} "
+                    f"model={row.get('model_id')} "
+                    f"rollout={row.get('rollout_id')} seed={row.get('seed')} "
+                    f"record_id={record_id} sample_id={row.get('sample_id')} "
+                    f"checkpoint={row.get('checkpoint')} "
+                    f"processor_path={row.get('processor_path')} "
+                    f"git_commit={row.get('git_commit')} "
+                    f"baseline_git_commit={row.get('baseline_git_commit')} "
+                    f"worker_git_commit={row.get('worker_git_commit')} "
+                    f"task={row.get('task')} "
+                    f"source_image_id={row.get('source_image_id')}"
+                )
+            completed.add(record_id)
+            counters["attempted"] += 1
+            inference_success = bool(row.get("inference_success"))
+            counters["inference_success"] += int(inference_success)
+            counters["runtime_error"] += int(
+                not inference_success or row.get("runtime_error") is not None
+            )
+            counters["parse_error"] += int(
+                inference_success
+                and (
+                    row.get("parse_status") == "parse_error"
+                    or bool(row.get("contains_crop_parse_error"))
+                )
+            )
+            counters["oom_exception_count"] += int(row.get("oom_events", 0))
+            counters["oom_recovered_samples"] += int(bool(row.get("oom_recovered")))
+            counters["oom_final_failed_samples"] += int(
+                bool(row.get("oom_final_failure"))
+            )
+    return completed, counters
+
+
 class PartWriter:
     def __init__(self, directory: Path, part_size: int):
         self.directory = directory
         self.part_size = part_size
         self.directory.mkdir(parents=True, exist_ok=True)
-        stale = sorted(self.directory.glob("part-*.jsonl"))
-        if stale:
-            raise RuntimeError(
-                f"raw rollout directory is not empty; refusing to mix runs: {self.directory}"
-            )
-        self.part_index = -1
+        existing_indices: list[int] = []
+        for path in sorted(self.directory.glob("part-*.jsonl")):
+            suffix = path.stem.removeprefix("part-")
+            if not suffix.isdigit():
+                raise RuntimeError(f"invalid rollout part filename: {path}")
+            existing_indices.append(int(suffix))
+        if len(existing_indices) != len(set(existing_indices)):
+            raise RuntimeError(f"duplicate rollout part index in {self.directory}")
+        # A resumed worker never appends to an existing part.  The completed
+        # JSONL is validated before this writer is constructed, and new rows
+        # start in the next part so a killed process cannot corrupt old data.
+        self.part_index = max(existing_indices, default=-1)
         self.part_rows = 0
         self.handle = None
 
@@ -456,12 +833,59 @@ class PartWriter:
 
 
 class ProgressWriter:
-    def __init__(self, path: Path, model_id: str, rollout_id: int, seed: int, total: int):
+    def __init__(
+        self,
+        path: Path,
+        model_id: str,
+        rollout_id: int,
+        seed: int,
+        total: int,
+        resume_attempted: int = 0,
+        recovery_diagnostics_dir: Path | None = None,
+    ):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists() and path.stat().st_size:
-            raise RuntimeError(f"progress file already exists: {path}")
-        self.handle = path.open("x", encoding="utf-8")
+        prior_elapsed = 0.0
+        prior_inference_elapsed = 0.0
+        prior_attempted = 0
+        if path.exists():
+            rows = _iter_jsonl_with_tail_recovery(
+                path,
+                allow_incomplete_tail_recovery=True,
+                normalize_valid_eof_newline=True,
+                recovery_diagnostics_dir=recovery_diagnostics_dir,
+                model_id=model_id,
+                rollout_id=rollout_id,
+                kind="progress",
+            )
+            for line_no, row in rows:
+                if (
+                    row.get("model_id") != model_id
+                    or int(row.get("rollout_id", -1)) != rollout_id
+                    or int(row.get("seed", -1)) != seed
+                    or int(row.get("total", -1)) != total
+                ):
+                    raise RuntimeError(
+                        f"progress route mismatch at {path}:{line_no}: {row}"
+                    )
+                attempted = int(row.get("attempted", -1))
+                if attempted < prior_attempted or not 0 <= attempted <= total:
+                    raise RuntimeError(
+                        f"invalid/non-monotonic progress at {path}:{line_no}: "
+                        f"attempted={attempted} previous={prior_attempted} total={total}"
+                    )
+                prior_attempted = attempted
+                prior_elapsed = max(prior_elapsed, float(row.get("elapsed_seconds", 0)))
+                prior_inference_elapsed = max(
+                    prior_inference_elapsed,
+                    float(row.get("inference_elapsed_seconds", 0)),
+                )
+        if prior_attempted > resume_attempted:
+            raise RuntimeError(
+                f"progress is ahead of durable raw JSONL for {model_id} rollout "
+                f"{rollout_id}: progress={prior_attempted} raw={resume_attempted}"
+            )
+        self.handle = path.open("a", encoding="utf-8")
         self.model_id = model_id
         self.rollout_id = rollout_id
         self.seed = seed
@@ -469,6 +893,8 @@ class ProgressWriter:
         self.started = time.monotonic()
         self.inference_started: float | None = None
         self.last_emit = self.started
+        self.prior_elapsed = prior_elapsed
+        self.prior_inference_elapsed = prior_inference_elapsed
 
     def should_emit(self, attempted: int, every: int, seconds: float) -> bool:
         now = time.monotonic()
@@ -488,8 +914,8 @@ class ProgressWriter:
             return
         if status == "running" and self.inference_started is None:
             self.inference_started = now
-        elapsed = max(0.0, now - self.started)
-        inference_elapsed = max(
+        elapsed = self.prior_elapsed + max(0.0, now - self.started)
+        inference_elapsed = self.prior_inference_elapsed + max(
             0.0,
             now - (self.inference_started if self.inference_started is not None else now),
         )
@@ -808,8 +1234,10 @@ def worker_record(
         "schema_version": SCHEMA_VERSION,
         "model_id": args.model_id,
         "checkpoint": str(args.checkpoint),
+        "processor_path": str(args.processor_path),
         "git_commit": code["head"],
         "baseline_git_commit": code["baseline"],
+        "worker_git_commit": args.worker_git_commit,
         "rollout_id": int(args.rollout_id),
         "seed": int(args.seed),
         "generation_config": generation_config(args),
@@ -893,8 +1321,10 @@ def error_record(
         "schema_version": SCHEMA_VERSION,
         "model_id": args.model_id,
         "checkpoint": str(args.checkpoint),
+        "processor_path": str(args.processor_path),
         "git_commit": code["head"],
         "baseline_git_commit": code["baseline"],
+        "worker_git_commit": args.worker_git_commit,
         "rollout_id": int(args.rollout_id),
         "seed": int(args.seed),
         "generation_config": generation_config(args),
@@ -1131,20 +1561,32 @@ def validate_run_args(args: argparse.Namespace) -> None:
         raise ValueError("run mode missing arguments: " + ", ".join(missing))
     rollout_ids = parse_int_csv(args.rollout_ids, "rollout-ids")
     seeds = parse_int_csv(args.seeds, "seeds")
-    if len(rollout_ids) != 4 or len(set(rollout_ids)) != 4:
-        raise ValueError("--rollout-ids must contain exactly four distinct rollout IDs")
+    if len(rollout_ids) != 2 or len(set(rollout_ids)) != 2:
+        raise ValueError("--rollout-ids must contain exactly two distinct rollout IDs")
     if any(rollout_id not in range(4) for rollout_id in rollout_ids):
         raise ValueError("--rollout-ids values must be in 0,1,2,3")
     if len(seeds) != len(rollout_ids):
         raise ValueError("--seeds must have one seed per rollout ID")
-    if tuple(rollout_ids) != (0, 1, 2, 3):
-        raise ValueError("formal workers must own rollout IDs 0,1,2,3 in order")
+    if tuple(rollout_ids) not in {(0, 1), (2, 3)}:
+        raise ValueError("formal workers must own rollout IDs 0,1 or 2,3 in order")
     if any(FORMAL_SEEDS[rollout_id] != seed for rollout_id, seed in zip(rollout_ids, seeds)):
         raise ValueError(
             f"formal rollout seeds must match {FORMAL_SEEDS}; got {dict(zip(rollout_ids, seeds))}"
         )
-    if args.gpu_model_processes != 1:
-        raise ValueError("formal H20x2 execution requires one model process per GPU")
+    if args.gpu_model_processes != 2:
+        raise ValueError("formal H20x2 execution requires two model processes per GPU")
+    expected_physical_gpu = {"m31": 0, "crop": 1}[str(args.model_id)]
+    if args.physical_gpu != expected_physical_gpu:
+        raise ValueError(
+            f"formal {args.model_id} worker must use physical GPU "
+            f"{expected_physical_gpu}, got {args.physical_gpu}"
+        )
+    if args.attn_implementation != "sdpa":
+        raise ValueError("formal rollout text attention must be sdpa")
+    if args.vision_attn_implementation != "flash_attention_2":
+        raise ValueError(
+            "formal rollout vision attention must be flash_attention_2"
+        )
     token_values = {
         "max_seq_length": args.max_seq_length,
         "max_num_tokens_per_sample": args.max_num_tokens_per_sample,
@@ -1179,10 +1621,47 @@ def validate_run_args(args: argparse.Namespace) -> None:
         )
 
 
+def wait_for_model_load_barrier(
+    output_root: Path,
+    *,
+    model_id: str,
+    physical_gpu: int,
+    rollout_ids: Sequence[int],
+) -> dict[str, Any]:
+    """Wait until the launcher validates all four live model processes.
+
+    The launcher removes this marker before spawning workers and publishes it
+    atomically only after all four MODEL_LOAD_OK records pass their PID and
+    attention-backend checks.  In particular, no worker starts inference while
+    its same-GPU peer is still allocating model weights.
+    """
+    marker = output_root / "diagnostics" / "_MODEL_LOADS_OK"
+    rollout_text = ",".join(str(value) for value in rollout_ids)
+    started = time.monotonic()
+    print(
+        "[MODEL_LOAD_BARRIER_WAIT] "
+        f"model={model_id} gpu={physical_gpu} pid={os.getpid()} "
+        f"rollouts={rollout_text} marker={marker}",
+        flush=True,
+    )
+    while not marker.is_file():
+        time.sleep(1.0)
+    waited = max(0.0, time.monotonic() - started)
+    print(
+        "[MODEL_LOAD_BARRIER_RELEASE] "
+        f"model={model_id} gpu={physical_gpu} pid={os.getpid()} "
+        f"rollouts={rollout_text} marker={marker} waited_seconds={waited:.3f}",
+        flush=True,
+    )
+    return {"marker": str(marker), "waited_seconds": waited}
+
+
 def run_worker(args: argparse.Namespace) -> int:
     validate_run_args(args)
     repo = args.repo_root.expanduser().resolve(strict=True)
     code = verify_code_identity(repo, str(args.model_id))
+    worker_repo = Path(__file__).resolve().parents[1]
+    args.worker_git_commit = git_output(worker_repo, "rev-parse", "HEAD")
     bundle = args.bundle_root.expanduser().resolve(strict=True)
     samples = fixed_interleaved_samples(
         read_jsonl(bundle / "manifest" / "task_samples.jsonl")
@@ -1236,6 +1715,8 @@ def run_worker(args: argparse.Namespace) -> int:
         for rollout_id, seed in zip(rollout_ids, seeds)
     ]
     output_root = args.output_root.expanduser().resolve(strict=False)
+    recovery_diagnostics_dir = output_root / "diagnostics" / "resume_recovery"
+    samples_by_record = {str(row["record_id"]): row for row in samples}
     contexts = []
     for assigned_args in assigned:
         raw_dir = (
@@ -1250,6 +1731,20 @@ def run_worker(args: argparse.Namespace) -> int:
             / str(args.model_id)
             / f"rollout_{assigned_args.rollout_id}.jsonl"
         )
+        completed_record_ids, counters = resume_route_state(
+            raw_dir,
+            model_id=str(args.model_id),
+            rollout_id=int(assigned_args.rollout_id),
+            seed=int(assigned_args.seed),
+            checkpoint=args.checkpoint,
+            processor_path=args.processor_path,
+            generation=generation_config(assigned_args),
+            git_commit=str(code["head"]),
+            baseline_git_commit=str(code["baseline"]),
+            worker_git_commit=str(args.worker_git_commit),
+            samples_by_record=samples_by_record,
+            recovery_diagnostics_dir=recovery_diagnostics_dir,
+        )
         contexts.append(
             {
                 "args": assigned_args,
@@ -1260,16 +1755,11 @@ def run_worker(args: argparse.Namespace) -> int:
                     int(assigned_args.rollout_id),
                     int(assigned_args.seed),
                     len(samples),
+                    resume_attempted=int(counters["attempted"]),
+                    recovery_diagnostics_dir=recovery_diagnostics_dir,
                 ),
-                "counters": {
-                    "attempted": 0,
-                    "inference_success": 0,
-                    "runtime_error": 0,
-                    "parse_error": 0,
-                    "oom_exception_count": 0,
-                    "oom_recovered_samples": 0,
-                    "oom_final_failed_samples": 0,
-                },
+                "counters": counters,
+                "completed_record_ids": completed_record_ids,
                 "logical_status": "pending",
             }
         )
@@ -1286,13 +1776,21 @@ def run_worker(args: argparse.Namespace) -> int:
         "processor_path": str(args.processor_path),
         "generation_config": generation_config(args),
         "sample_order": {
-            "policy": "fixed_round_robin_task_then_positive_negative",
+            "policy": "sample_major_fixed_round_robin_task_then_positive_negative",
             "tasks": list(TASKS),
             "polarity_order": ["positive", "negative"],
             "records": len(samples),
             "record_id_sha256": sample_order_digest,
         },
         "gpu_model_processes": args.gpu_model_processes,
+        "worker_git_commit": args.worker_git_commit,
+        "resume": {
+            str(context["args"].rollout_id): {
+                "completed_records": len(context["completed_record_ids"]),
+                "remaining_records": len(samples) - len(context["completed_record_ids"]),
+            }
+            for context in contexts
+        },
         "runtime_environment": {
             "HF_MODULES_CACHE": os.environ.get("HF_MODULES_CACHE"),
             "PYTHONPYCACHEPREFIX": os.environ.get("PYTHONPYCACHEPREFIX"),
@@ -1310,6 +1808,13 @@ def run_worker(args: argparse.Namespace) -> int:
         f"model={args.model_id} gpu={args.physical_gpu} pid={os.getpid()} "
         f"rollouts={rollout_text} gpu_model_processes={args.gpu_model_processes} "
         f"checkpoint={args.checkpoint} processor={args.processor_path}",
+        flush=True,
+    )
+    print(
+        "[RESUME_STATE] "
+        f"model={args.model_id} gpu={args.physical_gpu} pid={os.getpid()} "
+        f"rollouts={rollout_text} routes="
+        + json.dumps(worker_manifest["resume"], sort_keys=True),
         flush=True,
     )
     print(
@@ -1368,6 +1873,8 @@ def run_worker(args: argparse.Namespace) -> int:
         inferencer = module.LocateAnythingInferencer(model_args)
         load_stage = "install_token_budget"
         processor_limit = install_generation_token_budget(inferencer, assigned[0])
+        load_stage = "verify_attention_backends"
+        attention_report = verify_loaded_attention_backends(inferencer, args)
         load_stage = "cuda_synchronize"
         torch.cuda.synchronize()
         model_loaded = True
@@ -1375,7 +1882,10 @@ def run_worker(args: argparse.Namespace) -> int:
         load_seconds = time.monotonic() - load_started
         memory_after = cuda_memory(torch)
         model_load_path = (
-            output_root / "diagnostics" / "model_load" / f"{args.model_id}.json"
+            output_root
+            / "diagnostics"
+            / "model_load"
+            / f"{args.model_id}_rollouts_{rollout_text.replace(',', '_')}.json"
         )
         atomic_json(
             model_load_path,
@@ -1394,6 +1904,7 @@ def run_worker(args: argparse.Namespace) -> int:
                 "memory_after": memory_after,
                 "runtime_environment": worker_manifest["runtime_environment"],
                 "generation_config": generation_config(args),
+                "attention_backends": attention_report,
             },
         )
         print(
@@ -1401,137 +1912,200 @@ def run_worker(args: argparse.Namespace) -> int:
             f"model={args.model_id} gpu={args.physical_gpu} pid={os.getpid()} "
             f"rollouts={rollout_text} checkpoint={args.checkpoint} "
             f"processor={args.processor_path} load_seconds={load_seconds:.3f} "
+            f"text_config={attention_report['text_config']} "
+            f"vision_config={attention_report['vision_config']} "
+            f"vision_first_layer={attention_report['vision_first_layer']} "
+            f"vision_blocks={attention_report['vision_blocks']} "
             f"token_config={json.dumps(generation_config(args), sort_keys=True)} "
             f"processor_limit={json.dumps(processor_limit, sort_keys=True)} "
             f"memory_before={json.dumps(memory_before, sort_keys=True)} "
             f"memory_after={json.dumps(memory_after, sort_keys=True)}",
             flush=True,
         )
-        for index, context in enumerate(contexts):
-            status = "running" if index == 0 else "pending"
-            context["logical_status"] = status
+        wait_for_model_load_barrier(
+            output_root,
+            model_id=str(args.model_id),
+            physical_gpu=int(args.physical_gpu),
+            rollout_ids=rollout_ids,
+        )
+        for context in contexts:
+            already_complete = len(context["completed_record_ids"]) == len(samples)
+            status = "completed" if already_complete else "running"
+            if already_complete and context["counters"]["runtime_error"]:
+                status = "completed_with_runtime_errors"
+            context["logical_status"] = (
+                "completed" if already_complete else "running"
+            )
             context["progress"].emit(
                 context["counters"], status, force=True, memory=memory_after
             )
-        for context_index, context in enumerate(contexts):
-            assigned_args = context["args"]
-            context["logical_status"] = "running"
-            if context_index:
-                context["progress"].emit(
-                    context["counters"], "running", force=True, memory=cuda_memory(torch)
-                )
-            for row in samples:
-                image = None
-                inference_started = time.monotonic()
-                failure_context: dict[str, Any] = {
-                    "stage": "image_read",
-                    "crop_id": None,
-                    "crop_index": None,
-                    "crop_xyxy": [0, 0, int(row["width"]), int(row["height"])],
-                    "tile_count": (
-                        len(crop_index.get(str(row["record_id"]), []))
-                        if args.model_id == "crop"
-                        else 1
-                    ),
-                    "tile_size": {
-                        "width": int(row["width"]),
-                        "height": int(row["height"]),
-                    },
-                    "input_tokens": None,
-                    "memory_before_oom": cuda_memory(torch),
-                }
-                context["counters"]["attempted"] += 1
-                try:
-                    image_path = bundle / str(row["image_relpath"])
-                    with Image.open(image_path) as opened:
-                        image = opened.convert("RGB")
-                    config = task_config(module, str(row["task"]))
 
-                    def predict_once(active_context: dict[str, Any]) -> dict[str, Any]:
-                        inferencer.last_rollout_token_usage = None
-                        inferencer.last_ui_diagnostics = {}
-                        assert image is not None
-                        try:
-                            if args.model_id == "m31":
-                                return full_image_prediction(
+        # Sample-major execution: load one source image, finish both owned
+        # rollout routes in deterministic order, then advance to the next row.
+        load_stage = "sample_major_inference"
+        for row in samples:
+            record_id = str(row["record_id"])
+            pending_contexts = [
+                context
+                for context in contexts
+                if record_id not in context["completed_record_ids"]
+            ]
+            if not pending_contexts:
+                continue
+            image = None
+            image_read_started = time.monotonic()
+            image_failure_context: dict[str, Any] = {
+                "stage": "image_read",
+                "crop_id": None,
+                "crop_index": None,
+                "crop_xyxy": [0, 0, int(row["width"]), int(row["height"])],
+                "tile_count": (
+                    len(crop_index.get(record_id, []))
+                    if args.model_id == "crop"
+                    else 1
+                ),
+                "tile_size": {
+                    "width": int(row["width"]),
+                    "height": int(row["height"]),
+                },
+                "input_tokens": None,
+                "memory_before_oom": cuda_memory(torch),
+            }
+            try:
+                image_path = bundle / str(row["image_relpath"])
+                with Image.open(image_path) as opened:
+                    image = opened.convert("RGB")
+                config = task_config(module, str(row["task"]))
+            except Exception as image_exc:
+                image_latency = time.monotonic() - image_read_started
+                for context in pending_contexts:
+                    assigned_args = context["args"]
+                    context["counters"]["attempted"] += 1
+                    context["counters"]["runtime_error"] += 1
+                    record = error_record(
+                        assigned_args,
+                        code,
+                        row,
+                        image_exc,
+                        image_latency,
+                        failure_context=image_failure_context,
+                    )
+                    context["writer"].write(record)
+                    context["completed_record_ids"].add(record_id)
+                    if context["progress"].should_emit(
+                        context["counters"]["attempted"],
+                        args.progress_every,
+                        args.progress_seconds,
+                    ):
+                        context["writer"].flush()
+                        context["progress"].emit(
+                            context["counters"],
+                            "running",
+                            force=True,
+                            memory=cuda_memory(torch),
+                        )
+                if image is not None:
+                    image.close()
+                continue
+
+            try:
+                for context in pending_contexts:
+                    assigned_args = context["args"]
+                    inference_started = time.monotonic()
+                    failure_context = dict(image_failure_context)
+                    context["counters"]["attempted"] += 1
+                    try:
+                        def predict_once(
+                            active_context: dict[str, Any],
+                        ) -> dict[str, Any]:
+                            inferencer.last_rollout_token_usage = None
+                            inferencer.last_ui_diagnostics = {}
+                            assert image is not None
+                            try:
+                                if args.model_id == "m31":
+                                    return full_image_prediction(
+                                        module=module,
+                                        inferencer=inferencer,
+                                        scorer=scorer,
+                                        row=row,
+                                        image=image,
+                                        args=assigned_args,
+                                        config=config,
+                                        torch=torch,
+                                        inference_context=active_context,
+                                    )
+                                assert tiling is not None
+                                return crop_prediction(
                                     module=module,
+                                    tiling=tiling,
                                     inferencer=inferencer,
                                     scorer=scorer,
                                     row=row,
+                                    crop_rows=crop_index[record_id],
                                     image=image,
                                     args=assigned_args,
                                     config=config,
                                     torch=torch,
                                     inference_context=active_context,
                                 )
-                            assert tiling is not None
-                            return crop_prediction(
-                                module=module,
-                                tiling=tiling,
-                                inferencer=inferencer,
-                                scorer=scorer,
-                                row=row,
-                                crop_rows=crop_index[str(row["record_id"])],
-                                image=image,
-                                args=assigned_args,
-                                config=config,
-                                torch=torch,
-                                inference_context=active_context,
-                            )
-                        finally:
-                            failure_context.clear()
-                            failure_context.update(active_context)
+                            finally:
+                                failure_context.clear()
+                                failure_context.update(active_context)
 
-                    result = prediction_with_oom_retry(
-                        predict_once, torch=torch, inferencer=inferencer
-                    )
-                    record = worker_record(assigned_args, code, row, result)
-                    context["counters"]["inference_success"] += 1
-                    context["counters"]["parse_error"] += int(
-                        result["parse_status"] == "parse_error"
-                        or result.get("contains_crop_parse_error", False)
-                    )
-                    context["counters"]["oom_exception_count"] += int(
-                        result.get("oom_events", 0)
-                    )
-                    context["counters"]["oom_recovered_samples"] += int(
-                        bool(result.get("oom_recovered"))
-                    )
-                except Exception as exc:
-                    oom_diagnostics = getattr(exc, "oom_diagnostics", {})
-                    context["counters"]["runtime_error"] += 1
-                    if isinstance(oom_diagnostics, Mapping):
+                        result = prediction_with_oom_retry(
+                            predict_once, torch=torch, inferencer=inferencer
+                        )
+                        record = worker_record(assigned_args, code, row, result)
+                        context["counters"]["inference_success"] += 1
+                        context["counters"]["parse_error"] += int(
+                            result["parse_status"] == "parse_error"
+                            or result.get("contains_crop_parse_error", False)
+                        )
                         context["counters"]["oom_exception_count"] += int(
-                            oom_diagnostics.get("oom_events", 0)
+                            result.get("oom_events", 0)
                         )
-                        context["counters"]["oom_final_failed_samples"] += int(
-                            bool(oom_diagnostics.get("oom_final_failure"))
+                        context["counters"]["oom_recovered_samples"] += int(
+                            bool(result.get("oom_recovered"))
                         )
-                    record = error_record(
-                        assigned_args,
-                        code,
-                        row,
-                        exc,
-                        time.monotonic() - inference_started,
-                        failure_context=failure_context,
-                    )
-                finally:
-                    inferencer.active_rollout_context = None
-                    if image is not None:
-                        image.close()
-                context["writer"].write(record)
-                if context["progress"].should_emit(
-                    context["counters"]["attempted"],
-                    args.progress_every,
-                    args.progress_seconds,
-                ):
-                    context["writer"].flush()
-                    context["progress"].emit(
-                        context["counters"],
-                        "running",
-                        force=True,
-                        memory=cuda_memory(torch),
-                    )
+                    except Exception as exc:
+                        oom_diagnostics = getattr(exc, "oom_diagnostics", {})
+                        context["counters"]["runtime_error"] += 1
+                        if isinstance(oom_diagnostics, Mapping):
+                            context["counters"]["oom_exception_count"] += int(
+                                oom_diagnostics.get("oom_events", 0)
+                            )
+                            context["counters"]["oom_final_failed_samples"] += int(
+                                bool(oom_diagnostics.get("oom_final_failure"))
+                            )
+                        record = error_record(
+                            assigned_args,
+                            code,
+                            row,
+                            exc,
+                            time.monotonic() - inference_started,
+                            failure_context=failure_context,
+                        )
+                    finally:
+                        inferencer.active_rollout_context = None
+                    context["writer"].write(record)
+                    context["completed_record_ids"].add(record_id)
+                    if context["progress"].should_emit(
+                        context["counters"]["attempted"],
+                        args.progress_every,
+                        args.progress_seconds,
+                    ):
+                        context["writer"].flush()
+                        context["progress"].emit(
+                            context["counters"],
+                            "running",
+                            force=True,
+                            memory=cuda_memory(torch),
+                        )
+            finally:
+                if image is not None:
+                    image.close()
+
+        for context in contexts:
             context["writer"].flush()
             context["logical_status"] = "completed"
             raw_status = (
@@ -1559,7 +2133,7 @@ def run_worker(args: argparse.Namespace) -> int:
             output_root
             / "diagnostics"
             / ("model_load" if not model_loaded else "worker_fatal")
-            / f"{args.model_id}.json"
+            / f"{args.model_id}_rollouts_{rollout_text.replace(',', '_')}.json"
         )
         atomic_json(
             failure_path,
@@ -1652,11 +2226,17 @@ def parse_physical_worker(value: str) -> dict[str, Any]:
         )
     model_id, gpu, pid, rollout_text = parts
     rollout_ids = [int(item) for item in rollout_text.split("|") if item]
-    if model_id not in MODEL_IDS or rollout_ids != [0, 1, 2, 3]:
+    physical_gpu = int(gpu)
+    expected_gpu = {"m31": 0, "crop": 1}
+    if (
+        model_id not in MODEL_IDS
+        or physical_gpu != expected_gpu.get(model_id)
+        or rollout_ids not in ([0, 1], [2, 3])
+    ):
         raise ValueError(f"invalid --physical-worker mapping: {value}")
     return {
         "model_id": model_id,
-        "physical_gpu": int(gpu),
+        "physical_gpu": physical_gpu,
         "pid": int(pid),
         "rollout_ids": rollout_ids,
     }
@@ -1706,8 +2286,17 @@ def progress_snapshot(args: argparse.Namespace) -> int:
                 }
             )
     physical_processes = []
+    physical_keys: set[tuple[str, int, tuple[int, ...]]] = set()
     for value in args.physical_worker:
         physical = parse_physical_worker(value)
+        physical_key = (
+            str(physical["model_id"]),
+            int(physical["physical_gpu"]),
+            tuple(int(item) for item in physical["rollout_ids"]),
+        )
+        if physical_key in physical_keys:
+            raise ValueError(f"duplicate --physical-worker ownership: {value}")
+        physical_keys.add(physical_key)
         owned = [
             row
             for row in logical_rollouts
@@ -1744,7 +2333,7 @@ def progress_snapshot(args: argparse.Namespace) -> int:
             and row["status"] == "completed"
         ]
         attempted_rate = (
-            running_rates[0]
+            sum(running_rates)
             if running_rates
             else max(completed_rates, default=(-1, 0.0))[1]
         )
@@ -1776,6 +2365,17 @@ def progress_snapshot(args: argparse.Namespace) -> int:
                 "remaining_seconds": physical_remaining,
             }
         )
+    expected_physical_keys = {
+        (model_id, physical_gpu, rollout_pair)
+        for model_id, physical_gpu in (("m31", 0), ("crop", 1))
+        for rollout_pair in ((0, 1), (2, 3))
+    }
+    if args.physical_worker and physical_keys != expected_physical_keys:
+        raise ValueError(
+            "formal progress snapshot requires four physical workers with "
+            f"exact ownership {sorted(expected_physical_keys)}; got "
+            f"{sorted(physical_keys)}"
+        )
     failed_physical = [
         row for row in physical_processes if row["status"] == "failed"
     ]
@@ -1794,7 +2394,7 @@ def progress_snapshot(args: argparse.Namespace) -> int:
         "workers_seen": len(latest),
         "workers_expected": args.expected_workers,
         "workers": latest,
-        "physical_processes_expected": len(args.physical_worker),
+        "physical_processes_expected": 4,
         "physical_processes": physical_processes,
         "logical_rollouts_expected": args.expected_workers,
         "logical_rollouts": logical_rollouts,
@@ -1807,8 +2407,8 @@ def progress_snapshot(args: argparse.Namespace) -> int:
             "failed physical worker or logical rollout" if eta_blocked else None
         ),
         "eta_basis": (
-            "attempted throughput of the active (or most recently completed) "
-            "rollout applied to remaining sequential attempts"
+            "sum of sample-major active rollout attempted throughputs applied "
+            "to remaining physical inference attempts"
         ),
         "total_remaining_seconds": total_remaining,
         "total_estimated_completion": (

@@ -33,7 +33,7 @@ from snapshot_ui5_train_rollouts import (
 )
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MODELS = ("m31", "crop")
 TASKS = ("occlusion", "cropping", "text_overflow", "text_ellipsis", "content_missing")
 THRESHOLDS = (0.1, 0.3, 0.5)
@@ -505,6 +505,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     execution_counts = Counter()
     runtime_error_types = Counter()
     runtime_excluded_groups = Counter()
+    parse_excluded_groups = Counter()
     run_metadata: dict[str, dict[str, Any]] = {}
     for model in MODELS:
         for group in grouped_rollouts(root, model):
@@ -554,6 +555,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if has_parse_error:
                     for scope in (task, "micro"):
                         execution_counts[(model, rollout_id, scope, "parse_error")] += 1
+                    # Parsing failures are technical failures in v5.  Preserve
+                    # them in execution/error reports, but never manufacture a
+                    # TP/FP/FN score or count them as a wrong model answer.
+                    continue
                 for threshold in THRESHOLDS:
                     score = score_prediction(
                         scorer,
@@ -568,9 +573,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     accumulators[(model, rollout_id, "micro", threshold)].add(score)
                     if threshold == 0.1:
                         error_counts[(model, rollout_id, task, score["error_type"])] += 1
-            if any(row.get("runtime_error") for row in group):
+            group_has_runtime_error = any(row.get("runtime_error") for row in group)
+            group_has_parse_error = any(
+                row.get("parse_status") == "parse_error"
+                or row.get("contains_crop_parse_error")
+                for row in group
+                if not row.get("runtime_error")
+            )
+            if group_has_runtime_error:
                 runtime_excluded_groups[(model, task)] += 1
                 runtime_excluded_groups[(model, "micro")] += 1
+            if group_has_parse_error:
+                parse_excluded_groups[(model, task)] += 1
+                parse_excluded_groups[(model, "micro")] += 1
+            if group_has_runtime_error or group_has_parse_error:
                 continue
             correct_count = sum(
                 bool(threshold_scores[(int(row["rollout_id"]), 0.1)]["exact_correct"])
@@ -644,12 +660,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     difficulty_file_counts = write_difficulty_exports(
         selection_dir, difficulty_records
     )
+    complete_difficulty_records = [
+        row
+        for row in difficulty_records
+        if row.get("cross_model_complete8") is True
+    ]
     difficulty_counts = Counter(
-        str(row["difficulty"]) for row in difficulty_records
+        str(row["difficulty"]) for row in complete_difficulty_records
     )
     difficulty_task_counts = Counter(
         (str(row["task"]), str(row["difficulty"]))
-        for row in difficulty_records
+        for row in complete_difficulty_records
     )
     for difficulty in DIFFICULTIES:
         selection_counts[("cross_model_8", difficulty)] = difficulty_file_counts[
@@ -771,6 +792,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 sum(correct_distributions[(model, task, item)] for item in range(5)),
             ),
             "runtime_excluded_samples": runtime_excluded_groups[(model, task)],
+            "parse_excluded_samples": parse_excluded_groups[(model, task)],
         }
         for model in MODELS
         for task in (*TASKS, "micro")
@@ -779,10 +801,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     difficulty_rows = []
     for task in (*TASKS, "micro"):
         denominator = (
-            len(difficulty_records)
+            len(complete_difficulty_records)
             if task == "micro"
             else sum(
-                1 for row in difficulty_records if str(row["task"]) == task
+                1
+                for row in complete_difficulty_records
+                if str(row["task"]) == task
             )
         )
         for difficulty in DIFFICULTIES:
@@ -922,7 +946,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "image_confusion": "presence-level GT/pred emptiness; wrong location remains Image TP",
             "bbox_tn_defined": False,
             "difficulty_rule": (
-                "only eight complete runtime-error-free records enter easy/medium/hard"
+                "only eight complete runtime/parse-error-free records enter "
+                "easy/medium/hard"
             ),
             "grpo_ready_rule": (
                 "medium sample; same-model complete4; source and parse eligible; "
@@ -992,7 +1017,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
         "generation": {
             "dtype": "bf16",
-            "attention": "sdpa",
+            "text_attention": "sdpa",
+            "vision_attention": "flash_attention_2",
             "mode": "hybrid",
             "sampling": True,
             "max_seq_length": MAX_SEQ_LENGTH,
@@ -1008,15 +1034,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "rescore_iou": [0.3, 0.5],
         },
         "execution_architecture": {
-            "physical_processes_total": 2,
-            "physical_processes_per_gpu": 1,
-            "gpu_0": {"model_id": "m31", "rollout_ids": [0, 1, 2, 3]},
-            "gpu_1": {"model_id": "crop", "rollout_ids": [0, 1, 2, 3]},
-            "rollout_execution": "sequential_after_single_model_load",
+            "physical_processes_total": 4,
+            "physical_processes_per_gpu": 2,
+            "gpu_0": {
+                "model_id": "m31",
+                "processes": [
+                    {"rollout_ids": [0, 1]},
+                    {"rollout_ids": [2, 3]},
+                ],
+            },
+            "gpu_1": {
+                "model_id": "crop",
+                "processes": [
+                    {"rollout_ids": [0, 1]},
+                    {"rollout_ids": [2, 3]},
+                ],
+            },
+            "rollout_execution": "sample_major_two_rollouts_after_single_model_load",
             "checkpoint_loads_per_physical_process": 1,
         },
         "sample_order": {
-            "policy": "fixed_task_polarity_round_robin_v1",
+            "policy": "sample_major_fixed_task_polarity_round_robin_v1",
             "task_order": list(TASKS),
             "polarity_order": ["positive", "negative"],
             "within_bucket_order": ["record_id", "sample_id"],

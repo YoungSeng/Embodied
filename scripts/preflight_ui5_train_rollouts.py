@@ -55,10 +55,10 @@ M31_REPO = (
 )
 CROP_REPO = (
     "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/"
-    "Embodied-rollout8-h20x2-v4"
+    "Embodied-rollout8-h20x2-v5"
 )
 M31_ROLLOUT_COMMIT = "6367cc6660f7eb933048b81100915a05f9b49bf4"
-V4_BASE_COMMIT = "5b7197bf5db1d7fb272b82d7784bb0552eaf38aa"
+V5_BASE_COMMIT = "29de39933fa12612eeed7d552c5dc7d78bc25211"
 REQUIRED_CHECKPOINT_CODE = (
     "configuration_locateanything.py",
     "modeling_locateanything.py",
@@ -372,12 +372,34 @@ def git_revision(
 
 
 def check_output_root(path: Path) -> dict[str, Any]:
-    report: dict[str, Any] = {"path": str(path), "writable": False, "fresh": False}
+    report: dict[str, Any] = {
+        "path": str(path),
+        "writable": False,
+        "fresh": False,
+        "resume": False,
+    }
     path.mkdir(parents=True, exist_ok=True)
+    # v5 workers can resume from append-only raw/progress streams.  Keep a
+    # strict allow-list so an unrelated directory still fails preflight while
+    # a previous interrupted formal run is accepted without deleting results.
+    allowed_entries = {
+        "diagnostics",
+        "logs",
+        "manifests",
+        "progress",
+        "raw",
+        "reports",
+        "runtime_cache",
+        "selection",
+        "snapshots",
+        "summary.json",
+        "run_config.snapshot.json",
+        "visualizations",
+    }
     disallowed = sorted(
         child.name
         for child in path.iterdir()
-        if child.name not in {"diagnostics", "logs", "runtime_cache"}
+        if child.name not in allowed_entries
     )
     probe = path / f".preflight-write-{os.getpid()}"
     try:
@@ -391,8 +413,15 @@ def check_output_root(path: Path) -> dict[str, Any]:
     finally:
         probe.unlink(missing_ok=True)
     report["unexpected_entries"] = disallowed
-    report["fresh"] = not disallowed
-    report["complete"] = bool(report["writable"] and report["fresh"])
+    existing_result_entries = sorted(
+        child.name
+        for child in path.iterdir()
+        if child.name in allowed_entries - {"diagnostics", "logs", "runtime_cache"}
+    )
+    report["existing_result_entries"] = existing_result_entries
+    report["fresh"] = not existing_result_entries and not disallowed
+    report["resume"] = bool(existing_result_entries and not disallowed)
+    report["complete"] = bool(report["writable"] and not disallowed)
     return report
 
 
@@ -718,7 +747,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     )
     crop_repo = git_revision(
         args.crop_repo.expanduser().resolve(strict=False),
-        required_ancestor=V4_BASE_COMMIT,
+        required_ancestor=V5_BASE_COMMIT,
     )
     output_arg = getattr(args, "output_root", None)
     output = (
@@ -763,7 +792,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "repositories_h20": {"m31": M31_REPO, "crop": CROP_REPO},
         "rollout_output_h20": (
             "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/"
-            "gui_rollouts/ui5-train-rollout8-h20x2-v4-20260904"
+            "gui_rollouts/ui5-train-rollout8-h20x2-v5-20260904"
         ),
     }
     atomic_json(diagnostics / "preflight_summary.json", summary)

@@ -2,13 +2,13 @@
 set -Eeuo pipefail
 
 WORKSPACE=${WORKSPACE:-/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace}
-ORCHESTRATOR_REPO=${ORCHESTRATOR_REPO:-${WORKSPACE}/code/Eagle/Embodied-rollout8-h20x2-v4}
+ORCHESTRATOR_REPO=${ORCHESTRATOR_REPO:-${WORKSPACE}/code/Eagle/Embodied-rollout8-h20x2-v5}
 M31_REPO=${M31_REPO:-${WORKSPACE}/code/Eagle/Embodied-ui5-rollout8-m31}
 CROP_REPO=${CROP_REPO:-${ORCHESTRATOR_REPO}}
 BUNDLE_ROOT=${BUNDLE_ROOT:-${WORKSPACE}/gui_data/ui5_train_rollout_bundle_v1}
 M31_CHECKPOINT=${M31_CHECKPOINT:-${WORKSPACE}/gui_models/Embodied/locany-ui5-m31-taskmoe-setdecoder-a800x4-sft-20260830-r2/checkpoint-12000}
 CROP_CHECKPOINT=${CROP_CHECKPOINT:-${WORKSPACE}/gui_models/Embodied-ui5-det-crop/locany-ui5-v5-croponly-sourcebalanced-a800x4-20260830/checkpoint-12000}
-OUTPUT_ROOT=${OUTPUT_ROOT:-${WORKSPACE}/gui_rollouts/ui5-train-rollout8-h20x2-v4-20260904}
+OUTPUT_ROOT=${OUTPUT_ROOT:-${WORKSPACE}/gui_rollouts/ui5-train-rollout8-h20x2-v5-20260904}
 ENV_DIR=${ENV_DIR:-${WORKSPACE}/conda_envs/LocateAnything}
 PYTHON_BIN=${PYTHON_BIN:-${ENV_DIR}/bin/python}
 SEEDS=(20260903 20260917 20260931 20260947)
@@ -35,9 +35,9 @@ test -d "${M31_CHECKPOINT}" || { echo "ERROR: M31 checkpoint missing" >&2; exit 
 test -d "${CROP_CHECKPOINT}" || { echo "ERROR: crop checkpoint missing" >&2; exit 24; }
 test -f "${M31_REPO}/scripts/inference_ui_defect_locany.py" || { echo "ERROR: M31 inference entrypoint missing" >&2; exit 25; }
 test -f "${CROP_REPO}/scripts/inference_ui_defect_locany.py" || { echo "ERROR: crop inference entrypoint missing" >&2; exit 26; }
-test -f "${ORCHESTRATOR_REPO}/scripts/run_ui5_train_rollout_worker.py" || { echo "ERROR: v4 rollout worker missing" >&2; exit 27; }
-test -f "${ORCHESTRATOR_REPO}/scripts/aggregate_ui5_train_rollouts.py" || { echo "ERROR: v4 aggregator missing" >&2; exit 28; }
-test -f "${ORCHESTRATOR_REPO}/scripts/snapshot_ui5_train_rollouts.py" || { echo "ERROR: v4 snapshotter missing" >&2; exit 29; }
+test -f "${ORCHESTRATOR_REPO}/scripts/run_ui5_train_rollout_worker.py" || { echo "ERROR: v5 rollout worker missing" >&2; exit 27; }
+test -f "${ORCHESTRATOR_REPO}/scripts/aggregate_ui5_train_rollouts.py" || { echo "ERROR: v5 aggregator missing" >&2; exit 28; }
+test -f "${ORCHESTRATOR_REPO}/scripts/snapshot_ui5_train_rollouts.py" || { echo "ERROR: v5 snapshotter missing" >&2; exit 29; }
 
 export PATH="${ENV_DIR}/bin:${PATH}"
 export PYTHONUNBUFFERED=1
@@ -52,15 +52,13 @@ mkdir -p \
   "${OUTPUT_ROOT}/diagnostics" \
   "${OUTPUT_ROOT}/runtime_cache/hf_modules" \
   "${OUTPUT_ROOT}/runtime_cache/pycache"
-test ! -e "${OUTPUT_ROOT}/diagnostics/_MODEL_LOADS_OK" || {
-  echo "ERROR: refusing stale formal-run marker in new v4 output: ${OUTPUT_ROOT}/diagnostics/_MODEL_LOADS_OK" >&2
-  exit 19
-}
-test ! -e "${OUTPUT_ROOT}/diagnostics/formal_run_valid.json" || {
-  echo "ERROR: refusing stale formal-run validity record in new v4 output: ${OUTPUT_ROOT}/diagnostics/formal_run_valid.json" >&2
-  exit 19
-}
-
+# A resumed run keeps raw/progress data, but its formal-validity markers must be
+# earned again by this launch's four PIDs.  Logs below are also truncated per
+# physical worker before Python starts, so an old MODEL_LOAD_OK cannot match.
+rm -f -- \
+  "${OUTPUT_ROOT}/diagnostics/_MODEL_LOADS_OK" \
+  "${OUTPUT_ROOT}/diagnostics/formal_run_valid.json" \
+  "${OUTPUT_ROOT}/diagnostics/formal_run_invalid.json"
 CUDA_VISIBLE_DEVICES="" "${PYTHON_BIN}" "${ORCHESTRATOR_REPO}/scripts/preflight_ui5_train_rollouts.py" \
   --bundle-root "${BUNDLE_ROOT}" \
   --diagnostics-dir "${OUTPUT_ROOT}/diagnostics" \
@@ -102,8 +100,9 @@ launch_worker() {
     checkpoint=${CROP_CHECKPOINT}
   fi
   log_path=${OUTPUT_ROOT}/logs/${model_id}_rollouts_${rollout_ids//,/_}.log
-  hf_modules_cache=${OUTPUT_ROOT}/runtime_cache/hf_modules/${model_id}
-  python_pycache=${OUTPUT_ROOT}/runtime_cache/pycache/${model_id}
+  local worker_key=${model_id}_rollouts_${rollout_ids//,/_}
+  hf_modules_cache=${OUTPUT_ROOT}/runtime_cache/hf_modules/${worker_key}
+  python_pycache=${OUTPUT_ROOT}/runtime_cache/pycache/${worker_key}
   mkdir -p "${hf_modules_cache}" "${python_pycache}"
   (
     cd "${ORCHESTRATOR_REPO}"
@@ -125,10 +124,10 @@ launch_worker() {
       --rollout-ids "${rollout_ids}" \
       --seeds "${seeds}" \
       --physical-gpu "${gpu}" \
-      --gpu-model-processes 1 \
+      --gpu-model-processes 2 \
       --dtype bf16 \
       --attn-implementation sdpa \
-      --vision-attn-implementation sdpa \
+      --vision-attn-implementation flash_attention_2 \
       --generation-mode hybrid \
       --max-seq-length 7268 \
       --max-num-tokens-per-sample 7268 \
@@ -144,8 +143,11 @@ launch_worker() {
   echo "[WORKER_LAUNCH] model=${model_id} gpu=${gpu} pid=$! rollout_ids=${rollout_ids} log=${log_path}"
 }
 
-launch_worker m31 0 "0,1,2,3" "${SEEDS[0]},${SEEDS[1]},${SEEDS[2]},${SEEDS[3]}"
-launch_worker crop 1 "0,1,2,3" "${SEEDS[0]},${SEEDS[1]},${SEEDS[2]},${SEEDS[3]}"
+echo "[FORMAL_ARCHITECTURE] physical_processes=4 logical_rollouts=8 gpu0=m31:0,1+m31:2,3 gpu1=crop:0,1+crop:2,3 text_attention=sdpa vision_attention=flash_attention_2"
+launch_worker m31 0 "0,1" "${SEEDS[0]},${SEEDS[1]}"
+launch_worker m31 0 "2,3" "${SEEDS[2]},${SEEDS[3]}"
+launch_worker crop 1 "0,1" "${SEEDS[0]},${SEEDS[1]}"
+launch_worker crop 1 "2,3" "${SEEDS[2]},${SEEDS[3]}"
 
 terminate_workers() {
   for pid in "${PIDS[@]}"; do
@@ -177,7 +179,7 @@ for gpu in 0 1; do
 done
 
 load_status_count=0
-while [[ ${load_status_count} -lt 2 ]]; do
+while [[ ${load_status_count} -lt 4 ]]; do
   load_status_count=0
   premature_exit=0
   for index in "${!LOG_PATHS[@]}"; do
@@ -191,7 +193,7 @@ while [[ ${load_status_count} -lt 2 ]]; do
   if [[ ${premature_exit} -ne 0 ]]; then
     break
   fi
-  if [[ ${load_status_count} -lt 2 ]]; then
+  if [[ ${load_status_count} -lt 4 ]]; then
     sleep 5
   fi
 done
@@ -207,33 +209,75 @@ for log_path in "${LOG_PATHS[@]}"; do
     echo "${status_line}" >>"${MODEL_LOAD_STATUS}"
   fi
 done
-if ! "${PYTHON_BIN}" - "${OUTPUT_ROOT}" "${PIDS[0]}" "${PIDS[1]}" <<'PY'
+if ! "${PYTHON_BIN}" - "${OUTPUT_ROOT}" \
+  "${PIDS[0]}" "m31" "0,1" "${LOG_PATHS[0]}" \
+  "${PIDS[1]}" "m31" "2,3" "${LOG_PATHS[1]}" \
+  "${PIDS[2]}" "crop" "0,1" "${LOG_PATHS[2]}" \
+  "${PIDS[3]}" "crop" "2,3" "${LOG_PATHS[3]}" <<'PY'
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 root = Path(sys.argv[1])
-expected_pids = {"m31": int(sys.argv[2]), "crop": int(sys.argv[3])}
-statuses = []
-for model in ("m31", "crop"):
-    path = root / "diagnostics" / "model_load" / f"{model}.json"
-    if path.is_file():
-        statuses.append(json.loads(path.read_text(encoding="utf-8")))
-valid = (
-    len(statuses) == 2
-    and {row.get("model_id") for row in statuses} == {"m31", "crop"}
-    and all(row.get("status") == "MODEL_LOAD_OK" for row in statuses)
-    and all(int(row.get("pid", -1)) == expected_pids[row["model_id"]] for row in statuses)
-)
+workers = []
+arguments = sys.argv[2:]
+if len(arguments) != 16:
+    raise SystemExit(f"expected four pid/model/rollouts/log groups, got {arguments!r}")
+for offset in range(0, len(arguments), 4):
+    pid_text, model, rollout_text, log_text = arguments[offset : offset + 4]
+    pid = int(pid_text)
+    log_path = Path(log_text)
+    status_line = None
+    if log_path.is_file():
+        with log_path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.rstrip("\r\n")
+                if re.match(r"^\[MODEL_LOAD_(?:OK|FAIL)\]", line):
+                    status_line = line
+                    break
+    try:
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        alive = False
+    else:
+        alive = True
+    expected_tokens = (
+        "text_config=sdpa",
+        "vision_config=flash_attention_2",
+        "vision_first_layer=flash_attention_2",
+        "vision_blocks=27/27",
+    )
+    ok = bool(
+        alive
+        and status_line
+        and status_line.startswith("[MODEL_LOAD_OK]")
+        and f"model={model}" in status_line
+        and f"pid={pid}" in status_line
+        and f"rollouts={rollout_text}" in status_line
+        and all(token in status_line for token in expected_tokens)
+    )
+    workers.append(
+        {
+            "model_id": model,
+            "pid": pid,
+            "rollout_ids": [int(value) for value in rollout_text.split(",")],
+            "log_path": str(log_path),
+            "alive": alive,
+            "model_load_status_line": status_line,
+            "validated": ok,
+        }
+    )
+valid = len(workers) == 4 and all(worker["validated"] for worker in workers)
 payload = {
-    "schema_version": 1,
+    "schema_version": 2,
     "created_at": datetime.now(timezone.utc).isoformat(),
     "valid": valid,
-    "required_models": ["m31", "crop"],
-    "expected_pids": expected_pids,
-    "model_load_statuses": statuses,
+    "required_physical_workers": 4,
+    "required_models": {"m31": 2, "crop": 2},
+    "workers": workers,
 }
 name = "formal_run_valid.json" if valid else "formal_run_invalid.json"
 destination = root / "diagnostics" / name
@@ -246,10 +290,13 @@ if valid:
     marker_tmp.write_text(payload["created_at"] + "\n", encoding="utf-8")
     os.replace(marker_tmp, marker)
 else:
-    raise SystemExit("formal run invalid: both models must report MODEL_LOAD_OK")
+    raise SystemExit(
+        "formal run invalid: all four live physical workers must report "
+        "MODEL_LOAD_OK with text SDPA and 27/27 vision FlashAttention2 blocks"
+    )
 PY
 then
-  echo "ERROR: formal run invalid because both model loads did not succeed" >&2
+  echo "ERROR: formal run invalid because all four validated model loads did not succeed" >&2
   terminate_workers
   wait || true
   exit 30
@@ -301,8 +348,10 @@ while true; do
     --mode progress-snapshot \
     --output-root "${OUTPUT_ROOT}" \
     --expected-workers 8 \
-    --physical-worker "m31,0,${PIDS[0]},0|1|2|3" \
-    --physical-worker "crop,1,${PIDS[1]},0|1|2|3" || true
+    --physical-worker "m31,0,${PIDS[0]},0|1" \
+    --physical-worker "m31,0,${PIDS[1]},2|3" \
+    --physical-worker "crop,1,${PIDS[2]},0|1" \
+    --physical-worker "crop,1,${PIDS[3]},2|3" || true
   current_epoch=$(date +%s)
   elapsed_seconds=$((current_epoch - RUN_STARTED_EPOCH))
   while (( elapsed_seconds >= NEXT_SNAPSHOT_ELAPSED_SECONDS )); do
@@ -361,4 +410,4 @@ if [[ ${worker_failures} -ne 0 || ${snapshot_failures} -ne 0 || ${oom_summary_st
   echo "ERROR: rollout job failed workers=${worker_failures} snapshots=${snapshot_failures} oom_summary=${oom_summary_status} aggregate=${aggregate_status} gallery=${gallery_status}" >&2
   exit 1
 fi
-echo "UI5 train rollout 4+4 completed: ${OUTPUT_ROOT}"
+echo "UI5 train rollout8 v5 completed with four physical workers: ${OUTPUT_ROOT}"

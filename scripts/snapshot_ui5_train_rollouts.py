@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Create cumulative, time-triggered snapshots for the eight UI5 rollouts."""
+"""Create cumulative time snapshots from technically valid UI5 rollout8 groups."""
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import html
 import json
@@ -17,15 +18,14 @@ from typing import Any, Iterable, Mapping, Sequence
 from run_ui5_train_rollout_worker import TASKS, fixed_interleaved_samples
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MODELS = ("m31", "crop")
 ROLLOUT_IDS = (0, 1, 2, 3)
-DIFFICULTIES = ("easy", "medium", "hard", "incomplete_or_runtime_error")
+DIFFICULTIES = ("easy", "medium", "hard")
 CLASSIFICATION_FILES = {
     "easy": "easy.jsonl",
     "medium": "medium.jsonl",
     "hard": "hard.jsonl",
-    "incomplete_or_runtime_error": "incomplete_or_runtime_error.jsonl",
 }
 GRPO_FILES = {
     "m31": "grpo_m31_ready.jsonl",
@@ -101,6 +101,33 @@ def atomic_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> int:
     finally:
         temporary.unlink(missing_ok=True)
     return count
+
+
+def atomic_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    columns = list(rows[0]) if rows else ["record_id"]
+    try:
+        with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {
+                        column: (
+                            json.dumps(row.get(column), ensure_ascii=False, sort_keys=True)
+                            if isinstance(row.get(column), (dict, list))
+                            else row.get(column)
+                        )
+                        for column in columns
+                    }
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return len(rows)
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -269,107 +296,143 @@ def model_group_payload(
 
 
 def cumulative_metrics(
-    streams: Mapping[tuple[str, int], Mapping[str, Mapping[str, Any]]]
+    streams: Mapping[tuple[str, int], Mapping[str, Mapping[str, Any]]],
+    complete8_record_ids: set[str],
 ) -> list[dict[str, Any]]:
-    counters: dict[tuple[str, int, str], Counter[str]] = defaultdict(Counter)
+    """Score only routes belonging to technically valid, complete-eight samples."""
+    counters: dict[tuple[str, str, str, str], Counter[str]] = defaultdict(Counter)
+    sample_ids: dict[tuple[str, str, str, str], set[str]] = defaultdict(set)
+
+    def keys_for(model: str, rollout_id: int, task: str):
+        rollout = str(rollout_id)
+        yield ("overall", "all", "all", "all")
+        yield ("model", model, "all", "all")
+        yield ("task", "all", "all", task)
+        yield ("rollout", "all", rollout, "all")
+        yield ("model_task", model, "all", task)
+        yield ("model_rollout", model, rollout, "all")
+        yield ("model_rollout_task", model, rollout, task)
+
     for (model, rollout_id), stream in streams.items():
-        for row in stream.values():
+        for record_id in complete8_record_ids:
+            row = stream[record_id]
             task = str(row.get("task"))
-            for scope in (task, "micro"):
-                counter = counters[(model, rollout_id, scope)]
-                counter["attempted"] += 1
-                if row.get("runtime_error"):
-                    counter["runtime_error"] += 1
-                    continue
-                counter["inference_success"] += 1
-                if row.get("parse_status") == "parse_error" or row.get(
-                    "contains_crop_parse_error"
-                ):
-                    counter["parse_error"] += 1
+            for key in keys_for(model, rollout_id, task):
+                counter = counters[key]
+                sample_ids[key].add(record_id)
+                counter["scored_predictions"] += 1
                 confusion = row.get("image_confusion")
                 if confusion in {"TP", "TN", "FP", "FN"}:
-                    counter[f"image_{confusion}"] += 1
+                    counter[confusion] += 1
                 counter["bbox_TP"] += int(row.get("TP_box") or 0)
                 counter["bbox_FP"] += int(row.get("FP_box") or 0)
                 counter["bbox_FN"] += int(row.get("FN_box") or 0)
-                counter["exact_correct"] += int(bool(row.get("exact_correct")))
+                counter["exact_correct"] += int(row.get("exact_correct") is True)
+
+    expected_keys = {("overall", "all", "all", "all")}
+    expected_keys.update(("model", model, "all", "all") for model in MODELS)
+    expected_keys.update(("task", "all", "all", task) for task in TASKS)
+    expected_keys.update(
+        ("rollout", "all", str(rollout_id), "all")
+        for rollout_id in ROLLOUT_IDS
+    )
+    expected_keys.update(
+        ("model_task", model, "all", task)
+        for model in MODELS
+        for task in TASKS
+    )
+    expected_keys.update(
+        ("model_rollout", model, str(rollout_id), "all")
+        for model in MODELS
+        for rollout_id in ROLLOUT_IDS
+    )
+    expected_keys.update(
+        ("model_rollout_task", model, str(rollout_id), task)
+        for model in MODELS
+        for rollout_id in ROLLOUT_IDS
+        for task in TASKS
+    )
+    for key in expected_keys:
+        counters[key]
+
     rows: list[dict[str, Any]] = []
-    scopes = (*TASKS, "micro")
-    for model in MODELS:
-        for rollout_id in ROLLOUT_IDS:
-            for scope in scopes:
-                counter = counters[(model, rollout_id, scope)]
-                attempted = counter["attempted"]
-                success = counter["inference_success"]
-                tp = counter["image_TP"]
-                tn = counter["image_TN"]
-                fp = counter["image_FP"]
-                fn = counter["image_FN"]
-                scored = tp + tn + fp + fn
-                precision = tp / (tp + fp) if tp + fp else 0.0
-                recall = tp / (tp + fn) if tp + fn else 0.0
-                specificity = tn / (tn + fp) if tn + fp else 0.0
-                rows.append(
-                    {
-                        "model_id": model,
-                        "rollout_id": rollout_id,
-                        "scope": scope,
-                        "attempted": attempted,
-                        "inference_success": success,
-                        "runtime_error": counter["runtime_error"],
-                        "parse_error": counter["parse_error"],
-                        "image_TP": tp,
-                        "image_TN": tn,
-                        "image_FP": fp,
-                        "image_FN": fn,
-                        "TP": tp,
-                        "TN": tn,
-                        "FP": fp,
-                        "FN": fn,
-                        "image_TP_ratio": (
-                            counter["image_TP"] / success if success else 0.0
-                        ),
-                        "image_TN_ratio": (
-                            counter["image_TN"] / success if success else 0.0
-                        ),
-                        "image_FP_ratio": (
-                            counter["image_FP"] / success if success else 0.0
-                        ),
-                        "image_FN_ratio": (
-                            counter["image_FN"] / success if success else 0.0
-                        ),
-                        "TP_ratio": tp / success if success else 0.0,
-                        "TN_ratio": tn / success if success else 0.0,
-                        "FP_ratio": fp / success if success else 0.0,
-                        "FN_ratio": fn / success if success else 0.0,
-                        "bbox_TP": counter["bbox_TP"],
-                        "bbox_FP": counter["bbox_FP"],
-                        "bbox_FN": counter["bbox_FN"],
-                        "precision": precision,
-                        "recall": recall,
-                        "F1": (
-                            2 * precision * recall / (precision + recall)
-                            if precision + recall
-                            else 0.0
-                        ),
-                        "f1": (
-                            2 * precision * recall / (precision + recall)
-                            if precision + recall
-                            else 0.0
-                        ),
-                        "accuracy": (tp + tn) / scored if scored else 0.0,
-                        "specificity": specificity,
-                        "exact_correct": counter["exact_correct"],
-                        "inference_success_ratio": success / attempted if attempted else 0.0,
-                        "runtime_error_ratio": (
-                            counter["runtime_error"] / attempted if attempted else 0.0
-                        ),
-                        "exact_correct_ratio_of_inference_success": (
-                            counter["exact_correct"] / success if success else 0.0
-                        ),
-                    }
-                )
+    for key in sorted(counters):
+        level, model, rollout, task = key
+        counter = counters[key]
+        scored = counter["TP"] + counter["TN"] + counter["FP"] + counter["FN"]
+        tp, tn, fp, fn = (
+            counter["TP"],
+            counter["TN"],
+            counter["FP"],
+            counter["FN"],
+        )
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        specificity = tn / (tn + fp) if tn + fp else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        rows.append(
+            {
+                "level": level,
+                "model_id": model,
+                "rollout_id": rollout,
+                "task": task,
+                "scope": task if task != "all" else "micro",
+                "complete8_samples": len(sample_ids[key]),
+                "scored_predictions": counter["scored_predictions"],
+                "TP": tp,
+                "TN": tn,
+                "FP": fp,
+                "FN": fn,
+                "image_TP": tp,
+                "image_TN": tn,
+                "image_FP": fp,
+                "image_FN": fn,
+                "TP_ratio": tp / scored if scored else 0.0,
+                "TN_ratio": tn / scored if scored else 0.0,
+                "FP_ratio": fp / scored if scored else 0.0,
+                "FN_ratio": fn / scored if scored else 0.0,
+                "image_TP_ratio": tp / scored if scored else 0.0,
+                "image_TN_ratio": tn / scored if scored else 0.0,
+                "image_FP_ratio": fp / scored if scored else 0.0,
+                "image_FN_ratio": fn / scored if scored else 0.0,
+                "bbox_TP": counter["bbox_TP"],
+                "bbox_FP": counter["bbox_FP"],
+                "bbox_FN": counter["bbox_FN"],
+                "precision": precision,
+                "recall": recall,
+                "F1": f1,
+                "f1": f1,
+                "accuracy": (tp + tn) / scored if scored else 0.0,
+                "specificity": specificity,
+                "exact_correct": counter["exact_correct"],
+                "exact_correct_ratio": (
+                    counter["exact_correct"] / scored if scored else 0.0
+                ),
+            }
+        )
     return rows
+
+
+def rollout_technical_issues(row: Mapping[str, Any]) -> list[str]:
+    issues: list[str] = []
+    if row.get("runtime_error"):
+        issues.append("runtime_error")
+    if row.get("inference_success") is not True:
+        issues.append("inference_not_successful")
+    parse_status = row.get("parse_status")
+    if parse_status == "parse_error":
+        issues.append("parse_error")
+    elif not isinstance(parse_status, str) or not parse_status:
+        issues.append("missing_parse_status")
+    if row.get("contains_crop_parse_error"):
+        issues.append("crop_parse_error")
+    if row.get("oom_final_failure"):
+        issues.append("oom_final_failure")
+    if not isinstance(row.get("exact_correct"), bool):
+        issues.append("missing_reward")
+    if row.get("image_confusion") not in {"TP", "TN", "FP", "FN"}:
+        issues.append("missing_image_confusion")
+    return issues
 
 
 def build_difficulty_records(
@@ -395,6 +458,21 @@ def build_difficulty_records(
             ]
             for model in MODELS
         }
+        for model in MODELS:
+            for row in by_model[model]:
+                if str(row.get("sample_id")) != str(sample.get("sample_id")):
+                    raise RuntimeError(
+                        f"{model} raw sample_id mismatch for record_id={record_id}"
+                    )
+                if str(row.get("task")) != str(sample.get("task")):
+                    raise RuntimeError(
+                        f"{model} raw task mismatch for record_id={record_id}"
+                    )
+                expected_image = sample.get("source_image_id", sample.get("image_id"))
+                if str(row.get("source_image_id")) != str(expected_image):
+                    raise RuntimeError(
+                        f"{model} raw source_image_id mismatch for record_id={record_id}"
+                    )
         runtime_errors = [
             {
                 "model_id": model,
@@ -410,13 +488,19 @@ def build_difficulty_records(
             model: sum(row.get("exact_correct") is True for row in by_model[model])
             for model in MODELS
         }
+        technical_issues = {
+            model: {
+                int(row["rollout_id"]): rollout_technical_issues(row)
+                for row in by_model[model]
+                if rollout_technical_issues(row)
+            }
+            for model in MODELS
+        }
         complete4 = {
             model: bool(
                 completed[model] == 4
                 and all(
-                    row.get("inference_success", True) is True
-                    and not row.get("runtime_error")
-                    and isinstance(row.get("exact_correct"), bool)
+                    not rollout_technical_issues(row)
                     for row in by_model[model]
                 )
             )
@@ -425,7 +509,7 @@ def build_difficulty_records(
         complete8 = bool(complete4["m31"] and complete4["crop"])
         total_correct = correct["m31"] + correct["crop"]
         if not complete8:
-            difficulty = "incomplete_or_runtime_error"
+            difficulty = None
         elif total_correct == 8:
             difficulty = "easy"
         elif total_correct == 0:
@@ -485,7 +569,7 @@ def build_difficulty_records(
             "m31_correct_count": correct["m31"],
             "crop_correct_count": correct["crop"],
             "total_correct_count": total_correct,
-            "success_rate": total_correct / 8.0,
+            "success_rate": total_correct / 8.0 if complete8 else None,
             "difficulty": difficulty,
             "grpo_ready_m31": grpo_m31,
             "grpo_ready_crop": grpo_crop,
@@ -509,6 +593,17 @@ def build_difficulty_records(
                 if not row.get("runtime_error")
             ),
             "cross_model_complete8": complete8,
+            "technical_error_free": complete8,
+            "technical_issues": technical_issues,
+            "exclusion_reason": (
+                None
+                if complete8
+                else (
+                    "technical_error"
+                    if any(technical_issues[model] for model in MODELS)
+                    else "incomplete_eight_routes"
+                )
+            ),
             "rollouts": {
                 model: [
                     snapshot_rollout_payload(
@@ -577,10 +672,29 @@ def build_difficulty_records(
                     "complete": len(stream) == len(samples),
                 }
             )
+    complete8_ids = {
+        str(row["record_id"])
+        for row in records
+        if row.get("cross_model_complete8") is True
+    }
+    raw_record_ids = {
+        record_id
+        for stream in streams.values()
+        for record_id in stream
+    }
     return records, {
         "expected_total": len(samples),
         "raw_streams": stream_rows,
-        "cumulative_metrics": cumulative_metrics(streams),
+        "raw_records_visible": sum(len(stream) for stream in streams.values()),
+        "expected_raw_records": len(samples) * len(MODELS) * len(ROLLOUT_IDS),
+        "attempted_unique_samples": len(raw_record_ids),
+        "eight_raw_records_samples": sum(
+            all(str(row["record_id"]) in stream for stream in streams.values())
+            for row in records
+        ),
+        "complete8_samples": len(complete8_ids),
+        "incomplete_or_technical_error_samples": len(records) - len(complete8_ids),
+        "cumulative_metrics": cumulative_metrics(streams, complete8_ids),
         "correct_count_4": correct_count_4_rows(records),
         "correct_count_8": correct_count_8_rows(records),
     }
@@ -593,7 +707,10 @@ def correct_count_4_rows(records: Sequence[Mapping[str, Any]]) -> list[dict[str,
         count_field = f"{model}_correct_count"
         for scope in (*TASKS, "micro"):
             scoped = [
-                row for row in records if scope == "micro" or row.get("task") == scope
+                row
+                for row in records
+                if row.get("cross_model_complete8") is True
+                and (scope == "micro" or row.get("task") == scope)
             ]
             complete = [row for row in scoped if row.get(complete_field)]
             for correct_count in range(5):
@@ -685,6 +802,29 @@ def classification_projection(row: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in row.items() if key not in excluded}
 
 
+def difficulty_index_projection(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: row.get(key)
+        for key in (
+            "record_id",
+            "sample_id",
+            "source_image_id",
+            "task",
+            "image_relpath",
+            "m31_correct_count",
+            "crop_correct_count",
+            "total_correct_count",
+            "success_rate",
+            "difficulty",
+            "m31_complete4",
+            "crop_complete4",
+            "cross_model_complete8",
+            "grpo_ready_m31",
+            "grpo_ready_crop",
+        )
+    }
+
+
 def write_difficulty_exports(
     destination: Path,
     records: Sequence[Mapping[str, Any]],
@@ -694,14 +834,32 @@ def write_difficulty_exports(
 ) -> dict[str, int]:
     destination.mkdir(parents=True, exist_ok=True)
     counts: dict[str, int] = {}
+    complete = [row for row in records if row.get("cross_model_complete8") is True]
+    incomplete = [row for row in records if row.get("cross_model_complete8") is not True]
+    projected_complete = [classification_projection(row) for row in complete]
+    difficulty_rows = [difficulty_index_projection(row) for row in complete]
+    counts["complete8"] = atomic_jsonl(
+        destination / "complete8.jsonl", projected_complete
+    )
+    counts["sample_difficulty_jsonl"] = atomic_jsonl(
+        destination / "sample_difficulty.jsonl", difficulty_rows
+    )
+    counts["sample_difficulty_csv"] = atomic_csv(
+        destination / "sample_difficulty.csv", difficulty_rows
+    )
+    # Keep the generic sample stream as a complete8-only compatibility alias.
     counts["snapshot_samples"] = atomic_jsonl(
         destination / "samples.jsonl",
-        (classification_projection(row) for row in records),
+        projected_complete,
+    )
+    counts["incomplete_or_technical_error"] = atomic_jsonl(
+        destination / "incomplete_or_technical_error.jsonl",
+        (classification_projection(row) for row in incomplete),
     )
     for difficulty, filename in CLASSIFICATION_FILES.items():
         selected = [
             classification_projection(row)
-            for row in records
+            for row in complete
             if row["difficulty"] == difficulty
         ]
         counts[difficulty] = atomic_jsonl(destination / filename, selected)
@@ -718,7 +876,7 @@ def write_difficulty_exports(
     if write_delta:
         previous = previous_records or {}
         delta_rows = []
-        for row in records:
+        for row in complete:
             projected = classification_projection(row)
             old = previous.get(str(row["record_id"]))
             if old == projected:
@@ -755,10 +913,10 @@ def write_difficulty_exports(
 
 def read_snapshot_records(snapshot: Path) -> dict[str, dict[str, Any]]:
     records: dict[str, dict[str, Any]] = {}
-    for filename in CLASSIFICATION_FILES.values():
-        path = snapshot / filename
-        if not path.is_file():
-            continue
+    path = snapshot / "complete8.jsonl"
+    if not path.is_file():
+        path = snapshot / "samples.jsonl"
+    if path.is_file():
         for row in read_jsonl(path):
             records[str(row["record_id"])] = row
     return records
@@ -777,6 +935,100 @@ def previous_snapshot(snapshots_root: Path) -> Path | None:
     if not candidates:
         return None
     return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+
+
+def current_processing_status(
+    output_root: Path,
+    cumulative: Mapping[str, Any],
+    now_epoch: float,
+) -> dict[str, Any]:
+    eta_history = output_root / "progress" / "total_eta.jsonl"
+    latest_eta = None
+    if eta_history.is_file():
+        rows = visible_jsonl_rows(eta_history)
+        latest_eta = rows[-1] if rows else None
+
+    logical_progress: list[dict[str, Any]] = []
+    for model in MODELS:
+        for rollout_id in ROLLOUT_IDS:
+            path = output_root / "progress" / model / f"rollout_{rollout_id}.jsonl"
+            rows = visible_jsonl_rows(path) if path.is_file() else []
+            latest = rows[-1] if rows else None
+            logical_progress.append(
+                {
+                    "model_id": model,
+                    "rollout_id": rollout_id,
+                    "status": (latest or {}).get("status", "missing"),
+                    "attempted": int((latest or {}).get("attempted", 0)),
+                    "total": int((latest or {}).get("total", cumulative["expected_total"])),
+                    "throughput_attempted_per_second": float(
+                        (latest or {}).get(
+                            "throughput_attempted_per_second",
+                            (latest or {}).get("throughput_samples_per_second", 0.0),
+                        )
+                    ),
+                    "remaining_seconds": (latest or {}).get("remaining_seconds"),
+                    "estimated_completion": (latest or {}).get("estimated_completion"),
+                    "progress_history_rows": len(rows),
+                }
+            )
+
+    remaining_seconds = (
+        latest_eta.get("total_remaining_seconds")
+        if isinstance(latest_eta, Mapping)
+        else None
+    )
+    estimated_completion = (
+        latest_eta.get("total_estimated_completion")
+        if isinstance(latest_eta, Mapping)
+        else None
+    )
+    route_eta_fallback = False
+    if remaining_seconds is None:
+        route_remaining = [
+            float(row["remaining_seconds"])
+            for row in logical_progress
+            if isinstance(row.get("remaining_seconds"), (int, float))
+        ]
+        if len(route_remaining) == len(MODELS) * len(ROLLOUT_IDS):
+            route_eta_fallback = True
+            remaining_seconds = max(route_remaining, default=0.0)
+            estimated_completion = datetime.fromtimestamp(
+                now_epoch + remaining_seconds, timezone.utc
+            ).isoformat()
+
+    expected_total = int(cumulative["expected_total"])
+    complete8 = int(cumulative["complete8_samples"])
+    return {
+        "expected_samples": expected_total,
+        "attempted_unique_samples": int(cumulative["attempted_unique_samples"]),
+        "raw_records_visible": int(cumulative["raw_records_visible"]),
+        "expected_raw_records": int(cumulative["expected_raw_records"]),
+        "eight_raw_records_samples": int(cumulative["eight_raw_records_samples"]),
+        "complete8_samples": complete8,
+        "remaining_samples_until_complete8": max(0, expected_total - complete8),
+        "remaining_seconds": remaining_seconds,
+        "estimated_completion": estimated_completion,
+        "eta_valid": bool(
+            remaining_seconds is not None
+            and (
+                route_eta_fallback
+                or (
+                    isinstance(latest_eta, Mapping)
+                    and latest_eta.get("eta_valid") is True
+                )
+            )
+        ),
+        "eta_source": (
+            "progress/total_eta.jsonl"
+            if latest_eta is not None and not route_eta_fallback
+            else "logical_rollout_progress_max"
+            if route_eta_fallback
+            else None
+        ),
+        "eta_snapshot": latest_eta,
+        "logical_rollouts": logical_progress,
+    }
 
 
 def write_snapshot_workbook(
@@ -798,6 +1050,15 @@ def write_snapshot_workbook(
             {"metric": "created_at", "value": summary["created_at"]},
             {"metric": "elapsed_seconds", "value": summary["elapsed_seconds"]},
             {"metric": "expected_total", "value": summary["expected_total"]},
+            {"metric": "complete8_samples", "value": summary["complete8_samples"]},
+            {
+                "metric": "remaining_seconds",
+                "value": summary["processing_status"]["remaining_seconds"],
+            },
+            {
+                "metric": "estimated_completion",
+                "value": summary["processing_status"]["estimated_completion"],
+            },
             {"metric": "previous_snapshot", "value": summary["previous_snapshot"]},
         ],
         "difficulty": [
@@ -810,6 +1071,7 @@ def write_snapshot_workbook(
         ],
         "per_task_difficulty": list(summary["per_task_difficulty"]),
         "raw_streams": list(summary["raw_streams"]),
+        "processing_status": list(summary["processing_status"]["logical_rollouts"]),
         "cumulative_metrics": list(summary["cumulative_metrics"]),
         "correct_count_4": list(summary["correct_count_4"]),
         "correct_count_8": list(summary["correct_count_8"]),
@@ -865,8 +1127,8 @@ def render_snapshot_gallery(
     from render_ui5_train_rollout_gallery import render_panel
 
     visual_root = snapshot_root / "visualizations"
-    counts: Counter[tuple[str, str]] = Counter()
-    seen_images: dict[tuple[str, str], set[str]] = defaultdict(set)
+    counts: Counter[str] = Counter()
+    seen_images: dict[str, set[str]] = defaultdict(set)
     cards: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     for record in records:
@@ -877,10 +1139,6 @@ def render_snapshot_gallery(
             for model in MODELS
             for rollout in visualization_map.get(model, [])
         ]
-        if record.get("grpo_ready_m31"):
-            categories.append("grpo_m31_ready")
-        if record.get("grpo_ready_crop"):
-            categories.append("grpo_crop_ready")
         if any(
             rollout.get("image_confusion") == "FP"
             or int(rollout.get("FP_box") or 0) > 0
@@ -893,28 +1151,16 @@ def render_snapshot_gallery(
             for rollout in flattened_rollouts
         ):
             categories.append("FN")
-        if any(
-            int(rollout.get("oom_events", 0)) > 0
-            or rollout.get("oom_recovered")
-            for rollout in flattened_rollouts
-        ):
-            categories.append("OOM")
         for category in categories:
             task = str(record["task"])
-            key = (category, task)
             image_id = str(record["source_image_id"])
-            if len(seen_images[key]) >= 10 or image_id in seen_images[key]:
+            if len(seen_images[category]) >= 10 or image_id in seen_images[category]:
                 continue
-            seen_images[key].add(image_id)
-            model_filter = (
-                "m31" if category == "grpo_m31_ready" else
-                "crop" if category == "grpo_crop_ready" else None
-            )
+            seen_images[category].add(image_id)
             rollout_map = visualization_map
             rollouts = [
                 rollout
                 for model in MODELS
-                if model_filter is None or model == model_filter
                 for rollout in rollout_map.get(model, [])
                 if category != "FP"
                 or rollout.get("image_confusion") == "FP"
@@ -922,9 +1168,6 @@ def render_snapshot_gallery(
                 if category != "FN"
                 or rollout.get("image_confusion") == "FN"
                 or int(rollout.get("FN_box") or 0) > 0
-                if category != "OOM"
-                or int(rollout.get("oom_events", 0)) > 0
-                or rollout.get("oom_recovered")
             ]
             source_path = bundle_root / str(record["image_relpath"])
             try:
@@ -993,7 +1236,7 @@ def render_snapshot_gallery(
                         "visual_relpath": relative.as_posix(),
                     }
                 )
-                counts[key] += 1
+                counts[category] += 1
             except Exception as exc:
                 failures.append(
                     {
@@ -1003,19 +1246,20 @@ def render_snapshot_gallery(
                     }
                 )
     sections = []
-    for key in sorted(counts):
-        category, task = key
+    for category in sorted(counts):
         selected = [
             card
             for card in cards
-            if card["category"] == category and card["task"] == task
+            if card["category"] == category
         ]
         cards_html = "".join(
             "<article><img loading='lazy' src='"
             + html.escape(str(card["visual_relpath"]))
             + "'><div><code>"
             + html.escape(str(card["record_id"]))
-            + "</code> m31="
+            + "</code> task="
+            + html.escape(str(card["task"]))
+            + " m31="
             + str(card["m31_correct_count"])
             + "/4 crop="
             + str(card["crop_correct_count"])
@@ -1025,7 +1269,7 @@ def render_snapshot_gallery(
             for card in selected
         )
         sections.append(
-            f"<section><h2>{html.escape(category)} / {html.escape(task)} "
+            f"<section><h2>{html.escape(category)} "
             f"({len(selected)})</h2><div class='grid'>{cards_html}</div></section>"
         )
     document = f"""<!doctype html><html><head><meta charset='utf-8'>
@@ -1044,7 +1288,7 @@ img{{width:100%;height:auto}} code{{font-size:12px}}
         "index": "visualizations/index.html",
         "rendered": len(cards),
         "failures": failures,
-        "counts": {"|".join(key): value for key, value in sorted(counts.items())},
+        "counts": dict(sorted(counts.items())),
     }
     atomic_json(visual_root / "gallery_summary.json", result)
     return result
@@ -1105,6 +1349,9 @@ def create_snapshot(
     previous = previous_snapshot(snapshots_root)
     previous_records = read_snapshot_records(previous) if previous else {}
     records, cumulative = build_difficulty_records(output_root, bundle_root)
+    complete_records = [
+        row for row in records if row.get("cross_model_complete8") is True
+    ]
     prefix = f"hour_{scheduled_hour:03d}" if kind == "hourly" else "final"
     base_name = f"{prefix}_{timestamp_token(now_epoch)}"
     destination = snapshots_root / base_name
@@ -1124,12 +1371,43 @@ def create_snapshot(
             write_delta=True,
         )
         error_counts = write_error_exports(temporary, output_root, records)
-        difficulty_counts = Counter(str(row["difficulty"]) for row in records)
+        difficulty_counts = Counter(str(row["difficulty"]) for row in complete_records)
         task_counts = Counter(
-            (str(row["task"]), str(row["difficulty"])) for row in records
+            (str(row["task"]), str(row["difficulty"])) for row in complete_records
         )
-        task_totals = Counter(str(row["task"]) for row in records)
+        task_totals = Counter(str(row["task"]) for row in complete_records)
+        exclusion_counts = Counter(
+            str(row.get("exclusion_reason"))
+            for row in records
+            if row.get("cross_model_complete8") is not True
+        )
         expected_total = int(cumulative["expected_total"])
+        complete8_total = len(complete_records)
+        processing_status = current_processing_status(
+            output_root, cumulative, now_epoch
+        )
+        file_counts["confusion_metrics_jsonl"] = atomic_jsonl(
+            temporary / "confusion_metrics.jsonl",
+            cumulative["cumulative_metrics"],
+        )
+        file_counts["confusion_metrics_csv"] = atomic_csv(
+            temporary / "confusion_metrics.csv",
+            cumulative["cumulative_metrics"],
+        )
+        file_counts["correct_count_8_jsonl"] = atomic_jsonl(
+            temporary / "correct_count_8.jsonl",
+            cumulative["correct_count_8"],
+        )
+        file_counts["correct_count_8_csv"] = atomic_csv(
+            temporary / "correct_count_8.csv",
+            cumulative["correct_count_8"],
+        )
+        atomic_json(temporary / "processing_status.json", processing_status)
+        correct_count_distribution = {
+            str(row["correct_count_8"]): int(row["samples"])
+            for row in cumulative["correct_count_8"]
+            if row["scope"] == "micro"
+        }
         summary = {
             "schema_version": SCHEMA_VERSION,
             "snapshot_kind": kind,
@@ -1143,14 +1421,24 @@ def create_snapshot(
             "elapsed_seconds": max(0.0, now_epoch - started_at_epoch),
             "previous_snapshot": previous.name if previous else None,
             "expected_total": expected_total,
+            "complete8_samples": complete8_total,
+            "current_processed_samples": processing_status["attempted_unique_samples"],
+            "remaining_seconds": processing_status["remaining_seconds"],
+            "estimated_completion": processing_status["estimated_completion"],
+            "processing_status": processing_status,
             "classification_policy": {
                 "complete8_required": True,
-                "runtime_error_excluded": True,
+                "technical_error_free_required": True,
+                "difficulty_ratio_denominator": "complete8_samples",
                 "easy": "total_correct_count == 8",
                 "medium": "1 <= total_correct_count <= 7",
                 "hard": "total_correct_count == 0",
-                "incomplete_or_runtime_error": (
-                    "fewer than eight raw records, a runtime_error, or missing exact_correct"
+                "excluded_from_difficulty": (
+                    "fewer than eight raw records, runtime/final-OOM error, parse error, "
+                    "crop parse error, missing reward, or missing image confusion"
+                ),
+                "oom_recovered_policy": (
+                    "eligible when retry inference and parsing succeeded and reward is valid"
                 ),
                 "complete_fields_are_not_difficulties": [
                     "m31_complete4",
@@ -1173,8 +1461,8 @@ def create_snapshot(
                 for difficulty in DIFFICULTIES
             },
             "difficulty_ratios": {
-                difficulty: difficulty_counts[difficulty] / expected_total
-                if expected_total
+                difficulty: difficulty_counts[difficulty] / complete8_total
+                if complete8_total
                 else 0.0
                 for difficulty in DIFFICULTIES
             },
@@ -1189,9 +1477,14 @@ def create_snapshot(
                         else 0.0
                     ),
                 }
-                for task in sorted(task_totals)
+                for task in TASKS
                 for difficulty in DIFFICULTIES
             ],
+            "excluded_from_difficulty_counts": {
+                "incomplete_eight_routes": exclusion_counts["incomplete_eight_routes"],
+                "technical_error": exclusion_counts["technical_error"],
+                "total": expected_total - complete8_total,
+            },
             "grpo_ready_counts": {
                 "m31": file_counts["grpo_m31_ready"],
                 "crop": file_counts["grpo_crop_ready"],
@@ -1202,31 +1495,23 @@ def create_snapshot(
                 "all_correct": difficulty_counts["easy"],
                 "all_wrong": difficulty_counts["hard"],
                 "partially_correct": difficulty_counts["medium"],
-                "incomplete_or_runtime_error": difficulty_counts[
-                    "incomplete_or_runtime_error"
-                ],
             },
             "outcome_ratios": {
-                "all_correct": difficulty_counts["easy"] / expected_total
-                if expected_total
+                "all_correct": difficulty_counts["easy"] / complete8_total
+                if complete8_total
                 else 0.0,
-                "all_wrong": difficulty_counts["hard"] / expected_total
-                if expected_total
+                "all_wrong": difficulty_counts["hard"] / complete8_total
+                if complete8_total
                 else 0.0,
-                "partially_correct": difficulty_counts["medium"] / expected_total
-                if expected_total
-                else 0.0,
-                "incomplete_or_runtime_error": difficulty_counts[
-                    "incomplete_or_runtime_error"
-                ]
-                / expected_total
-                if expected_total
+                "partially_correct": difficulty_counts["medium"] / complete8_total
+                if complete8_total
                 else 0.0,
             },
+            "correct_count_distribution_0to8": correct_count_distribution,
             **cumulative,
         }
         summary["visualizations"] = render_snapshot_gallery(
-            temporary, bundle_root, records
+            temporary, bundle_root, complete_records
         )
         summary["statistics_workbook"] = "snapshot_statistics.xlsx"
         write_snapshot_workbook(temporary / "snapshot_statistics.xlsx", summary)

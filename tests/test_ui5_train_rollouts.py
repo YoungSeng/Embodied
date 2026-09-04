@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -88,19 +90,21 @@ class UI5TrainRolloutTest(unittest.TestCase):
                 "--bundle-root",
                 "bundle",
                 "--rollout-ids",
-                "0,1,2,3",
+                "0,1",
                 "--seeds",
-                "20260903,20260917,20260931,20260947",
+                "20260903,20260917",
                 "--physical-gpu",
                 "0",
+                "--gpu-model-processes",
+                "2",
             ]
         )
         with mock.patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0"}):
             validate_run_args(worker_args)
-            worker_args.gpu_model_processes = 2
-            with self.assertRaisesRegex(ValueError, "one model process per GPU"):
-                validate_run_args(worker_args)
             worker_args.gpu_model_processes = 1
+            with self.assertRaisesRegex(ValueError, "two model processes per GPU"):
+                validate_run_args(worker_args)
+            worker_args.gpu_model_processes = 2
             worker_args.max_new_tokens = 7268
             with self.assertRaisesRegex(ValueError, "token configuration mismatch"):
                 validate_run_args(worker_args)
@@ -108,25 +112,31 @@ class UI5TrainRolloutTest(unittest.TestCase):
         launcher = (
             PROJECT_ROOT / "shell" / "run_ui5_train_rollouts_h20x2.sh"
         ).read_text(encoding="utf-8")
-        self.assertEqual(launcher.count("launch_worker m31"), 1)
-        self.assertEqual(launcher.count("launch_worker crop"), 1)
+        self.assertEqual(launcher.count("launch_worker m31"), 2)
+        self.assertEqual(launcher.count("launch_worker crop"), 2)
         self.assertIn(
-            'launch_worker m31 0 "0,1,2,3" '
-            '"${SEEDS[0]},${SEEDS[1]},${SEEDS[2]},${SEEDS[3]}"',
+            'launch_worker m31 0 "0,1" "${SEEDS[0]},${SEEDS[1]}"',
             launcher,
         )
         self.assertIn(
-            'launch_worker crop 1 "0,1,2,3" '
-            '"${SEEDS[0]},${SEEDS[1]},${SEEDS[2]},${SEEDS[3]}"',
+            'launch_worker m31 0 "2,3" "${SEEDS[2]},${SEEDS[3]}"',
+            launcher,
+        )
+        self.assertIn(
+            'launch_worker crop 1 "0,1" "${SEEDS[0]},${SEEDS[1]}"',
+            launcher,
+        )
+        self.assertIn(
+            'launch_worker crop 1 "2,3" "${SEEDS[2]},${SEEDS[3]}"',
             launcher,
         )
         self.assertEqual(tuple(FORMAL_SEEDS.values()), (20260903, 20260917, 20260931, 20260947))
-        self.assertIn("--gpu-model-processes 1", launcher)
+        self.assertIn("--gpu-model-processes 2", launcher)
         self.assertIn('HF_MODULES_CACHE="${hf_modules_cache}"', launcher)
         self.assertIn('PYTHONPYCACHEPREFIX="${python_pycache}"', launcher)
         self.assertIn("PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", launcher)
-        self.assertIn("runtime_cache/hf_modules/${model_id}", launcher)
-        self.assertIn("runtime_cache/pycache/${model_id}", launcher)
+        self.assertIn("runtime_cache/hf_modules/${worker_key}", launcher)
+        self.assertIn("runtime_cache/pycache/${worker_key}", launcher)
         self.assertNotIn(
             "/home/tiger/.cache/huggingface/modules/transformers_modules/"
             "checkpoint_hyphen_12000",
@@ -140,9 +150,385 @@ class UI5TrainRolloutTest(unittest.TestCase):
             "--max-new-tokens 512",
             "--n-future-tokens 6",
             "--attn-implementation sdpa",
-            "--vision-attn-implementation sdpa",
+            "--vision-attn-implementation flash_attention_2",
         ):
             self.assertIn(argument, launcher)
+        for backend_status in (
+            "text_config=sdpa",
+            "vision_config=flash_attention_2",
+            "vision_first_layer=flash_attention_2",
+            "vision_blocks=27/27",
+        ):
+            self.assertIn(backend_status, launcher)
+
+    def test_formal_model_load_gate_rejects_ok_log_for_dead_pid(self) -> None:
+        launcher = (
+            PROJECT_ROOT / "shell" / "run_ui5_train_rollouts_h20x2.sh"
+        ).read_text(encoding="utf-8")
+        marker = "<<'PY'\n"
+        start = launcher.index(marker) + len(marker)
+        gate = launcher[start : launcher.index("\nPY\nthen", start)]
+
+        dead_pid = 99_999_999
+        with self.assertRaises(OSError):
+            os.kill(dead_pid, 0)
+        alive_pid = os.getpid()
+        workers = (
+            (alive_pid, "m31", "0,1"),
+            (alive_pid, "m31", "2,3"),
+            (alive_pid, "crop", "0,1"),
+            (dead_pid, "crop", "2,3"),
+        )
+        required_attention = (
+            "text_config=sdpa vision_config=flash_attention_2 "
+            "vision_first_layer=flash_attention_2 vision_blocks=27/27"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "diagnostics").mkdir()
+            arguments: list[str] = [str(root)]
+            for index, (pid, model, rollout_ids) in enumerate(workers):
+                log_path = root / f"worker-{index}.log"
+                log_path.write_text(
+                    f"[MODEL_LOAD_OK] model={model} pid={pid} "
+                    f"rollouts={rollout_ids} {required_attention}\n",
+                    encoding="utf-8",
+                )
+                arguments.extend((str(pid), model, rollout_ids, str(log_path)))
+            result = subprocess.run(
+                [sys.executable, "-", *arguments],
+                input=gate,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            invalid = json.loads(
+                (root / "diagnostics" / "formal_run_invalid.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertFalse(invalid["valid"])
+            self.assertEqual(len(invalid["workers"]), 4)
+            self.assertTrue(all(row["alive"] for row in invalid["workers"][:3]))
+            self.assertFalse(invalid["workers"][3]["alive"])
+            self.assertFalse(invalid["workers"][3]["validated"])
+            self.assertFalse((root / "diagnostics" / "_MODEL_LOADS_OK").exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "diagnostics").mkdir()
+            arguments = [str(root)]
+            for index, (_, model, rollout_ids) in enumerate(workers):
+                log_path = root / f"worker-{index}.log"
+                log_path.write_text(
+                    f"[MODEL_LOAD_OK] model={model} pid={alive_pid} "
+                    f"rollouts={rollout_ids} {required_attention}\n",
+                    encoding="utf-8",
+                )
+                arguments.extend(
+                    (str(alive_pid), model, rollout_ids, str(log_path))
+                )
+            result = subprocess.run(
+                [sys.executable, "-", *arguments],
+                input=gate,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            valid = json.loads(
+                (root / "diagnostics" / "formal_run_valid.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(valid["valid"])
+            self.assertTrue(all(row["alive"] for row in valid["workers"]))
+            self.assertTrue((root / "diagnostics" / "_MODEL_LOADS_OK").is_file())
+
+    def test_model_load_barrier_precedes_resume_completion_and_inference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_root = Path(directory)
+            marker = output_root / "diagnostics" / "_MODEL_LOADS_OK"
+
+            def release_marker(_: float) -> None:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text("released\n", encoding="utf-8")
+
+            with mock.patch.object(
+                worker.time, "sleep", side_effect=release_marker
+            ) as sleep_mock, mock.patch("builtins.print") as print_mock:
+                report = worker.wait_for_model_load_barrier(
+                    output_root,
+                    model_id="m31",
+                    physical_gpu=0,
+                    rollout_ids=(0, 1),
+                )
+            sleep_mock.assert_called_once_with(1.0)
+            self.assertEqual(report["marker"], str(marker))
+            messages = [str(call.args[0]) for call in print_mock.call_args_list]
+            self.assertTrue(any("[MODEL_LOAD_BARRIER_WAIT]" in row for row in messages))
+            self.assertTrue(
+                any("[MODEL_LOAD_BARRIER_RELEASE]" in row for row in messages)
+            )
+
+        worker_source = (
+            PROJECT_ROOT / "scripts" / "run_ui5_train_rollout_worker.py"
+        ).read_text(encoding="utf-8")
+        load_ok = worker_source.index('"[MODEL_LOAD_OK] "')
+        barrier = worker_source.index("wait_for_model_load_barrier(", load_ok)
+        resume_completion = worker_source.index("already_complete =", barrier)
+        sample_inference = worker_source.index("# Sample-major execution:", barrier)
+        self.assertLess(load_ok, barrier)
+        self.assertLess(barrier, resume_completion)
+        self.assertLess(barrier, sample_inference)
+
+    def test_attention_audit_resume_and_output_preflight(self) -> None:
+        flash = "flash_attention_2"
+        blocks = [SimpleNamespace(attn_implementation=flash) for _ in range(27)]
+        inferencer = SimpleNamespace(
+            model=SimpleNamespace(
+                config=SimpleNamespace(
+                    text_config=SimpleNamespace(_attn_implementation="sdpa"),
+                    vision_config=SimpleNamespace(_attn_implementation=flash),
+                ),
+                vision_model=SimpleNamespace(
+                    encoder=SimpleNamespace(blocks=blocks)
+                ),
+            )
+        )
+        attention_args = SimpleNamespace(
+            attn_implementation="sdpa",
+            vision_attn_implementation=flash,
+        )
+        report = worker.verify_loaded_attention_backends(inferencer, attention_args)
+        self.assertEqual(report["text_config"], "sdpa")
+        self.assertEqual(report["vision_config"], flash)
+        self.assertEqual(report["vision_first_layer"], flash)
+        self.assertEqual(report["vision_blocks"], "27/27")
+        blocks[-1].attn_implementation = "sdpa"
+        with self.assertRaisesRegex(RuntimeError, "vision_blocks=26/27"):
+            worker.verify_loaded_attention_backends(inferencer, attention_args)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw_dir = root / "output" / "raw" / "m31" / "rollout_0"
+            checkpoint = root / "checkpoint"
+            processor = root / "processor"
+            generation = {"mode": "hybrid", "vision_attn_implementation": flash}
+            sample = {
+                "record_id": "record_0",
+                "sample_id": "sample_0",
+                "task": "occlusion",
+                "source_image_id": "image_0",
+                "image_relpath": "images/image_0.png",
+            }
+            prior = {
+                "schema_version": worker.SCHEMA_VERSION,
+                "model_id": "m31",
+                "rollout_id": 0,
+                "seed": FORMAL_SEEDS[0],
+                "checkpoint": str(checkpoint),
+                "processor_path": str(processor),
+                "generation_config": generation,
+                "git_commit": "model-head",
+                "baseline_git_commit": "5d7a313",
+                "worker_git_commit": "worker-head",
+                **sample,
+                "inference_success": True,
+                "runtime_error": None,
+                "parse_status": "ok",
+                "contains_crop_parse_error": False,
+                "oom_events": 1,
+                "oom_recovered": True,
+                "oom_final_failure": False,
+            }
+            write_jsonl(raw_dir / "part-00000.jsonl", [prior])
+            completed, counters = worker.resume_route_state(
+                raw_dir,
+                model_id="m31",
+                rollout_id=0,
+                seed=FORMAL_SEEDS[0],
+                checkpoint=checkpoint,
+                processor_path=processor,
+                generation=generation,
+                git_commit="model-head",
+                baseline_git_commit="5d7a313",
+                worker_git_commit="worker-head",
+                samples_by_record={"record_0": sample},
+            )
+            self.assertEqual(completed, {"record_0"})
+            self.assertEqual(counters["attempted"], 1)
+            self.assertEqual(counters["inference_success"], 1)
+            self.assertEqual(counters["oom_recovered_samples"], 1)
+            writer = worker.PartWriter(raw_dir, part_size=10)
+            writer.write({"new": True})
+            writer.close()
+            self.assertTrue((raw_dir / "part-00001.jsonl").is_file())
+
+            with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+                worker.resume_route_state(
+                    raw_dir,
+                    model_id="m31",
+                    rollout_id=0,
+                    seed=FORMAL_SEEDS[0],
+                    checkpoint=checkpoint,
+                    processor_path=processor,
+                    generation={"mode": "changed"},
+                    git_commit="model-head",
+                    baseline_git_commit="5d7a313",
+                    worker_git_commit="worker-head",
+                    samples_by_record={"record_0": sample},
+                )
+
+            output = root / "resumable_output"
+            (output / "raw").mkdir(parents=True)
+            output_report = preflight.check_output_root(output)
+            self.assertTrue(output_report["complete"])
+            self.assertFalse(output_report["fresh"])
+            self.assertTrue(output_report["resume"])
+            (output / "unrelated.payload").write_text("no", encoding="utf-8")
+            rejected = preflight.check_output_root(output)
+            self.assertFalse(rejected["complete"])
+            self.assertIn("unrelated.payload", rejected["unexpected_entries"])
+
+    def test_resume_repairs_only_unterminated_highest_eof_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "checkpoint"
+            processor = root / "processor"
+            diagnostics = root / "diagnostics"
+            generation = {"mode": "hybrid"}
+            sample = {
+                "record_id": "record_0",
+                "sample_id": "sample_0",
+                "task": "occlusion",
+                "source_image_id": "image_0",
+                "image_relpath": "images/image_0.png",
+            }
+            prior = {
+                "schema_version": worker.SCHEMA_VERSION,
+                "model_id": "m31",
+                "rollout_id": 0,
+                "seed": FORMAL_SEEDS[0],
+                "checkpoint": str(checkpoint),
+                "processor_path": str(processor),
+                "generation_config": generation,
+                "git_commit": "model-head",
+                "baseline_git_commit": "5d7a313",
+                "worker_git_commit": "worker-head",
+                **sample,
+                "inference_success": True,
+                "runtime_error": None,
+                "parse_status": "ok",
+                "oom_events": 0,
+            }
+            valid_raw = (json.dumps(prior) + "\n").encode("utf-8")
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            highest = raw_dir / "part-00000.jsonl"
+            highest.write_bytes(valid_raw + b'{"schema_version":5')
+            resume_kwargs = {
+                "model_id": "m31",
+                "rollout_id": 0,
+                "seed": FORMAL_SEEDS[0],
+                "checkpoint": checkpoint,
+                "processor_path": processor,
+                "generation": generation,
+                "git_commit": "model-head",
+                "baseline_git_commit": "5d7a313",
+                "worker_git_commit": "worker-head",
+                "samples_by_record": {"record_0": sample},
+                "recovery_diagnostics_dir": diagnostics,
+            }
+            completed, counters = worker.resume_route_state(raw_dir, **resume_kwargs)
+            self.assertEqual(completed, {"record_0"})
+            self.assertEqual(counters["attempted"], 1)
+            self.assertEqual(highest.read_bytes(), valid_raw)
+
+            valid_unterminated_dir = root / "valid_unterminated"
+            valid_unterminated_dir.mkdir()
+            valid_unterminated = valid_unterminated_dir / "part-00000.jsonl"
+            valid_unterminated.write_bytes(valid_raw.rstrip(b"\n"))
+            normalized, _ = worker.resume_route_state(
+                valid_unterminated_dir, **resume_kwargs
+            )
+            self.assertEqual(normalized, {"record_0"})
+            self.assertEqual(valid_unterminated.read_bytes(), valid_raw)
+
+            progress_path = root / "progress.jsonl"
+            progress_row = {
+                "model_id": "m31",
+                "rollout_id": 0,
+                "seed": FORMAL_SEEDS[0],
+                "total": 2,
+                "attempted": 1,
+                "elapsed_seconds": 5.0,
+                "inference_elapsed_seconds": 4.0,
+            }
+            valid_progress = (json.dumps(progress_row) + "\n").encode("utf-8")
+            progress_path.write_bytes(valid_progress + b'{"attempted":')
+            progress = worker.ProgressWriter(
+                progress_path,
+                "m31",
+                0,
+                FORMAL_SEEDS[0],
+                2,
+                resume_attempted=1,
+                recovery_diagnostics_dir=diagnostics,
+            )
+            progress.close()
+            self.assertEqual(progress_path.read_bytes(), valid_progress)
+            events = [json.loads(path.read_text(encoding="utf-8")) for path in diagnostics.glob("*.json")]
+            self.assertEqual(len(events), 3)
+            self.assertEqual(
+                sum(
+                    event["action"]
+                    == "truncate_incomplete_unterminated_eof_fragment"
+                    for event in events
+                ),
+                2,
+            )
+            self.assertEqual(
+                sum(
+                    event["action"]
+                    == "append_missing_newline_after_valid_eof_record"
+                    for event in events
+                ),
+                1,
+            )
+            truncated = [event for event in events if event["removed_bytes"] > 0]
+            self.assertEqual(len(truncated), 2)
+
+            nonhighest = root / "nonhighest"
+            nonhighest.mkdir()
+            (nonhighest / "part-00000.jsonl").write_bytes(
+                valid_raw + b'{"schema_version":5'
+            )
+            (nonhighest / "part-00001.jsonl").write_bytes(b"")
+            with self.assertRaisesRegex(RuntimeError, "not recoverable|invalid JSONL"):
+                worker.resume_route_state(nonhighest, **resume_kwargs)
+
+            terminated_bad = root / "terminated_bad"
+            terminated_bad.mkdir()
+            (terminated_bad / "part-00000.jsonl").write_bytes(
+                valid_raw + b'{"schema_version":5\n'
+            )
+            with self.assertRaisesRegex(RuntimeError, "invalid JSONL"):
+                worker.resume_route_state(terminated_bad, **resume_kwargs)
+
+            bad_progress = root / "bad_progress.jsonl"
+            bad_progress.write_bytes(valid_progress + b'{"attempted":\n')
+            with self.assertRaisesRegex(RuntimeError, "invalid JSONL"):
+                worker.ProgressWriter(
+                    bad_progress,
+                    "m31",
+                    0,
+                    FORMAL_SEEDS[0],
+                    2,
+                    resume_attempted=1,
+                    recovery_diagnostics_dir=diagnostics,
+                )
 
     def test_checkpoint_source_syntax_and_exact_copy_commands(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -430,19 +816,23 @@ class UI5TrainRolloutTest(unittest.TestCase):
                     "--expected-workers",
                     "8",
                     "--physical-worker",
-                    "m31,0,111,0|1|2|3",
+                    "m31,0,111,0|1",
                     "--physical-worker",
-                    "crop,1,222,0|1|2|3",
+                    "m31,0,112,2|3",
+                    "--physical-worker",
+                    "crop,1,222,0|1",
+                    "--physical-worker",
+                    "crop,1,223,2|3",
                 ]
             )
-            with mock.patch.object(worker, "pid_alive", side_effect=lambda pid: pid == 222):
+            with mock.patch.object(worker, "pid_alive", side_effect=lambda pid: pid != 111):
                 self.assertEqual(worker.progress_snapshot(args), 0)
 
             snapshots = snapshot.read_jsonl(output / "progress" / "total_eta.jsonl")
             self.assertEqual(len(snapshots), 1)
             status = snapshots[0]
-            self.assertEqual(status["physical_processes_expected"], 2)
-            self.assertEqual(len(status["physical_processes"]), 2)
+            self.assertEqual(status["physical_processes_expected"], 4)
+            self.assertEqual(len(status["physical_processes"]), 4)
             self.assertEqual(status["logical_rollouts_expected"], 8)
             self.assertEqual(len(status["logical_rollouts"]), 8)
             self.assertEqual(status["progress_files_discovered"], 3)
@@ -450,18 +840,20 @@ class UI5TrainRolloutTest(unittest.TestCase):
             self.assertEqual(status["workers_seen"], 3)
 
             by_pid = {row["pid"]: row for row in status["physical_processes"]}
-            self.assertEqual(set(by_pid), {111, 222})
+            self.assertEqual(set(by_pid), {111, 112, 222, 223})
             self.assertEqual(by_pid[111]["status"], "failed")
             self.assertFalse(by_pid[111]["alive"])
+            self.assertEqual(by_pid[112]["status"], "alive")
+            self.assertTrue(by_pid[112]["alive"])
             self.assertEqual(by_pid[222]["status"], "alive")
             self.assertTrue(by_pid[222]["alive"])
             self.assertEqual(
                 by_pid[111]["logical_rollout_statuses"],
-                {"0": "completed", "1": "failed", "2": "failed", "3": "failed"},
+                {"0": "completed", "1": "failed"},
             )
             self.assertEqual(by_pid[222]["logical_rollout_statuses"]["0"], "running")
             self.assertEqual(status["failed_physical_processes"], 1)
-            self.assertEqual(status["failed_logical_rollouts"], 3)
+            self.assertEqual(status["failed_logical_rollouts"], 1)
             self.assertFalse(status["eta_valid"])
             self.assertEqual(
                 status["eta_unavailable_reason"],
@@ -773,10 +1165,14 @@ class UI5TrainRolloutTest(unittest.TestCase):
                     "easy": 0,
                     "medium": 0,
                     "hard": 0,
-                    "incomplete_or_runtime_error": 5,
                 },
             )
-            self.assertEqual(first_summary["file_counts"]["delta_since_previous"], 5)
+            self.assertEqual(first_summary["complete8_samples"], 0)
+            self.assertEqual(first_summary["file_counts"]["complete8"], 0)
+            self.assertEqual(
+                first_summary["file_counts"]["incomplete_or_technical_error"], 5
+            )
+            self.assertEqual(first_summary["file_counts"]["delta_since_previous"], 0)
             self.assertTrue((first_snapshot / "snapshot_statistics.xlsx").is_file())
             self.assertTrue((first_snapshot / "visualizations" / "index.html").is_file())
             for model in ("m31", "crop"):
@@ -969,16 +1365,20 @@ class UI5TrainRolloutTest(unittest.TestCase):
                     "easy": 1,
                     "medium": 2,
                     "hard": 1,
-                    "incomplete_or_runtime_error": 1,
                 },
             )
-            self.assertEqual(second_summary["file_counts"]["delta_since_previous"], 5)
+            self.assertEqual(second_summary["complete8_samples"], 4)
+            self.assertEqual(second_summary["file_counts"]["complete8"], 4)
+            self.assertEqual(
+                second_summary["file_counts"]["incomplete_or_technical_error"], 1
+            )
+            self.assertEqual(second_summary["file_counts"]["delta_since_previous"], 4)
             self.assertEqual(second_summary["grpo_ready_counts"], {"m31": 1, "crop": 1})
             self.assertEqual(second_summary["error_counts"]["runtime_errors"], 1)
             self.assertEqual(second_summary["error_counts"]["oom_events"], 2)
             self.assertEqual(len(second_summary["correct_count_4"]), 60)
             self.assertEqual(len(second_summary["correct_count_8"]), 54)
-            self.assertEqual(len(second_summary["cumulative_metrics"]), 48)
+            self.assertEqual(len(second_summary["cumulative_metrics"]), 70)
             for metric_row in second_summary["cumulative_metrics"]:
                 self.assertTrue(
                     {
@@ -1021,13 +1421,13 @@ class UI5TrainRolloutTest(unittest.TestCase):
                     }.issubset(rollout_payload)
                 )
             incomplete = snapshot.read_jsonl(
-                second_snapshot / "incomplete_or_runtime_error.jsonl"
+                second_snapshot / "incomplete_or_technical_error.jsonl"
             )[0]
             self.assertFalse(incomplete["m31_complete4"])
             self.assertTrue(incomplete["crop_complete4"])
             self.assertFalse(incomplete["cross_model_complete8"])
             self.assertFalse(incomplete["grpo_ready_crop"])
-            self.assertEqual(incomplete["difficulty"], "incomplete_or_runtime_error")
+            self.assertIsNone(incomplete["difficulty"])
             self.assertEqual(incomplete["runtime_error_count"], 1)
             grpo_crop = snapshot.read_jsonl(second_snapshot / "grpo_crop_ready.jsonl")
             self.assertEqual(len(grpo_crop), 1)
@@ -1080,16 +1480,29 @@ class UI5TrainRolloutTest(unittest.TestCase):
             self.assertTrue(final_snapshot.name.startswith("final_"))
             self.assertEqual(final_summary["file_counts"]["delta_since_previous"], 0)
             self.assertFalse((first_snapshot / "cross_model_complete8.jsonl").exists())
+            self.assertTrue((second_snapshot / "complete8.jsonl").is_file())
+            self.assertTrue((second_snapshot / "sample_difficulty.jsonl").is_file())
+            self.assertTrue((second_snapshot / "sample_difficulty.csv").is_file())
+            self.assertTrue((second_snapshot / "confusion_metrics.jsonl").is_file())
+            self.assertTrue((second_snapshot / "confusion_metrics.csv").is_file())
+            self.assertTrue((second_snapshot / "correct_count_8.jsonl").is_file())
+            self.assertTrue((second_snapshot / "correct_count_8.csv").is_file())
+            self.assertEqual(
+                set(second_summary["correct_count_distribution_0to8"]),
+                {str(value) for value in range(9)},
+            )
             launcher = (PROJECT_ROOT / "shell" / "run_ui5_train_rollouts_h20x2.sh").read_text(
                 encoding="utf-8"
             )
             self.assertIn("SNAPSHOT_INTERVAL_SECONDS=10800", launcher)
             self.assertIn("NEXT_SNAPSHOT_HOUR=$((NEXT_SNAPSHOT_HOUR + 3))", launcher)
             self.assertNotIn("SNAPSHOT_SAMPLE", launcher)
-            self.assertEqual(launcher.count("launch_worker m31"), 1)
-            self.assertEqual(launcher.count("launch_worker crop"), 1)
-            self.assertIn('launch_worker m31 0 "0,1,2,3"', launcher)
-            self.assertIn('launch_worker crop 1 "0,1,2,3"', launcher)
+            self.assertEqual(launcher.count("launch_worker m31"), 2)
+            self.assertEqual(launcher.count("launch_worker crop"), 2)
+            self.assertIn('launch_worker m31 0 "0,1"', launcher)
+            self.assertIn('launch_worker m31 0 "2,3"', launcher)
+            self.assertIn('launch_worker crop 1 "0,1"', launcher)
+            self.assertIn('launch_worker crop 1 "2,3"', launcher)
             self.assertIn("--max-seq-length 7268", launcher)
             self.assertIn("--max-new-tokens 512", launcher)
             analysis = aggregate.run(
@@ -1106,18 +1519,16 @@ class UI5TrainRolloutTest(unittest.TestCase):
             self.assertEqual(m31_r3["runtime_error"], 1)
             self.assertEqual(m31_r3["inference_success"], 4)
             self.assertTrue(all(row["complete"] for row in analysis["raw_alignment"]))
+            self.assertEqual(analysis["difficulty_file_counts"]["complete8"], 4)
+            self.assertEqual(analysis["difficulty_file_counts"]["easy"], 1)
+            self.assertEqual(analysis["difficulty_file_counts"]["medium"], 2)
+            self.assertEqual(analysis["difficulty_file_counts"]["hard"], 1)
             self.assertEqual(
-                analysis["difficulty_file_counts"],
-                {
-                    "snapshot_samples": 5,
-                    "easy": 1,
-                    "medium": 2,
-                    "hard": 1,
-                    "incomplete_or_runtime_error": 1,
-                    "grpo_m31_ready": 1,
-                    "grpo_crop_ready": 1,
-                },
+                analysis["difficulty_file_counts"]["incomplete_or_technical_error"],
+                1,
             )
+            self.assertEqual(analysis["difficulty_file_counts"]["grpo_m31_ready"], 1)
+            self.assertEqual(analysis["difficulty_file_counts"]["grpo_crop_ready"], 1)
             self.assertFalse((output / "selection" / "cross_model_complete8.jsonl").exists())
             self.assertTrue((output / "summary.json").is_file())
             self.assertTrue((output / "reports" / "ui5_train_rollout_analysis.xlsx").is_file())
@@ -1132,19 +1543,22 @@ class UI5TrainRolloutTest(unittest.TestCase):
             )
             self.assertEqual(
                 run_config["sample_order"]["policy"],
-                "fixed_task_polarity_round_robin_v1",
+                "sample_major_fixed_task_polarity_round_robin_v1",
             )
-            for sync_name in (
-                "sync_ui5_train_rollout_latest.sh",
-                "sync_ui5_train_rollout_all.sh",
-            ):
-                sync_script = (PROJECT_ROOT / "shell" / sync_name).read_text(
-                    encoding="utf-8"
-                )
-                self.assertIn("nastk cp -c=32", sync_script)
-                self.assertIn("h20x2-v4-20260904", sync_script)
-                self.assertIn("SNAPSHOT_ROOT=${OUTPUT_ROOT}/snapshots", sync_script)
-                self.assertIn('"${A800_DESTINATION}"', sync_script)
+            self.assertEqual(
+                run_config["execution_architecture"]["physical_processes_total"],
+                4,
+            )
+            self.assertEqual(
+                run_config["generation"]["vision_attention"],
+                "flash_attention_2",
+            )
+            sync_script = (
+                PROJECT_ROOT / "shell" / "sync_ui5_rollout_results.sh"
+            ).read_text(encoding="utf-8")
+            self.assertIn("nastk cp -c=32", sync_script)
+            self.assertIn('if [[ $# -ne 2 ]]', sync_script)
+            self.assertIn('"${OUTPUT_ROOT}" "${DESTINATION}"', sync_script)
             rendered = gallery.render(
                 SimpleNamespace(output_root=output, bundle_root=bundle, panel_long_side=160)
             )
