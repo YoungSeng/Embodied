@@ -33,7 +33,7 @@ from snapshot_ui5_train_rollouts import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MODELS = ("m31", "crop")
 TASKS = ("occlusion", "cropping", "text_overflow", "text_ellipsis", "content_missing")
 THRESHOLDS = (0.1, 0.3, 0.5)
@@ -73,6 +73,15 @@ def atomic_json(path: Path, value: Any) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def read_json_if_present(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"expected JSON object: {path}")
+    return value
 
 
 def raw_iterator(root: Path, model: str, rollout: int) -> Iterator[dict[str, Any]]:
@@ -285,6 +294,7 @@ class JsonlWriter:
 
 def compact_rollout(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
+        "model_id": row["model_id"],
         "rollout_id": row["rollout_id"],
         "seed": row["seed"],
         "checkpoint": row["checkpoint"],
@@ -292,15 +302,30 @@ def compact_rollout(row: Mapping[str, Any]) -> dict[str, Any]:
         "baseline_git_commit": row["baseline_git_commit"],
         "generation_config": row["generation_config"],
         "parse_status": row["parse_status"],
+        "parse_warnings": row.get("parse_warnings", []),
+        "contains_crop_parse_error": bool(row.get("contains_crop_parse_error")),
         "error_type": row["error_type"],
+        "reward": row["exact_correct"],
         "exact_correct": row["exact_correct"],
+        "raw_output": row.get("raw_output"),
+        "pred_local": row.get("pred_local"),
+        "pred_global": row.get("pred_global"),
+        "gt_local": row.get("gt_local"),
+        "gt_global": row.get("gt_global"),
+        "matched_pairs": row.get("matched_pairs", []),
         "TP_box": row["TP_box"],
         "FP_box": row["FP_box"],
         "FN_box": row["FN_box"],
+        "image_confusion": row.get("image_confusion"),
+        "crop_outputs": row.get("crop_outputs", []),
         "latency_seconds": row["latency_seconds"],
         "inference_success": row.get("inference_success", True),
         "runtime_error": row.get("runtime_error"),
         "token_usage": row.get("token_usage"),
+        "oom_recovered": bool(row.get("oom_recovered")),
+        "oom_events": int(row.get("oom_events", 0)),
+        "oom_final_failure": bool(row.get("oom_final_failure")),
+        "oom_retry": row.get("oom_retry"),
     }
 
 
@@ -448,6 +473,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     selection_dir = root / "selection"
     reports.mkdir(parents=True, exist_ok=True)
     selection_dir.mkdir(parents=True, exist_ok=True)
+    formal_run_status = read_json_if_present(
+        root / "diagnostics" / "formal_run_valid.json"
+    )
+    model_load_root = root / "diagnostics" / "model_load"
+    model_load_statuses = {
+        path.stem: read_json_if_present(path)
+        for path in sorted(model_load_root.glob("*.json"))
+    } if model_load_root.is_dir() else {}
+    if model_load_statuses and not bool((formal_run_status or {}).get("valid")):
+        raise RuntimeError(
+            "model-load diagnostics exist but formal_run_valid.json does not "
+            "confirm MODEL_LOAD_OK for both current physical workers"
+        )
+    oom_summary = read_json_if_present(root / "reports" / "oom_summary.json")
     raw_alignment, expected_total = validate_raw_alignment(root, bundle)
     scorer = load_module(
         repo / "qwen3vl_merge_and_score_fixed_5tasks.py",
@@ -886,7 +925,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "only eight complete runtime-error-free records enter easy/medium/hard"
             ),
             "grpo_ready_rule": (
-                "medium subset; same-model four-rollout correct count is 1..3"
+                "medium sample; same-model complete4; source and parse eligible; "
+                "four exact rewards contain both true and false"
             ),
         },
         "paths": {"output_root": str(root), "bundle_root": str(bundle)},
@@ -901,11 +941,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "error_subtypes": error_rows,
         "execution_counts": execution_rows,
         "runtime_errors": runtime_error_rows,
+        "oom_summary_table": (
+            [
+                {
+                    "metric": key,
+                    "value": value,
+                }
+                for key, value in (oom_summary or {}).items()
+                if key not in {"unique_oom_samples", "by_model_rollout_oom_events"}
+            ]
+        ),
+        "oom_by_model_rollout": list(
+            (oom_summary or {}).get("by_model_rollout_oom_events", [])
+        ),
+        "oom_sample_index": list((oom_summary or {}).get("unique_oom_samples", [])),
+        "model_load_status": [
+            row for row in model_load_statuses.values() if row is not None
+        ],
         "raw_alignment": raw_alignment,
         "expected_total_per_rollout": expected_total,
         "selection_counts": selection_count_rows,
         "runtime_eta": runtime_rows,
         "total_eta_last_snapshot": total_eta,
+        "formal_run_status": formal_run_status,
+        "model_load_statuses": model_load_statuses,
+        "oom_summary": oom_summary,
     }
     analysis_path = reports / "ui5_train_rollout_analysis.json"
     atomic_json(analysis_path, analysis)
@@ -947,6 +1007,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "main_iou": 0.1,
             "rescore_iou": [0.3, 0.5],
         },
+        "execution_architecture": {
+            "physical_processes_total": 2,
+            "physical_processes_per_gpu": 1,
+            "gpu_0": {"model_id": "m31", "rollout_ids": [0, 1, 2, 3]},
+            "gpu_1": {"model_id": "crop", "rollout_ids": [0, 1, 2, 3]},
+            "rollout_execution": "sequential_after_single_model_load",
+            "checkpoint_loads_per_physical_process": 1,
+        },
         "sample_order": {
             "policy": "fixed_task_polarity_round_robin_v1",
             "task_order": list(TASKS),
@@ -955,6 +1023,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
         "bundle_root": str(bundle),
         "output_root": str(root),
+        "formal_run_status": formal_run_status,
     }
     atomic_json(root / "run_config.snapshot.json", run_config)
     overview = {
@@ -1029,6 +1098,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "error_subtypes": error_rows,
         "execution_counts": execution_rows,
         "runtime_errors": runtime_error_rows,
+        "oom_summary": analysis["oom_summary_table"],
+        "oom_by_model_rollout": analysis["oom_by_model_rollout"],
+        "oom_sample_index": analysis["oom_sample_index"],
+        "model_load_status": analysis["model_load_status"],
         "raw_alignment": raw_alignment,
         "selection_counts": selection_count_rows,
         "runtime_eta": runtime_rows,
@@ -1054,6 +1127,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "raw_alignment": raw_alignment,
             "execution_counts": execution_rows,
             "runtime_errors": runtime_error_rows,
+            "formal_run_status": formal_run_status,
+            "model_load_statuses": model_load_statuses,
+            "oom_summary": oom_summary,
             "correct_0to4": correct_rows,
             "difficulty_8route": difficulty_rows,
             "difficulty_file_counts": difficulty_file_counts,

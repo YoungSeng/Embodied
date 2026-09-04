@@ -10,7 +10,15 @@ A800_DESTINATION=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_ro
 test -x "${PYTHON_BIN}" || { echo "ERROR: Python missing: ${PYTHON_BIN}" >&2; exit 2; }
 test -d "${SNAPSHOT_ROOT}" || { echo "ERROR: snapshot directory missing: ${SNAPSHOT_ROOT}" >&2; exit 3; }
 
-LATEST_SNAPSHOT=$("${PYTHON_BIN}" - "${SNAPSHOT_ROOT}" <<'PY'
+snapshot_count=0
+while IFS= read -r snapshot; do
+  [[ -n "${snapshot}" ]] || continue
+  echo "[NASTK_SYNC_ALL] source=${snapshot} destination=${A800_DESTINATION}"
+  nastk cp -c=32 \
+    "${snapshot}" \
+    "${A800_DESTINATION}"
+  snapshot_count=$((snapshot_count + 1))
+done < <("${PYTHON_BIN}" - "${SNAPSHOT_ROOT}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -30,11 +38,13 @@ for path in root.iterdir():
     candidates.append((float(summary["created_at_epoch"]), path))
 if not candidates:
     raise SystemExit("no atomic snapshot with manifest.json and _SUCCESS is ready")
-print(max(candidates, key=lambda item: item[0])[1])
+for _, path in sorted(candidates):
+    print(path)
 PY
 )
 
-echo "[NASTK_SYNC_LATEST] source=${LATEST_SNAPSHOT} destination=${A800_DESTINATION}"
-nastk cp -c=32 \
-  "${LATEST_SNAPSHOT}" \
-  "${A800_DESTINATION}"
+if [[ ${snapshot_count} -eq 0 ]]; then
+  echo "ERROR: no atomic snapshot with manifest.json and _SUCCESS is ready" >&2
+  exit 4
+fi
+echo "[NASTK_SYNC_ALL_OK] snapshots=${snapshot_count} destination=${A800_DESTINATION}"

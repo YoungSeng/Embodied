@@ -55,10 +55,15 @@ M31_REPO = (
 )
 CROP_REPO = (
     "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Eagle/"
-    "Embodied-rollout8-h20x2-v3"
+    "Embodied-rollout8-h20x2-v4"
 )
 M31_ROLLOUT_COMMIT = "6367cc6660f7eb933048b81100915a05f9b49bf4"
-V3_BASE_COMMIT = "ff6b3b7507e762012b23c8700f832b05e606dbd4"
+V4_BASE_COMMIT = "5b7197bf5db1d7fb272b82d7784bb0552eaf38aa"
+REQUIRED_CHECKPOINT_CODE = (
+    "configuration_locateanything.py",
+    "modeling_locateanything.py",
+    "relation_modules.py",
+)
 A800_M31_SOURCE = (
     "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/"
     "Eagle_LocateUI5_v4/Embodied/work_dirs/"
@@ -156,12 +161,55 @@ def check_checkpoint(path: Path) -> dict[str, Any]:
         "weight_shards": [],
         "missing_weight_shards": [],
         "zero_byte_weight_shards": [],
+        "checkpoint_code": [],
         "complete": False,
     }
     if not path.is_dir():
         report["errors"] = ["checkpoint directory missing"]
         return report
     errors: list[str] = []
+    checkpoint_code = []
+    for filename in REQUIRED_CHECKPOINT_CODE:
+        source_path = path / filename
+        source_report: dict[str, Any] = {
+            "filename": filename,
+            "path": str(source_path),
+            "exists": source_path.is_file(),
+            "nonzero": False,
+            "syntax_ok": False,
+            "sha256": None,
+            "syntax_error": None,
+        }
+        if not source_path.is_file():
+            errors.append(f"required checkpoint source missing: {filename}")
+        else:
+            try:
+                payload = source_path.read_bytes()
+                if not payload:
+                    errors.append(f"required checkpoint source is empty: {filename}")
+                    checkpoint_code.append(source_report)
+                    continue
+                source_report["nonzero"] = True
+                source_report["sha256"] = hashlib.sha256(payload).hexdigest()
+                compile(payload, str(source_path), "exec")
+                source_report["syntax_ok"] = True
+            except (OSError, SyntaxError, UnicodeError) as exc:
+                source_report["syntax_error"] = {
+                    "python_type": type(exc).__name__,
+                    "message": str(exc),
+                    "line": getattr(exc, "lineno", None),
+                    "offset": getattr(exc, "offset", None),
+                }
+                errors.append(
+                    f"checkpoint source syntax failure: {filename}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        checkpoint_code.append(source_report)
+    report["checkpoint_code"] = checkpoint_code
+    report["checkpoint_code_complete"] = all(
+        item["exists"] and item["nonzero"] and item["syntax_ok"]
+        for item in checkpoint_code
+    )
     config_path = path / "config.json"
     if config_path.is_file():
         try:
@@ -212,18 +260,28 @@ def check_checkpoint(path: Path) -> dict[str, Any]:
             errors.append("no safetensors/bin weight file or shard index")
     report["weight_shards"] = [item.name for item in shards]
     report["missing_weight_shards"] = [item.name for item in shards if not item.is_file()]
+    shard_sizes: dict[str, int] = {}
+    shard_read_errors: list[str] = []
+    for item in shards:
+        if not item.is_file():
+            continue
+        try:
+            shard_sizes[item.name] = item.stat().st_size
+        except OSError as exc:
+            shard_read_errors.append(f"{item.name}: {type(exc).__name__}: {exc}")
     report["zero_byte_weight_shards"] = [
-        item.name for item in shards if item.is_file() and item.stat().st_size <= 0
+        name for name, size in shard_sizes.items() if size <= 0
     ]
+    report["weight_shard_read_errors"] = shard_read_errors
     if report["missing_weight_shards"]:
         errors.append("weight index references missing shards")
     if report["zero_byte_weight_shards"]:
         errors.append("weight shard is zero bytes")
+    if shard_read_errors:
+        errors.append("weight shard metadata could not be read")
     if not shards:
         errors.append("weight shard list is empty")
-    report["total_weight_bytes"] = sum(
-        item.stat().st_size for item in shards if item.is_file()
-    )
+    report["total_weight_bytes"] = sum(shard_sizes.values())
     report["errors"] = errors
     report["complete"] = bool(report["config_ok"] and not errors)
     return report
@@ -319,7 +377,7 @@ def check_output_root(path: Path) -> dict[str, Any]:
     disallowed = sorted(
         child.name
         for child in path.iterdir()
-        if child.name not in {"diagnostics", "logs"}
+        if child.name not in {"diagnostics", "logs", "runtime_cache"}
     )
     probe = path / f".preflight-write-{os.getpid()}"
     try:
@@ -538,7 +596,7 @@ def copy_commands(
         "",
         "# Checkpoints are copied only when their H20 targets are absent/incomplete.",
     ]
-    if not m31.get("complete"):
+    if not m31.get("exists"):
         lines.extend(
             [
                 f'mkdir -p "{Path(M31_CHECKPOINT).parent.as_posix()}"',
@@ -548,7 +606,31 @@ def copy_commands(
                 "",
             ]
         )
-    if not crop.get("complete"):
+    elif not m31.get("complete"):
+        missing_code = [
+            item["filename"]
+            for item in m31.get("checkpoint_code", [])
+            if not item.get("exists")
+        ]
+        for filename in missing_code:
+            lines.extend(
+                [
+                    "# Fill only a genuinely missing M31 checkpoint source file.",
+                    f"nastk cp -c=32 {continuation}",
+                    f'  "{A800_M31_SOURCE}/{filename}" {continuation}',
+                    f'  "{M31_CHECKPOINT}/"',
+                    "",
+                ]
+            )
+        if not missing_code:
+            lines.extend(
+                [
+                    "# M31 checkpoint exists but is incomplete; existing config/code is not overwritten.",
+                    f"# errors={json.dumps(m31.get('errors', []), ensure_ascii=False)}",
+                    "",
+                ]
+            )
+    if not crop.get("exists"):
         lines.extend(
             [
                 f'mkdir -p "{Path(CROP_CHECKPOINT).parent.as_posix()}"',
@@ -558,6 +640,30 @@ def copy_commands(
                 "",
             ]
         )
+    elif not crop.get("complete"):
+        missing_code = [
+            item["filename"]
+            for item in crop.get("checkpoint_code", [])
+            if not item.get("exists")
+        ]
+        for filename in missing_code:
+            lines.extend(
+                [
+                    "# Fill only a genuinely missing Crop checkpoint source file.",
+                    f"nastk cp -c=32 {continuation}",
+                    f'  "{A800_CROP_SOURCE}/{filename}" {continuation}',
+                    f'  "{CROP_CHECKPOINT}/"',
+                    "",
+                ]
+            )
+        if not missing_code:
+            lines.extend(
+                [
+                    "# Crop checkpoint exists but is incomplete; existing config/code is not overwritten.",
+                    f"# errors={json.dumps(crop.get('errors', []), ensure_ascii=False)}",
+                    "",
+                ]
+            )
     if not any(report.get("complete") for report in processors):
         processor_parent = Path(PROCESSOR_CANDIDATES[0]).parent.as_posix()
         lines.extend(
@@ -612,7 +718,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     )
     crop_repo = git_revision(
         args.crop_repo.expanduser().resolve(strict=False),
-        required_ancestor=V3_BASE_COMMIT,
+        required_ancestor=V4_BASE_COMMIT,
     )
     output_arg = getattr(args, "output_root", None)
     output = (
@@ -657,7 +763,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "repositories_h20": {"m31": M31_REPO, "crop": CROP_REPO},
         "rollout_output_h20": (
             "/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/"
-            "gui_rollouts/ui5-train-rollout8-h20x2-v3-20260904"
+            "gui_rollouts/ui5-train-rollout8-h20x2-v4-20260904"
         ),
     }
     atomic_json(diagnostics / "preflight_summary.json", summary)
@@ -669,6 +775,25 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         for model, report in (("m31", m31), ("crop", crop)):
             writer.writerow(["checkpoint", model, "complete", int(bool(report.get("complete")))])
             writer.writerow(["checkpoint", model, "weight_bytes", report.get("total_weight_bytes", 0)])
+            for source in report.get("checkpoint_code", []):
+                writer.writerow(
+                    [
+                        "checkpoint_source",
+                        model,
+                        source["filename"],
+                        json.dumps(
+                            {
+                                "exists": source.get("exists"),
+                                "nonzero": source.get("nonzero"),
+                                "syntax_ok": source.get("syntax_ok"),
+                                "sha256": source.get("sha256"),
+                                "syntax_error": source.get("syntax_error"),
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    ]
+                )
         for index, report in enumerate(processors):
             writer.writerow(["processor", str(index), "complete", int(bool(report.get("complete")))])
     commands = copy_commands(m31, crop, processors, bundle)

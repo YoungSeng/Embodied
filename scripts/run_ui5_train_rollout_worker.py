@@ -8,6 +8,7 @@ reuses the tiled-eval branch's global mapping plus class-aware greedy NMS.
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import importlib.util
 import json
@@ -23,7 +24,7 @@ from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 BASE_COMMITS = {"m31": "5d7a313", "crop": "945ce39"}
 MODEL_IDS = ("m31", "crop")
 TASKS = ("occlusion", "cropping", "text_overflow", "text_ellipsis", "content_missing")
@@ -50,13 +51,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rollout-ids")
     parser.add_argument("--seeds")
     parser.add_argument("--physical-gpu", type=int)
-    parser.add_argument("--gpu-model-processes", type=int, default=2)
+    parser.add_argument("--gpu-model-processes", type=int, default=1)
     parser.add_argument("--part-size", type=int, default=10000)
     parser.add_argument("--progress-every", type=int, default=100)
     parser.add_argument("--progress-seconds", type=float, default=60.0)
     parser.add_argument("--iou-threshold", type=float, default=0.1)
     parser.add_argument("--tile-nms-iou", type=float, default=0.5)
     parser.add_argument("--expected-workers", type=int, default=8)
+    parser.add_argument(
+        "--physical-worker",
+        action="append",
+        default=[],
+        help="progress mode: model,gpu,pid,rollout_ids (rollout IDs use |)",
+    )
     parser.add_argument("--dtype", choices=("bf16",), default="bf16")
     parser.add_argument("--attn-implementation", choices=("sdpa",), default="sdpa")
     parser.add_argument("--vision-attn-implementation", choices=("sdpa",), default="sdpa")
@@ -266,6 +273,7 @@ def install_generation_token_budget(
     processor.in_token_limit = int(args.processor_in_token_limit)
     original_generate = inferencer.model.generate
     inferencer.last_rollout_token_usage = None
+    inferencer.active_rollout_context = None
 
     def bounded_generate(*positional: Any, **inputs: Any) -> Any:
         if "input_ids" not in inputs:
@@ -287,6 +295,10 @@ def install_generation_token_budget(
             "max_seq_length": int(args.max_seq_length),
             "input_plus_generation_limit": input_tokens + effective_max_new_tokens,
         }
+        active_context = getattr(inferencer, "active_rollout_context", None)
+        if isinstance(active_context, dict):
+            active_context["input_tokens"] = input_tokens
+            active_context["effective_max_new_tokens"] = effective_max_new_tokens
         return original_generate(*positional, **inputs)
 
     inferencer.model.generate = bounded_generate
@@ -492,8 +504,8 @@ class ProgressWriter:
         )
         remaining_samples = max(0, self.total - attempted)
         remaining = (
-            remaining_samples / success_throughput
-            if success_throughput
+            remaining_samples / attempted_throughput
+            if attempted_throughput
             else (0.0 if remaining_samples == 0 else None)
         )
         eta = (
@@ -512,13 +524,18 @@ class ProgressWriter:
             "inference_success": inference_success,
             "runtime_error": int(counters["runtime_error"]),
             "parse_error": int(counters["parse_error"]),
+            "oom_exception_count": int(counters.get("oom_exception_count", 0)),
+            "oom_recovered_samples": int(counters.get("oom_recovered_samples", 0)),
+            "oom_final_failed_samples": int(
+                counters.get("oom_final_failed_samples", 0)
+            ),
             "total": self.total,
             "throughput_attempted_per_second": attempted_throughput,
             "throughput_inference_success_per_second": success_throughput,
-            "throughput_samples_per_second": success_throughput,
+            "throughput_samples_per_second": attempted_throughput,
             "elapsed_seconds": elapsed,
             "inference_elapsed_seconds": inference_elapsed,
-            "eta_basis": "inference_success_throughput_excluding_model_load",
+            "eta_basis": "attempted_throughput_excluding_model_load",
             "remaining_seconds": remaining,
             "estimated_completion": eta,
             "gpu_memory": dict(memory or {}),
@@ -533,6 +550,9 @@ class ProgressWriter:
             f"inference_success={inference_success} "
             f"runtime_error={counters['runtime_error']} "
             f"parse_error={counters['parse_error']} "
+            f"oom_exceptions={counters.get('oom_exception_count', 0)} "
+            f"oom_recovered={counters.get('oom_recovered_samples', 0)} "
+            f"oom_final_failed={counters.get('oom_final_failed_samples', 0)} "
             f"throughput_attempted={attempted_throughput:.6f} "
             f"throughput_inference_success={success_throughput:.6f} "
             f"elapsed={elapsed:.1f} inference_elapsed={inference_elapsed:.1f} "
@@ -553,12 +573,52 @@ def task_config(module: Any, task: str):
     return module.TASK_BY_NAME[task]
 
 
+def set_inference_context(
+    inferencer: Any,
+    context: dict[str, Any],
+    torch: Any,
+    *,
+    stage: str,
+    crop_id: str,
+    crop_index: int | None,
+    crop_xyxy: Sequence[int],
+    tile_count: int,
+    tile_size: tuple[int, int],
+) -> None:
+    context.clear()
+    context.update(
+        {
+            "stage": stage,
+            "crop_id": crop_id,
+            "crop_index": crop_index,
+            "crop_xyxy": list(map(int, crop_xyxy)),
+            "tile_count": int(tile_count),
+            "tile_size": {"width": int(tile_size[0]), "height": int(tile_size[1])},
+            "input_tokens": None,
+            "memory_before_oom": cuda_memory(torch),
+        }
+    )
+    inferencer.active_rollout_context = context
+
+
 def full_image_prediction(
     *, module: Any, inferencer: Any, scorer: Any, row: Mapping[str, Any], image: Any,
-    args: argparse.Namespace, config: Any
+    args: argparse.Namespace, config: Any, torch: Any,
+    inference_context: dict[str, Any],
 ) -> dict[str, Any]:
     sample_seed = stable_seed(int(args.seed), str(row["record_id"]))
     module.set_sample_seed(sample_seed)
+    set_inference_context(
+        inferencer,
+        inference_context,
+        torch,
+        stage="full_image_generate",
+        crop_id="full_image",
+        crop_index=None,
+        crop_xyxy=[0, 0, image.width, image.height],
+        tile_count=1,
+        tile_size=image.size,
+    )
     started = time.monotonic()
     answer = inferencer.predict(image=image, question=str(row["prompt"]))
     latency = time.monotonic() - started
@@ -588,7 +648,8 @@ def full_image_prediction(
 def crop_prediction(
     *, module: Any, tiling: Any, inferencer: Any, scorer: Any,
     row: Mapping[str, Any], crop_rows: Sequence[Mapping[str, Any]], image: Any,
-    args: argparse.Namespace, config: Any
+    args: argparse.Namespace, config: Any, torch: Any,
+    inference_context: dict[str, Any],
 ) -> dict[str, Any]:
     pending: list[dict[str, Any]] = []
     native: list[dict[str, Any]] = []
@@ -602,6 +663,17 @@ def crop_prediction(
         crop_seed = stable_seed(int(args.seed), str(row["record_id"]), crop_id)
         try:
             module.set_sample_seed(crop_seed)
+            set_inference_context(
+                inferencer,
+                inference_context,
+                torch,
+                stage="crop_generate",
+                crop_id=crop_id,
+                crop_index=int(crop["crop_index"]),
+                crop_xyxy=crop_box,
+                tile_count=len(crop_rows),
+                tile_size=tile.size,
+            )
             started = time.monotonic()
             answer = inferencer.predict(image=tile, question=str(row["prompt"]))
             latency = time.monotonic() - started
@@ -657,6 +729,17 @@ def crop_prediction(
             )
         finally:
             tile.close()
+    inference_context.update(
+        {
+            "stage": "tiled_merge_nms",
+            "crop_id": "merged_base_tiles",
+            "crop_index": None,
+            "crop_xyxy": [0, 0, image.width, image.height],
+            "tile_count": len(crop_rows),
+            "tile_size": {"width": image.width, "height": image.height},
+            "memory_before_oom": cuda_memory(torch),
+        }
+    )
     merged = tiling.merge_tile_predictions(
         pending, image_size=image.size, iou_threshold=args.tile_nms_iou
     )
@@ -767,6 +850,9 @@ def worker_record(
         "grpo_eligible": bool(row.get("grpo_eligible")),
         "sample_seed": result["sample_seed"],
         "token_usage": result.get("token_usage"),
+        "oom_recovered": bool(result.get("oom_recovered")),
+        "oom_events": int(result.get("oom_events", 0)),
+        "oom_retry": result.get("oom_retry"),
         "latency_seconds": result["latency_seconds"],
         "finished_at": utc_now(),
         "inference_success": True,
@@ -780,8 +866,29 @@ def error_record(
     row: Mapping[str, Any],
     exc: Exception,
     latency_seconds: float,
+    failure_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     width, height = int(row["width"]), int(row["height"])
+    context = dict(failure_context or {})
+    oom_diagnostics = getattr(exc, "oom_diagnostics", None)
+    if isinstance(oom_diagnostics, Mapping):
+        retry_context = oom_diagnostics.get("retry_attempt", {}).get("context", {})
+        if isinstance(retry_context, Mapping):
+            context = {**context, **retry_context}
+    runtime_error = exception_payload(exc, traceback.format_exc(limit=50))
+    runtime_error.update(
+        {
+            "stage": context.get("stage", "sample_inference"),
+            "crop_id": context.get("crop_id"),
+            "crop_index": context.get("crop_index"),
+            "crop_xyxy": context.get("crop_xyxy"),
+            "input_tokens": context.get("input_tokens"),
+            "tile_count": context.get("tile_count"),
+            "tile_size": context.get("tile_size"),
+            "memory_before_oom": context.get("memory_before_oom"),
+            "oom": oom_diagnostics,
+        }
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "model_id": args.model_id,
@@ -798,8 +905,11 @@ def error_record(
         "image_relpath": row["image_relpath"],
         "image_size": {"width": width, "height": height},
         "task": row["task"],
-        "crop_id": "full_image" if args.model_id == "m31" else "merged_base_tiles",
-        "crop_xyxy": [0, 0, width, height],
+        "crop_id": context.get(
+            "crop_id", "full_image" if args.model_id == "m31" else "merged_base_tiles"
+        ),
+        "crop_index": context.get("crop_index"),
+        "crop_xyxy": context.get("crop_xyxy", [0, 0, width, height]),
         "source_records": row.get("source_records", []),
         "original_training_record": row.get("original_training_record"),
         "prompt": row["prompt"],
@@ -826,12 +936,19 @@ def error_record(
         "coordinate_transform_anomaly": bool(row.get("coordinate_transform_anomaly")),
         "grpo_eligible": False,
         "token_usage": None,
-        "runtime_error": {
-            "type": classify_runtime_error(exc),
-            "python_type": type(exc).__name__,
-            "message": str(exc),
-            "traceback": traceback.format_exc(limit=50),
-        },
+        "oom_recovered": False,
+        "oom_events": int(
+            oom_diagnostics.get("oom_events", 0)
+            if isinstance(oom_diagnostics, Mapping)
+            else 0
+        ),
+        "oom_final_failure": bool(
+            oom_diagnostics.get("oom_final_failure")
+            if isinstance(oom_diagnostics, Mapping)
+            else False
+        ),
+        "oom_retry": oom_diagnostics,
+        "runtime_error": runtime_error,
         "inference_success": False,
         "sample_seed": stable_seed(int(args.seed), str(row["record_id"])),
         "latency_seconds": latency_seconds,
@@ -852,7 +969,14 @@ def parse_int_csv(value: str | None, name: str) -> list[int]:
 
 
 def classify_runtime_error(exc: BaseException) -> str:
-    message = f"{type(exc).__name__}: {exc}".lower()
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        parts.append(f"{type(current).__name__}: {current}")
+        current = current.__cause__ or current.__context__
+    message = " | ".join(parts).lower()
     if "out of memory" in message or "cuda_oom" in message:
         return "CUDA_OOM"
     if "cuda" in message:
@@ -872,6 +996,116 @@ def cuda_memory(torch: Any) -> dict[str, Any]:
         }
     except Exception as exc:
         return {"memory_query_error": f"{type(exc).__name__}: {exc}"}
+
+
+def exception_payload(exc: BaseException, traceback_text: str | None = None) -> dict[str, Any]:
+    return {
+        "type": classify_runtime_error(exc),
+        "python_type": type(exc).__name__,
+        "message": str(exc),
+        "traceback": traceback_text or "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        ),
+    }
+
+
+def exception_chain(exc: BaseException) -> list[dict[str, str]]:
+    chain: list[dict[str, str]] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(
+            {
+                "python_type": type(current).__name__,
+                "message": str(current),
+            }
+        )
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def release_after_oom(torch: Any, inferencer: Any) -> dict[str, Any]:
+    inferencer.active_rollout_context = None
+    inferencer.last_rollout_token_usage = None
+    collected = gc.collect()
+    torch.cuda.empty_cache()
+    return {
+        "gc_collected": int(collected),
+        "memory_after_cleanup": cuda_memory(torch),
+    }
+
+
+class OOMRetryFailure(RuntimeError):
+    def __init__(self, diagnostics: Mapping[str, Any]) -> None:
+        retry_exception = diagnostics.get("retry_attempt", {}).get("exception", {})
+        super().__init__(
+            "CUDA OOM retry failed: "
+            f"{retry_exception.get('python_type')}: {retry_exception.get('message')}"
+        )
+        self.oom_diagnostics = dict(diagnostics)
+
+
+def prediction_with_oom_retry(
+    operation: Any,
+    *,
+    torch: Any,
+    inferencer: Any,
+) -> dict[str, Any]:
+    first_context: dict[str, Any] = {}
+    try:
+        result = operation(first_context)
+    except torch.cuda.OutOfMemoryError as exc:
+        first_failure = {
+            "status": "oom",
+            "exception": exception_payload(exc),
+            "context": dict(first_context),
+            "memory_after_oom": cuda_memory(torch),
+        }
+    else:
+        result["oom_recovered"] = False
+        result["oom_events"] = 0
+        result["oom_retry"] = None
+        return result
+
+    cleanup = release_after_oom(torch, inferencer)
+    retry_context: dict[str, Any] = {}
+    retry_failure: dict[str, Any] | None = None
+    try:
+        result = operation(retry_context)
+    except Exception as retry_exc:
+        retry_is_oom = isinstance(retry_exc, torch.cuda.OutOfMemoryError)
+        retry_failure = {
+            "oom_recovered": False,
+            "oom_final_failure": True,
+            "oom_events": 2 if retry_is_oom else 1,
+            "first_attempt": first_failure,
+            "cleanup": cleanup,
+            "retry_attempt": {
+                "status": "oom" if retry_is_oom else "runtime_error",
+                "exception": exception_payload(retry_exc),
+                "context": dict(retry_context),
+                "memory_after_failure": cuda_memory(torch),
+            },
+        }
+    if retry_failure is not None:
+        retry_failure["final_cleanup"] = release_after_oom(torch, inferencer)
+        raise OOMRetryFailure(retry_failure)
+    result["oom_recovered"] = True
+    result["oom_events"] = 1
+    result["oom_retry"] = {
+        "oom_recovered": True,
+        "oom_final_failure": False,
+        "oom_events": 1,
+        "first_attempt": first_failure,
+        "cleanup": cleanup,
+        "retry_attempt": {
+            "status": "success",
+            "context": dict(retry_context),
+            "memory_after_success": cuda_memory(torch),
+        },
+    }
+    return result
 
 
 def rollout_args(
@@ -897,20 +1131,20 @@ def validate_run_args(args: argparse.Namespace) -> None:
         raise ValueError("run mode missing arguments: " + ", ".join(missing))
     rollout_ids = parse_int_csv(args.rollout_ids, "rollout-ids")
     seeds = parse_int_csv(args.seeds, "seeds")
-    if len(rollout_ids) != 2 or len(set(rollout_ids)) != 2:
-        raise ValueError("--rollout-ids must contain exactly two distinct rollout IDs")
+    if len(rollout_ids) != 4 or len(set(rollout_ids)) != 4:
+        raise ValueError("--rollout-ids must contain exactly four distinct rollout IDs")
     if any(rollout_id not in range(4) for rollout_id in rollout_ids):
         raise ValueError("--rollout-ids values must be in 0,1,2,3")
     if len(seeds) != len(rollout_ids):
         raise ValueError("--seeds must have one seed per rollout ID")
-    if tuple(rollout_ids) not in ((0, 1), (2, 3)):
-        raise ValueError("formal workers must own rollout IDs 0,1 or 2,3")
+    if tuple(rollout_ids) != (0, 1, 2, 3):
+        raise ValueError("formal workers must own rollout IDs 0,1,2,3 in order")
     if any(FORMAL_SEEDS[rollout_id] != seed for rollout_id, seed in zip(rollout_ids, seeds)):
         raise ValueError(
             f"formal rollout seeds must match {FORMAL_SEEDS}; got {dict(zip(rollout_ids, seeds))}"
         )
-    if args.gpu_model_processes != 2:
-        raise ValueError("formal H20x2 execution requires two model processes per GPU")
+    if args.gpu_model_processes != 1:
+        raise ValueError("formal H20x2 execution requires one model process per GPU")
     token_values = {
         "max_seq_length": args.max_seq_length,
         "max_num_tokens_per_sample": args.max_num_tokens_per_sample,
@@ -1032,7 +1266,11 @@ def run_worker(args: argparse.Namespace) -> int:
                     "inference_success": 0,
                     "runtime_error": 0,
                     "parse_error": 0,
+                    "oom_exception_count": 0,
+                    "oom_recovered_samples": 0,
+                    "oom_final_failed_samples": 0,
                 },
+                "logical_status": "pending",
             }
         )
     rollout_text = ",".join(map(str, rollout_ids))
@@ -1055,6 +1293,11 @@ def run_worker(args: argparse.Namespace) -> int:
             "record_id_sha256": sample_order_digest,
         },
         "gpu_model_processes": args.gpu_model_processes,
+        "runtime_environment": {
+            "HF_MODULES_CACHE": os.environ.get("HF_MODULES_CACHE"),
+            "PYTHONPYCACHEPREFIX": os.environ.get("PYTHONPYCACHEPREFIX"),
+            "PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
+        },
     }
     atomic_json(
         output_root
@@ -1089,20 +1332,24 @@ def run_worker(args: argparse.Namespace) -> int:
     load_started = time.monotonic()
     memory_before: dict[str, Any] = {}
     model_loaded = False
+    load_stage = "load_inference_module"
     try:
         module = load_module(
             inference_path, f"ui5_rollout_inference_{args.model_id}_{os.getpid()}"
         )
+        load_stage = "load_formal_scorer"
         scorer = load_module(
             repo / "qwen3vl_merge_and_score_fixed_5tasks.py",
             f"ui5_formal_scorer_{args.model_id}_{os.getpid()}",
         )
         tiling = None
         if args.model_id == "crop":
+            load_stage = "load_tiling_module"
             tiling = load_module(
                 repo / "scripts" / "ui5_lossless_tiling.py",
                 f"ui5_lossless_tiling_worker_{os.getpid()}",
             )
+        load_stage = "import_runtime_dependencies"
         import torch
         from PIL import Image
 
@@ -1117,12 +1364,38 @@ def run_worker(args: argparse.Namespace) -> int:
                 context["counters"], "loading_model", force=True, memory=memory_before
             )
         model_args = make_generation_args(assigned[0])
+        load_stage = "checkpoint_constructor"
         inferencer = module.LocateAnythingInferencer(model_args)
+        load_stage = "install_token_budget"
         processor_limit = install_generation_token_budget(inferencer, assigned[0])
+        load_stage = "cuda_synchronize"
         torch.cuda.synchronize()
         model_loaded = True
+        load_stage = "loaded"
         load_seconds = time.monotonic() - load_started
         memory_after = cuda_memory(torch)
+        model_load_path = (
+            output_root / "diagnostics" / "model_load" / f"{args.model_id}.json"
+        )
+        atomic_json(
+            model_load_path,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "status": "MODEL_LOAD_OK",
+                "created_at": utc_now(),
+                "model_id": args.model_id,
+                "physical_gpu": args.physical_gpu,
+                "pid": os.getpid(),
+                "rollout_ids": rollout_ids,
+                "checkpoint": str(args.checkpoint),
+                "processor_path": str(args.processor_path),
+                "load_seconds": load_seconds,
+                "memory_before": memory_before,
+                "memory_after": memory_after,
+                "runtime_environment": worker_manifest["runtime_environment"],
+                "generation_config": generation_config(args),
+            },
+        )
         print(
             "[MODEL_LOAD_OK] "
             f"model={args.model_id} gpu={args.physical_gpu} pid={os.getpid()} "
@@ -1134,44 +1407,65 @@ def run_worker(args: argparse.Namespace) -> int:
             f"memory_after={json.dumps(memory_after, sort_keys=True)}",
             flush=True,
         )
-        for context in contexts:
+        for index, context in enumerate(contexts):
+            status = "running" if index == 0 else "pending"
+            context["logical_status"] = status
             context["progress"].emit(
-                context["counters"], "running", force=True, memory=memory_after
+                context["counters"], status, force=True, memory=memory_after
             )
-        for row in samples:
-            image = None
-            try:
-                image_path = bundle / str(row["image_relpath"])
-                with Image.open(image_path) as opened:
-                    image = opened.convert("RGB")
-            except Exception as exc:
-                for context in contexts:
-                    context["counters"]["attempted"] += 1
-                    context["counters"]["runtime_error"] += 1
-                    context["writer"].write(
-                        error_record(context["args"], code, row, exc, 0.0)
-                    )
-            else:
-                for context in contexts:
-                    inference_started = time.monotonic()
-                    context["counters"]["attempted"] += 1
-                    try:
-                        assigned_args = context["args"]
+        for context_index, context in enumerate(contexts):
+            assigned_args = context["args"]
+            context["logical_status"] = "running"
+            if context_index:
+                context["progress"].emit(
+                    context["counters"], "running", force=True, memory=cuda_memory(torch)
+                )
+            for row in samples:
+                image = None
+                inference_started = time.monotonic()
+                failure_context: dict[str, Any] = {
+                    "stage": "image_read",
+                    "crop_id": None,
+                    "crop_index": None,
+                    "crop_xyxy": [0, 0, int(row["width"]), int(row["height"])],
+                    "tile_count": (
+                        len(crop_index.get(str(row["record_id"]), []))
+                        if args.model_id == "crop"
+                        else 1
+                    ),
+                    "tile_size": {
+                        "width": int(row["width"]),
+                        "height": int(row["height"]),
+                    },
+                    "input_tokens": None,
+                    "memory_before_oom": cuda_memory(torch),
+                }
+                context["counters"]["attempted"] += 1
+                try:
+                    image_path = bundle / str(row["image_relpath"])
+                    with Image.open(image_path) as opened:
+                        image = opened.convert("RGB")
+                    config = task_config(module, str(row["task"]))
+
+                    def predict_once(active_context: dict[str, Any]) -> dict[str, Any]:
+                        inferencer.last_rollout_token_usage = None
+                        inferencer.last_ui_diagnostics = {}
                         assert image is not None
-                        config = task_config(module, str(row["task"]))
-                        if args.model_id == "m31":
-                            result = full_image_prediction(
-                                module=module,
-                                inferencer=inferencer,
-                                scorer=scorer,
-                                row=row,
-                                image=image,
-                                args=assigned_args,
-                                config=config,
-                            )
-                        else:
+                        try:
+                            if args.model_id == "m31":
+                                return full_image_prediction(
+                                    module=module,
+                                    inferencer=inferencer,
+                                    scorer=scorer,
+                                    row=row,
+                                    image=image,
+                                    args=assigned_args,
+                                    config=config,
+                                    torch=torch,
+                                    inference_context=active_context,
+                                )
                             assert tiling is not None
-                            result = crop_prediction(
+                            return crop_prediction(
                                 module=module,
                                 tiling=tiling,
                                 inferencer=inferencer,
@@ -1181,57 +1475,79 @@ def run_worker(args: argparse.Namespace) -> int:
                                 image=image,
                                 args=assigned_args,
                                 config=config,
+                                torch=torch,
+                                inference_context=active_context,
                             )
-                        record = worker_record(assigned_args, code, row, result)
-                        context["counters"]["inference_success"] += 1
-                        context["counters"]["parse_error"] += int(
-                            result["parse_status"] == "parse_error"
-                            or result.get("contains_crop_parse_error", False)
+                        finally:
+                            failure_context.clear()
+                            failure_context.update(active_context)
+
+                    result = prediction_with_oom_retry(
+                        predict_once, torch=torch, inferencer=inferencer
+                    )
+                    record = worker_record(assigned_args, code, row, result)
+                    context["counters"]["inference_success"] += 1
+                    context["counters"]["parse_error"] += int(
+                        result["parse_status"] == "parse_error"
+                        or result.get("contains_crop_parse_error", False)
+                    )
+                    context["counters"]["oom_exception_count"] += int(
+                        result.get("oom_events", 0)
+                    )
+                    context["counters"]["oom_recovered_samples"] += int(
+                        bool(result.get("oom_recovered"))
+                    )
+                except Exception as exc:
+                    oom_diagnostics = getattr(exc, "oom_diagnostics", {})
+                    context["counters"]["runtime_error"] += 1
+                    if isinstance(oom_diagnostics, Mapping):
+                        context["counters"]["oom_exception_count"] += int(
+                            oom_diagnostics.get("oom_events", 0)
                         )
-                    except Exception as exc:
-                        context["counters"]["runtime_error"] += 1
-                        record = error_record(
-                            context["args"],
-                            code,
-                            row,
-                            exc,
-                            time.monotonic() - inference_started,
+                        context["counters"]["oom_final_failed_samples"] += int(
+                            bool(oom_diagnostics.get("oom_final_failure"))
                         )
-                    context["writer"].write(record)
-            finally:
-                if image is not None:
-                    image.close()
-            due_contexts = [
-                context
-                for context in contexts
+                    record = error_record(
+                        assigned_args,
+                        code,
+                        row,
+                        exc,
+                        time.monotonic() - inference_started,
+                        failure_context=failure_context,
+                    )
+                finally:
+                    inferencer.active_rollout_context = None
+                    if image is not None:
+                        image.close()
+                context["writer"].write(record)
                 if context["progress"].should_emit(
                     context["counters"]["attempted"],
                     args.progress_every,
                     args.progress_seconds,
-                )
-            ]
-            if due_contexts:
-                memory = cuda_memory(torch)
-            for context in due_contexts:
-                progress = context["progress"]
-                counters = context["counters"]
-                context["writer"].flush()
-                progress.emit(counters, "running", force=True, memory=memory)
-        final_memory = cuda_memory(torch)
-        for context in contexts:
+                ):
+                    context["writer"].flush()
+                    context["progress"].emit(
+                        context["counters"],
+                        "running",
+                        force=True,
+                        memory=cuda_memory(torch),
+                    )
             context["writer"].flush()
-            status = (
+            context["logical_status"] = "completed"
+            raw_status = (
                 "completed"
                 if context["counters"]["runtime_error"] == 0
                 else "completed_with_runtime_errors"
             )
             context["progress"].emit(
-                context["counters"], status, force=True, memory=final_memory
+                context["counters"], raw_status, force=True, memory=cuda_memory(torch)
             )
         return 0
     except BaseException as exc:
         load_seconds = time.monotonic() - load_started
         error_type = classify_runtime_error(exc)
+        traceback_text = traceback.format_exc()
+        chain = exception_chain(exc)
         try:
             import torch
 
@@ -1239,24 +1555,64 @@ def run_worker(args: argparse.Namespace) -> int:
         except Exception:
             memory_after_failure = {}
         event = "MODEL_LOAD_FAIL" if not model_loaded else "WORKER_FATAL"
+        failure_path = (
+            output_root
+            / "diagnostics"
+            / ("model_load" if not model_loaded else "worker_fatal")
+            / f"{args.model_id}.json"
+        )
+        atomic_json(
+            failure_path,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "status": event,
+                "created_at": utc_now(),
+                "model_id": args.model_id,
+                "physical_gpu": args.physical_gpu,
+                "pid": os.getpid(),
+                "rollout_ids": rollout_ids,
+                "checkpoint": str(args.checkpoint),
+                "processor_path": str(args.processor_path),
+                "failure_stage": load_stage,
+                "error_type": error_type,
+                "top_exception": chain[0] if chain else None,
+                "root_exception": chain[-1] if chain else None,
+                "exception_chain": chain,
+                "traceback": traceback_text,
+                "load_seconds": load_seconds,
+                "memory_before": memory_before,
+                "memory_after": memory_after_failure,
+                "runtime_environment": worker_manifest["runtime_environment"],
+            },
+        )
         print(
             f"[{event}] "
             f"model={args.model_id} gpu={args.physical_gpu} pid={os.getpid()} "
             f"rollouts={rollout_text} checkpoint={args.checkpoint} "
             f"processor={args.processor_path} error={error_type} "
-            f"message={str(exc)!r} load_seconds={load_seconds:.3f} "
+            f"exception_type={type(exc).__name__} message={str(exc)!r} "
+            f"root_exception={json.dumps(chain[-1] if chain else None, sort_keys=True)} "
+            f"failure_stage={load_stage} failure_json={failure_path} "
+            f"load_seconds={load_seconds:.3f} "
             f"memory_before={json.dumps(memory_before, sort_keys=True)} "
             f"memory_after={json.dumps(memory_after_failure, sort_keys=True)}",
             flush=True,
         )
         for context in contexts:
+            if model_loaded and context.get("logical_status") == "completed":
+                logical_failure_status = "completed"
+            else:
+                logical_failure_status = (
+                    "model_load_failed" if not model_loaded else "failed"
+                )
+                context["logical_status"] = "failed"
             context["progress"].emit(
                 context["counters"],
-                "model_load_failed" if not model_loaded else "failed",
+                logical_failure_status,
                 force=True,
                 memory=memory_after_failure,
             )
-        traceback.print_exc()
+        print(traceback_text, file=sys.stderr, flush=True)
         return 2
     finally:
         for context in contexts:
@@ -1275,26 +1631,185 @@ def last_jsonl_row(path: Path) -> dict[str, Any] | None:
     return last
 
 
+def progress_file_state(path: Path) -> tuple[dict[str, Any] | None, int]:
+    last = None
+    count = 0
+    if not path.is_file():
+        return None, count
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                last = json.loads(line)
+                count += 1
+    return last, count
+
+
+def parse_physical_worker(value: str) -> dict[str, Any]:
+    parts = value.split(",", 3)
+    if len(parts) != 4:
+        raise ValueError(
+            "--physical-worker must be model,gpu,pid,rollout_ids (IDs use |)"
+        )
+    model_id, gpu, pid, rollout_text = parts
+    rollout_ids = [int(item) for item in rollout_text.split("|") if item]
+    if model_id not in MODEL_IDS or rollout_ids != [0, 1, 2, 3]:
+        raise ValueError(f"invalid --physical-worker mapping: {value}")
+    return {
+        "model_id": model_id,
+        "physical_gpu": int(gpu),
+        "pid": int(pid),
+        "rollout_ids": rollout_ids,
+    }
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def progress_snapshot(args: argparse.Namespace) -> int:
     root = args.output_root.expanduser().resolve(strict=False)
-    latest = []
+    latest: list[dict[str, Any]] = []
+    logical_rollouts: list[dict[str, Any]] = []
+    history_rows_total = 0
+    progress_files_discovered = 0
     for model_id in MODEL_IDS:
         for rollout_id in range(4):
             path = root / "progress" / model_id / f"rollout_{rollout_id}.jsonl"
-            row = last_jsonl_row(path)
+            row, history_rows = progress_file_state(path)
+            history_rows_total += history_rows
+            progress_files_discovered += int(path.is_file())
             if row is not None:
                 latest.append(row)
-    remaining_values = [
+            raw_status = str((row or {}).get("status", "missing"))
+            if raw_status in {"completed", "completed_with_runtime_errors"}:
+                logical_status = "completed"
+                phase = "completed"
+            elif raw_status in {"failed", "model_load_failed"}:
+                logical_status = "failed"
+                phase = raw_status
+            else:
+                logical_status = "running"
+                phase = "pending" if raw_status in {"pending", "missing"} else raw_status
+            logical_rollouts.append(
+                {
+                    "model_id": model_id,
+                    "rollout_id": rollout_id,
+                    "status": logical_status,
+                    "phase": phase,
+                    "progress_path": str(path),
+                    "progress_history_rows": history_rows,
+                    "latest": row,
+                }
+            )
+    physical_processes = []
+    for value in args.physical_worker:
+        physical = parse_physical_worker(value)
+        owned = [
+            row
+            for row in logical_rollouts
+            if row["model_id"] == physical["model_id"]
+            and row["rollout_id"] in physical["rollout_ids"]
+        ]
+        alive = pid_alive(int(physical["pid"]))
+        all_completed = all(row["status"] == "completed" for row in owned)
+        has_failed = any(row["status"] == "failed" for row in owned)
+        if alive:
+            physical_status = "alive"
+        elif all_completed:
+            physical_status = "completed"
+        else:
+            physical_status = "failed"
+            for logical in owned:
+                if logical["status"] != "completed":
+                    logical["status"] = "failed"
+                    logical["phase"] = "physical_process_failed"
+            has_failed = True
+        running_rates = [
+            float(row["latest"].get("throughput_attempted_per_second", 0.0))
+            for row in owned
+            if isinstance(row.get("latest"), Mapping)
+            and row["phase"] == "running"
+        ]
+        completed_rates = [
+            (
+                int(row["rollout_id"]),
+                float(row["latest"].get("throughput_attempted_per_second", 0.0)),
+            )
+            for row in owned
+            if isinstance(row.get("latest"), Mapping)
+            and row["status"] == "completed"
+        ]
+        attempted_rate = (
+            running_rates[0]
+            if running_rates
+            else max(completed_rates, default=(-1, 0.0))[1]
+        )
+        remaining_attempts = sum(
+            max(
+                0,
+                int(row["latest"].get("total", 0))
+                - int(row["latest"].get("attempted", 0)),
+            )
+            for row in owned
+            if isinstance(row.get("latest"), Mapping)
+        )
+        physical_remaining = (
+            remaining_attempts / attempted_rate
+            if attempted_rate > 0 and not has_failed and physical_status != "failed"
+            else (0.0 if all_completed else None)
+        )
+        physical_processes.append(
+            {
+                **physical,
+                "status": physical_status,
+                "alive": alive,
+                "logical_rollout_statuses": {
+                    str(row["rollout_id"]): row["status"] for row in owned
+                },
+                "has_failed_logical_rollout": has_failed,
+                "attempted_throughput_per_second": attempted_rate,
+                "remaining_attempts": remaining_attempts,
+                "remaining_seconds": physical_remaining,
+            }
+        )
+    failed_physical = [
+        row for row in physical_processes if row["status"] == "failed"
+    ]
+    failed_logical = [row for row in logical_rollouts if row["status"] == "failed"]
+    eta_blocked = bool(failed_physical or failed_logical)
+    physical_remaining_values = [
         float(row["remaining_seconds"])
-        for row in latest
+        for row in physical_processes
         if isinstance(row.get("remaining_seconds"), (int, float))
     ]
-    total_remaining = max(remaining_values, default=None)
+    total_remaining = (
+        None if eta_blocked else max(physical_remaining_values, default=None)
+    )
     snapshot = {
         "timestamp": utc_now(),
         "workers_seen": len(latest),
         "workers_expected": args.expected_workers,
         "workers": latest,
+        "physical_processes_expected": len(args.physical_worker),
+        "physical_processes": physical_processes,
+        "logical_rollouts_expected": args.expected_workers,
+        "logical_rollouts": logical_rollouts,
+        "progress_files_discovered": progress_files_discovered,
+        "progress_history_rows_total": history_rows_total,
+        "failed_physical_processes": len(failed_physical),
+        "failed_logical_rollouts": len(failed_logical),
+        "eta_valid": not eta_blocked and total_remaining is not None,
+        "eta_unavailable_reason": (
+            "failed physical worker or logical rollout" if eta_blocked else None
+        ),
+        "eta_basis": (
+            "attempted throughput of the active (or most recently completed) "
+            "rollout applied to remaining sequential attempts"
+        ),
         "total_remaining_seconds": total_remaining,
         "total_estimated_completion": (
             datetime.fromtimestamp(time.time() + total_remaining, timezone.utc).isoformat()

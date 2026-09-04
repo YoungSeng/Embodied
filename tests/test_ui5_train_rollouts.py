@@ -10,6 +10,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from PIL import Image
 import numpy as np
@@ -22,17 +23,24 @@ import aggregate_ui5_train_rollouts as aggregate
 import preflight_ui5_train_rollouts as preflight
 import prepare_ui5_train_rollout_bundle as prepare
 import render_ui5_train_rollout_gallery as gallery
+import run_ui5_train_rollout_worker as worker
 import snapshot_ui5_train_rollouts as snapshot
+import summarize_ui5_rollout_oom as oom_summary
 from run_ui5_train_rollout_worker import (
+    FORMAL_SEEDS,
     MAX_NUM_TOKENS_PER_SAMPLE,
     MAX_SEQ_LENGTH,
+    OOMRetryFailure,
     PROCESSOR_IN_TOKEN_LIMIT,
     ROLLOUT_MAX_NEW_TOKENS,
     TRAINING_MAX_NUM_TOKENS,
     fixed_interleaved_samples,
     install_generation_token_budget,
     load_module,
+    parse_args as parse_worker_args,
+    prediction_with_oom_retry,
     score_prediction,
+    validate_run_args,
 )
 
 
@@ -45,6 +53,423 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 class UI5TrainRolloutTest(unittest.TestCase):
+    @staticmethod
+    def write_checkpoint(path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        for filename in preflight.REQUIRED_CHECKPOINT_CODE:
+            (path / filename).write_text("CHECKPOINT_SOURCE = True\n", encoding="utf-8")
+        (path / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "locateanything",
+                    "auto_map": {
+                        "AutoConfig": (
+                            "configuration_locateanything.LocateAnythingConfig"
+                        ),
+                        "AutoModel": "modeling_locateanything.LocateAnythingModel",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (path / "model.safetensors").write_bytes(b"synthetic-nonempty-shard")
+
+    def test_formal_worker_validation_and_launcher_contract(self) -> None:
+        worker_args = parse_worker_args(
+            [
+                "--output-root",
+                "output",
+                "--model-id",
+                "m31",
+                "--checkpoint",
+                "checkpoint",
+                "--processor-path",
+                "processor",
+                "--bundle-root",
+                "bundle",
+                "--rollout-ids",
+                "0,1,2,3",
+                "--seeds",
+                "20260903,20260917,20260931,20260947",
+                "--physical-gpu",
+                "0",
+            ]
+        )
+        with mock.patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0"}):
+            validate_run_args(worker_args)
+            worker_args.gpu_model_processes = 2
+            with self.assertRaisesRegex(ValueError, "one model process per GPU"):
+                validate_run_args(worker_args)
+            worker_args.gpu_model_processes = 1
+            worker_args.max_new_tokens = 7268
+            with self.assertRaisesRegex(ValueError, "token configuration mismatch"):
+                validate_run_args(worker_args)
+
+        launcher = (
+            PROJECT_ROOT / "shell" / "run_ui5_train_rollouts_h20x2.sh"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(launcher.count("launch_worker m31"), 1)
+        self.assertEqual(launcher.count("launch_worker crop"), 1)
+        self.assertIn(
+            'launch_worker m31 0 "0,1,2,3" '
+            '"${SEEDS[0]},${SEEDS[1]},${SEEDS[2]},${SEEDS[3]}"',
+            launcher,
+        )
+        self.assertIn(
+            'launch_worker crop 1 "0,1,2,3" '
+            '"${SEEDS[0]},${SEEDS[1]},${SEEDS[2]},${SEEDS[3]}"',
+            launcher,
+        )
+        self.assertEqual(tuple(FORMAL_SEEDS.values()), (20260903, 20260917, 20260931, 20260947))
+        self.assertIn("--gpu-model-processes 1", launcher)
+        self.assertIn('HF_MODULES_CACHE="${hf_modules_cache}"', launcher)
+        self.assertIn('PYTHONPYCACHEPREFIX="${python_pycache}"', launcher)
+        self.assertIn("PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", launcher)
+        self.assertIn("runtime_cache/hf_modules/${model_id}", launcher)
+        self.assertIn("runtime_cache/pycache/${model_id}", launcher)
+        self.assertNotIn(
+            "/home/tiger/.cache/huggingface/modules/transformers_modules/"
+            "checkpoint_hyphen_12000",
+            launcher,
+        )
+        for argument in (
+            "--max-seq-length 7268",
+            "--max-num-tokens-per-sample 7268",
+            "--training-max-num-tokens 12800",
+            "--processor-in-token-limit 25600",
+            "--max-new-tokens 512",
+            "--n-future-tokens 6",
+            "--attn-implementation sdpa",
+            "--vision-attn-implementation sdpa",
+        ):
+            self.assertIn(argument, launcher)
+
+    def test_checkpoint_source_syntax_and_exact_copy_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid = root / "valid"
+            self.write_checkpoint(valid)
+            report = preflight.check_checkpoint(valid)
+            self.assertTrue(report["complete"])
+            self.assertTrue(report["checkpoint_code_complete"])
+            self.assertEqual(
+                [item["filename"] for item in report["checkpoint_code"]],
+                list(preflight.REQUIRED_CHECKPOINT_CODE),
+            )
+            self.assertTrue(all(item["syntax_ok"] for item in report["checkpoint_code"]))
+
+            empty = root / "empty"
+            shutil.copytree(valid, empty)
+            (empty / "relation_modules.py").write_bytes(b"")
+            empty_report = preflight.check_checkpoint(empty)
+            self.assertFalse(empty_report["complete"])
+            empty_source = next(
+                row
+                for row in empty_report["checkpoint_code"]
+                if row["filename"] == "relation_modules.py"
+            )
+            self.assertTrue(empty_source["exists"])
+            self.assertFalse(empty_source["nonzero"])
+            self.assertIn("required checkpoint source is empty", "\n".join(empty_report["errors"]))
+
+            broken = root / "broken"
+            shutil.copytree(valid, broken)
+            (broken / "modeling_locateanything.py").write_text(
+                "def broken(:\n    pass\n", encoding="utf-8"
+            )
+            broken_report = preflight.check_checkpoint(broken)
+            broken_source = next(
+                row
+                for row in broken_report["checkpoint_code"]
+                if row["filename"] == "modeling_locateanything.py"
+            )
+            self.assertFalse(broken_report["complete"])
+            self.assertEqual(broken_source["syntax_error"]["python_type"], "SyntaxError")
+            self.assertIsNotNone(broken_source["syntax_error"]["line"])
+            commands = preflight.copy_commands(
+                broken_report,
+                report,
+                [{"complete": True}],
+                Path(preflight.H20_BUNDLE),
+            )
+            self.assertNotIn(
+                f"{preflight.A800_M31_SOURCE}/modeling_locateanything.py",
+                commands,
+            )
+            self.assertIn("existing config/code is not overwritten", commands)
+
+            missing_m31 = root / "missing_m31_source"
+            shutil.copytree(valid, missing_m31)
+            (missing_m31 / "relation_modules.py").unlink()
+            m31_report = preflight.check_checkpoint(missing_m31)
+            missing_crop = root / "missing_crop_source"
+            shutil.copytree(valid, missing_crop)
+            (missing_crop / "configuration_locateanything.py").unlink()
+            crop_report = preflight.check_checkpoint(missing_crop)
+            commands = preflight.copy_commands(
+                m31_report,
+                crop_report,
+                [{"complete": True}],
+                Path(preflight.H20_BUNDLE),
+            )
+            self.assertIn(
+                f"{preflight.A800_M31_SOURCE}/relation_modules.py", commands
+            )
+            self.assertIn(
+                f"{preflight.A800_CROP_SOURCE}/configuration_locateanything.py",
+                commands,
+            )
+            self.assertNotIn(
+                f"{preflight.A800_CROP_SOURCE}/relation_modules.py", commands
+            )
+            self.assertNotIn(
+                f"{preflight.A800_M31_SOURCE}/configuration_locateanything.py",
+                commands,
+            )
+
+    def test_oom_retry_recovery_and_final_failure(self) -> None:
+        class FakeOOM(RuntimeError):
+            pass
+
+        class FakeCuda:
+            OutOfMemoryError = FakeOOM
+
+            def __init__(self) -> None:
+                self.empty_cache_calls = 0
+
+            @staticmethod
+            def mem_get_info():
+                return 8 * 1024**3, 80 * 1024**3
+
+            @staticmethod
+            def memory_allocated():
+                return 10 * 1024**3
+
+            @staticmethod
+            def memory_reserved():
+                return 12 * 1024**3
+
+            def empty_cache(self):
+                self.empty_cache_calls += 1
+
+        fake_torch = SimpleNamespace(cuda=FakeCuda())
+        inferencer = SimpleNamespace(
+            active_rollout_context={"stale": True},
+            last_rollout_token_usage={"stale": True},
+        )
+        calls: list[int] = []
+
+        def recovers(context):
+            calls.append(20260903)
+            context.update(
+                {
+                    "stage": "crop_generate",
+                    "crop_id": "crop_2",
+                    "crop_index": 2,
+                    "crop_xyxy": [0, 100, 200, 300],
+                    "input_tokens": 7000,
+                    "tile_count": 4,
+                    "tile_size": {"width": 200, "height": 200},
+                    "memory_before_oom": {"allocated_gib": 10.0},
+                }
+            )
+            if len(calls) == 1:
+                raise FakeOOM("CUDA out of memory on first attempt")
+            return {"pred_global": [[1, 2, 3, 4]]}
+
+        recovered = prediction_with_oom_retry(
+            recovers, torch=fake_torch, inferencer=inferencer
+        )
+        self.assertEqual(calls, [20260903, 20260903])
+        self.assertTrue(recovered["oom_recovered"])
+        self.assertEqual(recovered["oom_events"], 1)
+        self.assertEqual(fake_torch.cuda.empty_cache_calls, 1)
+        retry = recovered["oom_retry"]
+        self.assertEqual(retry["first_attempt"]["context"]["crop_id"], "crop_2")
+        self.assertEqual(retry["first_attempt"]["context"]["input_tokens"], 7000)
+        self.assertEqual(retry["first_attempt"]["exception"]["python_type"], "FakeOOM")
+        self.assertIn("first attempt", retry["first_attempt"]["exception"]["traceback"])
+        self.assertEqual(retry["retry_attempt"]["status"], "success")
+
+        failed_calls = 0
+
+        def always_oom(context):
+            nonlocal failed_calls
+            failed_calls += 1
+            context.update(
+                {
+                    "stage": "full_image_generate",
+                    "crop_id": "full_image",
+                    "crop_index": None,
+                    "crop_xyxy": [0, 0, 100, 100],
+                    "input_tokens": 7100,
+                    "tile_count": 1,
+                    "tile_size": {"width": 100, "height": 100},
+                    "memory_before_oom": {"reserved_gib": 12.0},
+                }
+            )
+            raise FakeOOM(f"CUDA out of memory attempt {failed_calls}")
+
+        with self.assertRaises(OOMRetryFailure) as caught:
+            prediction_with_oom_retry(
+                always_oom, torch=fake_torch, inferencer=inferencer
+            )
+        diagnostics = caught.exception.oom_diagnostics
+        self.assertEqual(failed_calls, 2)
+        self.assertEqual(diagnostics["oom_events"], 2)
+        self.assertTrue(diagnostics["oom_final_failure"])
+        self.assertEqual(diagnostics["first_attempt"]["context"]["input_tokens"], 7100)
+        self.assertEqual(diagnostics["retry_attempt"]["status"], "oom")
+        self.assertIn("attempt 2", diagnostics["retry_attempt"]["exception"]["message"])
+        self.assertEqual(fake_torch.cuda.empty_cache_calls, 3)
+        self.assertIsNone(inferencer.active_rollout_context)
+        self.assertIsNone(inferencer.last_rollout_token_usage)
+
+    def test_no_jq_oom_summary_deduplicates_record_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            common = {
+                "record_id": "same_record",
+                "sample_id": "same_sample",
+                "source_image_id": "same_image",
+                "task": "cropping",
+                "image_relpath": "images/same.png",
+            }
+            write_jsonl(
+                output / "raw" / "m31" / "rollout_0" / "part-00000.jsonl",
+                [
+                    {
+                        **common,
+                        "model_id": "m31",
+                        "rollout_id": 0,
+                        "oom_events": 1,
+                        "oom_recovered": True,
+                        "oom_final_failure": False,
+                        "oom_retry": {"retry_attempt": {"status": "success"}},
+                        "runtime_error": None,
+                    }
+                ],
+            )
+            write_jsonl(
+                output / "raw" / "crop" / "rollout_3" / "part-00000.jsonl",
+                [
+                    {
+                        **common,
+                        "model_id": "crop",
+                        "rollout_id": 3,
+                        "oom_events": 2,
+                        "oom_recovered": False,
+                        "oom_final_failure": True,
+                        "oom_retry": {"retry_attempt": {"status": "oom"}},
+                        "runtime_error": {"type": "CUDA_OOM"},
+                    },
+                    {
+                        **common,
+                        "record_id": "no_oom",
+                        "model_id": "crop",
+                        "rollout_id": 3,
+                        "oom_events": 0,
+                        "oom_recovered": False,
+                        "oom_final_failure": False,
+                    },
+                ],
+            )
+            result = oom_summary.run(output)
+            self.assertEqual(result["raw_records_scanned"], 3)
+            self.assertEqual(result["oom_total_count"], 3)
+            self.assertEqual(result["oom_recovered_count"], 1)
+            self.assertEqual(result["oom_final_failed_count"], 1)
+            self.assertEqual(result["oom_affected_rollout_records"], 2)
+            self.assertEqual(result["unique_oom_record_ids"], 1)
+            self.assertEqual(result["unique_oom_samples"][0]["oom_events"], 3)
+            self.assertTrue((output / "reports" / "oom_summary.json").is_file())
+            affected = snapshot.read_jsonl(
+                output / "reports" / "oom_affected_rollouts.jsonl"
+            )
+            unique = snapshot.read_jsonl(output / "selection" / "oom_samples.jsonl")
+            self.assertEqual(len(affected), 2)
+            self.assertEqual(len(unique), 1)
+
+    def test_progress_snapshot_keeps_failed_physical_worker_and_invalidates_eta(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            completed = {
+                "status": "completed",
+                "attempted": 5,
+                "total": 5,
+                "throughput_attempted_per_second": 2.0,
+            }
+            running = {
+                "status": "running",
+                "attempted": 2,
+                "total": 5,
+                "throughput_attempted_per_second": 1.0,
+            }
+            write_jsonl(
+                output / "progress" / "m31" / "rollout_0.jsonl",
+                [{**completed, "status": "running", "attempted": 3}, completed],
+            )
+            write_jsonl(
+                output / "progress" / "m31" / "rollout_1.jsonl",
+                [running],
+            )
+            write_jsonl(
+                output / "progress" / "crop" / "rollout_0.jsonl",
+                [
+                    {**running, "attempted": 0},
+                    {**running, "attempted": 1},
+                    running,
+                ],
+            )
+            args = parse_worker_args(
+                [
+                    "--mode",
+                    "progress-snapshot",
+                    "--output-root",
+                    str(output),
+                    "--expected-workers",
+                    "8",
+                    "--physical-worker",
+                    "m31,0,111,0|1|2|3",
+                    "--physical-worker",
+                    "crop,1,222,0|1|2|3",
+                ]
+            )
+            with mock.patch.object(worker, "pid_alive", side_effect=lambda pid: pid == 222):
+                self.assertEqual(worker.progress_snapshot(args), 0)
+
+            snapshots = snapshot.read_jsonl(output / "progress" / "total_eta.jsonl")
+            self.assertEqual(len(snapshots), 1)
+            status = snapshots[0]
+            self.assertEqual(status["physical_processes_expected"], 2)
+            self.assertEqual(len(status["physical_processes"]), 2)
+            self.assertEqual(status["logical_rollouts_expected"], 8)
+            self.assertEqual(len(status["logical_rollouts"]), 8)
+            self.assertEqual(status["progress_files_discovered"], 3)
+            self.assertEqual(status["progress_history_rows_total"], 6)
+            self.assertEqual(status["workers_seen"], 3)
+
+            by_pid = {row["pid"]: row for row in status["physical_processes"]}
+            self.assertEqual(set(by_pid), {111, 222})
+            self.assertEqual(by_pid[111]["status"], "failed")
+            self.assertFalse(by_pid[111]["alive"])
+            self.assertEqual(by_pid[222]["status"], "alive")
+            self.assertTrue(by_pid[222]["alive"])
+            self.assertEqual(
+                by_pid[111]["logical_rollout_statuses"],
+                {"0": "completed", "1": "failed", "2": "failed", "3": "failed"},
+            )
+            self.assertEqual(by_pid[222]["logical_rollout_statuses"]["0"], "running")
+            self.assertEqual(status["failed_physical_processes"], 1)
+            self.assertEqual(status["failed_logical_rollouts"], 3)
+            self.assertFalse(status["eta_valid"])
+            self.assertEqual(
+                status["eta_unavailable_reason"],
+                "failed physical worker or logical rollout",
+            )
+            self.assertIsNone(status["total_remaining_seconds"])
+            self.assertIsNone(status["total_estimated_completion"])
+
     def test_fixed_interleave_and_effective_generation_budget(self) -> None:
         tasks = (
             "occlusion",
@@ -125,6 +550,16 @@ class UI5TrainRolloutTest(unittest.TestCase):
         task_samples = []
         task_aware = []
         for task, label in labels.items():
+            pixel_gt = (
+                [10, 10, 30, 30]
+                if task == "text_ellipsis"
+                else [10, 40, 30, 60]
+            )
+            normalized_gt = (
+                [100, 100, 300, 300]
+                if task == "text_ellipsis"
+                else [100, 400, 300, 600]
+            )
             source_path = full / f"ui_{task}_train.jsonl"
             original = {
                 "conversations": [
@@ -134,7 +569,11 @@ class UI5TrainRolloutTest(unittest.TestCase):
                     },
                     {
                         "from": "gpt",
-                        "value": f"<ref>{label}</ref><box><100><400><300><600></box>",
+                        "value": (
+                            f"<ref>{label}</ref><box>"
+                            f"<{normalized_gt[0]}><{normalized_gt[1]}>"
+                            f"<{normalized_gt[2]}><{normalized_gt[3]}></box>"
+                        ),
                     },
                 ],
                 "image": str(image_path),
@@ -148,8 +587,8 @@ class UI5TrainRolloutTest(unittest.TestCase):
                     "task": f"ui_{task}",
                     "width": 100,
                     "height": 100,
-                    "gt_boxes": [[10, 40, 30, 60]],
-                    "gt_boxes_1000": [[100, 400, 300, 600]],
+                    "gt_boxes": [pixel_gt],
+                    "gt_boxes_1000": [normalized_gt],
                     "source_records": [
                         {"source_file": str(source_path), "line_no": 1}
                     ],
@@ -237,7 +676,7 @@ class UI5TrainRolloutTest(unittest.TestCase):
                 output_dir=output,
             )
         )
-        self.assertEqual(summary["pipeline_coverage_failures"], 4)
+        self.assertEqual(summary["pipeline_coverage_failures"], 3)
         self.assertEqual(summary["registered_annotation_exclusions"], 1)
         samples = prepare.read_jsonl(output / "manifest" / "task_samples.jsonl")
         excluded = next(row for row in samples if row["task"] == "text_overflow")
@@ -402,6 +841,8 @@ class UI5TrainRolloutTest(unittest.TestCase):
                             ],
                             "prompt": sample["prompt"],
                             "gt_global": sample["gt_global"],
+                            "gt_local": sample["gt_global"],
+                            "pred_local": pred,
                             "pred_global": pred,
                             "raw_output": "<box>synthetic</box>",
                             "parse_status": "defect",
@@ -416,6 +857,30 @@ class UI5TrainRolloutTest(unittest.TestCase):
                             "runtime_error": None,
                             **score,
                         }
+                        if (
+                            model == "crop"
+                            and rollout == 0
+                            and sample["task"] == "text_ellipsis"
+                        ):
+                            raw.update(
+                                {
+                                    "oom_events": 1,
+                                    "oom_recovered": True,
+                                    "oom_final_failure": False,
+                                    "oom_retry": {
+                                        "first_attempt": {
+                                            "status": "oom",
+                                            "context": {
+                                                "stage": "crop_generate",
+                                                "crop_id": sample["crop_ids"][0],
+                                                "crop_index": 0,
+                                                "input_tokens": 7000,
+                                            },
+                                        },
+                                        "retry_attempt": {"status": "success"},
+                                    },
+                                }
+                            )
                         if (
                             model == "m31"
                             and rollout == 3
@@ -433,6 +898,27 @@ class UI5TrainRolloutTest(unittest.TestCase):
                                     "error_type": "RUNTIME_ERROR",
                                     "exact_correct": None,
                                     "inference_success": False,
+                                    "oom_events": 2,
+                                    "oom_recovered": False,
+                                    "oom_final_failure": True,
+                                    "oom_retry": {
+                                        "first_attempt": {
+                                            "status": "oom",
+                                            "context": {
+                                                "stage": "full_image_generate",
+                                                "crop_id": "full_image",
+                                                "crop_index": None,
+                                                "crop_xyxy": [0, 0, 100, 100],
+                                                "input_tokens": 7100,
+                                                "tile_count": 1,
+                                                "tile_size": {
+                                                    "width": 100,
+                                                    "height": 100,
+                                                },
+                                            },
+                                        },
+                                        "retry_attempt": {"status": "oom"},
+                                    },
                                     "runtime_error": {
                                         "type": "CUDA_OOM",
                                         "python_type": "RuntimeError",
@@ -488,6 +974,25 @@ class UI5TrainRolloutTest(unittest.TestCase):
             )
             self.assertEqual(second_summary["file_counts"]["delta_since_previous"], 5)
             self.assertEqual(second_summary["grpo_ready_counts"], {"m31": 1, "crop": 1})
+            self.assertEqual(second_summary["error_counts"]["runtime_errors"], 1)
+            self.assertEqual(second_summary["error_counts"]["oom_events"], 2)
+            self.assertEqual(len(second_summary["correct_count_4"]), 60)
+            self.assertEqual(len(second_summary["correct_count_8"]), 54)
+            self.assertEqual(len(second_summary["cumulative_metrics"]), 48)
+            for metric_row in second_summary["cumulative_metrics"]:
+                self.assertTrue(
+                    {
+                        "TP",
+                        "TN",
+                        "FP",
+                        "FN",
+                        "precision",
+                        "recall",
+                        "f1",
+                        "accuracy",
+                        "specificity",
+                    }.issubset(metric_row)
+                )
             medium_rows = snapshot.read_jsonl(second_snapshot / "medium.jsonl")
             no_reward_variance = next(
                 row for row in medium_rows if row["task"] == "content_missing"
@@ -496,6 +1001,63 @@ class UI5TrainRolloutTest(unittest.TestCase):
             self.assertEqual(no_reward_variance["crop_correct_count"], 0)
             self.assertFalse(no_reward_variance["grpo_ready_m31"])
             self.assertFalse(no_reward_variance["grpo_ready_crop"])
+            self.assertTrue(no_reward_variance["m31_complete4"])
+            self.assertTrue(no_reward_variance["crop_complete4"])
+            self.assertTrue(no_reward_variance["cross_model_complete8"])
+            self.assertEqual(len(no_reward_variance["rollouts"]["m31"]), 4)
+            self.assertEqual(len(no_reward_variance["rollouts"]["crop"]), 4)
+            for rollout_payload in (
+                no_reward_variance["rollouts"]["m31"]
+                + no_reward_variance["rollouts"]["crop"]
+            ):
+                self.assertTrue(
+                    {
+                        "raw_output",
+                        "reward",
+                        "pred_global",
+                        "gt_global",
+                        "parse_status",
+                        "runtime_error",
+                    }.issubset(rollout_payload)
+                )
+            incomplete = snapshot.read_jsonl(
+                second_snapshot / "incomplete_or_runtime_error.jsonl"
+            )[0]
+            self.assertFalse(incomplete["m31_complete4"])
+            self.assertTrue(incomplete["crop_complete4"])
+            self.assertFalse(incomplete["cross_model_complete8"])
+            self.assertFalse(incomplete["grpo_ready_crop"])
+            self.assertEqual(incomplete["difficulty"], "incomplete_or_runtime_error")
+            self.assertEqual(incomplete["runtime_error_count"], 1)
+            grpo_crop = snapshot.read_jsonl(second_snapshot / "grpo_crop_ready.jsonl")
+            self.assertEqual(len(grpo_crop), 1)
+            self.assertTrue(all(row["group_size"] == 4 for row in grpo_crop))
+            self.assertTrue(all(row["cross_model_group"] is False for row in grpo_crop))
+            self.assertTrue(all(len(set(row["rewards_exact"])) == 2 for row in grpo_crop))
+            for filename in (
+                "errors/runtime_errors.jsonl",
+                "errors/parse_errors.jsonl",
+                "errors/oom_events.jsonl",
+                "errors/model_load_errors.jsonl",
+            ):
+                self.assertTrue((second_snapshot / filename).is_file())
+            manifest = json.loads(
+                (second_snapshot / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(manifest["append_only"])
+            self.assertTrue(manifest["atomic_publish"])
+            self.assertEqual(manifest["success_marker"], "_SUCCESS")
+            self.assertTrue((second_snapshot / "_SUCCESS").is_file())
+            self.assertFalse(
+                any(
+                    path.name.startswith(f".{second_snapshot.name}.tmp-")
+                    for path in second_snapshot.parent.iterdir()
+                )
+            )
+            for item in manifest["files"]:
+                artifact = second_snapshot / item["path"]
+                self.assertTrue(artifact.is_file())
+                self.assertEqual(snapshot.sha256_file(artifact), item["sha256"])
             third_snapshot, third_summary = snapshot.create_snapshot(
                 output,
                 bundle,
@@ -524,12 +1086,10 @@ class UI5TrainRolloutTest(unittest.TestCase):
             self.assertIn("SNAPSHOT_INTERVAL_SECONDS=10800", launcher)
             self.assertIn("NEXT_SNAPSHOT_HOUR=$((NEXT_SNAPSHOT_HOUR + 3))", launcher)
             self.assertNotIn("SNAPSHOT_SAMPLE", launcher)
-            self.assertEqual(launcher.count("launch_worker m31"), 2)
-            self.assertEqual(launcher.count("launch_worker crop"), 2)
-            self.assertIn('launch_worker m31 0 "0,1"', launcher)
-            self.assertIn('launch_worker m31 0 "2,3"', launcher)
-            self.assertIn('launch_worker crop 1 "0,1"', launcher)
-            self.assertIn('launch_worker crop 1 "2,3"', launcher)
+            self.assertEqual(launcher.count("launch_worker m31"), 1)
+            self.assertEqual(launcher.count("launch_worker crop"), 1)
+            self.assertIn('launch_worker m31 0 "0,1,2,3"', launcher)
+            self.assertIn('launch_worker crop 1 "0,1,2,3"', launcher)
             self.assertIn("--max-seq-length 7268", launcher)
             self.assertIn("--max-new-tokens 512", launcher)
             analysis = aggregate.run(
@@ -549,6 +1109,7 @@ class UI5TrainRolloutTest(unittest.TestCase):
             self.assertEqual(
                 analysis["difficulty_file_counts"],
                 {
+                    "snapshot_samples": 5,
                     "easy": 1,
                     "medium": 2,
                     "hard": 1,
@@ -575,13 +1136,15 @@ class UI5TrainRolloutTest(unittest.TestCase):
             )
             for sync_name in (
                 "sync_ui5_train_rollout_latest.sh",
-                "sync_ui5_train_rollout_all_ready.sh",
+                "sync_ui5_train_rollout_all.sh",
             ):
                 sync_script = (PROJECT_ROOT / "shell" / sync_name).read_text(
                     encoding="utf-8"
                 )
                 self.assertIn("nastk cp -c=32", sync_script)
-                self.assertIn("h20x2-v3-20260904", sync_script)
+                self.assertIn("h20x2-v4-20260904", sync_script)
+                self.assertIn("SNAPSHOT_ROOT=${OUTPUT_ROOT}/snapshots", sync_script)
+                self.assertIn('"${A800_DESTINATION}"', sync_script)
             rendered = gallery.render(
                 SimpleNamespace(output_root=output, bundle_root=bundle, panel_long_side=160)
             )
