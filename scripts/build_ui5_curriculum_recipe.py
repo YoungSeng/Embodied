@@ -29,9 +29,16 @@ import shutil
 import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from PIL import Image
+
+try:
+    from ui5_curriculum_progress import BuildProgress
+except ModuleNotFoundError as exc:
+    if exc.name != "ui5_curriculum_progress":
+        raise
+    from scripts.ui5_curriculum_progress import BuildProgress
 
 
 SCHEMA_VERSION = 4
@@ -69,11 +76,42 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--progress-interval-seconds", type=float, default=10.0,
+        help="Heartbeat/progress interval; ETA is estimated for the current stage.",
+    )
+    parser.add_argument(
+        "--print-full-summary", action="store_true",
+        help="Also print the full manifest; it is always saved in the output directory.",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Replace an existing complete curriculum instead of verifying/reusing it.",
     )
     return parser.parse_args(argv)
+
+
+def _progress_items(
+    progress: BuildProgress | None,
+    name: str,
+    items: Iterable[Any],
+    *,
+    total: int | None = None,
+    unit: str = "items",
+    detail: Callable[[Any], str] | None = None,
+) -> Iterator[Any]:
+    """Count completed items, keeping a heartbeat active inside each slow item."""
+    if progress is None:
+        yield from items
+        return
+    if total is None and hasattr(items, "__len__"):
+        total = len(items)
+    with progress.stage(name, total=total, unit=unit) as stage:
+        for completed, item in enumerate(items, 1):
+            if detail is not None:
+                stage.set_detail(detail(item))
+            yield item
+            stage.update(completed)
 
 
 def _json_digest(value: Any) -> str:
@@ -119,6 +157,7 @@ def _bundle_file(bundle: Path, value: Any, *, label: str) -> Path:
 
 def _verify_rollout_bundle(
     bundle: Path,
+    progress: BuildProgress | None = None,
 ) -> tuple[dict[str, Any], dict[Path, str]]:
     """Fail closed unless every declared bundle input and image is immutable."""
 
@@ -147,7 +186,10 @@ def _verify_rollout_bundle(
         )
 
     verified_declared: dict[str, str] = {}
-    for relative, raw_metadata in declared_files.items():
+    for relative, raw_metadata in _progress_items(
+        progress, "verify_bundle_files", declared_files.items(), unit="files",
+        detail=lambda item: str(item[0]),
+    ):
         label = f"rollout bundle declared file {relative!r}"
         if not isinstance(raw_metadata, Mapping):
             raise ValueError(f"{label} metadata is not an object")
@@ -196,7 +238,10 @@ def _verify_rollout_bundle(
 
     verified_images: dict[Path, str] = {}
     seen_image_ids: set[str] = set()
-    for row_number, row in enumerate(unique_rows, 1):
+    for row_number, row in enumerate(_progress_items(
+        progress, "verify_bundle_images", unique_rows, unit="images",
+        detail=lambda row: str(row.get("image_relpath", "")),
+    ), 1):
         image_id = str(row.get("image_id") or "")
         if not image_id:
             raise ValueError(f"unique_images.jsonl row {row_number} lacks image_id")
@@ -1293,6 +1338,7 @@ def _strict_vertical_partition(
 def _bundle_crop_geometry(
     bundle: Path,
     verified_images: Mapping[Path, str],
+    progress: BuildProgress | None = None,
 ) -> tuple[
     dict[str, list[dict[str, Any]]],
     dict[str, dict[str, Any]],
@@ -1302,7 +1348,10 @@ def _bundle_crop_geometry(
 
     unique_rows = _read_jsonl(bundle / "manifest" / "unique_images.jsonl")
     images_by_id: dict[str, dict[str, Any]] = {}
-    for row_number, raw in enumerate(unique_rows, 1):
+    for row_number, raw in enumerate(_progress_items(
+        progress, "index_image_geometry", unique_rows, unit="images",
+        detail=lambda row: str(row.get("image_id", "")),
+    ), 1):
         image_id = str(raw.get("image_id") or "")
         if not image_id or image_id in images_by_id:
             raise ValueError(
@@ -1337,7 +1386,10 @@ def _bundle_crop_geometry(
     if not isinstance(plans_payload, Mapping):
         raise ValueError("base_scan_plans.json is not an object")
     plans: dict[str, dict[str, Any]] = {}
-    for raw_image_id, raw_plan in plans_payload.items():
+    for raw_image_id, raw_plan in _progress_items(
+        progress, "validate_base_scan_plans", plans_payload.items(), unit="images",
+        detail=lambda item: str(item[0]),
+    ):
         image_id = str(raw_image_id)
         if image_id not in images_by_id:
             raise ValueError(f"base scan plan references unknown image_id={image_id}")
@@ -1371,9 +1423,11 @@ def _bundle_crop_geometry(
     rows_by_sample: dict[str, list[dict[str, Any]]] = defaultdict(list)
     seen_crop_ids: set[str] = set()
     seen_sample_indices: set[tuple[str, int]] = set()
-    for row_number, raw in enumerate(
-        _read_jsonl(bundle / "manifest" / "crop_samples.jsonl"), 1
-    ):
+    for row_number, raw in enumerate(_progress_items(
+        progress, "validate_crop_geometry",
+        _read_jsonl(bundle / "manifest" / "crop_samples.jsonl"), unit="crops",
+        detail=lambda row: str(row.get("crop_id", "")),
+    ), 1):
         row = dict(raw)
         sample_id = _sample_id(row)
         image_id = str(row.get("source_image_id") or "")
@@ -1671,7 +1725,8 @@ def _selected_crop_supervision(
 
 
 def _materialize_crop_assets(
-    output_dir: Path, asset_namespace: str, assets: Sequence[Mapping[str, Any]]
+    output_dir: Path, asset_namespace: str, assets: Sequence[Mapping[str, Any]],
+    progress: BuildProgress | None = None,
 ) -> list[dict[str, Any]]:
     """Publish every selected crop as one atomically-renamed image tree."""
 
@@ -1684,7 +1739,11 @@ def _materialize_crop_assets(
     inventory: list[dict[str, Any]] = []
     try:
         seen_relative: set[str] = set()
-        for raw in sorted(assets, key=lambda row: str(row["relative_path"])):
+        for raw in _progress_items(
+            progress, "materialize_crop_pngs",
+            sorted(assets, key=lambda row: str(row["relative_path"])), unit="crops",
+            detail=lambda row: f"crop_id={row['crop_id']} source={row['source_image']}",
+        ):
             relative = Path(str(raw["relative_path"]))
             if relative.parts[0] != asset_namespace or len(relative.parts) != 2:
                 raise ValueError(f"unsafe crop asset path: {relative}")
@@ -1740,7 +1799,10 @@ def _materialize_crop_assets(
                 != int(row["bytes"])
                 or _sha256_file(target_dir / Path(row["relative_path"]).name)
                 != row["sha256"]
-                for row in inventory
+                for row in _progress_items(
+                    progress, "verify_existing_crop_directory", inventory, unit="crops",
+                    detail=lambda row: str(row["relative_path"]),
+                )
             ):
                 raise RuntimeError(
                     f"existing crop asset directory differs: {target_dir}"
@@ -1748,7 +1810,10 @@ def _materialize_crop_assets(
             shutil.rmtree(staging)
         else:
             os.replace(staging, target_dir)
-        for row in inventory:
+        for row in _progress_items(
+            progress, "verify_published_crop_pngs", inventory, unit="crops",
+            detail=lambda row: str(row["relative_path"]),
+        ):
             published = output_dir / row["relative_path"]
             if (
                 not published.is_file()
@@ -1917,6 +1982,7 @@ def _match_anchors(
     crop_rows_by_sample: Mapping[str, Sequence[Mapping[str, Any]]],
     *,
     seed: int,
+    progress: BuildProgress | None = None,
 ) -> list[dict[str, Any]]:
     buckets: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in eligible.values():
@@ -1928,7 +1994,13 @@ def _match_anchors(
         hard_buckets[(str(row["task"]), str(row["polarity"]))].append(dict(row))
 
     by_hard_id: dict[str, dict[str, Any]] = {}
-    for key in sorted(hard_buckets):
+    for key in _progress_items(
+        progress, "match_anchor_strata", sorted(hard_buckets), unit="strata",
+        detail=lambda key: (
+            f"task={key[0]} polarity={key[1]} hard={len(hard_buckets[key])} "
+            f"anchor_candidates={len(buckets.get(key, []))}"
+        ),
+    ):
         hard_rows = sorted(hard_buckets[key], key=lambda row: str(row["sample_id"]))
         candidates = sorted(buckets.get(key, []), key=lambda row: str(row["sample_id"]))
         if len(candidates) < len(hard_rows):
@@ -2081,6 +2153,16 @@ def _require_all_ui5_strata(
 
 
 def build(args: argparse.Namespace) -> dict[str, Any]:
+    with BuildProgress(
+        args.output_dir,
+        interval_seconds=float(getattr(args, "progress_interval_seconds", 10.0)),
+    ) as progress:
+        with progress.stage("curriculum_build", unit="stages") as status:
+            return _build(args, progress, status)
+
+
+def _build(args: argparse.Namespace, progress: BuildProgress, status: Any) -> dict[str, Any]:
+    status.set_detail("resolving frozen selection, bundle and output paths")
     base_recipe = (
         args.base_recipe.expanduser().resolve(strict=True)
         if args.base_recipe is not None
@@ -2109,10 +2191,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 
     bundle_state: dict[str, Any] | None = None
     verified_bundle_images: dict[Path, str] = {}
-    difficulty_rows, difficulty_state = _load_difficulty_rows(difficulty_path)
-    formal_hard_ids, frozen_summary_state = _load_frozen_selection_summary(
-        difficulty_state, difficulty_rows
-    )
+    with progress.stage("load_frozen_selection", unit="records"):
+        difficulty_rows, difficulty_state = _load_difficulty_rows(difficulty_path)
+        formal_hard_ids, frozen_summary_state = _load_frozen_selection_summary(
+            difficulty_state, difficulty_rows
+        )
     if configured_expected_hard is not None and int(configured_expected_hard) != len(
         formal_hard_ids
     ):
@@ -2120,16 +2203,17 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "configured hard group assertion differs from frozen summary: "
             f"configured={configured_expected_hard}, frozen={len(formal_hard_ids)}"
         )
-    bundle_state, verified_bundle_images = _verify_rollout_bundle(bundle)
-    crop_rows_by_sample, _, _ = _bundle_crop_geometry(
-        bundle, verified_bundle_images
-    )
+    status.set_detail("reading rollout bundle inventory and validating all source bytes")
+    bundle_state, verified_bundle_images = _verify_rollout_bundle(bundle, progress)
+    status.set_detail("loading crop manifests and detector scan geometry")
+    crop_rows_by_sample, _, _ = _bundle_crop_geometry(bundle, verified_bundle_images, progress)
 
     existing_manifest_path = output_dir / "curriculum_manifest.json"
     existing_success_path = output_dir / "_SUCCESS.json"
     if existing_manifest_path.is_file() and existing_success_path.is_file() and not bool(
         getattr(args, "force", False)
     ):
+        status.set_detail("complete curriculum found; verifying identity for reuse (no crop generation)")
         existing = json.loads(existing_manifest_path.read_text(encoding="utf-8"))
         success = json.loads(existing_success_path.read_text(encoding="utf-8"))
         if int(existing.get("schema_version", -1)) != SCHEMA_VERSION or int(
@@ -2205,7 +2289,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError(
                 "existing curriculum success marker artifact hashes do not match"
             )
-        for relative, metadata in success_files.items():
+        for relative, metadata in _progress_items(
+            progress, "verify_existing_curriculum", success_files.items(), unit="files",
+            detail=lambda item: str(item[0]),
+        ):
             path = output_dir / str(relative)
             if not isinstance(metadata, Mapping):
                 raise RuntimeError(
@@ -2217,18 +2304,22 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 or _sha256_file(path) != metadata.get("sha256")
             ):
                 raise RuntimeError(f"existing curriculum artifact changed: {path}")
+        status.set_detail("existing curriculum verified; reusing all published data")
         return existing
 
-    records = _bundle_records(bundle)
-    _verify_bundle_record_images(records, verified_bundle_images)
-    record_truth = _record_group_truth(records)
-    records_by_sample: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for record in records:
-        records_by_sample[_sample_id(record)].append(record)
-    bundle_groups, eligible_bundle_groups = _bundle_group_catalog(
-        bundle, crop_rows_by_sample, record_truth
-    )
-    difficulty = _eligible_difficulty(difficulty_rows, record_truth)
+    with progress.stage("load_original_groups", unit="groups") as group_status:
+        group_status.set_detail("loading original records, union GT and full-bundle group catalog")
+        records = _bundle_records(bundle)
+        _verify_bundle_record_images(records, verified_bundle_images)
+        record_truth = _record_group_truth(records)
+        records_by_sample: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for record in records:
+            records_by_sample[_sample_id(record)].append(record)
+        bundle_groups, eligible_bundle_groups = _bundle_group_catalog(
+            bundle, crop_rows_by_sample, record_truth
+        )
+        difficulty = _eligible_difficulty(difficulty_rows, record_truth)
+    status.set_detail("validating frozen hard membership against original sample groups")
     missing_difficulty_bundle = sorted(set(difficulty) - set(eligible_bundle_groups))
     if missing_difficulty_bundle:
         raise ValueError(
@@ -2263,7 +2354,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         key=lambda row: (str(row["task"]), str(row["sample_id"])),
     )
     anchors = _match_anchors(
-        hard, difficulty, crop_rows_by_sample, seed=int(args.seed)
+        hard, difficulty, crop_rows_by_sample, seed=int(args.seed), progress=progress,
     )
     hard_ids = {str(row["sample_id"]) for row in hard}
     anchor_ids = {str(row["sample_id"]) for row in anchors}
@@ -2330,6 +2421,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "matched_anchor": anchor_ids,
         "global_replay": replay_ids,
     }
+    status.set_detail(
+        f"planning training views: hard={len(hard_ids)} anchor={len(anchor_ids)} "
+        f"global_replay={len(replay_ids)} groups"
+    )
     selected_crop_identity = {
         pool: [
             {
@@ -2354,7 +2449,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "global_replay": [],
     }
     for pool, sample_ids in pool_group_ids.items():
-        for sid in sorted(sample_ids):
+        for sid in _progress_items(
+            progress, f"plan_{pool}_views", sorted(sample_ids), unit="groups",
+            detail=lambda sid: str(sid),
+        ):
             rollout_row = selected_rollout_rows[sid]
             canonical = _canonical_selected_supervision(
                 sid, records_by_sample[sid], rollout_row
@@ -2397,12 +2495,13 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     asset_inventory = _materialize_crop_assets(
-        output_dir, asset_namespace, crop_assets
+        output_dir, asset_namespace, crop_assets, progress,
     )
+    status.set_detail("binding generated crop assets to training annotations")
     assets_by_relative = {
         str(row["relative_path"]): row for row in asset_inventory
     }
-    for pool in POOLS:
+    for pool in _progress_items(progress, "bind_crop_assets", POOLS, unit="pools"):
         for record in pool_records[pool]:
             relative = record.pop("_ui5_crop_asset_relpath", None)
             if relative is None:
@@ -2441,7 +2540,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     _atomic_jsonl(output_dir / "matched_anchor_groups.jsonl", anchors)
 
     recipe: dict[str, Any] = {}
-    for pool in POOLS:
+    for pool in _progress_items(progress, "publish_pool_annotations", POOLS, unit="pools"):
         crop_recipe = any(
             row.get("_ui5_record_kind") == "crop" for row in pool_records[pool]
         )
@@ -2460,6 +2559,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "curriculum_pool": pool,
         }
     recipe_path = output_dir / "ui5_crop_rollout4_curriculum.json"
+    status.set_detail("publishing recipe and full curriculum manifest")
     _atomic_json(recipe_path, recipe)
 
     summary = {
@@ -2563,7 +2663,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     # Read every published artifact before declaring success.  This catches a
     # truncated network-volume write before the two-GPU job starts.
     published_counts = {
-        pool: len(_read_jsonl(annotation_paths[pool])) for pool in POOLS
+        pool: len(_read_jsonl(annotation_paths[pool]))
+        for pool in _progress_items(progress, "verify_pool_annotations", POOLS, unit="pools")
     }
     if published_counts != {
         pool: len(pool_records[pool]) for pool in POOLS
@@ -2584,10 +2685,14 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "bytes": path.stat().st_size,
             "sha256": _sha256_file(path),
         }
-        for path in durable_paths
+        for path in _progress_items(
+            progress, "verify_final_artifacts", durable_paths, unit="files",
+            detail=lambda path: str(path.relative_to(output_dir)),
+        )
     }
     if len(success_files) != len(durable_paths):
         raise AssertionError("curriculum durable artifact paths are not unique")
+    status.set_detail("all artifacts verified; publishing _SUCCESS.json")
     _atomic_json(
         output_dir / "_SUCCESS.json",
         {
@@ -2603,7 +2708,22 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     try:
-        print(json.dumps(build(parse_args(argv)), ensure_ascii=False, indent=2))
+        args = parse_args(argv)
+        summary = build(args)
+        if args.print_full_summary:
+            print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+        else:
+            print(json.dumps({
+                "complete": True,
+                "curriculum_manifest": str(args.output_dir.resolve() / "curriculum_manifest.json"),
+                "progress_path": str(args.output_dir.resolve() / "progress" / "build_progress.json"),
+                "identity_digest": summary["identity_digest"],
+                "hard_groups": summary["hard_groups"],
+                "matched_anchor_groups": summary["matched_anchor_groups"],
+                "base_sample_groups": summary["base_sample_groups"],
+                "crop_assets": len(summary["crop_assets"]),
+                "pools": summary["pools"],
+            }, ensure_ascii=False, indent=2), flush=True)
     except Exception as exc:
         print(f"[curriculum-recipe:error] {type(exc).__name__}: {exc}", file=os.sys.stderr)
         return 1

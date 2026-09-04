@@ -38,6 +38,7 @@ FROZEN_SELECTION="${FROZEN_SELECTION:-}"
   "FROZEN_SELECTION must name one immutable selection produced by merge_ui5_rollout_selections.py"
 ROLLOUT_DIFFICULTY="${FROZEN_SELECTION}/complete8.jsonl"
 CURRICULUM_SOURCE_RECIPE="${CURRICULUM_SOURCE_RECIPE:-}"
+CURRICULUM_PROGRESS_INTERVAL_SECONDS="${CURRICULUM_PROGRESS_INTERVAL_SECONDS:-10}"
 EVAL_INPUT_DIR="${EVAL_INPUT_DIR:-${WORKSPACE}/data}"
 EVAL_SCAN_NAME="${EVAL_SCAN_NAME:-horizontal_scan_v5_raw_detector_edge_aligned}"
 EVAL_DETECTOR_CACHE="${EVAL_DETECTOR_CACHE:-${WORKSPACE}/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v5}"
@@ -126,6 +127,7 @@ export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
 export PROJECT_ROOT WORKSPACE ENV_DIR PYTHON_BIN MODEL_PATH BASE_MODEL PROCESSOR_PATH
 export OUTPUT_DIR ROLLOUT_BUNDLE_ROOT FROZEN_SELECTION ROLLOUT_DIFFICULTY CURRICULUM_SOURCE_RECIPE
+export CURRICULUM_PROGRESS_INTERVAL_SECONDS
 export EVAL_INPUT_DIR EVAL_DETECTOR_MANIFEST SCORER_SCRIPT SEED
 export ROLLING_CHECKPOINT_PATH
 export NNODES NODE_RANK
@@ -347,6 +349,7 @@ relative_paths = (
     "eaglevl/train/ui5_curriculum.py",
     "eaglevl/train/ui5_curriculum_artifacts.py",
     "scripts/build_ui5_curriculum_recipe.py",
+    "scripts/ui5_curriculum_progress.py",
     "scripts/inference_ui_defect_locany.py",
     "scripts/locany_ui5_checkpoint.py",
     "scripts/merge_ui5_rollout_selections.py",
@@ -362,6 +365,8 @@ relative_paths = (
     "tests/test_ui5_curriculum_evaluation.py",
     "tests/test_ui5_curriculum_pipeline.py",
     "tests/test_ui5_curriculum_recipe.py",
+    "tests/test_ui5_curriculum_recipe_progress.py",
+    "tests/test_ui5_curriculum_progress.py",
     "tests/test_ui5_curriculum_status.py",
     "tests/test_ui5_eval_manifest_portability.py",
     "tests/test_ui5_rollout_selection_merge.py",
@@ -388,22 +393,28 @@ check_bash_syntax() {
 
 build_recipe_dry_run() {
   local command=(
-    "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/build_ui5_curriculum_recipe.py"
+    "${PYTHON_BIN}" -u "${PROJECT_ROOT}/scripts/build_ui5_curriculum_recipe.py"
     --rollout-difficulty "${ROLLOUT_DIFFICULTY}"
     --rollout-bundle-root "${ROLLOUT_BUNDLE_ROOT}"
     --output-dir "${DRY_RUN_CURRICULUM_DIR}"
     --expected-hard-groups "${EXPECTED_HARD_GROUPS}"
     --seed "${SEED}"
+    --progress-interval-seconds "${CURRICULUM_PROGRESS_INTERVAL_SECONDS}"
   )
   if [[ -n "${CURRICULUM_SOURCE_RECIPE}" ]]; then
     command+=(--base-recipe "${CURRICULUM_SOURCE_RECIPE}")
   fi
   "${command[@]}"
 
-  "${PYTHON_BIN}" - "${DRY_RUN_CURRICULUM_DIR}" "${EXPECTED_HARD_GROUPS}" <<'PY'
+  "${PYTHON_BIN}" -u - "${DRY_RUN_CURRICULUM_DIR}" "${EXPECTED_HARD_GROUPS}" <<'PY'
+import hashlib
 import json
+import os
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(os.environ["PROJECT_ROOT"]) / "scripts"))
+from ui5_curriculum_progress import BuildProgress
 
 root = Path(sys.argv[1])
 expected_hard = int(sys.argv[2])
@@ -506,14 +517,22 @@ record_paths = {
 }
 if asset_paths != record_paths:
     raise SystemExit("crop records do not reference exactly the asset inventory")
-for relative, metadata in success["files"].items():
-    path = root / relative
-    if not isinstance(metadata, dict):
-        raise SystemExit(f"success inventory lacks hash/bytes metadata: {relative}")
-    import hashlib
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    if path.stat().st_size != metadata.get("bytes") or digest != metadata.get("sha256"):
-        raise SystemExit(f"success inventory differs: {relative}")
+with BuildProgress(
+    root / "preflight_validation",
+    interval_seconds=float(os.environ["CURRICULUM_PROGRESS_INTERVAL_SECONDS"]),
+) as progress:
+    with progress.stage(
+        "preflight_verify_published_files", total=len(success["files"]), unit="files"
+    ) as stage:
+        for completed, (relative, metadata) in enumerate(success["files"].items(), 1):
+            stage.set_detail(relative)
+            path = root / relative
+            if not isinstance(metadata, dict):
+                raise SystemExit(f"success inventory lacks hash/bytes metadata: {relative}")
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if path.stat().st_size != metadata.get("bytes") or digest != metadata.get("sha256"):
+                raise SystemExit(f"success inventory differs: {relative}")
+            stage.update(completed)
 print(
     "recipe_dry_run=ok "
     f"hard_groups={manifest['hard_groups']} "
@@ -562,6 +581,8 @@ run_lightweight_tests() {
     tests.test_ui5_curriculum_artifacts \
     tests.test_ui5_curriculum_evaluation \
     tests.test_ui5_curriculum_recipe \
+    tests.test_ui5_curriculum_recipe_progress \
+    tests.test_ui5_curriculum_progress \
     tests.test_ui5_curriculum_diagnostics \
     tests.test_ui5_curriculum_pipeline \
     tests.test_ui5_curriculum_status \
@@ -589,6 +610,8 @@ printf '%-30s %s\n' \
   "MODEL_PATH" "${MODEL_PATH}" \
   "OUTPUT_DIR" "${OUTPUT_DIR}" \
   "FROZEN_SELECTION" "${FROZEN_SELECTION}" \
+  "CURRICULUM_PROGRESS_SECONDS" "${CURRICULUM_PROGRESS_INTERVAL_SECONDS}" \
+  "CURRICULUM_PROGRESS_JSON" "${DRY_RUN_CURRICULUM_DIR}/progress/build_progress.json" \
   "ATTN_IMPLEMENTATION" "${ATTN_IMPLEMENTATION}" \
   "TOKEN_LIMITS" "${MAX_SEQ_LENGTH}/${MAX_NUM_TOKENS_PER_SAMPLE}/${MAX_NUM_TOKENS}" \
   "ROLLING_CHECKPOINT" "${ROLLING_CHECKPOINT_PATH}" \

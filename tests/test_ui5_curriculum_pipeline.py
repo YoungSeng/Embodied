@@ -11,6 +11,47 @@ TRAINER = ROOT / "eaglevl" / "train" / "locany_finetune_magi_stream.py"
 
 
 class CurriculumPipelineContractTests(unittest.TestCase):
+    def test_builder_progress_is_unbuffered_and_configurable_in_both_entrypoints(self) -> None:
+        for path in (LAUNCHER, PREFLIGHT):
+            with self.subTest(entrypoint=path.name):
+                source = path.read_text(encoding="utf-8")
+                self.assertIn(
+                    'CURRICULUM_PROGRESS_INTERVAL_SECONDS="${CURRICULUM_PROGRESS_INTERVAL_SECONDS:-10}"',
+                    source,
+                )
+                self.assertIn(
+                    '"${PYTHON_BIN}" -u "${PROJECT_ROOT}/scripts/build_ui5_curriculum_recipe.py"',
+                    source,
+                )
+                self.assertNotIn(
+                    '"${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/build_ui5_curriculum_recipe.py"',
+                    source,
+                )
+                self.assertIn(
+                    '--progress-interval-seconds "${CURRICULUM_PROGRESS_INTERVAL_SECONDS}"',
+                    source,
+                )
+                self.assertIn('"CURRICULUM_PROGRESS_JSON"', source)
+                self.assertIn('/progress/build_progress.json"', source)
+
+    def test_preflight_inventory_checks_report_progress_without_omitting_hashes(self) -> None:
+        source = PREFLIGHT.read_text(encoding="utf-8")
+        start = source.index('with BuildProgress(')
+        end = source.index('"recipe_dry_run=ok "', start)
+        verification = source[start:end]
+        self.assertIn('root / "preflight_validation"', verification)
+        self.assertIn('"preflight_verify_published_files"', verification)
+        self.assertIn('total=len(success["files"]), unit="files"', verification)
+        self.assertIn('enumerate(success["files"].items(), 1)', verification)
+        self.assertIn('stage.set_detail(relative)', verification)
+        self.assertIn('hashlib.sha256(path.read_bytes()).hexdigest()', verification)
+        self.assertIn('metadata.get("sha256")', verification)
+        self.assertIn('stage.update(completed)', verification)
+        self.assertLess(verification.index('hashlib.sha256'), verification.index('stage.update'))
+        self.assertIn('"scripts/ui5_curriculum_progress.py"', source)
+        self.assertIn('"tests/test_ui5_curriculum_progress.py"', source)
+        self.assertIn('tests.test_ui5_curriculum_progress \\', source)
+
     def test_manifest_coverage_is_checked_before_models_and_uses_the_explicit_path(self) -> None:
         launcher = LAUNCHER.read_text(encoding="utf-8")
         check = launcher.index("scripts/relocate_ui5_eval_detector_manifest.py")

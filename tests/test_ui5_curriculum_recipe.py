@@ -1187,7 +1187,13 @@ class CurriculumRecipeTests(unittest.TestCase):
                 curriculum_recipe.build(
                     self._args(bundle, difficulty, root / "curriculum")
                 )
-            self.assertFalse((root / "curriculum").exists())
+            # Failed preparation may publish operational progress, but no
+            # training data or success marker may be published.
+            output = root / "curriculum"
+            self.assertEqual({path.name for path in output.iterdir()}, {"progress"})
+            progress = json.loads((output / "progress" / "build_progress.json").read_text())
+            self.assertEqual(progress["status"], "failed")
+            self.assertFalse((output / "_SUCCESS.json").exists())
 
     def test_fails_closed_when_declared_bundle_file_hash_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
