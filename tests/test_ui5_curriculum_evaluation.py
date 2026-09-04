@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import importlib.util
 import io
 import subprocess
@@ -29,6 +30,124 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
         encoding="utf-8",
     )
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def make_frozen_and_curriculum(
+    root: Path,
+    hard_groups: int,
+    *,
+    hard_sample_ids: list[str] | None = None,
+    hard_groups_path: Path | None = None,
+) -> tuple[Path, Path]:
+    frozen = root / "frozen"
+    frozen.mkdir(parents=True)
+    complete8 = frozen / "complete8.jsonl"
+    difficulty = frozen / "sample_difficulty.jsonl"
+    summary_path = frozen / "summary.json"
+    sample_ids = hard_sample_ids or [f"sample-{index}" for index in range(hard_groups)]
+    if len(sample_ids) != hard_groups:
+        raise ValueError("hard_sample_ids length differs from hard_groups")
+    selection_rows = [
+        {
+            "sample_id": sample_id,
+            "crop_correct_count": 0,
+            "grpo_source_eligible": True,
+            "pipeline_coverage_failure": False,
+            "annotation_anomaly": False,
+            "coordinate_transform_anomaly": False,
+        }
+        for sample_id in sample_ids
+    ]
+    write_jsonl(complete8, selection_rows)
+    write_jsonl(difficulty, selection_rows)
+    sources: list[dict] = []
+    source_set_sha256 = hashlib.sha256(
+        json.dumps(sources, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    hard_ids = sorted(row["sample_id"] for row in selection_rows)
+    hard_ids_digest = evaluation._canonical_json_sha256(hard_ids)
+    summary = {
+        "schema_version": 1,
+        "source_set_sha256": source_set_sha256,
+        "unique_complete8_samples": hard_groups,
+        "formal_eligible_groups": hard_groups,
+        "formal_crop_hard_groups": hard_groups,
+        "formal_crop_hard_sample_ids": hard_ids,
+        "formal_crop_hard_sample_ids_sha256": hard_ids_digest,
+    }
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    inventoried = []
+    for path in (complete8, difficulty, summary_path):
+        inventoried.append(
+            {
+                "path": path.name,
+                "bytes": path.stat().st_size,
+                "sha256": _sha256(path),
+                "jsonl_records": (
+                    len(path.read_text(encoding="utf-8").splitlines())
+                    if path.suffix == ".jsonl"
+                    else None
+                ),
+            }
+        )
+    manifest = {
+        "schema_version": 1,
+        "artifact_type": "ui5_frozen_rollout_selection",
+        "status": "complete",
+        "immutable": True,
+        "success_marker": "_SUCCESS",
+        "training_input_policy": "resolve_once_at_run_start_no_hot_reload",
+        "technical_policy": "complete8_and_error_free_routes_only",
+        "source_set_sha256": source_set_sha256,
+        "sources": sources,
+        "files": inventoried,
+    }
+    (frozen / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (frozen / "_SUCCESS").write_text("complete\n", encoding="utf-8")
+
+    curriculum_dir = root / "curriculum"
+    curriculum_dir.mkdir()
+    curriculum_path = curriculum_dir / "curriculum_manifest.json"
+    curriculum = {
+        "schema_version": 1,
+        "expected_hard_groups": hard_groups,
+        "hard_groups": hard_groups,
+        "inputs": {
+            "rollout_difficulty_sha256": _sha256(complete8),
+            "frozen_selection_summary": {
+                "path": str(summary_path.resolve()),
+                "sha256": _sha256(summary_path),
+                "formal_crop_hard_groups": hard_groups,
+                "formal_crop_hard_sample_ids_sha256": hard_ids_digest,
+                "membership_source": "explicit_summary_ids",
+                "authoritative_complete8_path": str(complete8.resolve()),
+                "authoritative_complete8_sha256": _sha256(complete8),
+            },
+        },
+    }
+    curriculum["identity_digest"] = evaluation._canonical_json_sha256(curriculum)
+    curriculum_path.write_text(json.dumps(curriculum), encoding="utf-8")
+    inventoried_hard_groups = hard_groups_path or complete8
+    (curriculum_dir / "_SUCCESS.json").write_text(
+        json.dumps(
+            {
+                "complete": True,
+                "identity_digest": curriculum["identity_digest"],
+                "files": {
+                    "hard_groups.jsonl": {
+                        "bytes": inventoried_hard_groups.stat().st_size,
+                        "sha256": _sha256(inventoried_hard_groups),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return frozen, curriculum_path
 
 
 def frozen_crop_rollouts() -> list[dict]:
@@ -180,6 +299,42 @@ class CurriculumEvaluationTopologyTest(unittest.TestCase):
                 ):
                     self.assertIn(explicit, command)
 
+    def test_curriculum_identity_rejects_wrong_frozen_summary_or_id_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            frozen, curriculum_path = make_frozen_and_curriculum(root, 3)
+            selection = evaluation.resolve_frozen_selection(frozen)
+            original = json.loads(curriculum_path.read_text(encoding="utf-8"))
+            success_path = curriculum_path.parent / "_SUCCESS.json"
+
+            for field, message in (
+                ("sha256", "summary SHA-256"),
+                ("formal_crop_hard_sample_ids_sha256", "hard-ID digest"),
+            ):
+                with self.subTest(field=field):
+                    changed = json.loads(json.dumps(original))
+                    changed["inputs"]["frozen_selection_summary"][field] = "0" * 64
+                    changed.pop("identity_digest", None)
+                    changed["identity_digest"] = evaluation._canonical_json_sha256(
+                        changed
+                    )
+                    curriculum_path.write_text(json.dumps(changed), encoding="utf-8")
+                    success_path.write_text(
+                        json.dumps(
+                            {
+                                "complete": True,
+                                "identity_digest": changed["identity_digest"],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(ValueError, message):
+                        evaluation.curriculum_evaluation_identity(
+                            curriculum_path,
+                            selection=selection,
+                            expected_hard_groups=3,
+                        )
+
     def test_identity_guard_rejects_matcher_change_after_worker_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -193,6 +348,7 @@ class CurriculumEvaluationTopologyTest(unittest.TestCase):
             (processor / "tokenizer.json").write_text("{}", encoding="utf-8")
 
             worker = root / "worker.py"
+            orchestrator = root / "orchestrator.py"
             crop = root / "tiling.py"
             matcher = root / "matching.py"
             scorer = root / "scorer.py"
@@ -200,7 +356,28 @@ class CurriculumEvaluationTopologyTest(unittest.TestCase):
             resolved = root / "resolved.jsonl"
             detector = root / "detector.jsonl"
             plans = bundle / "base_scan_plans.json"
-            for path in (worker, crop, matcher, scorer, hard, resolved, detector, plans):
+            curriculum = root / "curriculum.json"
+            curriculum_success = root / "curriculum_success.json"
+            selection_files = {
+                name: root / f"selection_{name}"
+                for name in ("manifest", "summary", "complete8", "success")
+            }
+            eval_gt = root / "eval_gt.jsonl"
+            for path in (
+                worker,
+                orchestrator,
+                crop,
+                matcher,
+                scorer,
+                hard,
+                resolved,
+                detector,
+                plans,
+                curriculum,
+                curriculum_success,
+                eval_gt,
+                *selection_files.values(),
+            ):
                 path.write_text(path.name, encoding="utf-8")
 
             args = SimpleNamespace(
@@ -215,6 +392,10 @@ class CurriculumEvaluationTopologyTest(unittest.TestCase):
             identity = {
                 "candidate": evaluation.directory_inventory(checkpoint),
                 "processor": evaluation.directory_inventory(processor),
+                "orchestrator": {
+                    "path": str(orchestrator),
+                    "sha256": evaluation.file_sha256(orchestrator),
+                },
                 "worker_script": {"sha256": evaluation.file_sha256(worker)},
                 "crop_and_merge": {
                     "implementation_path": str(crop),
@@ -232,11 +413,37 @@ class CurriculumEvaluationTopologyTest(unittest.TestCase):
                     "resolved_source_sha256": evaluation.file_sha256(resolved),
                     "base_scan_plans_sha256": evaluation.file_sha256(plans),
                 },
+                "curriculum": {
+                    "path": str(curriculum),
+                    "sha256": evaluation.file_sha256(curriculum),
+                    "success_path": str(curriculum_success),
+                    "success_sha256": evaluation.file_sha256(curriculum_success),
+                },
+                "frozen_selection": {
+                    **{
+                        f"{name}_path": str(path)
+                        for name, path in selection_files.items()
+                    },
+                    **{
+                        f"{name}_sha256": evaluation.file_sha256(path)
+                        for name, path in selection_files.items()
+                    },
+                },
+                "evaluation_inputs": {
+                    "occlusion": {
+                        "path": str(eval_gt),
+                        "sha256": evaluation.file_sha256(eval_gt),
+                    }
+                },
             }
 
             evaluation.validate_identity_unchanged(args, identity)
             matcher.write_text("changed", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "metric matching implementation"):
+                evaluation.validate_identity_unchanged(args, identity)
+            matcher.write_text(matcher.name, encoding="utf-8")
+            orchestrator.write_text("changed", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "evaluation orchestrator"):
                 evaluation.validate_identity_unchanged(args, identity)
 
     def test_launcher_starts_all_five_before_first_wait(self) -> None:
@@ -773,6 +980,12 @@ class EvaluationBarrierAndMetricsTest(unittest.TestCase):
                     }
                 ],
             )
+            frozen, curriculum = make_frozen_and_curriculum(
+                root,
+                1,
+                hard_sample_ids=["hard-global"],
+                hard_groups_path=hard,
+            )
             args = evaluation.parse_args(
                 [
                     "--checkpoint",
@@ -787,6 +1000,10 @@ class EvaluationBarrierAndMetricsTest(unittest.TestCase):
                     str(hard),
                     "--rollout-bundle-root",
                     str(bundle),
+                    "--curriculum-manifest",
+                    str(curriculum),
+                    "--frozen-selection",
+                    str(frozen),
                     "--expected-hard-groups",
                     "1",
                     "--inference-crop-mode",
@@ -854,9 +1071,9 @@ class EvaluationBarrierAndMetricsTest(unittest.TestCase):
             metrics=result,
             evaluation_seconds=12.5,
             hard_summary={
-                "group_count": 72,
+                "group_count": 114,
                 "groups_improved": 9,
-                "groups_still_hard": 63,
+                "groups_still_hard": 105,
                 "parse_error_count": 2,
                 "runtime_error_count": 0,
             },
@@ -870,8 +1087,8 @@ class EvaluationBarrierAndMetricsTest(unittest.TestCase):
         self.assertEqual(output.getvalue().count("[UI5 TASK METRICS]"), 5)
         self.assertIn("samples=4 invalid=0", output.getvalue())
         self.assertIn(
-            "[UI5 HARD TRANSITION] step=200 groups=72 improved=9 "
-            "still_hard=63 parse_errors=2 runtime_errors=0",
+            "[UI5 HARD TRANSITION] step=200 groups=114 improved=9 "
+            "still_hard=105 parse_errors=2 runtime_errors=0",
             output.getvalue(),
         )
         self.assertIn("samples=20 invalid=0", output.getvalue())
@@ -931,6 +1148,12 @@ class EvaluationBarrierAndMetricsTest(unittest.TestCase):
             )
             hard = root / "hard.jsonl"
             write_jsonl(hard, hard_rows)
+            frozen, curriculum = make_frozen_and_curriculum(
+                root,
+                5,
+                hard_sample_ids=[str(row["sample_id"]) for row in hard_rows],
+                hard_groups_path=hard,
+            )
             worker = root / "fake_worker.py"
             worker.write_text(
                 """
@@ -1005,6 +1228,10 @@ out=Path(a.output_root)/a.run_name; out.mkdir(parents=True)
                 str(hard),
                 "--rollout-bundle-root",
                 str(bundle),
+                "--curriculum-manifest",
+                str(curriculum),
+                "--frozen-selection",
+                str(frozen),
                 "--expected-hard-groups",
                 "5",
                 "--inference-crop-mode",
@@ -1026,6 +1253,7 @@ out=Path(a.output_root)/a.run_name; out.mkdir(parents=True)
             status = json.loads((output / "evaluation_status.json").read_text(encoding="utf-8"))
             metrics = json.loads((output / "ui5_metrics.json").read_text(encoding="utf-8"))
             self.assertTrue(status["success"])
+            self.assertEqual(status["metrics_sha256"], _sha256(output / "ui5_metrics.json"))
             self.assertEqual(metrics["overall"]["joint_score"], 1.0)
             transitions = (output / "hard_transition.jsonl").read_text(
                 encoding="utf-8"
@@ -1035,6 +1263,73 @@ out=Path(a.output_root)/a.run_name; out.mkdir(parents=True)
                 (output / "hard_rollout4_summary.json").read_text(encoding="utf-8")
             )
             self.assertEqual(hard_summary["group_count"], 5)
+
+            verified = subprocess.run(
+                [*command, "--verify-existing-identity"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                verified.returncode, 0, verified.stdout + verified.stderr
+            )
+            self.assertIn("[UI5 EVALUATION REUSE VERIFIED]", verified.stdout)
+
+            # Relation-gate settings change worker behavior and therefore form
+            # part of the durable evaluation identity.
+            rejected_gate_config = subprocess.run(
+                [
+                    *command,
+                    "--verify-existing-identity",
+                    "--relation-gate-mode",
+                    "hard",
+                    "--relation-gate-threshold",
+                    "0.25",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(rejected_gate_config.returncode, 0)
+            self.assertIn(
+                "evaluation identity differs", rejected_gate_config.stderr
+            )
+
+            # A durable evaluation is reusable only while the exact metrics
+            # bytes named by evaluation_status.json remain unchanged.
+            metrics_path = output / "ui5_metrics.json"
+            original_metrics = metrics_path.read_bytes()
+            metrics_path.write_text('{"tampered":true}\n', encoding="utf-8")
+            rejected_metrics = subprocess.run(
+                [*command, "--verify-existing-identity"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(rejected_metrics.returncode, 0)
+            self.assertIn("metrics SHA-256 differs", rejected_metrics.stderr)
+            completed_status = json.loads(
+                (output / "evaluation_status.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(completed_status["success"])
+            self.assertEqual(completed_status["status"], "completed")
+            metrics_path.write_bytes(original_metrics)
+
+            # Same path/size is not enough: checkpoint content changes must
+            # invalidate reuse, while the already completed status remains intact.
+            (checkpoint / "weights.bin").write_bytes(b"changed")
+            rejected = subprocess.run(
+                [*command, "--verify-existing-identity"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            completed_status = json.loads(
+                (output / "evaluation_status.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(completed_status["success"])
+            self.assertEqual(completed_status["status"], "completed")
 
 
 if __name__ == "__main__":

@@ -343,9 +343,9 @@ def validate_checkpoint(
                             errors.append(
                                 "strict UI5 resume requires curriculum_mode=scheduled"
                             )
-                        if int(continuity.get("dataloader_state_version", -1)) < 7:
+                        if int(continuity.get("dataloader_state_version", -1)) < 8:
                             errors.append(
-                                "continuity_state requires dataloader state version >= 7"
+                                "continuity_state requires dataloader state version >= 8"
                             )
                         training_config = continuity.get(
                             "training_continuity_config"
@@ -458,9 +458,13 @@ def validate_checkpoint(
                         )
                         if not isinstance(rank_state, dict):
                             raise ValueError("root must be a mapping")
-                        if int(rank_state.get("version", -1)) < 7:
+                        from eaglevl.train.ui5_curriculum import (
+                            CurriculumGroupCycle,
+                            DeferredSampleLocations,
+                        )
+                        if int(rank_state.get("version", -1)) < 8:
                             raise ValueError(
-                                f"state version {rank_state.get('version')!r} is older than 7"
+                                f"state version {rank_state.get('version')!r} is older than 8"
                             )
                         worker_states = rank_state.get("worker_states")
                         if not isinstance(worker_states, dict) or not worker_states:
@@ -482,9 +486,114 @@ def validate_checkpoint(
                                 raise ValueError(
                                     f"worker state {worker_key} lacks iterator_states"
                                 )
+                            iterator_states = worker_state["iterator_states"]
+                            sampler_draws = worker_state.get("dataset_sampler_draws")
+                            if (
+                                not isinstance(sampler_draws, list)
+                                or len(sampler_draws) != len(iterator_states)
+                                or any(
+                                    isinstance(value, bool)
+                                    or not isinstance(value, int)
+                                    or value < 0
+                                    for value in sampler_draws
+                                )
+                            ):
+                                raise ValueError(
+                                    f"worker state {worker_key} has invalid dataset_sampler_draws"
+                                )
+                            deferred = worker_state.get("deferred_locations")
+                            if not isinstance(deferred, list):
+                                raise ValueError(
+                                    f"worker state {worker_key} lacks deferred_locations"
+                                )
+                            DeferredSampleLocations(
+                                deferred
+                                + list(worker_state.get("current_batch_locations", []))
+                                + list(worker_state.get("buffer_locations", [])),
+                                dataset_count=len(iterator_states),
+                                iterator_states=iterator_states,
+                            )
+                            for dataset_index, iterator_state in enumerate(iterator_states):
+                                if not isinstance(iterator_state, dict):
+                                    raise ValueError(
+                                        f"worker state {worker_key} iterator {dataset_index} "
+                                        "is not a mapping"
+                                    )
+                                group_state = iterator_state.get(
+                                    "curriculum_group_cycle"
+                                )
+                                if not isinstance(group_state, dict):
+                                    raise ValueError(
+                                        f"worker state {worker_key} iterator {dataset_index} "
+                                        "lacks curriculum_group_cycle"
+                                    )
+                                if (
+                                    int(group_state.get("seed", -1))
+                                    != int(iterator_state.get("seed", -2))
+                                    or int(group_state.get("global_idx", -1))
+                                    != int(iterator_state.get("global_idx", -2))
+                                ):
+                                    raise ValueError(
+                                        f"worker state {worker_key} iterator {dataset_index} "
+                                        "group cursor does not match iterator cursor"
+                                    )
                         stream_config = rank_state.get("stream_resume_config")
                         if not isinstance(stream_config, dict):
                             raise ValueError("missing stream_resume_config")
+                        dataset_configs = stream_config.get("datasets")
+                        if not isinstance(dataset_configs, list) or not dataset_configs:
+                            raise ValueError("stream_resume_config lacks datasets")
+                        group_cycles = []
+                        for dataset_index, dataset_config in enumerate(dataset_configs):
+                            if not isinstance(dataset_config, dict) or dataset_config.get(
+                                "sampling_unit"
+                            ) != "sample_group":
+                                raise ValueError(
+                                    f"stream dataset {dataset_index} is not sample-group sampled"
+                                )
+                            identity = dataset_config.get("curriculum_group_identity")
+                            if not isinstance(identity, dict):
+                                raise ValueError(
+                                    f"stream dataset {dataset_index} lacks group identity"
+                                )
+                            groups = identity.get("groups")
+                            if not isinstance(groups, list) or not groups:
+                                raise ValueError(
+                                    f"stream dataset {dataset_index} has invalid group identity"
+                                )
+                            cycle = CurriculumGroupCycle(
+                                {
+                                    str(group["group_id"]): tuple(group["views"])
+                                    for group in groups
+                                }
+                            )
+                            if cycle.identity != identity:
+                                raise ValueError(
+                                    f"stream dataset {dataset_index} group identity mismatch"
+                                )
+                            group_cycles.append(cycle)
+                        if len(group_cycles) != len(dataset_configs):
+                            raise ValueError("stream group cycle inventory is incomplete")
+                        for worker_key, worker_state in worker_states.items():
+                            iterator_states = worker_state["iterator_states"]
+                            if len(iterator_states) != len(group_cycles):
+                                raise ValueError(
+                                    f"worker state {worker_key} iterator/dataset count mismatch"
+                                )
+                            for dataset_index, (cycle, iterator_state) in enumerate(
+                                zip(group_cycles, iterator_states)
+                            ):
+                                try:
+                                    cycle.validate_iterator_state(
+                                        iterator_state["curriculum_group_cycle"],
+                                        seed=int(iterator_state["seed"]),
+                                        global_idx=int(iterator_state["global_idx"]),
+                                    )
+                                except BaseException as exc:
+                                    raise ValueError(
+                                        f"worker state {worker_key} iterator {dataset_index} "
+                                        f"has invalid group cursor: {exc}"
+                                    ) from exc
                         stream_config_digests.add(
                             hashlib.sha256(
                                 json.dumps(

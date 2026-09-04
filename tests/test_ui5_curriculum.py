@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import pickle
+import random
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,9 @@ from eaglevl.train.ui5_checkpoint_utils import (
     validate_checkpoint,
 )
 from eaglevl.train.ui5_curriculum import (
+    CURRICULUM_POOLS,
+    CurriculumGroupCycle,
+    DeferredSampleLocations,
     UI5CurriculumSchedule,
     canonical_curriculum_pool,
     curriculum_artifact_identity,
@@ -36,7 +40,7 @@ def formal_schedule() -> UI5CurriculumSchedule:
         matched_anchor_ratios=(0.25, 0.35, 0.30),
         global_replay_ratios=(0.15, 0.20, 0.40),
         llm_lrs=(1.0e-6, 7.0e-7, 5.0e-7),
-        expected_hard_groups=72,
+        expected_hard_groups=114,
     )
 
 
@@ -105,6 +109,27 @@ class CurriculumScheduleTest(unittest.TestCase):
                 ("hard", "anchor"),
             )
 
+    def test_pool_draw_counts_prefer_sampler_draws_over_iterator_cursors(self) -> None:
+        counts = curriculum_pool_draw_counts(
+            {
+                "worker_0": {
+                    "iterator_states": [
+                        {"global_idx": 9},
+                        {"global_idx": 8},
+                        {"global_idx": 7},
+                    ],
+                    # A deferred hard sample was selected again without moving
+                    # its already-advanced iterator cursor.
+                    "dataset_sampler_draws": [10, 8, 7],
+                }
+            },
+            CURRICULUM_POOLS,
+        )
+        self.assertEqual(
+            counts,
+            {"hard": 10, "matched_anchor": 8, "global_replay": 7},
+        )
+
     def test_outer_weights_preserve_relative_weights_inside_each_pool(self) -> None:
         schedule = formal_schedule()
         weights = schedule.effective_dataset_weights(
@@ -130,11 +155,12 @@ class CurriculumScheduleTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "payload changed"):
             schedule.validate_sampler_state(state, expected_global_step=400)
 
-    def test_stage_transition_flushes_only_pending_packed_samples(self) -> None:
+    def test_stage_transition_defers_every_pending_sample_without_cursor_loss(self) -> None:
         original = {
             "worker_0": {
                 "iterator_states": [{"seed": 1, "global_idx": 99}],
                 "sample_rng_state": (3, (1, 2, 3), None),
+                "dataset_sampler_draws": [99],
                 "current_batch_locations": [(0, 90)],
                 "buffer_locations": [(0, 91), (0, 92)],
             }
@@ -145,11 +171,185 @@ class CurriculumScheduleTest(unittest.TestCase):
         self.assertEqual(resumed["worker_0"]["current_batch_locations"], [])
         self.assertEqual(resumed["worker_0"]["buffer_locations"], [])
         self.assertEqual(
+            resumed["worker_0"]["deferred_locations"],
+            [(0, 90), (0, 91), (0, 92)],
+        )
+        self.assertEqual(
             resumed["worker_0"]["iterator_states"][0]["global_idx"], 99
         )
+        self.assertEqual(resumed["worker_0"]["dataset_sampler_draws"], [99])
         self.assertEqual(report["current_batch_samples"], 1)
         self.assertEqual(report["buffer_samples"], 2)
+        self.assertEqual(report["deferred_samples"], 3)
         self.assertEqual(original["worker_0"]["buffer_locations"], [(0, 91), (0, 92)])
+
+        queue = DeferredSampleLocations(
+            resumed["worker_0"]["deferred_locations"],
+            dataset_count=1,
+            iterator_states=resumed["worker_0"]["iterator_states"],
+        )
+        replayed = []
+        while len(queue):
+            replayed.append(queue.pop_for_dataset(0))
+        self.assertEqual(replayed, [(0, 90), (0, 91), (0, 92)])
+
+    def test_same_stage_resume_preserves_packing_state_byte_for_byte(self) -> None:
+        original = {
+            "worker_0": {
+                "iterator_states": [{"seed": 1, "global_idx": 9}],
+                "sample_rng_state": random.Random(5).getstate(),
+                "dataset_sampler_draws": [11],
+                "current_batch_locations": [(0, 7)],
+                "buffer_locations": [(0, 8)],
+                "deferred_locations": [(0, 6)],
+            }
+        }
+        resumed, report = prepare_worker_states_for_resume(
+            original, saved_sampling_stage=1, resume_sampling_stage=1
+        )
+        self.assertEqual(resumed, original)
+        self.assertIsNot(resumed, original)
+        self.assertEqual(report["deferred_samples"], 0)
+
+    def test_deferred_locations_survive_repeated_checkpoint_resume(self) -> None:
+        queue = DeferredSampleLocations(
+            [(1, 8), (0, 5), (1, 7)],
+            dataset_count=2,
+            iterator_states=[{"global_idx": 6}, {"global_idx": 9}],
+        )
+        self.assertEqual(queue.pop_for_dataset(1), (1, 7))
+        serialized = pickle.loads(pickle.dumps(queue.to_list()))
+        resumed = DeferredSampleLocations(
+            serialized,
+            dataset_count=2,
+            iterator_states=[{"global_idx": 6}, {"global_idx": 9}],
+        )
+        self.assertEqual(resumed.pop_for_dataset(0), (0, 5))
+        self.assertEqual(resumed.pop_for_dataset(1), (1, 8))
+        self.assertEqual(len(resumed), 0)
+
+    def test_phase_transition_replays_exact_group_views_before_new_cursor(self) -> None:
+        cycle = CurriculumGroupCycle(
+            {"a": ("a0", "a1"), "b": ("b0", "b1", "b2")}
+        )
+        original = {
+            "worker_0": {
+                "iterator_states": [{"seed": 37, "global_idx": 6}],
+                "sample_rng_state": random.Random(8).getstate(),
+                "dataset_sampler_draws": [6],
+                # Packing order need not equal iterator order.
+                "current_batch_locations": [(0, 5)],
+                "buffer_locations": [(0, 4)],
+            }
+        }
+        prepared, _ = prepare_worker_states_for_resume(
+            original, saved_sampling_stage=0, resume_sampling_stage=1
+        )
+        queue = DeferredSampleLocations(
+            prepared["worker_0"]["deferred_locations"],
+            dataset_count=1,
+            iterator_states=prepared["worker_0"]["iterator_states"],
+        )
+        locations = [queue.pop_for_dataset(0), queue.pop_for_dataset(0)]
+        locations.append((0, prepared["worker_0"]["iterator_states"][0]["global_idx"]))
+        replayed = [cycle.draw_at(location[1], seed=37) for location in locations]
+        expected = [cycle.draw_at(index, seed=37) for index in (4, 5, 6)]
+        self.assertEqual(replayed, expected)
+
+    def test_group_cycle_is_group_uniform_and_each_group_cycles_its_views(self) -> None:
+        views = {
+            "one-tile": ("o0",),
+            "three-tiles": ("t0", "t1", "t2"),
+            "seven-tiles": tuple(f"s{i}" for i in range(7)),
+        }
+        cycle = CurriculumGroupCycle(views)
+        draws = [
+            cycle.draw_at(index, seed=42)
+            for index in range(cycle.group_count * 14)
+        ]
+        group_counts = {
+            group_id: sum(draw["group_id"] == group_id for draw in draws)
+            for group_id in views
+        }
+        self.assertEqual(set(group_counts.values()), {14})
+        for group_id, group_views in views.items():
+            selected = [draw for draw in draws if draw["group_id"] == group_id]
+            for previous, current in zip(selected, selected[1:]):
+                self.assertEqual(
+                    current["view_index"],
+                    (previous["view_index"] + 1) % len(group_views),
+                )
+
+    def test_tile_cardinality_cannot_change_pool_or_group_sequence(self) -> None:
+        schedule = formal_schedule()
+        small = {
+            pool: CurriculumGroupCycle(
+                {f"{pool}-a": ("a0",), f"{pool}-b": ("b0",)}
+            )
+            for pool in CURRICULUM_POOLS
+        }
+        uneven = {
+            pool: CurriculumGroupCycle(
+                {
+                    f"{pool}-a": tuple(f"a{i}" for i in range(9)),
+                    f"{pool}-b": tuple(f"b{i}" for i in range(2)),
+                }
+            )
+            for pool in CURRICULUM_POOLS
+        }
+        rng = random.Random(42)
+        cursors = {pool: 0 for pool in CURRICULUM_POOLS}
+        small_sequence = []
+        uneven_sequence = []
+        # Four microbatches per optimizer step, with variable packed sample
+        # counts, exercises both gradient accumulation and packing cardinality.
+        packed_samples = (1, 3, 2, 4)
+        for optimizer_step in range(1, 1201):
+            weights = schedule.stage_for_optimizer_step(optimizer_step).pool_weights
+            for sample_count in packed_samples:
+                for _ in range(sample_count):
+                    pool_index = rng.choices(range(3), weights=weights)[0]
+                    pool = CURRICULUM_POOLS[pool_index]
+                    cursor = cursors[pool]
+                    small_draw = small[pool].draw_at(cursor, seed=123 + pool_index)
+                    uneven_draw = uneven[pool].draw_at(
+                        cursor, seed=123 + pool_index
+                    )
+                    small_sequence.append((pool, small_draw["group_id"]))
+                    uneven_sequence.append((pool, uneven_draw["group_id"]))
+                    cursors[pool] += 1
+            for pool in CURRICULUM_POOLS:
+                state = uneven[pool].iterator_state(
+                    seed=123 + CURRICULUM_POOLS.index(pool),
+                    global_idx=cursors[pool],
+                )
+                uneven[pool].validate_iterator_state(
+                    pickle.loads(pickle.dumps(state)),
+                    seed=123 + CURRICULUM_POOLS.index(pool),
+                    global_idx=cursors[pool],
+                )
+        self.assertEqual(small_sequence, uneven_sequence)
+
+    def test_group_cycle_arbitrary_resume_reproduces_future_sequence(self) -> None:
+        cycle = CurriculumGroupCycle(
+            {"a": ("a0", "a1"), "b": ("b0",), "c": ("c0", "c1", "c2")}
+        )
+        uninterrupted = [cycle.draw_at(index, seed=91) for index in range(300)]
+        # Check every optimizer boundary for gradient_accumulation_steps=4;
+        # packed microbatches contain a non-constant number of sample groups.
+        cursor = 0
+        packed_samples = (3, 1, 4, 2)
+        for _optimizer_step in range(30):
+            cursor += sum(packed_samples)
+            state = pickle.loads(
+                pickle.dumps(cycle.iterator_state(seed=91, global_idx=cursor))
+            )
+            cycle.validate_iterator_state(state, seed=91, global_idx=cursor)
+            resumed = [
+                cycle.draw_at(index, seed=state["seed"])
+                for index in range(state["global_idx"], 300)
+            ]
+            self.assertEqual(resumed, uninterrupted[cursor:])
 
     def test_environment_defaults_reproduce_formal_schedule(self) -> None:
         schedule = UI5CurriculumSchedule.from_environment(
@@ -159,6 +359,90 @@ class CurriculumScheduleTest(unittest.TestCase):
         self.assertIsNotNone(schedule)
         self.assertEqual(schedule.stages[1].first_optimizer_step, 401)
         self.assertEqual(schedule.stages[2].pool_weights, (0.30, 0.30, 0.40))
+
+    def test_training_continuity_binds_model_data_loss_and_implementation(self) -> None:
+        training = SimpleNamespace(
+            seed=42,
+            data_seed=None,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=4,
+            learning_rate=1.0e-6,
+            weight_decay=0.01,
+            adam_beta1=0.9,
+            adam_beta2=0.999,
+            adam_epsilon=1.0e-8,
+            max_grad_norm=1.0,
+            optim="adamw_torch",
+            bf16=True,
+            fp16=False,
+            max_steps=1200,
+            deepspeed=None,
+        )
+        model = SimpleNamespace(
+            model_name_or_path="/models/crop",
+            attn_implementation="sdpa",
+            enable_ui_relation=True,
+            relation_gate_loss_weight=1.0,
+            relation_slot_gate_loss_weight=0.1,
+            relation_attention_loss_weight=0.1,
+            relation_gate_threshold=0.5,
+            relation_focal_beta=0.999,
+            relation_focal_gamma=2.0,
+        )
+        data = SimpleNamespace(
+            max_seq_length=7268,
+            meta_path="/run/curriculum.json",
+            use_online_packing=True,
+            max_num_tokens_per_sample=7268,
+            max_num_tokens=7268,
+            packing_buffer_size=32,
+            ui_sampling_mode="fixed_ratio",
+        )
+        first = training_continuity_config(
+            training, formal_schedule(), model_args=model, data_args=data
+        )
+        unchanged = training_continuity_config(
+            training, formal_schedule(), model_args=model, data_args=data
+        )
+        self.assertEqual(first, unchanged)
+        self.assertEqual(first["model_semantics"]["attn_implementation"], "sdpa")
+        self.assertEqual(first["data_semantics"]["max_num_tokens"], 7268)
+        expected_implementations = {
+            "eaglevl/train/arguments.py",
+            "eaglevl/train/locany_finetune_magi_stream.py",
+            "eaglevl/train/ui5_checkpoint_utils.py",
+            "eaglevl/train/ui5_curriculum.py",
+            "eaglevl/model/locany/modeling_locateanything.py",
+            "eaglevl/model/locany/relation_modules.py",
+            "eaglevl/model/locany/ui_relation_setup.py",
+        }
+        self.assertEqual(set(first["implementation_sha256"]), expected_implementations)
+        self.assertTrue(
+            all(len(value) == 64 for value in first["implementation_sha256"].values())
+        )
+
+        changed_model = SimpleNamespace(**vars(model))
+        changed_model.relation_gate_loss_weight = 1.25
+        self.assertNotEqual(
+            first,
+            training_continuity_config(
+                training,
+                formal_schedule(),
+                model_args=changed_model,
+                data_args=data,
+            ),
+        )
+        changed_data = SimpleNamespace(**vars(data))
+        changed_data.max_num_tokens = 7000
+        self.assertNotEqual(
+            first,
+            training_continuity_config(
+                training,
+                formal_schedule(),
+                model_args=model,
+                data_args=changed_data,
+            ),
+        )
 
     def test_segment_mode_never_exports_a_duplicate_root_model(self) -> None:
         self.assertFalse(should_export_model_at_training_end(segment_mode=True))
@@ -177,9 +461,9 @@ class CurriculumScheduleTest(unittest.TestCase):
             hard.write_text("{}\n", encoding="utf-8")
             manifest = {
                 "schema_version": 1,
-                "expected_hard_groups": 72,
-                "hard_groups": 72,
-                "matched_anchor_groups": 72,
+                "expected_hard_groups": 114,
+                "hard_groups": 114,
+                "matched_anchor_groups": 114,
             }
             identity = hashlib.sha256(
                 json.dumps(
@@ -203,7 +487,7 @@ class CurriculumScheduleTest(unittest.TestCase):
                 },
             )
             result = curriculum_artifact_identity(recipe, formal_schedule())
-            self.assertEqual(result["hard_groups"], 72)
+            self.assertEqual(result["hard_groups"], 114)
             hard.write_text('{"changed": true}\n', encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
                 curriculum_artifact_identity(recipe, formal_schedule())
@@ -220,6 +504,9 @@ class StrictCheckpointTest(unittest.TestCase):
 
     def _make_checkpoint(self, root: Path, step: int, *, ranks: int = 1) -> Path:
         schedule = formal_schedule()
+        group_cycle = CurriculumGroupCycle(
+            {"sample-0": ("full_image:global",)}
+        )
         checkpoint = root / f"checkpoint-{step}"
         checkpoint.mkdir(parents=True)
         (checkpoint / "config.json").write_text("{}", encoding="utf-8")
@@ -242,7 +529,9 @@ class StrictCheckpointTest(unittest.TestCase):
             "datasets": [
                 {
                     "name": "hard",
-                    "rows": 72,
+                    "rows": 114,
+                    "sampling_unit": "sample_group",
+                    "curriculum_group_identity": group_cycle.identity,
                     "base_probability": 1.0,
                     "curriculum_pool": "hard",
                 }
@@ -250,15 +539,25 @@ class StrictCheckpointTest(unittest.TestCase):
             "curriculum_schedule": schedule.to_dict(),
         }
         rank_state = {
-            "version": 7,
+            "version": 8,
             "num_workers": 1,
             "stream_resume_config": stream_config,
             "worker_states": {
                 "worker_0": {
-                    "iterator_states": [{"seed": 42, "global_idx": step}],
+                    "iterator_states": [
+                        {
+                            "seed": 42,
+                            "global_idx": step,
+                            "curriculum_group_cycle": group_cycle.iterator_state(
+                                seed=42, global_idx=step
+                            ),
+                        }
+                    ],
                     "sample_rng_state": (3, (1, 2, 3), None),
+                    "dataset_sampler_draws": [step],
                     "current_batch_locations": [],
                     "buffer_locations": [],
+                    "deferred_locations": [],
                 }
             },
             "curriculum_sampler": schedule.sampler_state(
@@ -319,7 +618,7 @@ class StrictCheckpointTest(unittest.TestCase):
                     "storage": "not_applicable",
                 },
                 "curriculum_mode": "scheduled",
-                "dataloader_state_version": 7,
+                "dataloader_state_version": 8,
                 "curriculum_schedule_fingerprint": schedule.fingerprint,
                 "stream_resume_config_digest": stream_digest,
                 "training_continuity_config": training_config,
@@ -357,6 +656,54 @@ class StrictCheckpointTest(unittest.TestCase):
                 )
             self.assertTrue(report["valid"], report["errors"])
             self.assertEqual(checkpoint_step(latest), 400)
+
+    def test_scheduled_resume_rejects_legacy_v7_dataloader_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = self._make_checkpoint(Path(temporary), 400)
+            continuity_path = checkpoint / "continuity_state.json"
+            continuity = json.loads(continuity_path.read_text(encoding="utf-8"))
+            continuity["dataloader_state_version"] = 7
+            self._write_json(continuity_path, continuity)
+            rank_path = checkpoint / "dataloader_state_rank0.pt"
+            with rank_path.open("rb") as handle:
+                rank_state = pickle.load(handle)
+            rank_state["version"] = 7
+            with rank_path.open("wb") as handle:
+                pickle.dump(rank_state, handle)
+            with mock.patch.dict(sys.modules, {"torch": self._fake_torch()}):
+                report = validate_checkpoint(
+                    checkpoint, mode="resume", expected_ranks=1, strict=True
+                )
+            self.assertFalse(report["valid"])
+            self.assertTrue(
+                any("version >= 8" in error for error in report["errors"]),
+                report["errors"],
+            )
+            self.assertTrue(
+                any("older than 8" in error for error in report["errors"]),
+                report["errors"],
+            )
+
+    def test_strict_validation_rejects_corrupt_group_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = self._make_checkpoint(Path(temporary), 400)
+            rank_path = checkpoint / "dataloader_state_rank0.pt"
+            with rank_path.open("rb") as handle:
+                rank_state = pickle.load(handle)
+            rank_state["worker_states"]["worker_0"]["iterator_states"][0][
+                "curriculum_group_cycle"
+            ]["next_draw"]["view_id"] = "wrong-view"
+            with rank_path.open("wb") as handle:
+                pickle.dump(rank_state, handle)
+            with mock.patch.dict(sys.modules, {"torch": self._fake_torch()}):
+                report = validate_checkpoint(
+                    checkpoint, mode="resume", expected_ranks=1, strict=True
+                )
+            self.assertFalse(report["valid"])
+            self.assertTrue(
+                any("invalid group cursor" in error for error in report["errors"]),
+                report["errors"],
+            )
 
     def test_strict_validation_rejects_missing_rng(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

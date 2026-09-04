@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import tempfile
@@ -152,6 +153,15 @@ class RolloutSelectionMergeTests(unittest.TestCase):
             self.assertEqual(summary["input_rows"], 3)
             self.assertEqual(summary["unique_complete8_samples"], 2)
             self.assertEqual(summary["deduplicated_rows"], 1)
+            self.assertEqual(
+                summary["formal_crop_hard_sample_ids"], ["one", "two"]
+            )
+            self.assertEqual(
+                summary["formal_crop_hard_sample_ids_sha256"],
+                hashlib.sha256(
+                    merge._canonical(["one", "two"]).encode("utf-8")
+                ).hexdigest(),
+            )
             self.assertTrue((output / "_SUCCESS").is_file())
             manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
             self.assertTrue(manifest["immutable"])
@@ -173,6 +183,31 @@ class RolloutSelectionMergeTests(unittest.TestCase):
                     output,
                 )
             self.assertFalse(output.exists())
+
+    def test_structurally_ineligible_zero_of_four_is_not_a_formal_hard_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            eligible = complete_row("eligible-hard", correct=0)
+            excluded = complete_row("excluded-hard", correct=0)
+            excluded["grpo_source_eligible"] = False
+            excluded["annotation_anomaly"] = True
+
+            summary = merge.freeze(
+                [selection(root / "selection", [eligible, excluded])],
+                root / "frozen",
+            )
+
+            self.assertEqual(summary["crop_correct_count_distribution"]["0"], 2)
+            self.assertEqual(summary["formal_crop_hard_groups"], 1)
+            self.assertEqual(
+                summary["formal_crop_hard_sample_ids"], ["eligible-hard"]
+            )
+            self.assertEqual(
+                summary["formal_crop_hard_sample_ids_sha256"],
+                hashlib.sha256(
+                    merge._canonical(["eligible-hard"]).encode("utf-8")
+                ).hexdigest(),
+            )
 
     def test_conflicting_record_id_across_different_samples_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -233,6 +268,11 @@ class RolloutSelectionMergeTests(unittest.TestCase):
             self.assertEqual(summary["changed_route_scores"], 8)
             self.assertEqual(summary["changed_sample_classifications"], 1)
             self.assertEqual(summary["formal_crop_hard_groups"], 0)
+            self.assertEqual(summary["formal_crop_hard_sample_ids"], [])
+            self.assertEqual(
+                summary["formal_crop_hard_sample_ids_sha256"],
+                hashlib.sha256(merge._canonical([]).encode("utf-8")).hexdigest(),
+            )
             self.assertEqual(
                 summary["crop_correct_count_distribution"],
                 {"0": 0, "1": 0, "2": 0, "3": 0, "4": 1},

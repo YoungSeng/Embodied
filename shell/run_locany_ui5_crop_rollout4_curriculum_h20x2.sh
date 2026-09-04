@@ -13,7 +13,10 @@ source "${SCRIPT_DIR}/bash_error_report.sh"
 WORKSPACE="${WORKSPACE:-/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace}"
 ENV_DIR="${ENV_DIR:-${WORKSPACE}/conda_envs/LocateAnything}"
 PYTHON_BIN="${PYTHON_BIN:-${ENV_DIR}/bin/python}"
-RUN_NAME="${RUN_NAME:-locany-ui5-crop-rollout4-curriculum-h20x2-20260904}"
+SUGGESTED_RUN_NAME="locany-ui5-crop-rollout4-curriculum-hard114-h20x2-sdpa7268-v1"
+RUN_NAME="${RUN_NAME:-}"
+[[ -n "${RUN_NAME}" ]] || locany_die 18 \
+  "RUN_NAME must be explicit so each formal run has an intentional OUTPUT_DIR; suggested: ${SUGGESTED_RUN_NAME}"
 OUTPUT_DIR="${OUTPUT_DIR:-${WORKSPACE}/gui_models/Embodied-ui5-det-crop/${RUN_NAME}}"
 
 MODEL_PATH="${MODEL_PATH:-${WORKSPACE}/gui_models/Embodied-ui5-det-crop/locany-ui5-v5-croponly-sourcebalanced-a800x4-20260830/checkpoint-12000}"
@@ -35,7 +38,10 @@ ROLLOUT_ROOT="${ROLLOUT_ROOT:-${WORKSPACE}/gui_rollouts/ui5-train-rollout8-h20x2
 # complete8.jsonl retains prompt/GT and the technical-error evidence that the
 # compact sample_difficulty projection intentionally omits.  The recipe builder
 # also cross-checks the compact sibling when one is supplied explicitly.
-ROLLOUT_DIFFICULTY="${ROLLOUT_DIFFICULTY:-${ROLLOUT_ROOT}/selection/complete8.jsonl}"
+FROZEN_SELECTION="${FROZEN_SELECTION:-}"
+[[ -n "${FROZEN_SELECTION}" ]] || locany_die 19 \
+  "FROZEN_SELECTION must name one immutable selection produced by merge_ui5_rollout_selections.py"
+ROLLOUT_DIFFICULTY="${FROZEN_SELECTION}/complete8.jsonl"
 CURRICULUM_SOURCE_RECIPE="${CURRICULUM_SOURCE_RECIPE:-}"
 CURRICULUM_DATA_DIR="${CURRICULUM_DATA_DIR:-${OUTPUT_DIR}/curriculum_data}"
 META_PATH="${CURRICULUM_DATA_DIR}/ui5_crop_rollout4_curriculum.json"
@@ -59,11 +65,14 @@ HARD_RATIOS="${HARD_RATIOS:-0.60,0.45,0.30}"
 ANCHOR_RATIOS="${ANCHOR_RATIOS:-0.25,0.35,0.30}"
 GLOBAL_REPLAY_RATIOS="${GLOBAL_REPLAY_RATIOS:-0.15,0.20,0.40}"
 LLM_LRS="${LLM_LRS:-1e-6,7e-7,5e-7}"
-EXPECTED_HARD_GROUPS="${EXPECTED_HARD_GROUPS:-72}"
 SEED="${SEED:-42}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
+MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-7268}"
+MAX_NUM_TOKENS_PER_SAMPLE="${MAX_NUM_TOKENS_PER_SAMPLE:-7268}"
+MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-7268}"
 
 if [[ "${ROLLING_CHECKPOINT_DIR}" = /* ]]; then
   ROLLING_CHECKPOINT_PATH="${ROLLING_CHECKPOINT_DIR}"
@@ -91,20 +100,39 @@ require_equal HARD_RATIOS "${HARD_RATIOS}" 0.60,0.45,0.30
 require_equal ANCHOR_RATIOS "${ANCHOR_RATIOS}" 0.25,0.35,0.30
 require_equal GLOBAL_REPLAY_RATIOS "${GLOBAL_REPLAY_RATIOS}" 0.15,0.20,0.40
 require_equal LLM_LRS "${LLM_LRS}" 1e-6,7e-7,5e-7
-require_equal EXPECTED_HARD_GROUPS "${EXPECTED_HARD_GROUPS}" 72
 require_equal SEED "${SEED}" 42
 require_equal CUDA_VISIBLE_DEVICES "${CUDA_VISIBLE_DEVICES}" 0,1
 require_equal NNODES "${NNODES}" 1
 require_equal NODE_RANK "${NODE_RANK}" 0
+require_equal ATTN_IMPLEMENTATION "${ATTN_IMPLEMENTATION}" sdpa
+require_equal MAX_SEQ_LENGTH "${MAX_SEQ_LENGTH}" 7268
+require_equal MAX_NUM_TOKENS_PER_SAMPLE "${MAX_NUM_TOKENS_PER_SAMPLE}" 7268
+require_equal MAX_NUM_TOKENS "${MAX_NUM_TOKENS}" 7268
 
 [[ -x "${PYTHON_BIN}" ]] || locany_die 21 "Python is missing: ${PYTHON_BIN}"
 [[ -d "${MODEL_PATH}" ]] || locany_die 22 "Original crop checkpoint is missing: ${MODEL_PATH}"
 [[ -d "${PROCESSOR_PATH}" ]] || locany_die 23 "Processor/tokenizer snapshot is missing: ${PROCESSOR_PATH:-<unset>}"
 [[ -d "${ROLLOUT_BUNDLE_ROOT}" ]] || locany_die 24 "Rollout bundle is missing: ${ROLLOUT_BUNDLE_ROOT}"
+[[ -d "${FROZEN_SELECTION}" ]] || locany_die 25 "Frozen selection is missing: ${FROZEN_SELECTION}"
 [[ -s "${ROLLOUT_DIFFICULTY}" ]] || locany_die 25 "Rollout difficulty file is missing: ${ROLLOUT_DIFFICULTY}"
 [[ -d "${EVAL_INPUT_DIR}" ]] || locany_die 26 "UI5 full-evaluation input is missing: ${EVAL_INPUT_DIR}"
 [[ -s "${EVAL_DETECTOR_MANIFEST}" ]] || locany_die 27 "GT-free detector crop manifest is missing: ${EVAL_DETECTOR_MANIFEST}"
 [[ -s "${SCORER_SCRIPT}" ]] || locany_die 28 "Canonical evaluator is missing: ${SCORER_SCRIPT}"
+
+# The formal hard-set cardinality is data, not a launcher constant.  The
+# resolver verifies the immutable publication and its exact file inventory
+# before returning the count recorded in summary.json.
+if [[ -v EXPECTED_HARD_GROUPS && -n "${EXPECTED_HARD_GROUPS}" ]]; then
+  echo "[WARN] inherited EXPECTED_HARD_GROUPS is ignored; deriving from ${FROZEN_SELECTION}/summary.json"
+fi
+readonly EXPECTED_HARD_GROUPS="$(
+  "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/ui5_frozen_selection.py" \
+    --frozen-selection "${FROZEN_SELECTION}" \
+    --field formal_crop_hard_groups
+)"
+[[ "${EXPECTED_HARD_GROUPS}" =~ ^[1-9][0-9]*$ ]] || \
+  locany_die 29 "Frozen selection returned an invalid hard-group count: ${EXPECTED_HARD_GROUPS}"
+echo "[FROZEN SELECTION] root=${FROZEN_SELECTION} formal_crop_hard_groups=${EXPECTED_HARD_GROUPS}"
 
 mkdir -p \
   "${OUTPUT_DIR}/logs" \
@@ -121,7 +149,7 @@ export CURRICULUM_MODE TOTAL_STEPS EVAL_INTERVAL_STEPS ROLLING_CHECKPOINT_DIR
 export CHECKPOINT_SAVE_POLICY UI5_GPU0_WORKERS UI5_GPU1_WORKERS
 export UI5_EVAL_HEARTBEAT_SECONDS
 export HARD_RATIOS ANCHOR_RATIOS GLOBAL_REPLAY_RATIOS LLM_LRS
-export EXPECTED_HARD_GROUPS SEED
+export FROZEN_SELECTION ROLLOUT_DIFFICULTY EXPECTED_HARD_GROUPS SEED
 export MAX_STEPS="${TOTAL_STEPS}"
 export SAVE_STEPS="${EVAL_INTERVAL_STEPS}"
 export SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-2}"
@@ -132,10 +160,8 @@ export WARMUP_STEPS=0
 export GPUS=2
 export GPU_COUNT=2
 export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
-export ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-magi}"
-export MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-8192}"
-export MAX_NUM_TOKENS_PER_SAMPLE="${MAX_NUM_TOKENS_PER_SAMPLE:-8192}"
-export MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-12800}"
+export ATTN_IMPLEMENTATION MAX_SEQ_LENGTH MAX_NUM_TOKENS_PER_SAMPLE MAX_NUM_TOKENS
+export CHECK_MAGI_IMPORT=0
 # Crop images are already materialized and digest-bound by the curriculum
 # builder.  Keep the legacy on-the-fly crop-audit switch disabled (it would
 # reject the intentional full-image replay dataset), but report the actual
@@ -163,6 +189,10 @@ printf '%-30s %s\n' \
   "OUTPUT_DIR" "${OUTPUT_DIR}" \
   "ROLLING_CHECKPOINT" "${ROLLING_CHECKPOINT_PATH}" \
   "ROLLOUT_DIFFICULTY" "${ROLLOUT_DIFFICULTY}" \
+  "FROZEN_SELECTION" "${FROZEN_SELECTION}" \
+  "EXPECTED_HARD_GROUPS" "${EXPECTED_HARD_GROUPS}" \
+  "ATTN_IMPLEMENTATION" "${ATTN_IMPLEMENTATION}" \
+  "TOKEN_LIMITS" "${MAX_SEQ_LENGTH}/${MAX_NUM_TOKENS_PER_SAMPLE}/${MAX_NUM_TOKENS}" \
   "EVAL_DETECTOR_MANIFEST" "${EVAL_DETECTOR_MANIFEST}" \
   "CUDA_VISIBLE_DEVICES" "${CUDA_VISIBLE_DEVICES}" \
   "NNODES" "${NNODES}" \
@@ -202,6 +232,7 @@ print(
     f"anchor_groups={state['matched_anchor_groups']} "
     f"anchor_tile_records={pools['matched_anchor']['crop_training_records']} "
     f"anchor_content_missing_global={pools['matched_anchor']['content_missing_global_records']} "
+    f"replay_crop_records={pools['global_replay']['crop_training_records']} "
     f"replay_full_image_records={pools['global_replay']['retention_full_image_records']} "
     f"crop_assets={len(state['crop_assets'])}",
     flush=True,
@@ -296,10 +327,6 @@ PY
 
 evaluate_and_register() {
   local step="$1" candidate="$2" resume_from="$3"
-  if evaluation_recorded "${step}"; then
-    echo "[EVAL REUSE] step=${step} is already durable in checkpoints.json and Excel"
-    return 0
-  fi
 
   # Trainer checkpoints contain the full weights/config but do not
   # necessarily carry the Python files referenced by config.auto_map.  Patch
@@ -336,7 +363,10 @@ evaluate_and_register() {
       --total-steps "${TOTAL_STEPS}"
     --hard-groups-jsonl "${HARD_GROUPS_JSONL}"
     --rollout-bundle-root "${ROLLOUT_BUNDLE_ROOT}"
+    --curriculum-manifest "${CURRICULUM_DATA_DIR}/curriculum_manifest.json"
+    --frozen-selection "${FROZEN_SELECTION}"
     --expected-hard-groups "${EXPECTED_HARD_GROUPS}"
+    --step "${step}"
     --seed "${SEED}"
     --gpu-devices "${CUDA_VISIBLE_DEVICES}"
     --gpu0-workers "${UI5_GPU0_WORKERS}"
@@ -365,6 +395,13 @@ evaluate_and_register() {
     --tile-nms-iou "${EVAL_TILE_NMS_IOU:-0.50}"
     --evaluator-iou-threshold "${EVAL_IOU_THRESHOLD:-0.10}"
   )
+  if evaluation_recorded "${step}"; then
+    eval_command+=(--verify-existing-identity)
+    echo "[EVAL REUSE CHECK] step=${step} verifying checkpoint/curriculum/selection/eval identity"
+    "${eval_command[@]}"
+    echo "[EVAL REUSE] step=${step} is durable and identity-exact"
+    return 0
+  fi
   if (( overwrite == 1 )); then
     eval_command+=(--overwrite)
   fi

@@ -14,6 +14,8 @@ class CurriculumPipelineContractTests(unittest.TestCase):
     def test_formal_launcher_contains_the_complete_200_step_loop(self) -> None:
         source = LAUNCHER.read_text(encoding="utf-8")
         for contract in (
+            'SUGGESTED_RUN_NAME="locany-ui5-crop-rollout4-curriculum-hard114-h20x2-sdpa7268-v1"',
+            'RUN_NAME="${RUN_NAME:-}"',
             'TOTAL_STEPS="${TOTAL_STEPS:-1200}"',
             'EVAL_INTERVAL_STEPS="${EVAL_INTERVAL_STEPS:-200}"',
             'ROLLING_CHECKPOINT_DIR="${ROLLING_CHECKPOINT_DIR:-resume/latest}"',
@@ -25,9 +27,13 @@ class CurriculumPipelineContractTests(unittest.TestCase):
             'ANCHOR_RATIOS="${ANCHOR_RATIOS:-0.25,0.35,0.30}"',
             'GLOBAL_REPLAY_RATIOS="${GLOBAL_REPLAY_RATIOS:-0.15,0.20,0.40}"',
             'LLM_LRS="${LLM_LRS:-1e-6,7e-7,5e-7}"',
-            'EXPECTED_HARD_GROUPS="${EXPECTED_HARD_GROUPS:-72}"',
             'SEED="${SEED:-42}"',
-            'ROLLOUT_DIFFICULTY="${ROLLOUT_DIFFICULTY:-${ROLLOUT_ROOT}/selection/complete8.jsonl}"',
+            'FROZEN_SELECTION="${FROZEN_SELECTION:-}"',
+            'ROLLOUT_DIFFICULTY="${FROZEN_SELECTION}/complete8.jsonl"',
+            'ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"',
+            'MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-7268}"',
+            'MAX_NUM_TOKENS_PER_SAMPLE="${MAX_NUM_TOKENS_PER_SAMPLE:-7268}"',
+            'MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-7268}"',
             'NNODES="${NNODES:-1}"',
             'NODE_RANK="${NODE_RANK:-0}"',
             'require_equal NNODES "${NNODES}" 1',
@@ -36,6 +42,13 @@ class CurriculumPipelineContractTests(unittest.TestCase):
         ):
             self.assertIn(contract, source)
         self.assertIn("evaluate_and_register 0", source)
+        self.assertIn("RUN_NAME must be explicit", source)
+        self.assertNotIn(
+            "locany-ui5-crop-rollout4-curriculum-h20x2-20260904", source
+        )
+        self.assertIn("scripts/ui5_frozen_selection.py", source)
+        self.assertIn("--field formal_crop_hard_groups", source)
+        self.assertNotIn("EXPECTED_HARD_GROUPS:-", source)
         self.assertIn("while (( current_step < TOTAL_STEPS )); do", source)
         self.assertIn('export LOCANY_STOP_AFTER_STEP="${next_step}"', source)
         self.assertIn('bash "${PROJECT_ROOT}/shell/train_locany_ui_defect.sh"', source)
@@ -45,6 +58,9 @@ class CurriculumPipelineContractTests(unittest.TestCase):
         self.assertIn('--heartbeat-seconds "${UI5_EVAL_HEARTBEAT_SECONDS}"', source)
         self.assertIn("scripts/patch_locany_checkpoint.py", source)
         self.assertIn("--validate-relation-weights", source)
+        self.assertIn('--curriculum-manifest "${CURRICULUM_DATA_DIR}/curriculum_manifest.json"', source)
+        self.assertIn('--frozen-selection "${FROZEN_SELECTION}"', source)
+        self.assertIn("--verify-existing-identity", source)
         self.assertIn("--move-source", source)
         self.assertIn("--strict", source)
         self.assertIn("export SAVE_EVERY_N_HOURS=0", source)
@@ -82,12 +98,33 @@ class CurriculumPipelineContractTests(unittest.TestCase):
         self.assertIn('if self.is_world_process_zero():', source)
 
         preflight = PREFLIGHT.read_text(encoding="utf-8")
+        self.assertIn(
+            'SUGGESTED_RUN_NAME="locany-ui5-crop-rollout4-curriculum-hard114-h20x2-sdpa7268-v1"',
+            preflight,
+        )
+        self.assertIn('RUN_NAME="${RUN_NAME:-}"', preflight)
+        self.assertIn("RUN_NAME must be explicit", preflight)
+        self.assertNotIn(
+            "locany-ui5-crop-rollout4-curriculum-h20x2-20260904", preflight
+        )
         self.assertIn('export CUDA_VISIBLE_DEVICES=""', preflight)
         self.assertIn('NNODES="${NNODES:-1}"', preflight)
         self.assertIn('NODE_RANK="${NODE_RANK:-0}"', preflight)
         self.assertIn('requires NNODES=1', preflight)
         self.assertIn('requires NODE_RANK=0', preflight)
         self.assertIn('export NNODES NODE_RANK', preflight)
+        self.assertIn("scripts/ui5_frozen_selection.py", preflight)
+        self.assertIn("immutable frozen selection and derived hard-group count", preflight)
+        self.assertNotIn("magi_attention\", \"flash_attn", preflight)
+        self.assertIn(
+            "all_gt_free_detector_scan_base_tiles_except_content_missing_full_image",
+            preflight,
+        )
+        self.assertIn(
+            'for pool in ("hard", "matched_anchor", "global_replay"):',
+            preflight,
+        )
+        self.assertNotIn("global replay is not an all-full-image retention pool", preflight)
         self.assertIn('PREFLIGHT_MODE="${PREFLIGHT_MODE:-fast}"', preflight)
         self.assertIn("--full", preflight)
         self.assertIn("build_ui5_curriculum_recipe.py", preflight)
@@ -107,6 +144,22 @@ class CurriculumPipelineContractTests(unittest.TestCase):
             preflight,
         )
         self.assertNotIn('bash "${PROJECT_ROOT}/shell/train_locany_ui_defect.sh"', preflight)
+
+    def test_scheduled_stream_samples_groups_and_persists_exact_v8_state(self) -> None:
+        source = TRAINER.read_text(encoding="utf-8")
+        for contract in (
+            "curriculum_group_sampling=scheduled_curriculum",
+            "CurriculumGroupCycle(group_views)",
+            "dataset.curriculum_draw_length",
+            "dataset_sampler_draws[ds_idx] += 1",
+            "deferred_locations.pop_for_dataset(ds_idx)",
+            "deferred_locations=deferred_locations.to_list()",
+            "'version': 8",
+            '"dataloader_state_version": 8',
+        ):
+            self.assertIn(contract, source)
+        self.assertIn("exact curriculum group/view failed", source)
+        self.assertNotIn("discarded pending current_batch", source)
 
     def test_durable_eval_reuse_requires_matching_json_and_workbook(self) -> None:
         source = LAUNCHER.read_text(encoding="utf-8")

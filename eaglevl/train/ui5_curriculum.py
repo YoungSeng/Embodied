@@ -12,6 +12,8 @@ import copy
 import hashlib
 import json
 import math
+import random
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -19,6 +21,8 @@ from typing import Any, Mapping, Sequence
 
 CURRICULUM_STATE_VERSION = 1
 CURRICULUM_POOLS = ("hard", "matched_anchor", "global_replay")
+GROUP_CYCLE_STATE_VERSION = 1
+GROUP_CYCLE_POLICY = "uniform_group_epoch_shuffle_group_seeded_cyclic_view_v1"
 _POOL_ALIASES = {
     "hard": "hard",
     "hard_matched": "hard",
@@ -57,16 +61,235 @@ def canonical_curriculum_pool(value: str) -> str:
     return canonical
 
 
+class CurriculumGroupCycle:
+    """Deterministic group-uniform sampling with a cyclic view per group.
+
+    One iterator draw always selects exactly one sample group.  Every group is
+    visited once per shuffled group epoch, independent of how many crop views
+    it owns.  A group's successive visits advance one position in its own view
+    cycle.  ``seed`` and the scalar ``global_idx`` therefore fully determine
+    both the next group and the next view, which keeps the state compact and
+    exactly reconstructible across DataLoader worker restarts.
+    """
+
+    def __init__(self, group_views: Mapping[str, Sequence[str]]) -> None:
+        if not isinstance(group_views, Mapping) or not group_views:
+            raise ValueError("group_views must be a non-empty mapping")
+        normalized: dict[str, tuple[str, ...]] = {}
+        for raw_group_id, raw_views in group_views.items():
+            group_id = str(raw_group_id).strip()
+            if not group_id:
+                raise ValueError("curriculum group id must not be empty")
+            if not isinstance(raw_views, Sequence) or isinstance(
+                raw_views, (str, bytes)
+            ):
+                raise ValueError(f"group {group_id!r} views must be a sequence")
+            views = tuple(str(view).strip() for view in raw_views)
+            if not views or any(not view for view in views):
+                raise ValueError(f"group {group_id!r} must contain non-empty views")
+            if len(set(views)) != len(views):
+                raise ValueError(f"group {group_id!r} contains duplicate views")
+            normalized[group_id] = views
+        self._group_views = {
+            group_id: normalized[group_id] for group_id in sorted(normalized)
+        }
+        self._group_ids = tuple(self._group_views)
+        identity = {
+            "schema_version": GROUP_CYCLE_STATE_VERSION,
+            "policy": GROUP_CYCLE_POLICY,
+            "groups": [
+                {"group_id": group_id, "views": list(self._group_views[group_id])}
+                for group_id in self._group_ids
+            ],
+        }
+        encoded = json.dumps(
+            identity,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self._identity = identity
+        self._fingerprint = hashlib.sha256(encoded).hexdigest()
+        self._order_cache: dict[tuple[int, int], tuple[str, ...]] = {}
+        self._offset_cache: dict[tuple[int, str], int] = {}
+
+    @property
+    def group_count(self) -> int:
+        return len(self._group_ids)
+
+    @property
+    def fingerprint(self) -> str:
+        return self._fingerprint
+
+    @property
+    def identity(self) -> dict[str, Any]:
+        return copy.deepcopy(self._identity)
+
+    def _group_order(self, *, seed: int, epoch_index: int) -> tuple[str, ...]:
+        key = (int(seed), int(epoch_index))
+        cached = self._order_cache.get(key)
+        if cached is None:
+            order = list(self._group_ids)
+            random.Random(key[0] + key[1] * 999983).shuffle(order)
+            cached = tuple(order)
+            self._order_cache[key] = cached
+        return cached
+
+    def _initial_view_offset(
+        self, *, seed: int, group_id: str, view_count: int
+    ) -> int:
+        key = (int(seed), str(group_id))
+        cached = self._offset_cache.get(key)
+        if cached is not None:
+            return cached
+        encoded = json.dumps(
+            [GROUP_CYCLE_POLICY, key[0], key[1]],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        offset = int.from_bytes(hashlib.sha256(encoded).digest()[:8], "big") % int(
+            view_count
+        )
+        self._offset_cache[key] = offset
+        return offset
+
+    def draw_at(self, global_idx: int, *, seed: int) -> dict[str, Any]:
+        draw_index = int(global_idx)
+        if draw_index < 0 or isinstance(global_idx, bool):
+            raise ValueError("group draw global_idx must be a non-negative integer")
+        try:
+            if float(global_idx) != draw_index:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "group draw global_idx must be a non-negative integer"
+            ) from exc
+        epoch_index, epoch_position = divmod(draw_index, self.group_count)
+        group_id = self._group_order(
+            seed=int(seed), epoch_index=epoch_index
+        )[epoch_position]
+        views = self._group_views[group_id]
+        view_index = (
+            self._initial_view_offset(
+                seed=int(seed), group_id=group_id, view_count=len(views)
+            )
+            + epoch_index
+        ) % len(views)
+        return {
+            "global_idx": draw_index,
+            "epoch_index": epoch_index,
+            "epoch_position": epoch_position,
+            "group_id": group_id,
+            "group_draw_index": epoch_index,
+            "view_index": view_index,
+            "view_id": views[view_index],
+        }
+
+    def iterator_state(self, *, seed: int, global_idx: int) -> dict[str, Any]:
+        return {
+            "schema_version": GROUP_CYCLE_STATE_VERSION,
+            "policy": GROUP_CYCLE_POLICY,
+            "fingerprint": self.fingerprint,
+            "seed": int(seed),
+            "global_idx": int(global_idx),
+            "group_count": self.group_count,
+            "next_draw": self.draw_at(global_idx, seed=int(seed)),
+        }
+
+    def validate_iterator_state(
+        self, state: Mapping[str, Any], *, seed: int, global_idx: int
+    ) -> None:
+        expected = self.iterator_state(seed=int(seed), global_idx=int(global_idx))
+        if dict(state) != expected:
+            raise RuntimeError(
+                "curriculum group iterator state changed across resume: "
+                f"saved={dict(state)}, expected={expected}"
+            )
+
+
+class DeferredSampleLocations:
+    """Per-dataset FIFO queues for sampled-but-not-yet-trained locations."""
+
+    def __init__(
+        self,
+        locations: Sequence[Sequence[int]],
+        *,
+        dataset_count: int,
+        iterator_states: Sequence[Mapping[str, Any]] | None = None,
+    ) -> None:
+        count = int(dataset_count)
+        if count <= 0:
+            raise ValueError("dataset_count must be positive")
+        if not isinstance(locations, Sequence) or isinstance(locations, (str, bytes)):
+            raise ValueError("deferred sample locations must be a sequence")
+        if iterator_states is not None and len(iterator_states) != count:
+            raise ValueError("iterator state count does not match dataset_count")
+        normalized: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for position, raw in enumerate(locations):
+            if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)) or len(raw) != 2:
+                raise ValueError(f"invalid deferred sample location at index {position}")
+            values: list[int] = []
+            for value in raw:
+                if isinstance(value, bool):
+                    raise ValueError(
+                        f"invalid deferred sample location at index {position}"
+                    )
+                try:
+                    integer = int(value)
+                    if integer < 0 or float(value) != integer:
+                        raise ValueError
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"invalid deferred sample location at index {position}"
+                    ) from exc
+                values.append(integer)
+            location = (values[0], values[1])
+            if location[0] >= count:
+                raise ValueError(
+                    f"deferred sample dataset index is out of range: {location}"
+                )
+            if location in seen:
+                raise ValueError(f"duplicate deferred sample location: {location}")
+            if iterator_states is not None:
+                cursor = int(iterator_states[location[0]].get("global_idx", -1))
+                if location[1] >= cursor:
+                    raise ValueError(
+                        "deferred sample location is not behind its iterator cursor: "
+                        f"location={location}, cursor={cursor}"
+                    )
+            seen.add(location)
+            normalized.append(location)
+        self._queues = [deque() for _ in range(count)]
+        for dataset_index, global_index in sorted(normalized):
+            self._queues[dataset_index].append((dataset_index, global_index))
+
+    def __len__(self) -> int:
+        return sum(len(queue) for queue in self._queues)
+
+    def pop_for_dataset(self, dataset_index: int) -> tuple[int, int] | None:
+        index = int(dataset_index)
+        if index < 0 or index >= len(self._queues):
+            raise IndexError(f"dataset index out of range: {dataset_index}")
+        return self._queues[index].popleft() if self._queues[index] else None
+
+    def to_list(self) -> list[tuple[int, int]]:
+        return [location for queue in self._queues for location in queue]
+
+    def counts(self) -> list[int]:
+        return [len(queue) for queue in self._queues]
+
+
 def curriculum_pool_draw_counts(
     worker_states: Mapping[str, Any], dataset_pools: Sequence[str]
 ) -> dict[str, int]:
-    """Count cumulative iterator draws by curriculum pool for one rank.
+    """Count cumulative sampler selections by curriculum pool for one rank.
 
-    ``DeterministicIterator.global_idx`` is the durable per-dataset draw cursor
-    persisted in every worker snapshot.  Summing those cursors is therefore a
-    resume-stable count of actual sampler draws (including repeated epochs and
-    samples subsequently rejected for length), unlike an estimate from target
-    ratios.  The trainer all-reduces this rank-local result before reporting it.
+    New checkpoints persist ``dataset_sampler_draws`` separately from iterator
+    cursors.  That distinction matters when a phase-boundary packing backlog is
+    returned: choosing a pool consumes one sampler draw but reuses an already
+    materialized iterator location.  Version-7 checkpoints have no backlog and
+    safely fall back to their per-dataset iterator cursors.
     """
 
     if not isinstance(worker_states, Mapping):
@@ -88,24 +311,39 @@ def curriculum_pool_draw_counts(
                 f"{worker_key}.iterator_states length {len(iterator_states)} does not "
                 f"match dataset_pools length {len(canonical_pools)}"
             )
-        for dataset_index, (pool, iterator_state) in enumerate(
-            zip(canonical_pools, iterator_states)
-        ):
-            if not isinstance(iterator_state, Mapping):
+        sampler_draws = raw_worker.get("dataset_sampler_draws")
+        if sampler_draws is None:
+            raw_counts = []
+            for dataset_index, iterator_state in enumerate(iterator_states):
+                if not isinstance(iterator_state, Mapping):
+                    raise ValueError(
+                        f"{worker_key}.iterator_states[{dataset_index}] must be a mapping"
+                    )
+                raw_counts.append(iterator_state.get("global_idx"))
+        else:
+            if not isinstance(sampler_draws, Sequence) or isinstance(
+                sampler_draws, (str, bytes)
+            ):
+                raise ValueError(f"{worker_key}.dataset_sampler_draws must be a sequence")
+            if len(sampler_draws) != len(canonical_pools):
                 raise ValueError(
-                    f"{worker_key}.iterator_states[{dataset_index}] must be a mapping"
+                    f"{worker_key}.dataset_sampler_draws length {len(sampler_draws)} "
+                    f"does not match dataset_pools length {len(canonical_pools)}"
                 )
-            raw_index = iterator_state.get("global_idx")
+            raw_counts = list(sampler_draws)
+        for dataset_index, (pool, raw_index) in enumerate(
+            zip(canonical_pools, raw_counts)
+        ):
             if isinstance(raw_index, bool):
                 raise ValueError(
-                    f"{worker_key}.iterator_states[{dataset_index}].global_idx "
+                    f"{worker_key}.dataset_sampler_draws[{dataset_index}] "
                     "must be a non-negative integer"
                 )
             try:
                 global_index = int(raw_index)
             except (TypeError, ValueError) as exc:
                 raise ValueError(
-                    f"{worker_key}.iterator_states[{dataset_index}].global_idx "
+                    f"{worker_key}.dataset_sampler_draws[{dataset_index}] "
                     "must be a non-negative integer"
                 ) from exc
             try:
@@ -114,7 +352,7 @@ def curriculum_pool_draw_counts(
                 numeric_index = float(global_index)
             if global_index < 0 or numeric_index != global_index:
                 raise ValueError(
-                    f"{worker_key}.iterator_states[{dataset_index}].global_idx "
+                    f"{worker_key}.dataset_sampler_draws[{dataset_index}] "
                     "must be a non-negative integer"
                 )
             counts[pool] += global_index
@@ -145,6 +383,57 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+_CONTINUITY_IMPLEMENTATION_FILES = (
+    "eaglevl/train/arguments.py",
+    "eaglevl/train/locany_finetune_magi_stream.py",
+    "eaglevl/train/ui5_checkpoint_utils.py",
+    "eaglevl/train/ui5_curriculum.py",
+    "eaglevl/model/locany/modeling_locateanything.py",
+    "eaglevl/model/locany/relation_modules.py",
+    "eaglevl/model/locany/ui_relation_setup.py",
+)
+
+
+def _continuity_value(value: Any) -> Any:
+    """Convert an argument value to a stable JSON scalar/container."""
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Path):
+        return str(value.expanduser().resolve())
+    if isinstance(value, Mapping):
+        return {
+            str(key): _continuity_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_continuity_value(item) for item in value]
+    enum_value = getattr(value, "value", None)
+    if enum_value is not None and enum_value is not value:
+        return _continuity_value(enum_value)
+    return str(value)
+
+
+def _continuity_fields(arguments: Any, names: Sequence[str]) -> dict[str, Any]:
+    return {
+        name: _continuity_value(getattr(arguments, name, None))
+        for name in names
+    }
+
+
+def _continuity_implementation_sha256() -> dict[str, str]:
+    source_root = Path(__file__).resolve().parents[2]
+    identities: dict[str, str] = {}
+    for relative in _CONTINUITY_IMPLEMENTATION_FILES:
+        path = source_root / relative
+        if not path.is_file():
+            raise RuntimeError(
+                f"Training continuity implementation file is missing: {path}"
+            )
+        identities[relative] = _sha256_file(path)
+    return identities
 
 
 def curriculum_artifact_identity(
@@ -206,7 +495,11 @@ def curriculum_artifact_identity(
             "hard": "all_gt_free_detector_scan_base_tiles",
             "matched_anchor": "all_gt_free_detector_scan_base_tiles",
             "content_missing": "full_image_global_view",
-            "global_replay": "full_image_retention",
+            "global_replay": (
+                "all_gt_free_detector_scan_base_tiles_except_content_missing_full_image"
+                if artifact_schema >= 4
+                else "full_image_retention"
+            ),
             "tile_selection_uses_gt": False,
             "partial_gt_allowed": False,
         }
@@ -227,7 +520,21 @@ def curriculum_artifact_identity(
             ):
                 raise RuntimeError(f"Curriculum {pool} training views are invalid")
         replay = pools.get("global_replay")
-        if not isinstance(replay, Mapping) or any(
+        if artifact_schema >= 4:
+            if not isinstance(replay, Mapping) or any(
+                (
+                    int(replay.get("crop_training_records", 0)) <= 0,
+                    int(replay.get("content_missing_global_records", -1)) != 0,
+                    int(replay.get("retention_full_image_records", 0)) <= 0,
+                    int(replay.get("training_records", -1))
+                    != int(replay.get("crop_training_records", -2))
+                    + int(replay.get("retention_full_image_records", -3)),
+                )
+            ):
+                raise RuntimeError(
+                    "Curriculum global-replay crop/full-image views are invalid"
+                )
+        elif not isinstance(replay, Mapping) or any(
             (
                 int(replay.get("crop_training_records", -1)) != 0,
                 int(replay.get("content_missing_global_records", -1)) != 0,
@@ -244,7 +551,9 @@ def curriculum_artifact_identity(
         expected_recipe_views = {
             "hard": (True, False),
             "matched_anchor": (True, False),
-            "global_replay": (False, True),
+            "global_replay": (
+                (True, True) if artifact_schema >= 4 else (False, True)
+            ),
         }
         observed_recipe_views = {}
         if not isinstance(recipe_payload, Mapping):
@@ -327,9 +636,12 @@ def curriculum_artifact_identity(
         verified_files[str(name)] = actual_hash
     if artifact_schema >= 3:
         assert crop_assets is not None
+        crop_pools = CURRICULUM_POOLS if artifact_schema >= 4 else (
+            "hard",
+            "matched_anchor",
+        )
         expected_crop_records = sum(
-            int(pools[pool]["crop_training_records"])
-            for pool in ("hard", "matched_anchor")
+            int(pools[pool]["crop_training_records"]) for pool in crop_pools
         )
         if len(crop_assets) != expected_crop_records:
             raise RuntimeError(
@@ -363,9 +675,13 @@ def curriculum_artifact_identity(
 
 
 def training_continuity_config(
-    training_args: Any, schedule: "UI5CurriculumSchedule"
+    training_args: Any,
+    schedule: "UI5CurriculumSchedule",
+    *,
+    model_args: Any = None,
+    data_args: Any = None,
 ) -> dict[str, Any]:
-    """Return optimizer semantics that must not drift between segments."""
+    """Return all training semantics that must not drift between segments."""
 
     deepspeed = getattr(training_args, "deepspeed", None)
     if isinstance(deepspeed, (str, Path)) and Path(deepspeed).is_file():
@@ -386,37 +702,137 @@ def training_continuity_config(
         }
     else:
         deepspeed_identity = str(deepspeed) if deepspeed else None
+    training_semantics = _continuity_fields(
+        training_args,
+        (
+            "seed",
+            "data_seed",
+            "per_device_train_batch_size",
+            "gradient_accumulation_steps",
+            "dataloader_num_workers",
+            "dataloader_prefetch_factor",
+            "dataloader_persistent_workers",
+            "dataloader_drop_last",
+            "dataloader_pin_memory",
+            "learning_rate",
+            "weight_decay",
+            "adam_beta1",
+            "adam_beta2",
+            "adam_epsilon",
+            "max_grad_norm",
+            "optim",
+            "lr_scheduler_type",
+            "warmup_ratio",
+            "warmup_steps",
+            "gradient_checkpointing",
+            "bf16",
+            "fp16",
+            "tf32",
+            "max_steps",
+            "lr_scale",
+        ),
+    )
+    # Preserve historical defaults for lightweight callers while binding every
+    # concrete value supplied by Transformers in the formal trainer.
+    training_semantics.update(
+        {
+            "seed": int(getattr(training_args, "seed", 42)),
+            "per_device_train_batch_size": int(
+                getattr(training_args, "per_device_train_batch_size", 1)
+            ),
+            "gradient_accumulation_steps": int(
+                getattr(training_args, "gradient_accumulation_steps", 1)
+            ),
+            "dataloader_num_workers": int(
+                getattr(training_args, "dataloader_num_workers", 0)
+            ),
+            "learning_rate": float(getattr(training_args, "learning_rate")),
+            "weight_decay": float(getattr(training_args, "weight_decay", 0.0)),
+            "adam_beta1": float(getattr(training_args, "adam_beta1", 0.9)),
+            "adam_beta2": float(getattr(training_args, "adam_beta2", 0.999)),
+            "adam_epsilon": float(
+                getattr(training_args, "adam_epsilon", 1.0e-8)
+            ),
+            "max_grad_norm": float(getattr(training_args, "max_grad_norm", 1.0)),
+            "optimizer": str(getattr(training_args, "optim", "adamw_torch")),
+            "bf16": bool(getattr(training_args, "bf16", False)),
+            "fp16": bool(getattr(training_args, "fp16", False)),
+            "max_steps": int(
+                getattr(training_args, "max_steps", schedule.total_steps)
+            ),
+        }
+    )
+    training_semantics.pop("optim", None)
     return {
-        "seed": int(getattr(training_args, "seed", 42)),
-        "data_seed": getattr(training_args, "data_seed", None),
-        "per_device_train_batch_size": int(
-            getattr(training_args, "per_device_train_batch_size", 1)
+        "training": training_semantics,
+        "model_semantics": _continuity_fields(
+            model_args,
+            (
+                "model_name_or_path",
+                "vision_path",
+                "llm_path",
+                "mlp_path",
+                "processor_config_path",
+                "preprocessor_config_path",
+                "chat_template_path",
+                "freeze_llm",
+                "freeze_backbone",
+                "freeze_mlp",
+                "unfreeze_vit_layers",
+                "vision_select_layer",
+                "use_backbone_lora",
+                "use_llm_lora",
+                "unfreeze_lm_head",
+                "grad_checkpoint",
+                "freeze_backbones",
+                "lr_scale",
+                "use_fp8",
+                "mlp_connector_layers",
+                "block_size",
+                "causal_attn",
+                "attn_implementation",
+                "expected_mask_repeat_times",
+                "enable_ui_relation",
+                "relation_detail_hidden_size",
+                "relation_num_slots",
+                "relation_adapter_bottleneck",
+                "relation_detail_layers",
+                "relation_gate_loss_weight",
+                "relation_slot_gate_loss_weight",
+                "relation_attention_loss_weight",
+                "relation_gate_threshold",
+                "relation_focal_beta",
+                "relation_focal_gamma",
+            ),
         ),
-        "gradient_accumulation_steps": int(
-            getattr(training_args, "gradient_accumulation_steps", 1)
+        "data_semantics": _continuity_fields(
+            data_args,
+            (
+                "max_seq_length",
+                "meta_path",
+                "neftune_alpha",
+                "n_frames",
+                "sequence_parallel_degree",
+                "ring_sequence_parallel_degree",
+                "sample_length_div",
+                "use_online_packing",
+                "video_total_pixels",
+                "max_frames",
+                "target_fps",
+                "max_num_tokens_per_sample",
+                "max_num_tokens",
+                "packing_buffer_size",
+                "auto_thinking_handler",
+                "balance_ui_defects",
+                "ui_records_per_class",
+                "ui_negative_to_positive_ratio",
+                "ui_sampling_mode",
+            ),
         ),
-        "dataloader_num_workers": int(
-            getattr(training_args, "dataloader_num_workers", 0)
-        ),
-        "dataloader_prefetch_factor": getattr(
-            training_args, "dataloader_prefetch_factor", None
-        ),
-        "dataloader_persistent_workers": bool(
-            getattr(training_args, "dataloader_persistent_workers", False)
-        ),
-        "learning_rate": float(getattr(training_args, "learning_rate")),
-        "weight_decay": float(getattr(training_args, "weight_decay", 0.0)),
-        "adam_beta1": float(getattr(training_args, "adam_beta1", 0.9)),
-        "adam_beta2": float(getattr(training_args, "adam_beta2", 0.999)),
-        "adam_epsilon": float(getattr(training_args, "adam_epsilon", 1.0e-8)),
-        "max_grad_norm": float(getattr(training_args, "max_grad_norm", 1.0)),
-        "optimizer": str(getattr(training_args, "optim", "adamw_torch")),
-        "bf16": bool(getattr(training_args, "bf16", False)),
-        "fp16": bool(getattr(training_args, "fp16", False)),
-        "max_steps": int(getattr(training_args, "max_steps", schedule.total_steps)),
         "schedule_fingerprint": schedule.fingerprint,
         "schedule_total_steps": int(schedule.total_steps),
         "deepspeed": deepspeed_identity,
+        "implementation_sha256": _continuity_implementation_sha256(),
     }
 
 
@@ -721,23 +1137,48 @@ def prepare_worker_states_for_resume(
     saved_sampling_stage: int,
     resume_sampling_stage: int,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
-    """Copy worker states and discard old-stage pending samples at a transition.
+    """Return old-stage pending samples without changing durable cursors.
 
-    Iterator positions and the sampler RNG remain restored exactly.  Only
-    already-selected, not-yet-trained packing entries are discarded; otherwise
-    stage-0 samples could be used for optimizer step 401 (or stage-1 samples for
-    step 801).
+    Pending packing entries cannot stay directly in the new-stage buffer because
+    they were selected with the previous pool ratios.  They also cannot simply
+    be cleared while retaining advanced iterator cursors: that permanently loses
+    sampled-but-untrained records.  Instead, transition them into per-dataset
+    deferred FIFO queues.  The new-stage pool sampler must select that dataset
+    before its oldest deferred location is replayed, so phase ratios and record
+    identity are both preserved.
     """
 
     prepared = copy.deepcopy(dict(worker_states))
-    report = {"workers": len(prepared), "current_batch_samples": 0, "buffer_samples": 0}
+    report = {
+        "workers": len(prepared),
+        "current_batch_samples": 0,
+        "buffer_samples": 0,
+        "already_deferred_samples": 0,
+        "deferred_samples": 0,
+    }
     if int(saved_sampling_stage) == int(resume_sampling_stage):
         return prepared, report
-    for state in prepared.values():
+    for worker_key, state in prepared.items():
+        if not isinstance(state, dict):
+            raise ValueError(f"{worker_key}.worker_state must be a mapping")
+        iterator_states = state.get("iterator_states")
+        if not isinstance(iterator_states, Sequence) or isinstance(
+            iterator_states, (str, bytes)
+        ) or not iterator_states:
+            raise ValueError(f"{worker_key}.iterator_states must be a non-empty sequence")
         current = list(state.get("current_batch_locations", []))
         buffered = list(state.get("buffer_locations", []))
+        already_deferred = list(state.get("deferred_locations", []))
         report["current_batch_samples"] += len(current)
         report["buffer_samples"] += len(buffered)
+        report["already_deferred_samples"] += len(already_deferred)
+        queue = DeferredSampleLocations(
+            already_deferred + current + buffered,
+            dataset_count=len(iterator_states),
+            iterator_states=iterator_states,
+        )
         state["current_batch_locations"] = []
         state["buffer_locations"] = []
+        state["deferred_locations"] = queue.to_list()
+        report["deferred_samples"] += len(queue)
     return prepared, report

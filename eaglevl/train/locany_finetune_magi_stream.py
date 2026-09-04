@@ -21,7 +21,7 @@ import sys
 import warnings
 from contextlib import nullcontext
 import numpy as np
-from typing import Dict, Optional, List, Tuple, Any
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 from dataclasses import dataclass, field
 
 import json
@@ -93,6 +93,9 @@ from eaglevl.train.ui_defect_data import (
 from eaglevl.train.ui5_excel_logger import UI5ExcelLogger, TRAIN_TASKS
 from eaglevl.train.ui5_checkpoint_utils import atomic_save_with_fsync, validate_checkpoint
 from eaglevl.train.ui5_curriculum import (
+    CURRICULUM_POOLS,
+    CurriculumGroupCycle,
+    DeferredSampleLocations,
     UI5CurriculumSchedule,
     canonical_curriculum_pool,
     curriculum_artifact_identity,
@@ -319,7 +322,8 @@ class LazySupervisedDatasetMTP(Dataset):
                  balance_ui_defects: bool = False,
                  ui_records_per_class: int = 17604,
                  ui_negative_to_positive_ratio: float = 2.0,
-                 ui_sampling_mode: str = "fixed_ratio"):
+                 ui_sampling_mode: str = "fixed_ratio",
+                 curriculum_group_sampling: bool = False):
         super().__init__()
         self.ds_name = ds_name
         self.processor = processor
@@ -332,6 +336,12 @@ class LazySupervisedDatasetMTP(Dataset):
         self.data_augment = meta.get("data_augment", False)
         self.visual_prompt = bool(meta.get("visual_prompt", False))
         self.ui5_crop_recipe = bool(meta.get("ui5_crop_recipe", False))
+        self.curriculum_group_sampling = bool(curriculum_group_sampling)
+        self.curriculum_pool = (
+            canonical_curriculum_pool(meta.get("curriculum_pool"))
+            if self.curriculum_group_sampling
+            else None
+        )
         self.balance_ui_defects = bool(meta.get("balance_ui_defects", balance_ui_defects))
         # An explicitly exported runtime mode must override the recipe's
         # historical default.  This lets a new sampler reuse an already audited
@@ -682,6 +692,150 @@ class LazySupervisedDatasetMTP(Dataset):
             self._active_pool_length = len(self.active_indices)
             self._length = self._active_pool_length
 
+        self._curriculum_group_cycle = None
+        self._curriculum_group_view_indices = {}
+        if self.curriculum_group_sampling:
+            self._initialize_curriculum_group_cycle()
+
+    def _initialize_curriculum_group_cycle(self) -> None:
+        """Build one deterministic cyclic view stream per UI5 sample group."""
+
+        grouped = defaultdict(list)
+        for logical_index, raw_index in enumerate(self.active_indices):
+            record = self.lazy_loader[raw_index]
+            group_id = str(record.get("_ui5_sample_id") or "").strip()
+            if not group_id:
+                raise RuntimeError(
+                    f"[{self.ds_name}] curriculum record lacks _ui5_sample_id: "
+                    f"raw_index={raw_index}"
+                )
+            record_pool = canonical_curriculum_pool(
+                record.get("_ui5_curriculum_pool")
+            )
+            if record_pool != self.curriculum_pool:
+                raise RuntimeError(
+                    f"[{self.ds_name}] curriculum record pool mismatch: "
+                    f"record={record_pool}, dataset={self.curriculum_pool}, "
+                    f"group={group_id}"
+                )
+            kind = str(record.get("_ui5_record_kind") or "").strip()
+            if kind == "crop":
+                crop_id = str(record.get("_ui5_crop_id") or "").strip()
+                raw_crop_index = record.get("_ui5_crop_index")
+                if not crop_id or isinstance(raw_crop_index, bool):
+                    raise RuntimeError(
+                        f"[{self.ds_name}] invalid crop identity for group {group_id}"
+                    )
+                try:
+                    crop_index = int(raw_crop_index)
+                    if crop_index < 0 or float(raw_crop_index) != crop_index:
+                        raise ValueError
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"[{self.ds_name}] invalid crop index for group {group_id}"
+                    ) from exc
+                view_id = f"crop:{crop_index}:{crop_id}"
+                sort_key = (crop_index, view_id)
+            else:
+                view_id = f"{kind or 'full_image'}:global"
+                sort_key = (0, view_id)
+            grouped[group_id].append(
+                {
+                    "logical_index": logical_index,
+                    "raw_index": raw_index,
+                    "kind": kind,
+                    "view_id": view_id,
+                    "sort_key": sort_key,
+                    "base_tile_count": record.get("_ui5_base_tile_count"),
+                }
+            )
+
+        group_views = {}
+        view_lookup = {}
+        for group_id, entries in sorted(grouped.items()):
+            kinds = {entry["kind"] for entry in entries}
+            if "crop" in kinds:
+                if kinds != {"crop"}:
+                    raise RuntimeError(
+                        f"[{self.ds_name}] group {group_id} mixes crop and global views"
+                    )
+                declared_counts = {entry["base_tile_count"] for entry in entries}
+                if declared_counts != {len(entries)}:
+                    raise RuntimeError(
+                        f"[{self.ds_name}] group {group_id} base-tile count mismatch: "
+                        f"declared={declared_counts}, observed={len(entries)}"
+                    )
+                crop_indices = sorted(entry["sort_key"][0] for entry in entries)
+                if crop_indices != list(range(len(entries))):
+                    raise RuntimeError(
+                        f"[{self.ds_name}] group {group_id} crop indices are not contiguous"
+                    )
+            elif len(entries) != 1:
+                raise RuntimeError(
+                    f"[{self.ds_name}] non-crop group {group_id} must have one global view; "
+                    f"observed={len(entries)}"
+                )
+            ordered = sorted(entries, key=lambda item: item["sort_key"])
+            views = []
+            for entry in ordered:
+                key = (group_id, entry["view_id"])
+                if key in view_lookup:
+                    raise RuntimeError(
+                        f"[{self.ds_name}] duplicate curriculum view identity: {key}"
+                    )
+                view_lookup[key] = int(entry["logical_index"])
+                views.append(str(entry["view_id"]))
+            group_views[group_id] = views
+
+        self._curriculum_group_cycle = CurriculumGroupCycle(group_views)
+        self._curriculum_group_view_indices = view_lookup
+        view_counts = [len(views) for views in group_views.values()]
+        logger.warning(
+            "[UI5 curriculum] dataset=%s sampling_unit=sample_group groups=%s "
+            "records=%s views_per_group=min:%s,max:%s fingerprint=%s",
+            self.ds_name,
+            self._curriculum_group_cycle.group_count,
+            len(self.active_indices),
+            min(view_counts),
+            max(view_counts),
+            self._curriculum_group_cycle.fingerprint,
+        )
+
+    @property
+    def curriculum_draw_length(self) -> int:
+        if self._curriculum_group_cycle is not None:
+            return self._curriculum_group_cycle.group_count
+        return self._length
+
+    def curriculum_group_identity(self) -> Optional[dict]:
+        if self._curriculum_group_cycle is None:
+            return None
+        return self._curriculum_group_cycle.identity
+
+    def curriculum_group_iterator_state(self, *, seed: int, global_idx: int) -> Optional[dict]:
+        if self._curriculum_group_cycle is None:
+            return None
+        return self._curriculum_group_cycle.iterator_state(
+            seed=int(seed), global_idx=int(global_idx)
+        )
+
+    def validate_curriculum_group_iterator_state(
+        self, state: Mapping[str, Any], *, seed: int, global_idx: int
+    ) -> None:
+        if self._curriculum_group_cycle is None:
+            if state is not None:
+                raise RuntimeError(
+                    f"[{self.ds_name}] unexpected curriculum group iterator state"
+                )
+            return
+        if not isinstance(state, dict):
+            raise RuntimeError(
+                f"[{self.ds_name}] missing curriculum group iterator state"
+            )
+        self._curriculum_group_cycle.validate_iterator_state(
+            state, seed=int(seed), global_idx=int(global_idx)
+        )
+
     def __len__(self):
         return self._length
 
@@ -762,6 +916,17 @@ class LazySupervisedDatasetMTP(Dataset):
 
     def seen_raw_indices(self, seed: int, global_idx: int) -> set:
         """Reconstruct records consumed by one deterministic iterator."""
+        if self._curriculum_group_cycle is not None:
+            seen = set()
+            for draw_index in range(max(0, int(global_idx))):
+                draw = self._curriculum_group_cycle.draw_at(
+                    draw_index, seed=int(seed)
+                )
+                logical_index = self._curriculum_group_view_indices[
+                    (draw["group_id"], draw["view_id"])
+                ]
+                seen.add(self.active_indices[logical_index])
+            return seen
         seen = set()
         remaining = max(0, int(global_idx))
         epoch = 0
@@ -837,6 +1002,21 @@ class LazySupervisedDatasetMTP(Dataset):
         return {
             "dataset": self.ds_name,
             "sampling_mode": self.ui_sampling_mode,
+            "sampling_unit": (
+                "sample_group"
+                if self._curriculum_group_cycle is not None
+                else "record"
+            ),
+            "sample_groups": (
+                self._curriculum_group_cycle.group_count
+                if self._curriculum_group_cycle is not None
+                else len(active_raw)
+            ),
+            "group_cycle_fingerprint": (
+                self._curriculum_group_cycle.fingerprint
+                if self._curriculum_group_cycle is not None
+                else None
+            ),
             "raw_recipe_records": self._raw_recipe_rows,
             "excluded_records": self._excluded_record_count,
             "active_pool_records": len(active_raw),
@@ -1204,6 +1384,17 @@ class LazySupervisedDatasetMTP(Dataset):
             result.update(ui_targets)
         return result
 
+    def _materialize_logical_index(self, logical_index: int) -> Dict[str, torch.Tensor]:
+        real_idx = self.active_indices[int(logical_index)]
+        data_item = self.lazy_loader[real_idx]
+        ui_targets = extract_ui_defect_targets(data_item, max_boxes=8)
+        data_item = process_multimodal_sample(
+            data_item, self.root, self.max_frames,
+            self.target_fps, self.video_total_pixels,
+            visual_prompt=self.visual_prompt,
+        )
+        return self.multi_modal_get_item(data_item, ui_targets=ui_targets)
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         retry_count = 0
         current_idx = idx
@@ -1213,18 +1404,10 @@ class LazySupervisedDatasetMTP(Dataset):
         np.random.seed(seed)
         
         while retry_count <= 10:
-            real_idx = self.active_indices[
-                (current_idx + retry_count) % self._active_pool_length
-            ]
+            logical_index = (current_idx + retry_count) % self._active_pool_length
+            real_idx = self.active_indices[logical_index]
             try:
-                data_item = self.lazy_loader[real_idx]
-                ui_targets = extract_ui_defect_targets(data_item, max_boxes=8)
-                data_item = process_multimodal_sample(
-                    data_item, self.root, self.max_frames, 
-                    self.target_fps, self.video_total_pixels,
-                    visual_prompt=self.visual_prompt,
-                )
-                return self.multi_modal_get_item(data_item, ui_targets=ui_targets)
+                return self._materialize_logical_index(logical_index)
             except Exception as e:
                 tb = traceback.format_exc()
                 logger.warning(f"[{self.ds_name}] idx {real_idx} failed: {e}\n{tb}")
@@ -1234,6 +1417,24 @@ class LazySupervisedDatasetMTP(Dataset):
     
     def get_sample_at_global_idx(self, global_idx: int, seed: int) -> Dict[str, torch.Tensor]:
         """Get a sample by global index (used for resume)."""
+        if self._curriculum_group_cycle is not None:
+            draw = self._curriculum_group_cycle.draw_at(
+                int(global_idx), seed=int(seed)
+            )
+            logical_index = self._curriculum_group_view_indices[
+                (draw["group_id"], draw["view_id"])
+            ]
+            deterministic_seed = int(logical_index + 10086)
+            random.seed(deterministic_seed)
+            np.random.seed(deterministic_seed)
+            try:
+                return self._materialize_logical_index(logical_index)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"[{self.ds_name}] exact curriculum group/view failed: "
+                    f"group={draw['group_id']} view={draw['view_id']} "
+                    f"global_idx={global_idx}"
+                ) from exc
         ds_len = self._length
         if ds_len == 0:
             raise ValueError("Dataset is empty")
@@ -1268,7 +1469,7 @@ class DeterministicIterator:
     def __init__(self, dataset: LazySupervisedDatasetMTP, seed: int, start_global_idx: int = 0):
         self.dataset = dataset
         self.seed = seed
-        self.ds_len = len(dataset)
+        self.ds_len = int(dataset.curriculum_draw_length)
         self.ds_name = getattr(dataset, 'ds_name', 'unknown')
         self.global_idx = start_global_idx
         
@@ -1294,6 +1495,12 @@ class DeterministicIterator:
             raise StopIteration
         
         current_global_idx = self.global_idx
+        if self.dataset.curriculum_group_sampling:
+            sample = self.dataset.get_sample_at_global_idx(
+                current_global_idx, self.seed
+            )
+            self.global_idx += 1
+            return sample, current_global_idx
         epoch = current_global_idx // self.ds_len
         pos = current_global_idx % self.ds_len
         indices = self._get_epoch_indices(epoch)
@@ -1308,11 +1515,27 @@ class DeterministicIterator:
         return self.global_idx
     
     def state_dict(self) -> dict:
-        return IteratorState(seed=self.seed, global_idx=self.global_idx).to_dict()
+        state = IteratorState(seed=self.seed, global_idx=self.global_idx).to_dict()
+        group_state = self.dataset.curriculum_group_iterator_state(
+            seed=self.seed, global_idx=self.global_idx
+        )
+        if group_state is not None:
+            state["curriculum_group_cycle"] = group_state
+        return state
     
     @classmethod
     def from_state_dict(cls, dataset: LazySupervisedDatasetMTP, state: dict) -> 'DeterministicIterator':
-        return cls(dataset=dataset, seed=state['seed'], start_global_idx=state['global_idx'])
+        iterator = cls(
+            dataset=dataset,
+            seed=state['seed'],
+            start_global_idx=state['global_idx'],
+        )
+        dataset.validate_curriculum_group_iterator_state(
+            state.get("curriculum_group_cycle"),
+            seed=iterator.seed,
+            global_idx=iterator.global_idx,
+        )
+        return iterator
 
 
 @dataclass
@@ -1322,8 +1545,10 @@ class WorkerState:
     sample_rng_state: tuple
     samples_produced: int
     batches_produced: int
+    dataset_sampler_draws: List[int]
     current_batch_locations: List[Tuple[int, int]]
     buffer_locations: List[Tuple[int, int]]
+    deferred_locations: List[Tuple[int, int]]
     
     def to_dict(self) -> dict:
         return {
@@ -1331,8 +1556,10 @@ class WorkerState:
             'sample_rng_state': self.sample_rng_state,
             'samples_produced': self.samples_produced,
             'batches_produced': self.batches_produced,
+            'dataset_sampler_draws': self.dataset_sampler_draws,
             'current_batch_locations': self.current_batch_locations,
             'buffer_locations': self.buffer_locations,
+            'deferred_locations': self.deferred_locations,
         }
     
     @classmethod
@@ -1345,14 +1572,24 @@ class WorkerState:
             sample_rng_state = (version, internal_state, gauss_next)
         else:
             sample_rng_state = tuple(raw_rng_state) if isinstance(raw_rng_state, list) else raw_rng_state
+        iterator_states = d['iterator_states']
+        dataset_sampler_draws = d.get('dataset_sampler_draws')
+        if dataset_sampler_draws is None:
+            # Version-7 checkpoints predate deferred replay, so every sampler
+            # selection advanced exactly one dataset iterator.
+            dataset_sampler_draws = [
+                int(state.get('global_idx', 0)) for state in iterator_states
+            ]
         
         return cls(
-            iterator_states=d['iterator_states'],
+            iterator_states=iterator_states,
             sample_rng_state=sample_rng_state,
             samples_produced=d.get('samples_produced', 0),
             batches_produced=d.get('batches_produced', 0),
+            dataset_sampler_draws=list(dataset_sampler_draws),
             current_batch_locations=d.get('current_batch_locations', []),
             buffer_locations=d.get('buffer_locations', []),
+            deferred_locations=d.get('deferred_locations', []),
         )
 
 
@@ -1404,6 +1641,17 @@ class StreamPackedDatasetMTP(IterableDataset):
                 raise ValueError(
                     "Scheduled curriculum requires one curriculum_pool per dataset"
                 )
+            if any(not dataset.curriculum_group_sampling for dataset in self.datasets):
+                raise ValueError(
+                    "Scheduled UI5 curriculum requires sample-group sampling for every pool"
+                )
+            if len(self.dataset_pools) != len(CURRICULUM_POOLS) or set(
+                self.dataset_pools
+            ) != set(CURRICULUM_POOLS):
+                raise ValueError(
+                    "Scheduled UI5 curriculum requires exactly one dataset per pool: "
+                    f"observed={self.dataset_pools}"
+                )
             self._curriculum_completed_global_step = 0
             self._curriculum_stage_index = 0
             self.dataset_weight = self.curriculum_schedule.effective_dataset_weights(
@@ -1453,6 +1701,12 @@ class StreamPackedDatasetMTP(IterableDataset):
                 {
                     "name": dataset.ds_name,
                     "rows": len(dataset),
+                    "sampling_unit": (
+                        "sample_group"
+                        if dataset.curriculum_group_sampling
+                        else "record"
+                    ),
+                    "curriculum_group_identity": dataset.curriculum_group_identity(),
                     "base_probability": float(probability),
                     "curriculum_pool": (
                         self.dataset_pools[index]
@@ -1482,7 +1736,7 @@ class StreamPackedDatasetMTP(IterableDataset):
             'base_seed': self.base_seed,
             'stream_resume_config': self._stream_resume_config(),
             'num_workers': self._configured_num_workers,
-            'version': 7,
+            'version': 8,
         }
         if self.curriculum_schedule is not None:
             state["curriculum_sampler"] = self.curriculum_schedule.sampler_state(
@@ -1493,9 +1747,9 @@ class StreamPackedDatasetMTP(IterableDataset):
 
     def load_state_dict(self, state: dict, *, expected_global_step: Optional[int] = None):
         version = state.get('version', 1)
-        if self._strict_resume and version < 7:
+        if self._strict_resume and version < 8:
             raise RuntimeError(
-                "Scheduled UI5 curriculum requires dataloader state version >= 7; "
+                "Scheduled UI5 curriculum requires dataloader state version >= 8; "
                 f"checkpoint has version={version}"
             )
         if version < 3:
@@ -1550,6 +1804,32 @@ class StreamPackedDatasetMTP(IterableDataset):
                 )
             if "sample_rng_state" not in worker_state:
                 raise RuntimeError(f"Missing sample_rng_state for {worker_key}")
+            if version >= 8:
+                sampler_draws = worker_state.get("dataset_sampler_draws")
+                if not isinstance(sampler_draws, list) or len(sampler_draws) != len(
+                    self.datasets
+                ) or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                    for value in sampler_draws
+                ):
+                    raise RuntimeError(
+                        f"Invalid dataset_sampler_draws for {worker_key}"
+                    )
+                DeferredSampleLocations(
+                    list(worker_state.get("deferred_locations", []))
+                    + list(worker_state.get("current_batch_locations", []))
+                    + list(worker_state.get("buffer_locations", [])),
+                    dataset_count=len(self.datasets),
+                    iterator_states=iterator_states,
+                )
+                for dataset, iterator_state in zip(self.datasets, iterator_states):
+                    dataset.validate_curriculum_group_iterator_state(
+                        iterator_state.get("curriculum_group_cycle"),
+                        seed=int(iterator_state["seed"]),
+                        global_idx=int(iterator_state["global_idx"]),
+                    )
 
         if self.curriculum_schedule is not None:
             if expected_global_step is None:
@@ -1574,13 +1854,15 @@ class StreamPackedDatasetMTP(IterableDataset):
             if saved_stage != resume_stage:
                 logger.warning(
                     "[UI5 curriculum] stage transition %s -> %s at global_step=%s; "
-                    "discarded pending current_batch=%s buffer=%s while preserving "
-                    "iterator and RNG state",
+                    "deferred pending current_batch=%s buffer=%s existing=%s total=%s "
+                    "for new-stage pool selection while preserving iterator and RNG state",
                     saved_stage,
                     resume_stage,
                     expected_global_step,
                     transition["current_batch_samples"],
                     transition["buffer_samples"],
+                    transition["already_deferred_samples"],
+                    transition["deferred_samples"],
                 )
             self._curriculum_completed_global_step = int(expected_global_step)
             self._curriculum_stage_index = resume_stage
@@ -1666,10 +1948,14 @@ class StreamPackedDatasetMTP(IterableDataset):
         samples_produced = 0
         batches_produced = 0
         skipped_count = 0
+        dataset_sampler_draws = [0 for _ in self.datasets]
         
         current_batch = None
         current_batch_locations: List[Tuple[int, int]] = []
         buffer: List[Tuple[dict, int, int]] = []
+        deferred_locations = DeferredSampleLocations(
+            [], dataset_count=len(self.datasets)
+        )
         
         # Resume handling
         if self._strict_resume and self._resume_loaded and worker_key not in self._resume_states:
@@ -1692,6 +1978,12 @@ class StreamPackedDatasetMTP(IterableDataset):
                 sample_rng.setstate(ws.sample_rng_state)
                 samples_produced = ws.samples_produced
                 batches_produced = ws.batches_produced
+                dataset_sampler_draws = list(ws.dataset_sampler_draws)
+                deferred_locations = DeferredSampleLocations(
+                    ws.deferred_locations,
+                    dataset_count=len(self.datasets),
+                    iterator_states=ws.iterator_states,
+                )
                 
                 if ws.current_batch_locations:
                     if is_main_log:
@@ -1727,7 +2019,10 @@ class StreamPackedDatasetMTP(IterableDataset):
                             logger.warning(f'[{worker_key}] Failed to restore buffer sample {loc}: {e}')
                 
                 if is_main_log:
-                    logger.info(f'[{worker_key}] Resume complete. Buffer size: {len(buffer)}')
+                    logger.info(
+                        f'[{worker_key}] Resume complete. Buffer size: {len(buffer)}, '
+                        f'deferred samples: {len(deferred_locations)}'
+                    )
                     
             except Exception as e:
                 logger.error(f'[{worker_key}] Failed to resume: {e}')
@@ -1747,15 +2042,30 @@ class StreamPackedDatasetMTP(IterableDataset):
                 sample_rng_state=sample_rng.getstate(),
                 samples_produced=samples_produced,
                 batches_produced=batches_produced,
+                dataset_sampler_draws=list(dataset_sampler_draws),
                 current_batch_locations=list(current_batch_locations),
                 buffer_locations=[(b[1], b[2]) for b in buffer],
+                deferred_locations=deferred_locations.to_list(),
             ).to_dict()
 
         def fetch_next_sample() -> Tuple[dict, int, int]:
             nonlocal samples_produced, skipped_count
             while True:
                 ds_idx = sample_rng.choices(range(len(self.datasets)), weights=self.dataset_weight)[0]
+                dataset_sampler_draws[ds_idx] += 1
                 try:
+                    deferred_location = deferred_locations.pop_for_dataset(ds_idx)
+                    if deferred_location is not None:
+                        _, global_idx = deferred_location
+                        sample = self.datasets[ds_idx].get_sample_at_global_idx(
+                            global_idx, iterator_seeds[ds_idx]
+                        )
+                        if self._get_sample_length(sample) > self.max_num_tokens_per_sample:
+                            raise RuntimeError(
+                                f"[{worker_key}] restored deferred sample became too long: "
+                                f"location={deferred_location}"
+                            )
+                        return sample, ds_idx, global_idx
                     sample, global_idx = next(iterators[ds_idx])
                     samples_produced += 1
                     if self._get_sample_length(sample) > self.max_num_tokens_per_sample:
@@ -1920,6 +2230,10 @@ class StateAwareDataLoader:
                 state_snapshot = batch.pop('_state_snapshot')
                 
                 if self.dataset is not None:
+                    # Worker-side DataLoader prefetch may already have built
+                    # later batches.  Advance the durable main-process state
+                    # only when this wrapper actually hands a batch to Trainer;
+                    # unseen prefetched batches must be regenerated on resume.
                     self.dataset._worker_states[worker_key] = state_snapshot
 
             batch.pop('_batch_idx', None)
@@ -2077,8 +2391,16 @@ class SamplingCoverageCallback(TrainerCallback):
 class CheckpointCompletionCallback(TrainerCallback):
     """Validate every rank's resume state before declaring a save complete."""
 
-    def __init__(self, train_dataset: StreamPackedDatasetMTP):
+    def __init__(
+        self,
+        train_dataset: StreamPackedDatasetMTP,
+        *,
+        model_args=None,
+        data_args=None,
+    ):
         self.train_dataset = train_dataset
+        self.model_args = model_args
+        self.data_args = data_args
         self._segment_source_global_step: Optional[int] = None
         self._segment_target_global_step: Optional[int] = None
 
@@ -2122,7 +2444,12 @@ class CheckpointCompletionCallback(TrainerCallback):
             )
         )
         optimizer_config = (
-            training_continuity_config(args, schedule)
+            training_continuity_config(
+                args,
+                schedule,
+                model_args=self.model_args,
+                data_args=self.data_args,
+            )
             if schedule is not None
             else None
         )
@@ -2167,7 +2494,7 @@ class CheckpointCompletionCallback(TrainerCallback):
             "rng_state_pattern": "rng_state*.pth",
             "cuda_rng_required": bool(torch.cuda.is_available()),
             "dataloader_state_pattern": "dataloader_state_rank*.pt",
-            "dataloader_state_version": 7,
+            "dataloader_state_version": 8,
             "curriculum_mode": "scheduled" if schedule is not None else "none",
             "curriculum_schedule_fingerprint": (
                 schedule.fingerprint if schedule is not None else None
@@ -3587,13 +3914,16 @@ class StreamPackingMTPTrainer(Trainer):
         schedule = getattr(self.train_dataset, "curriculum_schedule", None)
         if schedule is not None:
             stage = schedule.stage_for_optimizer_step(int(step))
+            next_stage = schedule.stage_after_completed_step(int(step))
             target = stage.to_dict()["pool_weights"]
             curriculum_log = {
                 "curriculum_phase": stage.index + 1,
+                "curriculum_next_phase": next_stage.index + 1,
                 "hard_ratio": target["hard"],
                 "anchor_ratio": target["matched_anchor"],
                 "global_replay_ratio": target["global_replay"],
                 "curriculum_target_llm_lr": stage.llm_lr,
+                "curriculum_next_llm_lr": next_stage.llm_lr,
             }
             for name in (
                 "curriculum_hard_samples",
@@ -3642,8 +3972,16 @@ class StreamPackingMTPTrainer(Trainer):
                         "global_replay_ratio": target["global_replay"],
                         "llm_lr": stage.llm_lr,
                     },
+                    "next_curriculum_target": {
+                        "phase": next_stage.index + 1,
+                        "hard_ratio": next_stage.pool_weights[0],
+                        "anchor_ratio": next_stage.pool_weights[1],
+                        "global_replay_ratio": next_stage.pool_weights[2],
+                        "llm_lr": next_stage.llm_lr,
+                    },
                     "training": {
                         "learning_rate": metrics["learning_rate"],
+                        "learning_rate_semantics": "next_optimizer_step",
                         "loss_total": metrics["loss_total"],
                         "loss_lm": metrics["loss_lm"],
                         "grad_norm": metrics["grad_norm"],
@@ -3662,12 +4000,15 @@ class StreamPackingMTPTrainer(Trainer):
                     ),
                 }
                 logger.info(
-                    "[TRAIN SNAPSHOT] step=%s phase=%s lr=%s target_lr=%s "
+                    "[TRAIN SNAPSHOT] step=%s completed_phase=%s next_phase=%s "
+                    "lr_next=%s next_target_lr=%s completed_phase_lr=%s "
                     "loss=%s loss_lm=%s grad_norm=%s window_samples=%s "
-                    "pool_cumulative=hard:%s,anchor:%s,global_replay:%s",
+                    "pool_draws_cumulative=hard:%s,anchor:%s,global_replay:%s",
                     step,
                     stage.index + 1,
+                    next_stage.index + 1,
                     metrics["learning_rate"] if metrics["learning_rate"] is not None else "N/A",
+                    next_stage.llm_lr,
                     stage.llm_lr,
                     metrics["loss_total"] if metrics["loss_total"] is not None else "N/A",
                     metrics["loss_lm"] if metrics["loss_lm"] is not None else "N/A",
@@ -3815,6 +4156,7 @@ def build_stream_packed_dataset_mtp(
                 ui_records_per_class=data_args.ui_records_per_class,
                 ui_negative_to_positive_ratio=data_args.ui_negative_to_positive_ratio,
                 ui_sampling_mode=data_args.ui_sampling_mode,
+                curriculum_group_sampling=scheduled_curriculum,
             )
             
             if len(ds) == 0:
@@ -4203,7 +4545,11 @@ def main():
     my_callbacks.append(MemoryLoggerCallback())
     my_callbacks.append(DataloaderStateCallback(train_dataset))
     my_callbacks.append(SamplingCoverageCallback(train_dataset, interval=1000))
-    checkpoint_completion_callback = CheckpointCompletionCallback(train_dataset)
+    checkpoint_completion_callback = CheckpointCompletionCallback(
+        train_dataset,
+        model_args=model_args,
+        data_args=data_args,
+    )
     my_callbacks.append(checkpoint_completion_callback)
     stop_after_step = int(os.environ.get("LOCANY_STOP_AFTER_STEP", "0"))
     if stop_after_step:
@@ -4269,7 +4615,10 @@ def main():
                     "continuity_manifest"
                 ].get("training_continuity_config")
                 current_training_config = training_continuity_config(
-                    training_args, curriculum_schedule
+                    training_args,
+                    curriculum_schedule,
+                    model_args=model_args,
+                    data_args=data_args,
                 )
                 if saved_training_config != current_training_config:
                     raise RuntimeError(

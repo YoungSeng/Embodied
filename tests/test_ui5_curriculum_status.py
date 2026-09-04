@@ -150,6 +150,9 @@ class RegisteredEvaluationStatusTests(unittest.TestCase):
         self.assertEqual(status["checkpoint"]["improved_joint"], True)
         self.assertEqual(status["best"]["image"]["step"], 200)
         self.assertEqual(status["next_action"], "train_step_200_to_400")
+        self.assertEqual(
+            status["training"]["learning_rate_semantics"], "next_optimizer_step"
+        )
         output = io.StringIO()
         with redirect_stdout(output):
             artifact_status.print_curriculum_status(status)
@@ -163,6 +166,29 @@ class RegisteredEvaluationStatusTests(unittest.TestCase):
             if line.startswith("[CURRICULUM STATUS] ")
         )
         self.assertEqual(json.loads(structured), status)
+
+        boundary_result = {**result, "step": 400}
+        boundary = artifact_status.build_curriculum_status(
+            boundary_result,
+            train_curve_rows=[
+                {
+                    "step": 400,
+                    # HF reports the scheduler value for the next optimizer
+                    # update after completing step 400.
+                    "learning_rate": 7.0e-7,
+                }
+            ],
+            total_steps=1200,
+            eval_interval_steps=200,
+        )
+        self.assertEqual(boundary["phase"], 1)
+        self.assertEqual(boundary["curriculum_target"]["llm_lr"], 1.0e-6)
+        self.assertEqual(boundary["next_curriculum_target"]["phase"], 2)
+        self.assertEqual(boundary["next_curriculum_target"]["llm_lr"], 7.0e-7)
+        boundary_output = io.StringIO()
+        with redirect_stdout(boundary_output):
+            artifact_status.print_curriculum_status(boundary)
+        self.assertIn("lr_next=7e-07 next_target_lr=7e-07", boundary_output.getvalue())
 
 
 if __name__ == "__main__":

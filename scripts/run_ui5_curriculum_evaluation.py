@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
 from ui5_lossless_tiling import assert_lossless_coverage
+from ui5_frozen_selection import resolve_frozen_selection
 
 
 TASKS = (
@@ -102,10 +103,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--hard-groups-jsonl", type=Path, required=True)
     parser.add_argument("--rollout-bundle-root", type=Path, required=True)
+    parser.add_argument("--curriculum-manifest", type=Path, required=True)
+    parser.add_argument("--frozen-selection", type=Path, required=True)
     parser.add_argument(
         "--expected-hard-groups",
         type=int,
-        default=env_int("EXPECTED_HARD_GROUPS", 72),
+        required=True,
     )
     parser.add_argument("--seed", type=int, default=env_int("SEED", 42))
     parser.add_argument("--gpu-devices", default="0,1")
@@ -174,6 +177,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
+        "--verify-existing-identity",
+        action="store_true",
+        help=(
+            "Do not launch workers; prove that an already completed evaluation "
+            "has exactly the current checkpoint/curriculum/selection/eval identity."
+        ),
+    )
+    parser.add_argument(
         "--fake-worker",
         action="store_true",
         help="Relax worker artifact validation for a hermetic fake worker test only",
@@ -185,7 +196,7 @@ def atomic_write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     try:
-        with temporary.open("w", encoding="utf-8") as handle:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
             json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
@@ -199,7 +210,7 @@ def atomic_write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     try:
-        with temporary.open("w", encoding="utf-8") as handle:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
             for row in rows:
                 handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
             handle.flush()
@@ -207,6 +218,17 @@ def atomic_write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def jsonl_rows_sha256(rows: Sequence[Mapping[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(
+            (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
+                "utf-8"
+            )
+        )
+    return digest.hexdigest()
 
 
 def file_sha256(path: Path) -> str:
@@ -225,7 +247,7 @@ def directory_inventory(path: Path) -> dict[str, Any]:
             {
                 "path": item.relative_to(path).as_posix(),
                 "size": int(stat.st_size),
-                "mtime_ns": int(stat.st_mtime_ns),
+                "sha256": file_sha256(item),
             }
         )
     payload = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -234,6 +256,121 @@ def directory_inventory(path: Path) -> dict[str, Any]:
         "file_count": len(entries),
         "total_bytes": sum(row["size"] for row in entries),
         "inventory_sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def curriculum_evaluation_identity(
+    path: Path,
+    *,
+    selection: Mapping[str, Any],
+    expected_hard_groups: int,
+) -> dict[str, Any]:
+    """Validate and bind the published curriculum to its frozen selection."""
+
+    path = path.expanduser().resolve(strict=True)
+    manifest_sha256 = file_sha256(path)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, Mapping):
+        raise ValueError(f"curriculum manifest must be an object: {path}")
+    declared_identity = str(value.get("identity_digest") or "")
+    canonical = dict(value)
+    canonical.pop("identity_digest", None)
+    if declared_identity != _canonical_json_sha256(canonical):
+        raise ValueError("curriculum manifest identity digest is invalid")
+    if int(value.get("hard_groups", -1)) != expected_hard_groups or int(
+        value.get("expected_hard_groups", -1)
+    ) != expected_hard_groups:
+        raise ValueError(
+            "curriculum manifest hard-group count differs from frozen selection: "
+            f"expected={expected_hard_groups}, "
+            f"hard={value.get('hard_groups')!r}, "
+            f"assertion={value.get('expected_hard_groups')!r}"
+        )
+    inputs = value.get("inputs")
+    if not isinstance(inputs, Mapping) or inputs.get(
+        "rollout_difficulty_sha256"
+    ) != selection["complete8_sha256"]:
+        raise ValueError(
+            "curriculum manifest is not derived from the selected frozen complete8"
+        )
+    frozen_input = inputs.get("frozen_selection_summary")
+    if not isinstance(frozen_input, Mapping):
+        raise ValueError(
+            "curriculum manifest does not bind its frozen selection summary"
+        )
+    if frozen_input.get("sha256") != selection["summary_sha256"]:
+        raise ValueError(
+            "curriculum manifest frozen summary SHA-256 differs from current selection"
+        )
+    if frozen_input.get("authoritative_complete8_sha256") != selection[
+        "complete8_sha256"
+    ]:
+        raise ValueError(
+            "curriculum manifest complete8 SHA-256 differs from current selection"
+        )
+    if int(frozen_input.get("formal_crop_hard_groups", -1)) != expected_hard_groups:
+        raise ValueError(
+            "curriculum manifest frozen hard-group count differs from current selection"
+        )
+    if frozen_input.get("formal_crop_hard_sample_ids_sha256") != selection[
+        "formal_crop_hard_sample_ids_sha256"
+    ]:
+        raise ValueError(
+            "curriculum manifest frozen hard-ID digest differs from current selection"
+        )
+    success_path = path.parent / "_SUCCESS.json"
+    if not success_path.is_file():
+        raise FileNotFoundError(f"curriculum success marker is missing: {success_path}")
+    success_sha256 = file_sha256(success_path)
+    success = json.loads(success_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(success, Mapping)
+        or success.get("complete") is not True
+        or success.get("identity_digest") != declared_identity
+    ):
+        raise ValueError("curriculum success marker does not bind the manifest")
+    success_files = success.get("files")
+    hard_artifact = (
+        success_files.get("hard_groups.jsonl")
+        if isinstance(success_files, Mapping)
+        else None
+    )
+    if not isinstance(hard_artifact, Mapping):
+        raise ValueError(
+            "curriculum success marker does not inventory hard_groups.jsonl"
+        )
+    hard_artifact_bytes = hard_artifact.get("bytes")
+    if (
+        isinstance(hard_artifact_bytes, bool)
+        or not isinstance(hard_artifact_bytes, int)
+        or hard_artifact_bytes <= 0
+    ):
+        raise ValueError("curriculum hard_groups.jsonl byte count is invalid")
+    hard_artifact_sha256 = str(hard_artifact.get("sha256") or "").lower()
+    if len(hard_artifact_sha256) != 64 or any(
+        character not in "0123456789abcdef"
+        for character in hard_artifact_sha256
+    ):
+        raise ValueError("curriculum hard_groups.jsonl SHA-256 is invalid")
+    if file_sha256(path) != manifest_sha256 or file_sha256(success_path) != success_sha256:
+        raise RuntimeError("curriculum publication changed while its identity was resolved")
+    return {
+        "path": str(path),
+        "sha256": manifest_sha256,
+        "identity_digest": declared_identity,
+        "success_path": str(success_path.resolve()),
+        "success_sha256": success_sha256,
+        "hard_groups_artifact": {
+            "bytes": hard_artifact_bytes,
+            "sha256": hard_artifact_sha256,
+        },
     }
 
 
@@ -978,6 +1115,11 @@ def validate_identity_unchanged(args: argparse.Namespace, identity: Mapping[str,
     if directory_inventory(args.processor_path) != identity["processor"]:
         raise RuntimeError("processor/tokenizer changed while UI5 workers were running")
     immutable_files = (
+        (
+            Path(identity["orchestrator"]["path"]),
+            identity["orchestrator"]["sha256"],
+            "evaluation orchestrator",
+        ),
         (args.worker_script, identity["worker_script"]["sha256"], "worker script"),
         (
             Path(identity["crop_and_merge"]["implementation_path"]),
@@ -1004,6 +1146,28 @@ def validate_identity_unchanged(args: argparse.Namespace, identity: Mapping[str,
             args.rollout_bundle_root / "base_scan_plans.json",
             identity["hard_rollout"]["base_scan_plans_sha256"],
             "hard rollout base plans",
+        ),
+        (
+            Path(identity["curriculum"]["path"]),
+            identity["curriculum"]["sha256"],
+            "curriculum manifest",
+        ),
+        (
+            Path(identity["curriculum"]["success_path"]),
+            identity["curriculum"]["success_sha256"],
+            "curriculum success marker",
+        ),
+        *(
+            (
+                Path(identity["frozen_selection"][f"{name}_path"]),
+                identity["frozen_selection"][f"{name}_sha256"],
+                f"frozen selection {name}",
+            )
+            for name in ("manifest", "summary", "complete8", "success")
+        ),
+        *(
+            (Path(row["path"]), row["sha256"], f"UI5 {task} ground truth")
+            for task, row in identity["evaluation_inputs"].items()
         ),
     )
     for path, expected_digest, label in immutable_files:
@@ -1447,6 +1611,8 @@ def run(args: argparse.Namespace) -> int:
     args.input_dir = args.input_dir.expanduser().resolve(strict=True)
     args.hard_groups_jsonl = args.hard_groups_jsonl.expanduser().resolve(strict=True)
     args.rollout_bundle_root = args.rollout_bundle_root.expanduser().resolve(strict=True)
+    args.curriculum_manifest = args.curriculum_manifest.expanduser().resolve(strict=True)
+    args.frozen_selection = args.frozen_selection.expanduser().resolve(strict=True)
     args.worker_script = args.worker_script.expanduser().resolve(strict=True)
     args.scorer_script = args.scorer_script.expanduser().resolve(strict=True)
     args.output_dir = args.output_dir.expanduser().resolve(strict=False)
@@ -1490,23 +1656,43 @@ def run(args: argparse.Namespace) -> int:
     elif args.detector_crop_manifest is not None:
         raise ValueError("--detector-crop-manifest is only valid with detector_scan")
 
-    if args.output_dir.exists() and args.overwrite:
-        clean_owned_outputs(args.output_dir, args.score_run_name)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    owned = [args.output_dir / name for name in EXTERNAL_TASK_DIR.values()]
-    if any(path.exists() for path in owned):
-        raise FileExistsError(
-            "one or more task output directories already exist; use a new step directory "
-            "or --overwrite"
-        )
-
     resolved_rows, hard_counts, base_plan_path = resolve_hard_groups(
         args.hard_groups_jsonl, args.rollout_bundle_root, args.expected_hard_groups
     )
     resolved_hard_path = args.output_dir / "resolved_hard_groups.jsonl"
-    atomic_write_jsonl(resolved_hard_path, resolved_rows)
+    resolved_hard_sha256 = jsonl_rows_sha256(resolved_rows)
+    selection_identity = resolve_frozen_selection(args.frozen_selection)
+    if selection_identity["formal_crop_hard_groups"] != args.expected_hard_groups:
+        raise ValueError(
+            "--expected-hard-groups differs from frozen selection summary: "
+            f"argument={args.expected_hard_groups}, "
+            f"selection={selection_identity['formal_crop_hard_groups']}"
+        )
+    curriculum_identity = curriculum_evaluation_identity(
+        args.curriculum_manifest,
+        selection=selection_identity,
+        expected_hard_groups=args.expected_hard_groups,
+    )
+    hard_artifact = curriculum_identity["hard_groups_artifact"]
+    if (
+        args.hard_groups_jsonl.stat().st_size != hard_artifact["bytes"]
+        or file_sha256(args.hard_groups_jsonl) != hard_artifact["sha256"]
+    ):
+        raise ValueError(
+            "hard-group evaluation source differs from the curriculum publication"
+        )
+    selected_sample_ids = sorted(str(row["sample_id"]) for row in resolved_rows)
+    if len(selected_sample_ids) != len(set(selected_sample_ids)):
+        raise ValueError("hard-group evaluation source contains duplicate sample IDs")
+    if _canonical_json_sha256(selected_sample_ids) != selection_identity[
+        "formal_crop_hard_sample_ids_sha256"
+    ]:
+        raise ValueError(
+            "hard-group evaluation membership differs from the frozen selection"
+        )
     expected_images: dict[str, int] = {}
     expected_stems: dict[str, set[str]] = {}
+    input_files: dict[str, dict[str, Any]] = {}
     for task in TASKS:
         input_path = args.input_dir / TASK_GT_FILE[task]
         if not input_path.is_file():
@@ -1514,6 +1700,10 @@ def run(args: argparse.Namespace) -> int:
         image_paths = _input_image_paths(input_path, args.max_images_per_task)
         expected_images[task] = len(image_paths)
         expected_stems[task] = _expected_output_stems(image_paths)
+        input_files[task] = {
+            "path": str(input_path.resolve()),
+            "sha256": file_sha256(input_path),
+        }
         if expected_images[task] <= 0:
             raise ValueError(f"UI5 task {task} has no valid evaluation images")
 
@@ -1534,11 +1724,19 @@ def run(args: argparse.Namespace) -> int:
     matching_implementation = Path(__file__).with_name(
         "ui5_metric_matching.py"
     ).resolve(strict=True)
+    orchestrator_implementation = Path(__file__).resolve(strict=True)
     identity = {
         "schema_version": 1,
         "step": args.step,
+        "orchestrator": {
+            "path": str(orchestrator_implementation),
+            "sha256": file_sha256(orchestrator_implementation),
+        },
         "candidate": directory_inventory(args.checkpoint),
         "processor": directory_inventory(args.processor_path),
+        "curriculum": curriculum_identity,
+        "frozen_selection": selection_identity,
+        "evaluation_inputs": input_files,
         "worker_script": {
             "path": str(args.worker_script),
             "sha256": file_sha256(args.worker_script),
@@ -1556,6 +1754,10 @@ def run(args: argparse.Namespace) -> int:
             "top_k": args.top_k,
             "repetition_penalty": args.repetition_penalty,
             "seed": args.seed,
+        },
+        "relation_gate": {
+            "mode": args.relation_gate_mode,
+            "threshold": args.relation_gate_threshold,
         },
         "crop_and_merge": {
             "mode": args.inference_crop_mode,
@@ -1596,7 +1798,7 @@ def run(args: argparse.Namespace) -> int:
             "source": str(args.hard_groups_jsonl),
             "source_sha256": file_sha256(args.hard_groups_jsonl),
             "resolved_source": str(resolved_hard_path),
-            "resolved_source_sha256": file_sha256(resolved_hard_path),
+            "resolved_source_sha256": resolved_hard_sha256,
             "bundle_root": str(args.rollout_bundle_root),
             "base_scan_plans": str(base_plan_path),
             "base_scan_plans_sha256": file_sha256(base_plan_path),
@@ -1619,9 +1821,76 @@ def run(args: argparse.Namespace) -> int:
         },
         "worker_counts": {devices[0]: 2, devices[1]: 3},
         "expected_ui5_images": expected_images,
-        "created_at": utc_now(),
     }
     identity_path = args.output_dir / "evaluation_manifest.json"
+
+    if args.verify_existing_identity:
+        if args.overwrite or args.dry_run:
+            raise ValueError(
+                "--verify-existing-identity cannot be combined with --overwrite/--dry-run"
+            )
+        if not identity_path.is_file():
+            raise FileNotFoundError(
+                f"completed evaluation identity is missing: {identity_path}"
+            )
+        existing = json.loads(identity_path.read_text(encoding="utf-8"))
+        if existing != identity:
+            raise RuntimeError(
+                "completed evaluation identity differs from the current "
+                "checkpoint/curriculum/selection/eval configuration"
+            )
+        identity_digest = file_sha256(identity_path)
+        status_path = args.output_dir / "evaluation_status.json"
+        metrics_path = args.output_dir / "ui5_metrics.json"
+        if not status_path.is_file() or not metrics_path.is_file():
+            raise FileNotFoundError("completed evaluation status/metrics are missing")
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        if (
+            status.get("status") != "completed"
+            or status.get("success") is not True
+            or status.get("evaluation_identity_digest") != identity_digest
+        ):
+            raise RuntimeError("completed evaluation status does not bind its identity")
+        recorded_metrics_path = status.get("metrics_path")
+        try:
+            recorded_metrics_path = Path(str(recorded_metrics_path)).expanduser().resolve(
+                strict=True
+            )
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError("completed evaluation status has an invalid metrics path") from exc
+        if recorded_metrics_path != metrics_path.resolve(strict=True):
+            raise RuntimeError("completed evaluation status points to different metrics")
+        recorded_metrics_sha256 = str(status.get("metrics_sha256") or "").lower()
+        if (
+            len(recorded_metrics_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in recorded_metrics_sha256
+            )
+            or file_sha256(metrics_path) != recorded_metrics_sha256
+        ):
+            raise RuntimeError(
+                "completed evaluation metrics SHA-256 differs from its status"
+            )
+        print(
+            "[UI5 EVALUATION REUSE VERIFIED] "
+            f"step={args.step} identity_sha256={identity_digest}",
+            flush=True,
+        )
+        return 0
+
+    if args.output_dir.exists() and args.overwrite:
+        clean_owned_outputs(args.output_dir, args.score_run_name)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    owned = [args.output_dir / name for name in EXTERNAL_TASK_DIR.values()]
+    if any(path.exists() for path in owned):
+        raise FileExistsError(
+            "one or more task output directories already exist; use a new step directory "
+            "or --overwrite"
+        )
+    atomic_write_jsonl(resolved_hard_path, resolved_rows)
+    if file_sha256(resolved_hard_path) != resolved_hard_sha256:
+        raise RuntimeError("resolved hard-group publication digest mismatch")
     atomic_write_json(identity_path, identity)
     identity_digest = file_sha256(identity_path)
     specs = build_worker_specs(
@@ -1711,12 +1980,14 @@ def run(args: argparse.Namespace) -> int:
         evaluation_seconds=evaluation_seconds,
         hard_summary=hard_summary,
     )
+    metrics_sha256 = file_sha256(metrics_path)
     status.update(
         {
             "status": "completed",
             "success": True,
             "score_command": score_command,
             "metrics_path": str(metrics_path),
+            "metrics_sha256": metrics_sha256,
             "overall": metrics["overall"],
             "hard_rollout": hard_summary,
             "finished_at": utc_now(),
@@ -1748,7 +2019,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:
         print(f"[UI5 EVALUATION FAILED] {type(exc).__name__}: {exc}", file=sys.stderr)
         traceback.print_exc()
-        if args is not None:
+        if args is not None and not getattr(args, "verify_existing_identity", False):
             try:
                 output_dir = args.output_dir.expanduser().resolve(strict=False)
                 output_dir.mkdir(parents=True, exist_ok=True)

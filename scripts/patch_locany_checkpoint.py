@@ -286,16 +286,17 @@ def patch_checkpoint(
     if config_changed:
         atomic_write_json(config_path, config)
 
-    manifest = {
-        "schema_version": 1,
+    # Persist only the resulting canonical state.  Invocation-local fields
+    # such as ``config_changed`` or copied/skipped lists would make an
+    # otherwise idempotent second patch change the checkpoint's content hash,
+    # which in turn would invalidate a durable evaluation identity on resume.
+    durable_manifest = {
+        "schema_version": 2,
         "base_model": str(base_model),
         "checkpoint": str(checkpoint),
         "project_root": str(project_root),
-        "force": force,
-        "copied": copied,
-        "skipped": skipped,
-        "stale_skipped": stale,
-        "config_auto_map_updated": config_changed,
+        "config_auto_map_canonical": config.get("auto_map") == AUTO_MAP,
+        "config_sha256": sha256(config_path),
         "relation_weight_validation": relation_weight_report,
         "pbd_config_validation": pbd_config_report,
         "files": {
@@ -303,8 +304,17 @@ def patch_checkpoint(
             for name, source in sorted(selected_sources.items())
         },
     }
-    atomic_write_json(checkpoint / "locany_patch_manifest.json", manifest)
-    return manifest
+    manifest_path = checkpoint / "locany_patch_manifest.json"
+    atomic_write_json(manifest_path, durable_manifest)
+    return {
+        **durable_manifest,
+        "manifest": str(manifest_path),
+        "force": force,
+        "copied": copied,
+        "skipped": skipped,
+        "stale_skipped": stale,
+        "config_auto_map_updated": config_changed,
+    }
 
 
 def main() -> int:

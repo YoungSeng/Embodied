@@ -764,6 +764,44 @@ class CheckpointTests(unittest.TestCase):
                 "PROJECT = 2\n",
             )
 
+    def test_force_patch_persists_a_stable_checkpoint_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = root / "base"
+            base.mkdir()
+            (base / "modeling_locateanything.py").write_text(
+                "BASE = 1\n", encoding="utf-8"
+            )
+            project = root / "project"
+            inference = project / "eaglevl" / "utils" / "locany"
+            inference.mkdir(parents=True)
+            (inference / "modeling_locateanything.py").write_text(
+                "PROJECT = 1\n", encoding="utf-8"
+            )
+            checkpoint = self.make_eval_checkpoint(root, 1000)
+
+            first = patch_locany_checkpoint.patch_checkpoint(
+                base_model=base,
+                checkpoint=checkpoint,
+                project_root=project,
+                force=True,
+            )
+            manifest_path = checkpoint / "locany_patch_manifest.json"
+            first_bytes = manifest_path.read_bytes()
+            second = patch_locany_checkpoint.patch_checkpoint(
+                base_model=base,
+                checkpoint=checkpoint,
+                project_root=project,
+                force=True,
+            )
+
+            self.assertTrue(first["config_auto_map_updated"])
+            self.assertFalse(second["config_auto_map_updated"])
+            self.assertEqual(manifest_path.read_bytes(), first_bytes)
+            persisted = json.loads(first_bytes)
+            self.assertTrue(persisted["config_auto_map_canonical"])
+            self.assertNotIn("config_auto_map_updated", persisted)
+
     def test_relation_weight_validation_covers_relation_gate_and_pbd(self) -> None:
         keys = {
             f"model.{group}weight"

@@ -118,6 +118,9 @@ def build_curriculum_status(
 ) -> dict[str, Any]:
     step = int(result["step"])
     phase, profile = _phase_profile(step, total_steps)
+    next_phase, next_profile = _phase_profile(
+        min(total_steps, step + 1), total_steps
+    )
     candidates = [
         row
         for row in (train_curve_rows or [])
@@ -141,9 +144,17 @@ def build_curriculum_status(
             "global_replay_ratio": profile[2],
             "llm_lr": profile[3],
         },
+        "next_curriculum_target": {
+            "phase": next_phase,
+            "hard_ratio": next_profile[0],
+            "anchor_ratio": next_profile[1],
+            "global_replay_ratio": next_profile[2],
+            "llm_lr": next_profile[3],
+        },
         "training": {
             "log_step": latest.get("step"),
             "learning_rate": latest.get("learning_rate"),
+            "learning_rate_semantics": "next_optimizer_step",
             "loss_total": latest.get("loss_total"),
             "loss_lm": latest.get("loss_lm"),
             "grad_norm": latest.get("grad_norm"),
@@ -207,16 +218,21 @@ def _display(value: Any, *, digits: int = 8) -> str:
 
 def print_curriculum_status(status: dict[str, Any]) -> None:
     target = status["curriculum_target"]
+    next_target = status["next_curriculum_target"]
     training = status["training"]
     pools = training["pool_samples_cumulative"]
     print(
-        f"[TRAIN SNAPSHOT] step={status['step']} phase={status['phase']} "
-        f"lr={_display(training['learning_rate'])} target_lr={target['llm_lr']:.8g} "
-        f"ratios=hard:{target['hard_ratio']:.2f},anchor:{target['anchor_ratio']:.2f},"
-        f"global_replay:{target['global_replay_ratio']:.2f} "
+        f"[TRAIN SNAPSHOT] step={status['step']} completed_phase={status['phase']} "
+        f"next_phase={next_target['phase']} "
+        f"lr_next={_display(training['learning_rate'])} "
+        f"next_target_lr={next_target['llm_lr']:.8g} "
+        f"completed_phase_lr={target['llm_lr']:.8g} "
+        f"next_ratios=hard:{next_target['hard_ratio']:.2f},"
+        f"anchor:{next_target['anchor_ratio']:.2f},"
+        f"global_replay:{next_target['global_replay_ratio']:.2f} "
         f"loss={_display(training['loss_total'])} loss_lm={_display(training['loss_lm'])} "
         f"grad_norm={_display(training['grad_norm'])} "
-        f"pool_cumulative=hard:{_display(pools['hard'])},"
+        f"pool_draws_cumulative=hard:{_display(pools['hard'])},"
         f"anchor:{_display(pools['anchor'])},global_replay:{_display(pools['global_replay'])}"
     )
     for task, values in status["evaluation"]["tasks"].items():

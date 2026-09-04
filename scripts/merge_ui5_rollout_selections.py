@@ -871,6 +871,23 @@ def freeze(
         _atomic_jsonl(temporary / "complete8.jsonl", ordered)
         _atomic_jsonl(temporary / "sample_difficulty.jsonl", projected)
         _write_csv(temporary / "sample_difficulty.csv", projected)
+        formal_eligible_ids = sorted(
+            str(row["sample_id"])
+            for row in ordered
+            if row.get("grpo_source_eligible") is True
+            and not row.get("pipeline_coverage_failure")
+            and not row.get("annotation_anomaly")
+            and not row.get("coordinate_transform_anomaly")
+        )
+        formal_crop_hard_ids = sorted(
+            str(row["sample_id"])
+            for row in ordered
+            if int(row["crop_correct_count"]) == 0
+            and row.get("grpo_source_eligible") is True
+            and not row.get("pipeline_coverage_failure")
+            and not row.get("annotation_anomaly")
+            and not row.get("coordinate_transform_anomaly")
+        )
         summary = {
             "schema_version": SCHEMA_VERSION,
             "created_at": created_at,
@@ -900,21 +917,12 @@ def freeze(
                 )
                 for count in range(5)
             },
-            "formal_eligible_groups": sum(
-                row.get("grpo_source_eligible") is True
-                and not row.get("pipeline_coverage_failure")
-                and not row.get("annotation_anomaly")
-                and not row.get("coordinate_transform_anomaly")
-                for row in ordered
-            ),
-            "formal_crop_hard_groups": sum(
-                int(row["crop_correct_count"]) == 0
-                and row.get("grpo_source_eligible") is True
-                and not row.get("pipeline_coverage_failure")
-                and not row.get("annotation_anomaly")
-                and not row.get("coordinate_transform_anomaly")
-                for row in ordered
-            ),
+            "formal_eligible_groups": len(formal_eligible_ids),
+            "formal_crop_hard_groups": len(formal_crop_hard_ids),
+            "formal_crop_hard_sample_ids": formal_crop_hard_ids,
+            "formal_crop_hard_sample_ids_sha256": hashlib.sha256(
+                _canonical(formal_crop_hard_ids).encode("utf-8")
+            ).hexdigest(),
             "structural_anomaly_groups": sum(
                 row.get("pipeline_coverage_failure") is True
                 or row.get("annotation_anomaly") is True

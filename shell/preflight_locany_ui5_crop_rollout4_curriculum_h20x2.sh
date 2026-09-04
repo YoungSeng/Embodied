@@ -13,7 +13,8 @@ source "${SCRIPT_DIR}/bash_error_report.sh"
 WORKSPACE="${WORKSPACE:-/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace}"
 ENV_DIR="${ENV_DIR:-${WORKSPACE}/conda_envs/LocateAnything}"
 PYTHON_BIN="${PYTHON_BIN:-${ENV_DIR}/bin/python}"
-RUN_NAME="${RUN_NAME:-locany-ui5-crop-rollout4-curriculum-h20x2-20260904}"
+SUGGESTED_RUN_NAME="locany-ui5-crop-rollout4-curriculum-hard114-h20x2-sdpa7268-v1"
+RUN_NAME="${RUN_NAME:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-${WORKSPACE}/gui_models/Embodied-ui5-det-crop/${RUN_NAME}}"
 
 MODEL_PATH="${MODEL_PATH:-${WORKSPACE}/gui_models/Embodied-ui5-det-crop/locany-ui5-v5-croponly-sourcebalanced-a800x4-20260830/checkpoint-12000}"
@@ -32,23 +33,35 @@ fi
 
 ROLLOUT_BUNDLE_ROOT="${ROLLOUT_BUNDLE_ROOT:-${WORKSPACE}/gui_data/ui5_train_rollout_bundle_v1}"
 ROLLOUT_ROOT="${ROLLOUT_ROOT:-${WORKSPACE}/gui_rollouts/ui5-train-rollout8-h20x2-v6-20260904}"
-ROLLOUT_DIFFICULTY="${ROLLOUT_DIFFICULTY:-${ROLLOUT_ROOT}/selection/complete8.jsonl}"
+FROZEN_SELECTION="${FROZEN_SELECTION:-}"
+[[ -n "${FROZEN_SELECTION}" ]] || locany_die 2 \
+  "FROZEN_SELECTION must name one immutable selection produced by merge_ui5_rollout_selections.py"
+ROLLOUT_DIFFICULTY="${FROZEN_SELECTION}/complete8.jsonl"
 CURRICULUM_SOURCE_RECIPE="${CURRICULUM_SOURCE_RECIPE:-}"
 EVAL_INPUT_DIR="${EVAL_INPUT_DIR:-${WORKSPACE}/data}"
 EVAL_SCAN_NAME="${EVAL_SCAN_NAME:-horizontal_scan_v5_raw_detector_edge_aligned}"
 EVAL_DETECTOR_CACHE="${EVAL_DETECTOR_CACHE:-${WORKSPACE}/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v5}"
 EVAL_DETECTOR_MANIFEST="${EVAL_DETECTOR_MANIFEST:-${EVAL_DETECTOR_CACHE}/${EVAL_SCAN_NAME}/detector_scan_crops.jsonl}"
 SCORER_SCRIPT="${SCORER_SCRIPT:-${PROJECT_ROOT}/qwen3vl_merge_and_score_fixed_5tasks.py}"
-EXPECTED_HARD_GROUPS="${EXPECTED_HARD_GROUPS:-72}"
 SEED="${SEED:-42}"
 ROLLING_CHECKPOINT_DIR="${ROLLING_CHECKPOINT_DIR:-resume/latest}"
 NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
+MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-7268}"
+MAX_NUM_TOKENS_PER_SAMPLE="${MAX_NUM_TOKENS_PER_SAMPLE:-7268}"
+MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-7268}"
 
 [[ "${NNODES}" == 1 ]] || \
   locany_die 2 "Formal H20x2 launch requires NNODES=1; got ${NNODES}"
 [[ "${NODE_RANK}" == 0 ]] || \
   locany_die 2 "Formal H20x2 launch requires NODE_RANK=0; got ${NODE_RANK}"
+[[ "${ATTN_IMPLEMENTATION}" == sdpa ]] || \
+  locany_die 2 "Formal H20x2 launch requires ATTN_IMPLEMENTATION=sdpa; got ${ATTN_IMPLEMENTATION}"
+for token_limit in MAX_SEQ_LENGTH MAX_NUM_TOKENS_PER_SAMPLE MAX_NUM_TOKENS; do
+  [[ "${!token_limit}" == 7268 ]] || \
+    locany_die 2 "Formal H20x2 launch requires ${token_limit}=7268; got ${!token_limit}"
+done
 
 if [[ "${ROLLING_CHECKPOINT_DIR}" = /* ]]; then
   ROLLING_CHECKPOINT_PATH="${ROLLING_CHECKPOINT_DIR}"
@@ -100,6 +113,8 @@ esac
 if [[ "${KEEP_PREFLIGHT_WORKDIR}" != 0 && "${KEEP_PREFLIGHT_WORKDIR}" != 1 ]]; then
   locany_die 2 "KEEP_PREFLIGHT_WORKDIR must be 0 or 1"
 fi
+[[ -n "${RUN_NAME}" ]] || locany_die 2 \
+  "RUN_NAME must be explicit so preflight checks the intended formal OUTPUT_DIR; suggested: ${SUGGESTED_RUN_NAME}"
 
 # This is intentionally unconditional.  In particular, an inherited Slurm or
 # interactive-shell CUDA_VISIBLE_DEVICES value cannot leak into any check.
@@ -110,10 +125,11 @@ export PYTHONNOUSERSITE=1
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
 export PROJECT_ROOT WORKSPACE ENV_DIR PYTHON_BIN MODEL_PATH BASE_MODEL PROCESSOR_PATH
-export OUTPUT_DIR ROLLOUT_BUNDLE_ROOT ROLLOUT_DIFFICULTY CURRICULUM_SOURCE_RECIPE
-export EVAL_INPUT_DIR EVAL_DETECTOR_MANIFEST SCORER_SCRIPT EXPECTED_HARD_GROUPS SEED
+export OUTPUT_DIR ROLLOUT_BUNDLE_ROOT FROZEN_SELECTION ROLLOUT_DIFFICULTY CURRICULUM_SOURCE_RECIPE
+export EVAL_INPUT_DIR EVAL_DETECTOR_MANIFEST SCORER_SCRIPT SEED
 export ROLLING_CHECKPOINT_PATH
 export NNODES NODE_RANK
+export ATTN_IMPLEMENTATION MAX_SEQ_LENGTH MAX_NUM_TOKENS_PER_SAMPLE MAX_NUM_TOKENS
 
 PREFLIGHT_TMP_ROOT="${PREFLIGHT_TMP_ROOT:-${TMPDIR:-/tmp}}"
 [[ -d "${PREFLIGHT_TMP_ROOT}" ]] || locany_die 3 "Temporary root is missing: ${PREFLIGHT_TMP_ROOT}"
@@ -184,7 +200,7 @@ if openpyxl_version < (3, 1):
     raise SystemExit(
         f"openpyxl>=3.1 is required, found {versions['openpyxl']}"
     )
-for name in ("deepspeed", "magi_attention", "flash_attn"):
+for name in ("deepspeed", "flash_attn"):
     if importlib.util.find_spec(name) is None:
         raise SystemExit(f"required module is missing: {name}")
     versions[name] = "present"
@@ -206,6 +222,24 @@ if torch.cuda.is_available() or torch.cuda.device_count() != 0:
 print("dependency_versions=" + ", ".join(f"{key}:{value}" for key, value in versions.items()))
 print("cuda_visible_devices=<empty> torch_cuda_device_count=0")
 PY
+}
+
+resolve_frozen_selection() {
+  if [[ -v EXPECTED_HARD_GROUPS && -n "${EXPECTED_HARD_GROUPS}" ]]; then
+    echo "[WARN] inherited EXPECTED_HARD_GROUPS is ignored; deriving from ${FROZEN_SELECTION}/summary.json"
+  fi
+  EXPECTED_HARD_GROUPS="$(
+    "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/ui5_frozen_selection.py" \
+      --frozen-selection "${FROZEN_SELECTION}" \
+      --field formal_crop_hard_groups
+  )"
+  [[ "${EXPECTED_HARD_GROUPS}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "invalid derived hard-group count: ${EXPECTED_HARD_GROUPS}" >&2
+    return 1
+  }
+  readonly EXPECTED_HARD_GROUPS
+  export EXPECTED_HARD_GROUPS
+  echo "frozen_selection=${FROZEN_SELECTION} formal_crop_hard_groups=${EXPECTED_HARD_GROUPS}"
 }
 
 check_formal_inputs() {
@@ -316,6 +350,7 @@ relative_paths = (
     "scripts/inference_ui_defect_locany.py",
     "scripts/locany_ui5_checkpoint.py",
     "scripts/merge_ui5_rollout_selections.py",
+    "scripts/ui5_frozen_selection.py",
     "scripts/report_ui5_training_segment.py",
     "scripts/run_ui5_curriculum_evaluation.py",
     "scripts/summarize_ui5_curriculum_diagnostics.py",
@@ -389,7 +424,9 @@ expected_policy = {
     "hard": "all_gt_free_detector_scan_base_tiles",
     "matched_anchor": "all_gt_free_detector_scan_base_tiles",
     "content_missing": "full_image_global_view",
-    "global_replay": "full_image_retention",
+    "global_replay": (
+        "all_gt_free_detector_scan_base_tiles_except_content_missing_full_image"
+    ),
     "tile_selection_uses_gt": False,
     "partial_gt_allowed": False,
 }
@@ -410,15 +447,26 @@ for pool in ("hard", "matched_anchor", "global_replay"):
         for line in (root / f"{pool}.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-for pool in ("hard", "matched_anchor"):
+for pool in ("hard", "matched_anchor", "global_replay"):
     by_sample = {}
     for row in records[pool]:
         by_sample.setdefault(str(row["_ui5_sample_id"]), []).append(row)
         task = str(row["_ui5_task"]).removeprefix("ui_")
         kind = row.get("_ui5_record_kind")
         if task == "content_missing":
-            if kind != "global_view" or row.get("_ui5_crop_source") != "content_missing_global":
-                raise SystemExit(f"{pool} content_missing is not a global view")
+            expected_kind = "full_image" if pool == "global_replay" else "global_view"
+            expected_source = (
+                "global_replay_retention"
+                if pool == "global_replay"
+                else "content_missing_global"
+            )
+            if (
+                kind != expected_kind
+                or row.get("_ui5_crop_source") != expected_source
+            ):
+                raise SystemExit(
+                    f"{pool} content_missing is not its canonical full-image view"
+                )
         elif (
             kind != "crop"
             or row.get("_ui5_crop_source") != "gt_free_detector_scan_base_tile"
@@ -436,14 +484,6 @@ for pool in ("hard", "matched_anchor"):
                 f"{pool} sample {sample_id} omitted a base tile: "
                 f"expected={expected_records}, observed={len(sample_rows)}"
             )
-if any(
-    row.get("_ui5_record_kind") != "full_image"
-    or row.get("_ui5_retention_view") is not True
-    or row.get("_ui5_crop_source") != "global_replay_retention"
-    for row in records["global_replay"]
-):
-    raise SystemExit("global replay is not an all-full-image retention pool")
-
 asset_rows = [
     json.loads(line)
     for line in (root / "crop_assets.jsonl").read_text(encoding="utf-8").splitlines()
@@ -451,7 +491,7 @@ asset_rows = [
 ]
 crop_records = [
     row
-    for pool in ("hard", "matched_anchor")
+    for pool in ("hard", "matched_anchor", "global_replay")
     for row in records[pool]
     if row.get("_ui5_record_kind") == "crop"
 ]
@@ -539,6 +579,9 @@ printf '%-30s %s\n' \
   "PYTHON_BIN" "${PYTHON_BIN}" \
   "MODEL_PATH" "${MODEL_PATH}" \
   "OUTPUT_DIR" "${OUTPUT_DIR}" \
+  "FROZEN_SELECTION" "${FROZEN_SELECTION}" \
+  "ATTN_IMPLEMENTATION" "${ATTN_IMPLEMENTATION}" \
+  "TOKEN_LIMITS" "${MAX_SEQ_LENGTH}/${MAX_NUM_TOKENS_PER_SAMPLE}/${MAX_NUM_TOKENS}" \
   "ROLLING_CHECKPOINT" "${ROLLING_CHECKPOINT_PATH}" \
   "NNODES" "${NNODES}" \
   "NODE_RANK" "${NODE_RANK}" \
@@ -547,6 +590,7 @@ printf '%-30s %s\n' \
 
 run_check "Python executable" test -x "${PYTHON_BIN}"
 run_check "Python dependencies and zero visible GPUs" check_python_dependencies
+run_check "immutable frozen selection and derived hard-group count" resolve_frozen_selection
 run_check "formal input paths and lightweight JSON readability" check_formal_inputs
 run_check "Bash static syntax" check_bash_syntax
 run_check "Python static syntax (AST, no imports)" check_python_syntax
