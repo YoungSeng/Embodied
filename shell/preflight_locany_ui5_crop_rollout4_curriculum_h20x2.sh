@@ -350,6 +350,7 @@ from pathlib import Path
 root = Path(sys.argv[1])
 relative_paths = (
     "eaglevl/train/locany_finetune_magi_stream.py",
+    "eaglevl/model/locany/ui_relation_setup.py",
     "eaglevl/train/ui5_checkpoint_utils.py",
     "eaglevl/train/ui5_curriculum.py",
     "eaglevl/train/ui5_curriculum_artifacts.py",
@@ -366,6 +367,7 @@ relative_paths = (
     "scripts/summarize_ui5_curriculum_diagnostics.py",
     "scripts/update_ui5_curriculum_artifacts.py",
     "tests/test_ui5_curriculum.py",
+    "tests/test_ui5_detail_scale_audit.py",
     "tests/test_ui5_curriculum_artifacts.py",
     "tests/test_ui5_curriculum_diagnostics.py",
     "tests/test_ui5_curriculum_evaluation.py",
@@ -588,6 +590,7 @@ check_resume_checkpoint_contract() {
 
 run_lightweight_tests() {
   "${PYTHON_BIN}" -B -m unittest \
+    tests.test_ui5_detail_scale_audit \
     tests.test_ui5_curriculum \
     tests.test_ui5_curriculum_artifacts \
     tests.test_ui5_curriculum_evaluation \

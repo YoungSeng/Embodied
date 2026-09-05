@@ -51,6 +51,7 @@ from eaglevl.patch import (
 from eaglevl.model.locany.modeling_locateanything import LocateAnythingForConditionalGeneration
 from eaglevl.model.locany.configuration_locateanything import LocateAnythingConfig
 from eaglevl.model.locany.ui_relation_setup import (
+    audit_ui5_detail_scale_weights,
     configure_ui5_model_config,
     initialize_or_validate_ui_relation,
 )
@@ -2714,6 +2715,7 @@ class StreamPackingMTPTrainer(Trainer):
         *args,
         sample_log_interval: int = 100,
         max_num_tokens: int = 0,
+        ui_relation_load_state: str = "unknown",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -2751,6 +2753,8 @@ class StreamPackingMTPTrainer(Trainer):
         self._ui5_last_grad_seen_global = {}
         self._ui5_parameter_baseline = {}
         self._ui5_real_data_audit_logged = False
+        self._ui5_relation_load_state = ui_relation_load_state
+        self._ui5_scale_audit_resuming = False
         if self._ui5_enabled:
             self._register_ui5_gradient_hooks()
             self._snapshot_ui5_parameters()
@@ -3361,24 +3365,16 @@ class StreamPackingMTPTrainer(Trainer):
 
         if not self._ui5_real_data_audit_logged and torch.is_tensor(detail_norm):
             detail_weights_for_audit = getattr(outputs, "detail_layer_weights", None)
+            scale_audit = {}
             if torch.is_tensor(detail_weights_for_audit):
-                weight_sums = detail_weights_for_audit.detach().float().sum(dim=-1)
-                if not bool(torch.allclose(weight_sums, torch.ones_like(weight_sums), atol=1.0e-5)):
-                    raise RuntimeError(
-                        f"Detail Pyramid scale weights do not sum to one: {weight_sums.tolist()}"
-                    )
-                if int(self.state.global_step) == 0 and not bool(
-                    torch.allclose(
-                        detail_weights_for_audit.detach().float(),
-                        torch.full_like(detail_weights_for_audit.detach().float(), 1.0 / 3.0),
-                        atol=1.0e-4,
-                    )
-                ):
-                    raise RuntimeError(
-                        "Initial Detail Pyramid scale weights are not thirds: "
-                        f"{detail_weights_for_audit.detach().float().cpu().tolist()}"
-                    )
+                scale_audit = audit_ui5_detail_scale_weights(
+                    detail_weights_for_audit,
+                    global_step=int(self.state.global_step),
+                    load_state=self._ui5_relation_load_state,
+                    resuming_from_checkpoint=self._ui5_scale_audit_resuming,
+                )
             audit = {
+                **scale_audit,
                 "rank": get_rank(),
                 "projected_norm": detail_norm.detach().float().cpu().tolist(),
                 "projected_abs_max": (
@@ -4399,9 +4395,13 @@ def main():
             relation_focal_gamma=model_args.relation_focal_gamma)
         locateanything_config._attn_implementation = 'magi'
         model = LocateAnythingForConditionalGeneration(locateanything_config, vision_model, llm)
-        model.initialize_ui_relation_modules(
+        ui_initialization_report = model.initialize_ui_relation_modules(
             training_args.seed, "new-model-without-composite-checkpoint"
         )
+        ui_load_report = {
+            "state": "new_model" if model.enable_ui_relation else "disabled",
+            "initialization": ui_initialization_report,
+        }
 
         chat_template_data = load_config(model_args.chat_template_path)
         processor_config = load_config(model_args.processor_config_path)
@@ -4580,6 +4580,7 @@ def main():
         processing_class=processor,
         sample_log_interval=getattr(data_args, 'sample_log_interval', 100),
         max_num_tokens=getattr(data_args, 'max_num_tokens', 0),
+        ui_relation_load_state=ui_load_report["state"],
     )
 
     # Training
@@ -4688,6 +4689,10 @@ def main():
                 active_stage.llm_lr,
             )
 
+        # A freshly loaded base model may be overwritten by Trainer/DeepSpeed
+        # during exact resume. Do not audit restored weights as new parameters,
+        # including the valid case of a checkpoint whose global step is zero.
+        trainer._ui5_scale_audit_resuming = checkpoint is not None
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         segment_mode = _env_flag("LOCANY_SEGMENT_MODE", default=False)
         if should_export_model_at_training_end(segment_mode=segment_mode):

@@ -179,3 +179,31 @@ groups 仍取自本次冻结 summary，不写死数量。GPU 启动后的原有�
 重试生成新的 RUN_NAME、OUTPUT_DIR、job YAML，并绑定 pull 后的当前代码 SHA；镜像、资源、
 模型、评测配置和课程参数保持不变。旧 YAML、状态及标记全部保留，新增独占
 `caption-retry.started` 防止同一个旧提交被重复恢复。
+
+### 原 crop checkpoint 启动时被错误要求 scale weights = 1/3
+
+`global_step=0` 只表示本轮课程还没有 optimizer update，不表示模型参数是随机初始化。
+完整加载原 crop checkpoint 后，Detail Pyramid 的 `scale_logits` 已经学过，三层权重可以
+不相等。诊断不应将它们重置为 1/3，也不应因此终止训练。
+
+首批检查现在使用本进程真实的 UI 参数加载报告：只有 `all_missing`（基础模型完全缺少 UI
+参数）或 `new_model`，且 global step 为 0、没有 checkpoint 续训时，要求各层为 1/3。
+`complete` 或精确续训检查有限值、[0,1] 范围、三层归一化，但保留已学习权重。
+checkpoint 中保存的历史初始化原因不作为“本次新初始化”的依据；部分缺失参数仍拒绝加载。
+
+控制台 `[UI5 first-real-batch audit]` 和
+`diagnostics/first_real_batch_audit_rank{0,1}.json` 会记录 `ui_relation_load_state`、
+`resuming_from_checkpoint`、`initial_thirds_required`、实际 scale weights 及其偏离 1/3 的幅度。
+原有训练曲线、各任务 scale weight 指标、Excel 输出和其他数值检查保持不变。
+
+无需重新构建课程，开发机可先运行无 GPU 回归：
+
+```bash
+CUDA_VISIBLE_DEVICES="" /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python \
+  -B -m unittest -v tests.test_ui5_detail_scale_audit
+```
+
+修复需要重新启动训练进程。已有完整 `resume/latest` 时仍按原严格规则恢复 optimizer、
+scheduler、RNG、sampler 和 global step；首批就失败且尚无完整滚动 checkpoint 时从原 crop
+模型启动。不要删除或重置已有 checkpoint，也不要使用仅适用于 caption 拒绝的提交重试入口。
+提交 YAML 中的 `CODE_REVISION` 和入口 SHA 检查需要同步更新到修复后的提交。

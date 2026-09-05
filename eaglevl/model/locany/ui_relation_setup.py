@@ -13,6 +13,51 @@ import torch
 import torch.distributed as dist
 
 
+def audit_ui5_detail_scale_weights(
+    weights: torch.Tensor,
+    *,
+    global_step: int,
+    load_state: str,
+    resuming_from_checkpoint: bool,
+) -> dict[str, Any]:
+    """Check the simplex without mistaking a new run for a newly created model.
+
+    ``load_state`` comes from this process's loading report, not a checkpoint's
+    persisted initialization metadata. Learned weights are never reset here.
+    A checkpoint restore takes precedence even when its trainer step is zero.
+    """
+    values = weights.detach().float()
+    if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] != 3:
+        raise RuntimeError(f"Detail Pyramid scale weights must have nonempty [N, 3] shape: {list(values.shape)}")
+    if not bool(torch.isfinite(values).all()):
+        raise FloatingPointError("Detail Pyramid scale weights are non-finite")
+    if bool(((values < 0.0) | (values > 1.0)).any()):
+        raise RuntimeError("Detail Pyramid scale weights must lie in [0, 1]")
+    weight_sums = values.sum(dim=-1)
+    if not bool(torch.allclose(weight_sums, torch.ones_like(weight_sums), atol=1.0e-5, rtol=0.0)):
+        raise RuntimeError(f"Detail Pyramid scale weights do not sum to one: {weight_sums.cpu().tolist()}")
+    expect_thirds = (
+        load_state in {"all_missing", "new_model"}
+        and int(global_step) == 0
+        and not resuming_from_checkpoint
+    )
+    if expect_thirds and not bool(torch.allclose(
+        values, torch.full_like(values, 1.0 / 3.0), atol=1.0e-4, rtol=0.0,
+    )):
+        raise RuntimeError(
+            "Freshly initialized Detail Pyramid scale weights are not thirds: "
+            f"{values.cpu().tolist()}"
+        )
+    return {
+        "global_step": int(global_step),
+        "ui_relation_load_state": str(load_state),
+        "resuming_from_checkpoint": bool(resuming_from_checkpoint),
+        "initial_thirds_required": expect_thirds,
+        "scale_weights_valid": True,
+        "scale_weight_max_deviation_from_thirds": float((values - 1.0 / 3.0).abs().max().item()),
+    }
+
+
 def ui_relation_collective_device(
     parameter_device: torch.device | str | None = None,
 ) -> torch.device:
