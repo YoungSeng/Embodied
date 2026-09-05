@@ -13,6 +13,7 @@ from ui14_repair import (source_manifest_tasks, capture_repair_snapshot, validat
 from eaglevl.train.ui_defect_data import (identify_ui_defect_task, is_positive_ui_defect,
     build_task_source_balanced_rotating_plan, materialize_task_source_balanced_rotating_indices)
 from locany_ui5_common import TASK_JSONL
+from ui14_progress import ProgressSession, phase, phase_function, track
 
 
 def normalize(args):
@@ -30,7 +31,8 @@ def normalize(args):
     rows_by_task, stats, registry, errors, issues = {}, {}, [], [], []
     identity_cache, image_info = {}, {}
     artifacts, total_comparison, total_formats = {}, Counter(), Counter()
-    for task in UI_TASKS:
+    for task in track(UI_TASKS, "normalize 任务注册与来源扫描", unit="任务",
+                      detail=lambda t: t.task_key, estimate=False):
         spec = task.to_dict()
         if task.task_id < 5:
             spec.update(train=str(args.ui5_recipe), test=str(Path(args.ui5_test_dir) / TASK_JSONL[task.task_key]))
@@ -48,7 +50,8 @@ def normalize(args):
                 legacy_record_ids = set()
                 formats, comparison, selected_fields, bases = Counter(), Counter(), Counter(), Counter()
                 raw_count, failed = 0, 0
-                for line, raw, json_error in iter_records(src):
+                for line, raw, json_error in track(iter_records(src), f"{task.task_key}/{split} 标注与图片",
+                        total=source[f"{split}_records"], unit="记录", detail=lambda item: f"源文件第 {item[0]} 行"):
                     raw_count += 1
                     current = None
                     if json_error:
@@ -176,9 +179,10 @@ def normalize(args):
     print(f"Normalized repair {snapshot['repair_run_id']} under {root}; train/test duplicate images={len(duplicates['train_test'])}")
 
 
+@phase_function("统计原图重复")
 def image_overlaps(rows):
     identities = defaultdict(set)
-    for row in rows:
+    for row in track(rows, "原图身份与 split 归属", unit="记录"):
         identities[row["source_image_id"]].add((row["task_key"], row["split"]))
     return {"identity": "sha256(decoded RGB dimensions and pixels)",
             "train_test": [{"source_image_id": key, "uses": sorted(uses)} for key, uses in identities.items()
@@ -187,6 +191,7 @@ def image_overlaps(rows):
                              if len({task for task, _ in uses}) > 1]}
 
 
+@phase_function("核验 detector cache 的完整性与几何计划")
 def validate_task_cache(root, task, split, expected):
     from ui5_eval_detector_cache import validate_eval_detector_cache
     paths = paths_for(root, task.task_key, split)
@@ -197,14 +202,17 @@ def validate_task_cache(root, task, split, expected):
         require_detector_unique_containment=True)
 
 
+@phase_function("生成或核对 crop PNG 与标签")
 def crop_annotations(root, task, split, records):
     from PIL import Image, ImageOps
     paths = paths_for(root, task.task_key, split)
-    validate_task_cache(root, task, split, len({file_digest(r["source_image"]) for r in records}))
+    validate_task_cache(root, task, split, len({file_digest(r["source_image"]) for r in track(
+        records, f"{task.task_key}/{split} detector 图片摘要", unit="原图")}))
     plans = list(read_jsonl(paths["cache"] / SCAN_NAME / "detector_scan_crops.jsonl"))
     index = {str(Path(p).resolve()): row for row in plans for p in row["image_paths"]}
     derived, coverage = [], []
-    for row in records:
+    for row in track(records, f"{task.task_key}/{split} 原图 → crop PNG/标签", unit="原图",
+                     detail=lambda r: r["source_image"]):
         plan = index[row["source_image"]]
         if (plan["width"], plan["height"]) != (row["width"], row["height"]):
             raise ValueError("Crop cache screenshot dimensions changed")
@@ -239,6 +247,7 @@ def crop_annotations(root, task, split, records):
     return derived
 
 
+@phase_function("复用 UI5 审核样本与人工修复")
 def legacy_train(args):
     recipe_path = Path(args.ui5_recipe).resolve(strict=True)
     recipe = read_json(recipe_path)
@@ -263,7 +272,7 @@ def legacy_train(args):
         for value in annotations:
             path = Path(value)
             if not path.is_absolute(): path = recipe_path.parent / path
-            for record in read_jsonl(path):
+            for record in track(read_jsonl(path), f"UI5 训练来源 {path.name}", unit="记录"):
                 if (str(record.get("_ui5_sample_id", "")), str(record.get("_ui5_task", ""))) in exclusions:
                     if record.get("_ui5_crop_source") == "manual_gt_repair":
                         raise ValueError("Audited exclusion would remove a manual repair")
@@ -303,7 +312,8 @@ def finalize(args):
     registry = load_registry(root / "task_registry.json")
     legacy = legacy_train(args)
     recipe, evaluation, stats, all_sources = {}, [], {}, []
-    for task in UI_TASKS:
+    for task in track(UI_TASKS, "finalize 1/2 组装联合 recipe 与评测清单", unit="任务",
+                      detail=lambda t: t.task_key, estimate=False):
         spec = registry[task.task_id]
         if task.task_id < 5:
             train = legacy[task.task_key]
@@ -311,7 +321,7 @@ def finalize(args):
             write_jsonl(paths["derived"], train)
             test_path = Path(args.ui5_test_dir) / TASK_JSONL[task.task_key]
             # Preserve the test file and scorer's no_figma policy exactly.
-            for record in read_jsonl(test_path):
+            for record in track(read_jsonl(test_path), f"{task.task_key}/test 固定 UI5 原图", unit="记录"):
                 from qwen3vl_merge_and_score_fixed_5tasks import extract_image_path, is_figma_sample
                 if is_figma_sample(record): continue
                 image = extract_image_path(record)
@@ -328,12 +338,13 @@ def finalize(args):
                 if task.view_policy == "crops":
                     records = crop_annotations(root, task, split, normalized)
                 else:
-                    records = [training_record(r, task, r["source_image"], r["boxes_px"], r["width"], r["height"]) for r in normalized]
+                    records = [training_record(r, task, r["source_image"], r["boxes_px"], r["width"], r["height"])
+                               for r in track(normalized, f"{task.task_key}/{split} 全图标注", unit="原图")]
                 write_jsonl(paths["derived"], records)
                 if split == "train": train = records
             original_test = list(read_jsonl(paths_for(root, task.task_key, "test")["normalized"]))
             by_image = {}
-            for record in original_test:
+            for record in track(original_test, f"{task.task_key}/test 原图评测清单", unit="记录"):
                 key = record["source_image_id"]
                 if key not in by_image:
                     by_image[key] = {k: v for k, v in record.items() if k != "source_metadata"}
@@ -352,8 +363,9 @@ def finalize(args):
             "repeat_time": 1, "length": len(train), "ui5_crop_recipe": True, "view_policy": task.view_policy,
             "task_key": task.task_key, "task_id": task.task_id, "sampling_weight": 1.0,
             "ui_sampling_mode": "task_source_balanced_rotating"}
-        plan = build_task_source_balanced_rotating_plan(train)
-        draws = materialize_task_source_balanced_rotating_indices(plan, seed=42)
+        with phase(f"{task.task_key} 源图均衡采样统计"):
+            plan = build_task_source_balanced_rotating_plan(train)
+            draws = materialize_task_source_balanced_rotating_indices(plan, seed=42)
         stats[task.task_key] = {"train_records": len(train), "source_images": len({r["source_image_id"] for r in train}),
             "positive_records": sum(is_positive_ui_defect(r) for r in train), "negative_records": sum(not is_positive_ui_defect(r) for r in train),
             "sampling_probability": 1/14, "epoch_draws": len(draws),
@@ -372,6 +384,7 @@ def finalize(args):
     check(args)
 
 
+@phase_function("完整 CPU 检查（finalize 2/2）")
 def check(args):
     root = Path(args.output_dir).resolve()
     write_json(root / "cpu_check_report.json", {**read_json(root / "cpu_check_report.json"),
@@ -393,12 +406,12 @@ def check(args):
     for document in (read_json(root / "task_registry.json"), read_json(root / "evaluation_manifest.json")):
         if document.get("normalization_id") != snapshot["normalization_id"]:
             errors.append("Registry/evaluation belongs to another repair batch")
-    for spec in registry:
+    for spec in track(registry, "逐任务检查", unit="任务", detail=lambda s: s["task_key"], estimate=False):
         task = get_task(spec["task_id"])
         try:
             train = list(read_jsonl(recipe[task.task_key]["annotation"]))
             if not train: raise ValueError("Empty training stream")
-            for row in train:
+            for row in track(train, f"{task.task_key}/train 路径与路由", unit="训练样本"):
                 if row["split"] != "train" or identify_ui_defect_task(row)[1] != task.task_id: raise ValueError("Recipe route/split mismatch")
                 if not Path(row["image"]).is_file(): raise FileNotFoundError(row["image"])
             if recipe[task.task_key]["sampling_weight"] != 1.0: raise ValueError("Formal task sampling weights must all be one")
@@ -415,7 +428,8 @@ def check(args):
                     original_stat = read_json(root / "normalization_stats.json")["tasks"][f"{task.task_key}/{split}"]
                     if external_digests[str(source_path)] != original_stat["input_sha256"]:
                         raise ValueError("Original export changed after normalization")
-                    for row in records:
+                    for row in track(records, f"{task.task_key}/{split} 原图内容与归属", unit="原图",
+                                     detail=lambda r: r["source_image"]):
                         if row.get("normalization_id") != snapshot["normalization_id"] or row["split"] != split:
                             raise ValueError("Normalized record belongs to another repair/file split")
                         if row["source_image"] not in identity_cache:
@@ -424,7 +438,8 @@ def check(args):
                         if current != (row["source_image_id"], row["width"], row["height"]):
                             raise ValueError("Normalized screenshot content changed")
                     by_id = {r["source_record_id"]: r for r in records}
-                    for derived in read_jsonl(p["derived"]):
+                    for derived in track(read_jsonl(p["derived"]), f"{task.task_key}/{split} 标签、坐标与 crop 摘要",
+                                         unit="样本", total=len(train) if split == "train" else None):
                         source = by_id[derived["source_record_id"]]
                         if (derived["split"] != split or derived["source_image_id"] != source["source_image_id"]
                             or identify_ui_defect_task(derived)[1] != task.task_id
@@ -441,7 +456,8 @@ def check(args):
                         if derived["conversations"] != [{"from": "human", "value": "<image>\n" + task.prompt}, {"from": "gpt", "value": expected_answer}]:
                             raise ValueError("Prompt or crop-coordinate annotation drift")
                     if task.view_policy == "crops":
-                        validate_task_cache(root, task, split, len({file_digest(r["source_image"]) for r in records}))
+                        validate_task_cache(root, task, split, len({file_digest(r["source_image"]) for r in track(
+                            records, f"{task.task_key}/{split} detector 图片摘要", unit="原图")}))
                         coverage = read_json(p["derived"].with_suffix(".coverage.json"))
                         coverage_results[f"{task.task_key}/{split}"] = {
                             "gt_count": sum(r["gt_count"] for r in coverage),
@@ -461,14 +477,17 @@ def check(args):
             results[task.task_key] = "fail"
     try:
         from ui5_eval_detector_cache import validate_eval_detector_cache
-        validate_eval_detector_cache(Path(args.ui5_cache), scan_name=SCAN_NAME, expected_unique_images=1555,
-            input_dir=Path(args.ui5_test_dir), required_cache_scope="full_test", require_strict_nonoverlap=True,
-            require_raw_detector_edge_alignment=True, require_detector_unique_containment=True)
+        with phase("UI5 固定 1555 张 test detector cache 检查"):
+            validate_eval_detector_cache(Path(args.ui5_cache), scan_name=SCAN_NAME, expected_unique_images=1555,
+                input_dir=Path(args.ui5_test_dir), required_cache_scope="full_test", require_strict_nonoverlap=True,
+                require_raw_detector_edge_alignment=True, require_detector_unique_containment=True)
         from run_ui14_eval import validate_evaluation_manifest
-        validate_evaluation_manifest(root / "evaluation_manifest.json")
+        with phase("核验完整 14 项评测连接"):
+            validate_evaluation_manifest(root / "evaluation_manifest.json")
         from ui14_checks import validate_initial_checkpoint, render_formal_yaml
-        checkpoint_report = validate_initial_checkpoint(Path(args.init_checkpoint))
-        yaml_path, runtime_path = render_formal_yaml(root)
+        with phase("核验 CPT-9000 初始化并渲染正式 YAML"):
+            checkpoint_report = validate_initial_checkpoint(Path(args.init_checkpoint))
+            yaml_path, runtime_path = render_formal_yaml(root)
         bound_artifacts.update((yaml_path.name, runtime_path.name))
         for path in (Path(args.ui5_recipe), Path(args.ui5_cache) / SCAN_NAME / "eval_detector_cache_ready.json", Path(args.init_checkpoint) / "config.json"):
             external_digests[str(path)] = file_digest(path)
@@ -491,7 +510,8 @@ def check(args):
               "initialization": locals().get("checkpoint_report"), "sft_start_step": 0,
               "crop_coverage": coverage_results,
               "yaml": str(root / "formal_job.yaml"), "formal_runtime": str(root / "formal_runtime.json"),
-              "artifact_digests": {name: file_digest(root / name) for name in sorted(bound_artifacts)},
+              "artifact_digests": {name: file_digest(root / name) for name in track(sorted(bound_artifacts),
+                  "绑定最终产物摘要", unit="文件", detail=str)},
               "external_digests": external_digests,
               "registry_count": len(registry), "evaluation_count": len(evaluation), "ready": not errors}
     write_json(root / "cpu_check_report.json", report)
@@ -508,6 +528,8 @@ def parse_args():
     parser.add_argument("--ui5-test-dir", default=WORKSPACE + "/data")
     parser.add_argument("--ui5-cache", default=WORKSPACE + "/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v5")
     parser.add_argument("--init-checkpoint", default=INIT_CHECKPOINT)
+    parser.add_argument("--progress-interval-seconds", type=float,
+                        default=os.environ.get("UI14_PROGRESS_INTERVAL_SECONDS", "10"))
     return parser.parse_args()
 
 
@@ -525,4 +547,6 @@ def run_stage(args):
 
 
 if __name__ == "__main__":
-    run_stage(parse_args())
+    args = parse_args()
+    with ProgressSession(args.stage, args.output_dir, args.progress_interval_seconds):
+        run_stage(args)

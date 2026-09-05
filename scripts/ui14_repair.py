@@ -6,6 +6,7 @@ import math
 import re
 from ui14_common import *
 from ui9_source_parser import is_box
+from ui14_progress import phase_function, track
 
 
 def source_manifest_tasks(manifest):
@@ -42,6 +43,7 @@ def assert_repair_idle(source_root):
         raise ValueError("UI9 repair publication is pending; the current split is not a complete repair batch")
 
 
+@phase_function("读取修复批次与源文件摘要")
 def capture_repair_snapshot(source_root):
     source_root = Path(source_root).resolve(strict=True)
     assert_repair_idle(source_root)
@@ -61,7 +63,7 @@ def capture_repair_snapshot(source_root):
         raise ValueError("Repair summary must contain exactly nine source tasks")
     files = {str(source_root / name): file_digest(source_root / name)
              for name in ("manifest.json", "repair_summary.json")}
-    for task in UI9_TASKS:
+    for task in track(UI9_TASKS, "九来源 train/test 摘要", unit="来源", detail=lambda t: t.task_key, estimate=False):
         source = sources[task.task_key]
         kind = "synthetic" if task.task_id >= 7 else "annotated"
         if source.get("kind") != kind:
@@ -85,13 +87,14 @@ def capture_repair_snapshot(source_root):
     return {**snapshot, "normalization_id": digest(snapshot)}
 
 
+@phase_function("校验修复批次和规范化产物")
 def validate_normalization(root):
     root = Path(root)
     snapshot = read_json(root / "source_snapshot.json")
     assert_repair_idle(snapshot["source_root"])
     if digest({k: v for k, v in snapshot.items() if k != "normalization_id"}) != snapshot["normalization_id"]:
         raise ValueError("Source snapshot identity changed")
-    for name, expected in snapshot["source_files"].items():
+    for name, expected in track(snapshot["source_files"].items(), "核对源文件", unit="文件", detail=lambda item: item[0]):
         if file_digest(name) != expected:
             raise ValueError(f"Repaired source changed after normalization: {name}")
     if snapshot["parser"] != parser_provenance():
@@ -104,7 +107,7 @@ def validate_normalization(root):
                       for k in ("normalized", "detector_input", "detector_inputs")}
     if set(stats.get("artifact_digests", {})) != expected_paths:
         raise ValueError("Normalization did not bind all 18 source streams and detector inputs")
-    for name, expected in stats["artifact_digests"].items():
+    for name, expected in track(stats["artifact_digests"].items(), "核对规范化文件", unit="文件", detail=lambda item: item[0]):
         if file_digest(root / name) != expected:
             raise ValueError(f"Normalized artifact changed: {name}")
     assert_repair_idle(snapshot["source_root"])
@@ -125,11 +128,12 @@ def cache_label_binding(root, task, split):
             "artifact_digests": {str(p.relative_to(root)): file_digest(p) for p in files}}
 
 
+@phase_function("统计 UI9 页面归属")
 def page_statistics(rows):
     pages, image_paths = defaultdict(lambda: defaultdict(Counter)), defaultdict(set)
     per_task = {t.task_key: {s: {"records": 0, "with_page": 0, "pages": set()} for s in ("train", "test")}
                 for t in UI9_TASKS}
-    for row in rows:
+    for row in track(rows, "页面统计", unit="记录"):
         task, split, page = row["task_key"], row["split"], row.get("source_page_id")
         count = per_task[task][split]
         count["records"] += 1

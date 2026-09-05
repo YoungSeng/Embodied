@@ -47,6 +47,23 @@ bash -n shell/run_locany_ui5_pipeline.sh
 
 新增 repair 回归 14 项。集成 fixture 的旧 UI5 审核 marker/1555 图 cache 和 GPU worker 执行使用 mock；新标注转换、缓存几何、计划/标签绑定、recipe、原图评分、Excel 和报告校验实际执行。固定 detector fixture 不进入正式数据目录。
 
+## 准备阶段进度增量验证
+
+在 repair 提交 `46cdd657c6e79c937b3ea452de223e4d17c72de2` 上补充 normalize/cache/finalize 进度。此次 50 项 CPU 回归通过，其中新增进度回归 10 项；8 个修改/新增 Python 文件 AST、正式准备 Shell 的 `bash -n` 和两个 Python 入口的 `--help` 均通过。没有运行 GPU detector 或训练。
+
+- 按已完成工作计算速度/ETA；无完成量时不虚构剩余时间，异质任务外层不按任务数推算整条命令 ETA。
+- 前台未推进计数时后台仍更新状态；异常和中断保留失败语义，日志写入失败不覆盖数据处理异常。
+- normalize 开启/关闭进度的产物逐文件摘要相同；同一 detector 计划生成的 crop 标签与完成标记逐字节相同。
+- cache 仍调用原 detector 入口，按原顺序处理七任务 × train/test 共 14 项，保留四卡、resume、v5 几何参数；GPU 子进程失败会传播，后续标签任务不会启动（worker 使用 mock）。
+- detector 状态忽略前次运行记录，并同步本次 worker ETA；完整 finalize 产出仍通过数据绑定检查，进度文件不进入 artifact_digests。
+- 原 14 项评测、UI5 best/Excel、正式 YAML 和 `EVAL_FAIL_POLICY=stop` 的既有回归继续通过。
+
+```bash
+python -m unittest tests.test_ui14_progress tests.test_ui14_repair \
+  tests.test_ui14_pipeline tests.test_ui5_eval_detector_scan_v5
+bash -n shell/ui14_cpt9000_a800.sh
+```
+
 ## 实际数据统计的产生位置
 
 派生根目录：

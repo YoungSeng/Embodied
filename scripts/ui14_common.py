@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from ui14_progress import file_activity
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -26,12 +27,14 @@ def read_json(path):
 
 def read_jsonl(path):
     with Path(path).open(encoding="utf-8-sig") as handle:
-        for number, line in enumerate(handle, 1):
-            if line.strip():
-                try:
-                    yield json.loads(line)
-                except ValueError as exc:
-                    raise ValueError(f"Invalid JSON: {path}:{number}") from exc
+        with file_activity(path, os.fstat(handle.fileno()).st_size) as progress:
+            for number, line in enumerate(handle, 1):
+                progress.completed = handle.buffer.tell()
+                if line.strip():
+                    try:
+                        yield json.loads(line)
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid JSON: {path}:{number}") from exc
 
 
 def write_json(path, value):
@@ -47,8 +50,10 @@ def write_jsonl(path, records):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + f".tmp-{os.getpid()}")
     with tmp.open("w", encoding="utf-8", newline="\n") as handle:
-        for row in records:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with file_activity(path, len(records) if hasattr(records, "__len__") else None, "记录") as progress:
+            for row in records:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                progress.advance()
     os.replace(tmp, path)
 
 
@@ -59,8 +64,10 @@ def digest(value):
 def file_digest(path):
     value = hashlib.sha256()
     with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            value.update(chunk)
+        with file_activity(path, os.fstat(handle.fileno()).st_size) as progress:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                value.update(chunk)
+                progress.advance(len(chunk))
     return value.hexdigest()
 
 

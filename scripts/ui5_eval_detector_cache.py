@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
 from locany_ui5_common import TASK_JSONL
+from ui14_progress import file_activity, track
 from ui5_lossless_tiling import (
     build_raw_detector_edge_geometry,
     detector_task_context_bands,
@@ -22,8 +24,10 @@ GEOMETRY_SCHEMA_VERSION = 5
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
+        with file_activity(path, os.fstat(handle.fileno()).st_size) as progress:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+                progress.advance(len(chunk))
     return digest.hexdigest()
 
 
@@ -305,7 +309,8 @@ def validate_eval_detector_cache(
         raise RuntimeError("horizontal scan summary does not contain a passing hard gate")
     scan_rows = read_jsonl(scan_manifest)
     raw_edge_records: list[dict[str, Any]] = []
-    for row in scan_rows:
+    for row in track(scan_rows, "cache 横向分区、边缘与 detector 包含检查", unit="原图",
+                     detail=lambda r: r.get("image_id", "")):
         if row.get("geometry_config_digest") != geometry.get("config_digest"):
             raise RuntimeError(
                 f"scan row geometry config digest mismatch: {row.get('image_id')}"

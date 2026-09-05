@@ -284,10 +284,13 @@ class UI14EvaluationTests(unittest.TestCase):
                     for split in ("train","test"): detector_fixture(data,task,split)
             def validate(*a,**kw):
                 return {} if Path(a[0])==root/"ui5_cache" else real_validate(*a,**kw)
-            with mock.patch("run_ui5_crop_audit.validate_training_ready_marker",return_value={"crop_train_mode":"crop_only"}) as audited, mock.patch("ui5_eval_detector_cache.validate_eval_detector_cache",side_effect=validate):
+            from ui14_progress import ProgressSession
+            with mock.patch("run_ui5_crop_audit.validate_training_ready_marker",return_value={"crop_train_mode":"crop_only"}) as audited, mock.patch("ui5_eval_detector_cache.validate_eval_detector_cache",side_effect=validate), ProgressSession("finalize", data, .1):
                 prepare.finalize(args)
                 audited.assert_called_once()
             report=read_json(data/"cpu_check_report.json")
+            self.assertEqual(read_json(data/"progress/finalize.json")["status"],"completed")
+            self.assertFalse(any("progress" in p for p in report["artifact_digests"]))
             self.assertTrue(report["ready"])
             self.assertEqual(set(report["tasks"].values()),{"pass"})
             self.assertEqual(len(report["crop_coverage"]),14)
