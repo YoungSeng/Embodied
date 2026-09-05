@@ -115,15 +115,26 @@ git pull --ff-only origin codex/ui5-crop-rollout4-curriculum-hard114
 
 /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python -u \
   scripts/prepare_ui5_curriculum_snapshot.py \
-  --snapshot /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_rollouts/ui5-train-rollout8-h20x2-v6-20260904/snapshots/hour_018_20260905T030758Z \
+  --snapshot /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_rollouts/ui5-train-rollout8-h20x2-v6-20260904/snapshots/hour_021_20260905T060754Z \
   --reuse-crops-from /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_data/ui5_curriculum/hour009-s42-v1 \
   --previous-submission-dir /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_logs/ui5_curriculum/locany-ui5-crop-rollout4-curriculum-hour009-h20x2-sdpa7268-20260904T204242Z-276590 \
   --take-over-builder-pid 1883296
 ```
 
 `1883296` 是本次日志中的旧构建 PID，不是长期固定值。如果 PID/父进程身份不符，脚本拒绝
-发信号，不会猜测要停止哪个进程。需要 Linux/Python 的 pidfd 支持。若源目录已完整发布，
+发信号，不会猜测要停止哪个进程。若源目录已完整发布，
 且没有正在运行的旧构建/自动提交器，可以不传 `--take-over-builder-pid`。
+
+接管不要求 Python 自带 `os.pidfd_open` 或 `signal.pidfd_send_signal`。
+脚本打开 `/proc/<pid>` 的稳定进程句柄，并通过该句柄再次核对内核启动时间；
+有 Python 封装时使用封装，否则在 64 位 Linux x86_64/aarch64 上通过标准库 ctypes
+调用同一个 `pidfd_send_signal` 内核接口，不使用存在 PID 复用风险的数字 PID 发信号。
+接管前先对自身执行不投递信号的 signal-0 检查，打印 `[TAKEOVER SIGNAL] ... probe=signal_0_pass`。
+若内核不支持或权限策略拒绝，立即报错，不暂停旧进程，也不绕过检查。
+
+旧版 `safe takeover requires Linux Python pidfd signal support` 错误发生在暂停旧提交器之前，
+不会停止裁图或提交新任务；升级后可以重新执行上述命令。如果旧流程在此期间已尝试
+提交 hour009，脚本会拒绝重复提交，此时应先核对平台任务，不要删除提交保护标记。
 
 每次切换使用新的 frozen 目录、课程目录、RUN_NAME、OUTPUT_DIR 和评测身份。
 资源沿用现有 H20×2 的 Arnold 镜像/队列/挂载；GPU 作业开始后先校验完整课程，再进入

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import copy
+import ctypes
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -74,24 +76,60 @@ def process_active(identity: dict[str, Any]) -> bool:
                 and current["state"] not in {"Z", "X"})
 
 
+def open_process_descriptor(pid: int) -> int:
+    # An open /proc/PID directory is a supported pidfd_send_signal handle.
+    # It pins the process identity even if its numeric PID is later recycled.
+    # https://man7.org/linux/man-pages/man2/pidfd_send_signal.2.html
+    return os.open(f"/proc/{pid}", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+
+def descriptor_matches_identity(descriptor: int, identity: dict[str, Any]) -> bool:
+    # Inspect the pinned process, not /proc/PID again after opening the handle.
+    stat_fd = os.open("stat", os.O_RDONLY | os.O_CLOEXEC, dir_fd=descriptor)
+    with os.fdopen(stat_fd) as handle:
+        stat = handle.read()
+    fields = stat[stat.rfind(")") + 2:].split()
+    return fields[19] == identity["start_ticks"] and fields[0] not in {"Z", "X"}
+
+
+def send_process_descriptor(descriptor: int, sig: int) -> str:
+    native = getattr(signal, "pidfd_send_signal", None)
+    if callable(native):
+        native(descriptor, sig)
+        return "python_pidfd_send_signal"
+    # Older Python builds can lack the wrapper despite a supporting kernel.
+    # Invoke the same syscall, never a numeric-PID os.kill fallback. Syscall 424
+    # is shared by Linux x86-64 and the asm-generic aarch64 ABI only here.
+    if (sys.platform != "linux" or ctypes.sizeof(ctypes.c_void_p) != 8
+            or platform.machine().lower() not in {"x86_64", "amd64", "aarch64", "arm64"}):
+        raise RuntimeError("pidfd syscall compatibility requires 64-bit Linux x86_64/aarch64")
+    libc = ctypes.CDLL(None, use_errno=True)
+    syscall = libc.syscall
+    syscall.restype = ctypes.c_long
+    result = syscall(ctypes.c_long(424), ctypes.c_int(descriptor), ctypes.c_int(sig),
+                     ctypes.c_void_p(None), ctypes.c_uint(0))
+    if result < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+    return "libc_syscall_pidfd_send_signal"
+
+
 def signal_process(identity: dict[str, Any], sig: int) -> bool:
     if not process_active(identity):
         return False
-    # pidfd closes the remaining check-to-signal race when available (Linux).
-    if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
-        try:
-            descriptor = os.pidfd_open(identity["pid"])
-        except ProcessLookupError:
+    try:
+        descriptor = open_process_descriptor(identity["pid"])
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    try:
+        if not descriptor_matches_identity(descriptor, identity):
             return False
-        try:
-            if not process_active(identity):
-                return False
-            signal.pidfd_send_signal(descriptor, sig)
-        finally:
-            os.close(descriptor)
-    else:
-        raise RuntimeError("safe takeover requires Linux Python pidfd signal support")
-    return True
+        send_process_descriptor(descriptor, sig)
+        return True
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    finally:
+        os.close(descriptor)
 
 
 def assert_no_previous_submission(directory: Path | None) -> None:
@@ -110,10 +148,22 @@ def assert_no_previous_submission(directory: Path | None) -> None:
 
 
 def require_takeover_platform() -> None:
-    if os.name != "posix" or not Path("/proc").is_dir():
+    if sys.platform != "linux" or not Path("/proc").is_dir():
         raise RuntimeError("takeover must run on the same Linux development host as the old builder")
-    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
-        raise RuntimeError("safe takeover requires Linux Python pidfd signal support")
+    # Signal 0 checks kernel/permission support without delivering a signal.
+    # Probe ourselves BEFORE holding any old workflow; never weaken safety if
+    # seccomp, permissions or the kernel reject process-descriptor signalling.
+    descriptor = open_process_descriptor(os.getpid())
+    try:
+        backend = send_process_descriptor(descriptor, 0)
+    except OSError as exc:
+        raise RuntimeError(
+            f"safe takeover signal-0 check failed: {exc}; Linux pidfd_send_signal "
+            "must be supported and permitted; no old process was stopped"
+        ) from exc
+    finally:
+        os.close(descriptor)
+    log(f"[TAKEOVER SIGNAL] backend={backend} handle=proc_directory probe=signal_0_pass")
 
 
 def hold_legacy_submitter(builder_pid: int, source: Path, previous: Path) -> tuple[dict | None, dict | None]:
