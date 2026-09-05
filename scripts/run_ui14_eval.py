@@ -104,7 +104,8 @@ def run(args):
     validate_registry(checkpoint_config.get("ui_task_registry"), checkpoint_config.get("ui_num_tasks"))
     if checkpoint_config.get("ui_num_tasks") != 14: raise ValueError("UI14 evaluation requires a 14-task checkpoint")
     for saved, current in zip(checkpoint_config["ui_task_registry"], specs):
-        for field in ("task_id", "task_key", "source_dataset", "source_version", "train", "test", "view_policy"):
+        for field in ("task_id", "task_key", "source_dataset", "source_version", "train", "test", "view_policy",
+                      "repair_run_id", "normalization_id", "train_source_sha256", "test_source_sha256", "bbox_config"):
             if saved.get(field) != current.get(field): raise ValueError(f"Checkpoint/evaluation registry drift: {current['task_key']}.{field}")
     if not args.skip_patch:
         patch_checkpoint(base_model=Path(args.base_model), checkpoint=checkpoint,
@@ -118,6 +119,8 @@ def run(args):
     started = datetime.now(timezone.utc).isoformat()
     state = {"status": "running", "sft_step": args.step, "init_checkpoint": str(args.base_model),
              "init_cpt_step": 9000, "identity": identity, "tasks": {}, "started": started}
+    repair_metadata = {k: read_json(manifest).get(k) for k in ("repair_run_id", "normalization_id")}
+    state.update(repair_metadata)
     write_json(state_path, state)
     command = [sys.executable, str(PROJECT_ROOT / "scripts" / "run_ui5_parallel_inference.py"),
         "--checkpoint", str(checkpoint), "--processor-path", str(checkpoint),
@@ -157,7 +160,7 @@ def run(args):
         write_json(destination / "ui14_metrics.json", metrics)
         write_json(prediction / "_gate_metrics.json", gate_metrics)
         rows = [r for r in load_history(history_dir / "evaluation_history.json") if int(r.get("step", -1)) != args.step]
-        row = {"step": args.step, "sft_step": args.step, "checkpoint": str(checkpoint),
+        row = {"step": args.step, "sft_step": args.step, "checkpoint": str(checkpoint), **repair_metadata,
                "evaluation_status": "success", "relation_gate_mode": "observe", "evaluation_split": "test",
                "cache_scope": "full_test", "git_commit": identity["git_commit"], "config_hash": identity["config_hash"],
                "ui_model_signature": ui_model_signature(checkpoint), "init_checkpoint": str(args.base_model), "init_cpt_step": 9000,

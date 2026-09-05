@@ -1,0 +1,26 @@
+{
+  "source": "prepare_ui9_datasets.py",
+  "source_version": "2.1",
+  "source_sha256": "72a43e551c4388fdeaef985a9206105da400e4351bc817ef4d7cdedbce3c084e",
+  "extraction": "verbatim CPU function/class bodies; no repair or copy entrypoints",
+  "symbols": {
+    "remap": "9295f0c1ec705ba0ba3ebc2b66962ebdeecad28f3aa0db93a014e46654bef704",
+    "Resolver": "a837f2a19d451756c3e2cd5d08009a2ebab70a439e458e4d482d7697a86e75e5",
+    "image_slots": "6c74c3ab8630702c865ac2c699a0a8775786172c1cf5b4c3cd64eee20dfb89a0",
+    "primary_image": "27aa4594180ead133b03d08c8374e1e4e547fabb0a17576869161b3259808b53",
+    "bbox_values": "eb32c4ddcdfe2a531cf77795ed2ff19ce9f70308caa125c86feedd68b23f05ef",
+    "is_box": "01cb22b2e8d80be30ce77d5c397bcd1890fa669ed06b562f4d1ab9b2d26c9d80",
+    "location_boxes": "f9db93ffd3504c8ba26e71200b2c5d74cb3d0c80a4f6ac75b8f967c9e2b63ebe",
+    "gt_boxes": "a99ff5f3af2887a60230c170b65ed94f22f51b35dc87895d36ecfda8db233221",
+    "page_key": "5a2253e8d5479e397f66bfe05b10dbf5b321f8f65b486ccd677bf751ae799ec1",
+    "positive_number": "76708d91f643fc2b0d5de218635b17f6ed6c13b8ea5bebc8722c2020ef4082e8",
+    "coordinate_factors": "26e6d641c369ea0b366cd10a4318f631b96035d20b2f05c6b316836e4fb0a14d",
+    "inspect_image": "134205e40c7ac1f50f96a156b747d62de6923f3a66c5e6cca8cef35146cad58f",
+    "iter_records": "8dd204889805546cda3d95e5f7afc99039b4b979b137ca78e818a4ca076926fc",
+    "out_of_bounds": "e2aaeb1d95b9e553f4c94cbf073d90f761db4684c84658f1745d279912f0ec2d"
+  },
+  "constants": {
+    "HL": "/mnt/bn/intelligent-service-arnold-hl",
+    "IES": "/mnt/bn/ies-genai"
+  }
+}

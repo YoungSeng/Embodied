@@ -6,31 +6,30 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from ui14_common import *
-from ui14_annotations import main_image, source_boxes, training_record, crop_boxes, answer
+from ui14_annotations import main_image, resolve_image, source_box_details, source_boxes, training_record, crop_boxes, answer
+from ui9_source_parser import image_slots, inspect_image, iter_records, page_key
+from ui14_repair import (source_manifest_tasks, capture_repair_snapshot, validate_normalization,
+                        cache_label_binding, page_statistics, format_counts, legacy_comparison)
 from eaglevl.train.ui_defect_data import (identify_ui_defect_task, is_positive_ui_defect,
     build_task_source_balanced_rotating_plan, materialize_task_source_balanced_rotating_indices)
 from locany_ui5_common import TASK_JSONL
 
 
-def source_manifest_tasks(manifest):
-    value = manifest.get("tasks", manifest.get("datasets", manifest.get("sources", manifest)))
-    if isinstance(value, list):
-        value = {r.get("task_key", r.get("key", r.get("name"))): r for r in value}
-    if not isinstance(value, dict):
-        raise ValueError("manifest.json must contain tasks/datasets/sources keyed by task_key")
-    missing = {t.task_key for t in UI9_TASKS} - value.keys()
-    if missing:
-        raise ValueError(f"UI9 manifest is missing tasks: {sorted(missing)}")
-    return value
-
-
 def normalize(args):
     source_root, root = Path(args.ui9_data_root).resolve(), Path(args.output_dir).resolve()
-    manifest_path = source_root / "manifest.json"
-    manifest = read_json(manifest_path)
-    sources = source_manifest_tasks(manifest)
-    rows_by_task, stats, registry = {}, {}, []
-    identity_cache = {}
+    write_json(root / "cpu_check_report.json", {"ready": False, "stage": "normalize", "cpu_only": True})
+    try:
+        snapshot = capture_repair_snapshot(source_root)
+    except (OSError, ValueError, KeyError) as exc:
+        write_json(root / "cpu_check_report.json", {"ready": False, "stage": "normalize", "cpu_only": True,
+                                                   "errors": [str(exc)]})
+        raise
+    write_json(root / "source_snapshot.json", snapshot)
+    sources = snapshot["sources"]
+    repair_tasks = {r["dataset"]: r for r in snapshot["repair_summary"]["datasets"]}
+    rows_by_task, stats, registry, errors, issues = {}, {}, [], [], []
+    identity_cache, image_info = {}, {}
+    artifacts, total_comparison, total_formats = {}, Counter(), Counter()
     for task in UI_TASKS:
         spec = task.to_dict()
         if task.task_id < 5:
@@ -38,63 +37,143 @@ def normalize(args):
             spec["source_version"] = "crop_audit_v4_gt_repair"
         else:
             source = sources[task.task_key]
-            if not isinstance(source, dict):
-                raise ValueError(f"Bad manifest entry for {task.task_key}")
             spec["source_dataset"] = source.get("source_dataset", task.source_dataset)
-            spec["source_version"] = str(source.get("source_version", source.get("version", task.source_dataset if task.task_id >= 7 else manifest.get("version", "v1"))))
+            spec["source_version"] = str(source.get("source_version", source.get("version") or task.source_dataset))
+            spec.update(repair_run_id=snapshot["repair_run_id"], normalization_id=snapshot["normalization_id"],
+                        bbox_config=source.get("bbox", {"mode": "auto"}))
             for split in ("train", "test"):
                 paths = paths_for(root, task.task_key, split)
                 src = source_root / task.task_key / f"{split}.jsonl"
                 records, seen_records = [], set()
-                for index, raw in enumerate(read_jsonl(src)):
-                    # The existing exports own the split. Do not infer it from image names.
-                    if raw.get("split", split) != split:
-                        raise ValueError(f"Source split mismatch: {src}:{index + 1}")
-                    image = main_image(raw, src.parent, task.task_id >= 7)
-                    if str(image) not in identity_cache:
-                        identity_cache[str(image)] = image_identity(image)
-                    content_id, width, height = identity_cache[str(image)]
-                    annotation_field = "Objects" if task.task_id >= 7 else "objects"
-                    if annotation_field not in raw:
-                        raise ValueError(f"Missing {annotation_field}, cannot infer negative label: {src}:{index+1}")
-                    boxes = source_boxes(raw, width, height, synthetic=task.task_id >= 7)
-                    record_id = str(raw.get("source_record_id", raw.get("id", raw.get("ID", index))))
-                    if record_id in seen_records:
-                        raise ValueError(f"Duplicate source record ID: {task.task_key}/{split}/{record_id}")
-                    seen_records.add(record_id)
-                    row = {"source_dataset": spec["source_dataset"], "source_version": spec["source_version"],
-                           "source_record_id": record_id, "source_image_id": content_id,
-                           "source_image": str(image), "split": split, "task_key": task.task_key,
-                           "task_id": task.task_id, "crop_id": "full", "width": width, "height": height,
-                           "boxes_px": boxes, "image": str(image), "view_policy": task.view_policy,
-                           "source_jsonl": str(src), "source_line": index + 1,
-                           "source_metadata": raw}
-                    records.append(row)
+                legacy_record_ids = set()
+                formats, comparison, selected_fields, bases = Counter(), Counter(), Counter(), Counter()
+                raw_count, failed = 0, 0
+                for line, raw, json_error in iter_records(src):
+                    raw_count += 1
+                    current = None
+                    if json_error:
+                        failed += 1
+                        errors.append(f"{src}:{line}: {json_error}")
+                        comparison.update(legacy_json_failure_records=1, legacy_parse_failure_records=1,
+                                          legacy_consumer_failure_records=1, not_comparable_records=1)
+                        issues.append({"task_key": task.task_key, "split": split, "source_jsonl": str(src),
+                                       "source_line": line, "legacy_json_error": json_error})
+                        continue
+                    formats.update(format_counts(raw, task.task_id >= 7))
+                    try:
+                        image = main_image(raw, src.parent, task.task_id >= 7)
+                        # Reuse preparation's image roles and unrotated coordinate canvas.
+                        # References are checked as source material, never appended as samples.
+                        infos = {}
+                        for _, _, value, role in image_slots(raw):
+                            path = resolve_image(value, src.parent)
+                            if (src.parent / "sample_imgs").resolve() not in path.parents:
+                                raise ValueError(f"Prepared {role} image is outside this source's sample_imgs: {path}")
+                            if str(path) not in image_info:
+                                image_info[str(path)] = inspect_image(path)
+                            infos[value] = image_info[str(path)]
+                            if not infos[value]["ok"]:
+                                raise ValueError(f"Unreadable {role} image: {path}: {infos[value]}")
+                        if str(image) not in identity_cache:
+                            identity_cache[str(image)] = image_identity(image)
+                        content_id, width, height = identity_cache[str(image)]
+                        from PIL import Image
+                        with Image.open(image) as opened:
+                            if opened.getexif().get(274, 1) not in (None, 1):
+                                raise ValueError("Screenshot has EXIF orientation; preparation's raw canvas and detector canvas disagree")
+                        details = source_box_details(raw, width, height, synthetic=task.task_id >= 7,
+                                                     task_config=source, images=infos)
+                        record_id = str(raw.get("source_record_id", raw.get("id", raw.get("ID", line - 1))))
+                        if record_id in seen_records:
+                            raise ValueError(f"Duplicate source record ID: {task.task_key}/{split}/{record_id}")
+                        seen_records.add(record_id)
+                        current = {"source_dataset": spec["source_dataset"], "source_version": spec["source_version"],
+                                   "source_record_id": record_id, "source_image_id": content_id,
+                                   "source_image": str(image), "split": split, "task_key": task.task_key,
+                                   "source_split": raw.get("split"), "source_split_present": "split" in raw,
+                                   "source_page_id": page_key(raw), "repair_run_id": snapshot["repair_run_id"],
+                                   "normalization_id": snapshot["normalization_id"],
+                                   "task_id": task.task_id, "crop_id": "full", "width": width, "height": height,
+                                   **details, "image": str(image), "view_policy": task.view_policy,
+                                   "source_jsonl": str(src), "source_jsonl_sha256": snapshot["source_files"][str(src)],
+                                   "source_line": line, "source_metadata": raw}
+                        records.append(current)
+                        selected_fields.update(b["field"].rsplit(".", 1)[-1] for b in details["selected_gt"])
+                        bases[details["coordinate_basis"]] += 1
+                    except (OSError, ValueError, TypeError, KeyError, IndexError, OverflowError) as exc:
+                        failed += 1
+                        errors.append(f"{src}:{line}: {exc}")
+                    counts, detail = legacy_comparison(raw, src.parent, split, task.task_id >= 7,
+                                                       current, identity_cache, record_index=raw_count-1,
+                                                       seen_record_ids=legacy_record_ids)
+                    comparison.update(counts)
+                    if detail:
+                        issues.append({"task_key": task.task_key, "split": split, "source_jsonl": str(src),
+                                       "source_line": line, **detail})
+                expected = source[f"{split}_records"]
+                if expected != raw_count or repair_tasks[task.task_key][f"after_{split}"] != raw_count:
+                    errors.append(f"{task.task_key}/{split}: actual count {raw_count} disagrees with repair/manifest {expected}")
                 if not records:
-                    raise ValueError(f"Empty exported split: {src}")
-                expected = source.get(f"{split}_count", source.get(f"{split}_records"))
-                if isinstance(expected, (int, float)) and int(expected) != len(records):
-                    raise ValueError(f"Export count disagrees with manifest: {task.task_key}/{split}: {len(records)} != {expected}")
+                    errors.append(f"Empty usable exported split: {src}")
                 write_jsonl(paths["normalized"], records)
-                # Detector entrypoint receives no annotations, source messages, or reference images.
-                inputs = [{"image": r["source_image"]} for r in records]
-                write_jsonl(paths["detector_input"], inputs)
+                # Only input images enter the detector. File membership owns normalized split;
+                # record.split remains provenance even after repair moved the record.
+                write_jsonl(paths["detector_input"], [{"image": r["source_image"]} for r in records])
                 write_json(paths["detector_inputs"], {task.task_key: str(paths["detector_input"])})
+                for k in ("normalized", "detector_input", "detector_inputs"):
+                    artifacts[str(paths[k].relative_to(root))] = file_digest(paths[k])
                 rows_by_task[task.task_key, split] = records
                 spec[split] = str(paths["normalized"])
+                spec[f"{split}_source_sha256"] = snapshot["source_files"][str(src)]
                 stats[f"{task.task_key}/{split}"] = {
-                    "records": len(records), "unique_images": len({r["source_image_id"] for r in records}),
+                    "records": raw_count, "normalized_records": len(records), "failed_records": failed,
+                    "unique_images": len({r["source_image_id"] for r in records}),
                     "positive_count": sum(bool(r["boxes_px"]) for r in records),
                     "negative_count": sum(not r["boxes_px"] for r in records),
-                    "input_sha256": file_digest(src), "manifest_entry": source}
+                    "input_sha256": snapshot["source_files"][str(src)], "manifest_entry": source,
+                    "repair_counts": repair_tasks[task.task_key], "formats": dict(formats),
+                    "selected_gt_fields": dict(selected_fields), "coordinate_bases": dict(bases),
+                    "parser_comparison": dict(comparison)}
+                total_comparison.update(comparison)
+                total_formats.update(formats)
+                print(f"{task.task_key}/{split}: records={raw_count}, normalized={len(records)}, "
+                      f"legacy_parse_failures={comparison['legacy_parse_failure_records']}, "
+                      f"parse_differences={comparison['parse_result_difference_records']}", flush=True)
         registry.append(spec)
-    write_json(root / "task_registry.json", {"schema_version": 1, "tasks": registry,
-               "input_manifest": str(manifest_path), "input_manifest_sha256": file_digest(manifest_path)})
-    write_json(root / "normalization_stats.json", {"tasks": stats, "originals_modified": False,
-               "random_split_used": False, "reference_negatives_added": 0})
-    duplicates = image_overlaps([r for values in rows_by_task.values() for r in values])
+    all_rows = [r for values in rows_by_task.values() for r in values]
+    pages = page_statistics(all_rows)
+    write_json(root / "ui9_page_split.json", pages)
+    if pages["synthetic_train_test_page_count"] or pages["synthetic_train_test_image_paths"]:
+        errors.append("Repaired synthetic page/image grouping crosses train and test; exports were not repartitioned")
+    duplicates = image_overlaps(all_rows)
     write_json(root / "ui9_image_overlap.json", duplicates)
-    print(f"Normalized 9 source tasks under {root}; train/test duplicate images={len(duplicates['train_test'])}")
+    write_jsonl(root / "parser_compatibility_issues.jsonl", issues)
+    metadata = {"repair_run_id": snapshot["repair_run_id"], "normalization_id": snapshot["normalization_id"]}
+    write_json(root / "task_registry.json", {"schema_version": 2, "tasks": registry, **metadata,
+               "input_manifest": str(source_root / "manifest.json"),
+               "input_manifest_sha256": snapshot["source_files"][str(source_root / "manifest.json")]})
+    normalization = {"tasks": stats, "originals_modified": False, "random_split_used": False,
+                     "reference_negatives_added": 0, **metadata, "source_files": snapshot["source_files"],
+                     "repair_summary": snapshot["repair_summary"], "parser": snapshot["parser"],
+                     "parser_comparison": dict(total_comparison), "formats": dict(total_formats),
+                     "artifact_digests": artifacts, "errors": errors, "complete": not errors}
+    write_json(root / "normalization_stats.json", normalization)
+    if not errors:
+        try: validate_normalization(root)
+        except (OSError, ValueError) as exc:
+            errors.append(str(exc))
+            normalization["complete"] = False
+            write_json(root / "normalization_stats.json", normalization)
+    write_json(root / "cpu_check_report.json", {
+        "ready": False, "stage": "normalize", "cpu_only": True, "gpu_loaded": False,
+        "normalization_complete": not errors, "registry_count": 14, "evaluation_count": 0,
+        **metadata, "source_files": snapshot["source_files"], "repair_summary": snapshot["repair_summary"],
+        "tasks": stats, "parser_comparison": dict(total_comparison), "formats": dict(total_formats),
+        "ui9_page_split": {k: v for k, v in pages.items() if k != "pages"},
+        "ui9_train_test_duplicate_images": len(duplicates["train_test"]), "errors": errors})
+    if errors:
+        raise RuntimeError(f"UI9 repair intake failed ({len(errors)} errors); see {root / 'cpu_check_report.json'}")
+    print(f"Normalized repair {snapshot['repair_run_id']} under {root}; train/test duplicate images={len(duplicates['train_test'])}")
 
 
 def image_overlaps(rows):
@@ -153,6 +232,10 @@ def crop_annotations(root, task, split, records):
         coverage.append({"source_record_id": row["source_record_id"], "gt_count": len(row["boxes_px"]),
                          "fully_contained_gt": len(covered), "uncontained_gt": sorted(set(range(len(row["boxes_px"]))) - covered)})
     write_json(paths["derived"].with_suffix(".coverage.json"), coverage)
+    write_jsonl(paths["derived"], derived)
+    # Detector geometry may be unchanged by repair; labels and this completion
+    # marker always belong to the current annotations and actual file split.
+    write_json(paths["cache"] / "ui14_label_cache_ready.json", cache_label_binding(root, task, split))
     return derived
 
 
@@ -213,6 +296,9 @@ def legacy_train(args):
 
 def finalize(args):
     root = Path(args.output_dir).resolve()
+    write_json(root / "cpu_check_report.json", {**read_json(root / "cpu_check_report.json"),
+               "ready": False, "stage": "finalize", "cpu_only": True})
+    snapshot = validate_normalization(root)
     registry_document = read_json(root / "task_registry.json")
     registry = load_registry(root / "task_registry.json")
     legacy = legacy_train(args)
@@ -279,7 +365,8 @@ def finalize(args):
                            "expected_records": sum(1 for _ in read_jsonl(test_path))})
     write_json(root / "task_registry.json", {**registry_document, "tasks": registry})
     write_json(root / "training_recipe.json", recipe)
-    write_json(root / "evaluation_manifest.json", {"schema_version": 1, "tasks": evaluation})
+    write_json(root / "evaluation_manifest.json", {"schema_version": 2, "tasks": evaluation,
+               "repair_run_id": snapshot["repair_run_id"], "normalization_id": snapshot["normalization_id"]})
     write_json(root / "sampling_stats.json", stats)
     write_json(root / "image_overlap.json", image_overlaps(all_sources))
     check(args)
@@ -287,15 +374,25 @@ def finalize(args):
 
 def check(args):
     root = Path(args.output_dir).resolve()
+    write_json(root / "cpu_check_report.json", {**read_json(root / "cpu_check_report.json"),
+               "ready": False, "stage": "check", "cpu_only": True})
+    snapshot = validate_normalization(root)
+    normalization = read_json(root / "normalization_stats.json")
+    page_report = read_json(root / "ui9_page_split.json")
     registry = load_registry(root / "task_registry.json")
     recipe = read_json(root / "training_recipe.json")
     evaluation = read_json(root / "evaluation_manifest.json")["tasks"]
     errors, results, coverage_results, external_digests = [], {}, {}, {}
-    bound_artifacts = {"task_registry.json", "training_recipe.json", "evaluation_manifest.json", "sampling_stats.json", "image_overlap.json", "normalization_stats.json"}
+    bound_artifacts = {"task_registry.json", "training_recipe.json", "evaluation_manifest.json", "sampling_stats.json", "image_overlap.json", "normalization_stats.json",
+                       "source_snapshot.json", "ui9_page_split.json", "ui9_image_overlap.json", "parser_compatibility_issues.jsonl"}
+    external_digests.update(snapshot["source_files"])
     identity_cache = {}
     expected = {t.task_key for t in UI_TASKS}
     if set(recipe) != expected or {t["task_key"] for t in evaluation} != expected or len(evaluation) != 14:
         errors.append("Recipe/evaluation task sets are not exactly 14")
+    for document in (read_json(root / "task_registry.json"), read_json(root / "evaluation_manifest.json")):
+        if document.get("normalization_id") != snapshot["normalization_id"]:
+            errors.append("Registry/evaluation belongs to another repair batch")
     for spec in registry:
         task = get_task(spec["task_id"])
         try:
@@ -319,6 +416,8 @@ def check(args):
                     if external_digests[str(source_path)] != original_stat["input_sha256"]:
                         raise ValueError("Original export changed after normalization")
                     for row in records:
+                        if row.get("normalization_id") != snapshot["normalization_id"] or row["split"] != split:
+                            raise ValueError("Normalized record belongs to another repair/file split")
                         if row["source_image"] not in identity_cache:
                             identity_cache[row["source_image"]] = image_identity(row["source_image"])
                         current = identity_cache[row["source_image"]]
@@ -327,7 +426,10 @@ def check(args):
                     by_id = {r["source_record_id"]: r for r in records}
                     for derived in read_jsonl(p["derived"]):
                         source = by_id[derived["source_record_id"]]
-                        if derived["split"] != split or derived["source_image_id"] != source["source_image_id"] or identify_ui_defect_task(derived)[1] != task.task_id:
+                        if (derived["split"] != split or derived["source_image_id"] != source["source_image_id"]
+                            or identify_ui_defect_task(derived)[1] != task.task_id
+                            or derived.get("normalization_id") != snapshot["normalization_id"]
+                            or derived.get("source_split") != source.get("source_split")):
                             raise ValueError("Derived annotation source/split/task drift")
                         boxes, w, h = source["boxes_px"], source["width"], source["height"]
                         if task.view_policy == "crops":
@@ -348,6 +450,11 @@ def check(args):
                             "plan_uses_gt": False, "coverage_policy": "report; never alter input-only plans using GT"}
                         marker = p["cache"] / SCAN_NAME / "eval_detector_cache_ready.json"
                         bound_artifacts.add(str(marker.relative_to(root)))
+                        label_marker = p["cache"] / "ui14_label_cache_ready.json"
+                        if read_json(label_marker) != cache_label_binding(root, task, split):
+                            raise ValueError("Crop labels/index completion marker belongs to stale repair data")
+                        bound_artifacts.add(str(label_marker.relative_to(root)))
+                        bound_artifacts.add(str(p["derived"].with_suffix(".coverage.json").relative_to(root)))
             results[task.task_key] = "pass"
         except (OSError, ValueError, RuntimeError, KeyError) as exc:
             errors.append(f"{task.task_key}: {exc}")
@@ -372,7 +479,12 @@ def check(args):
     except (OSError, ValueError, RuntimeError, KeyError) as exc: errors.append(str(exc))
     overlaps = read_json(root / "image_overlap.json")
     # Frozen exports are never silently resplit or filtered. Surface every original-image overlap.
-    report = {"cpu_only": True, "gpu_loaded": False, "tasks": results, "errors": errors,
+    report = {"cpu_only": True, "gpu_loaded": False, "stage": "complete", "tasks": results, "errors": errors,
+              "repair_run_id": snapshot["repair_run_id"], "normalization_id": snapshot["normalization_id"],
+              "source_files": snapshot["source_files"], "repair_summary": snapshot["repair_summary"],
+              "post_repair_sources": normalization["tasks"], "parser": normalization["parser"],
+              "parser_comparison": normalization["parser_comparison"], "formats": normalization["formats"],
+              "ui9_page_split": {k: v for k, v in page_report.items() if k != "pages"},
               "train_test_duplicate_images": len(overlaps["train_test"]), "overlap_report": str(root / "image_overlap.json"),
               "overlap_policy": "report frozen source splits; no repartition or filtering",
               "init_checkpoint": str(args.init_checkpoint), "init_cpt_step": 9000,
@@ -399,6 +511,18 @@ def parse_args():
     return parser.parse_args()
 
 
+def run_stage(args):
+    try:
+        {"normalize": normalize, "finalize": finalize, "check": check}[args.stage](args)
+    except Exception as exc:
+        path = Path(args.output_dir) / "cpu_check_report.json"
+        report = read_json(path) if path.is_file() else {}
+        errors = list(report.get("errors", []))
+        if str(exc) not in errors: errors.append(str(exc))
+        write_json(path, {**report, "ready": False, "stage": args.stage, "cpu_only": True,
+                          "gpu_loaded": False, "errors": errors})
+        raise
+
+
 if __name__ == "__main__":
-    args = parse_args()
-    {"normalize": normalize, "finalize": finalize, "check": check}[args.stage](args)
+    run_stage(parse_args())

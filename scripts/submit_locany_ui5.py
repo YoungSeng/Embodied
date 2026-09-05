@@ -621,7 +621,7 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "PIPELINE_MODE",
     )
     if getattr(args, "profile", None):
-        env_keys = (*env_keys, "UI_TRAIN_PROFILE", "UI14_DATA_ROOT", "UI_TASK_REGISTRY", "UI_EVAL_MANIFEST", "UI14_CHECK_REPORT", "UI_NUM_TASKS", "OUTPUT_DIR", "LOGGING_STEPS", "SAMPLE_LOG_INTERVAL", "LOCANY_CPT_MODE")
+        env_keys = (*env_keys, "UI_TRAIN_PROFILE", "UI14_DATA_ROOT", "UI_TASK_REGISTRY", "UI_EVAL_MANIFEST", "UI14_CHECK_REPORT", "UI_NUM_TASKS", "META_PATH", "OUTPUT_DIR", "LOGGING_STEPS", "SAMPLE_LOG_INTERVAL", "LOCANY_CPT_MODE")
     if args.scorer_root:
         env_keys = (*env_keys, "SCORER_ROOT")
     if args.training_data_source_dir:

@@ -35,8 +35,11 @@ def make_record(task_id, positive=True, source="source", crop="full"):
 def source_fixture(root):
     entries = {}
     for task in UI9_TASKS:
-        entries[task.task_key] = {"source_dataset": task.source_dataset, "source_version": "fixture-v2",
-                                  "train_count": 1, "test_count": 1}
+        entries[task.task_key] = {"source_dataset": task.source_dataset, "source_version": "fixture-v2.1",
+            "key": task.task_key, "kind": "synthetic" if task.task_id >= 7 else "annotated",
+            "train_records": 1, "test_records": 1,
+            "bbox": {"mode": "logical-width", "width": 375} if task.task_id >= 7 else {"mode": "auto"},
+            "split_origin": "repaired_global_page" if task.task_id >= 7 else "provided"}
         for split in ("train", "test"):
             folder = root / task.task_key
             folder.joinpath("sample_imgs").mkdir(parents=True, exist_ok=True)
@@ -44,8 +47,10 @@ def source_fixture(root):
             # Deliberate cross-source and train/test duplicates to verify pixel identity.
             Image.new("RGB", (750, 1600), "white").save(image)
             record = {"id": "r1", "images": [str(image)], "split": split,
+                      "FigmaKey": "shared-design", "FigmaNodeID": split,
                       "messages": [{"role": "user", "content": "GT: 7 answers. Compare reference image."}]}
             if task.task_id >= 7:
+                record["split"] = "test" if split == "train" else "train"  # repair preserves old metadata
                 reference = folder / "sample_imgs" / f"reference-{split}.png"
                 Image.new("RGB", (100, 200), "blue").save(reference)
                 record.update(ScreenShotURL=f"/sample_imgs/{image.name}", RawImgURL=str(reference),
@@ -53,7 +58,14 @@ def source_fixture(root):
             else:
                 record["objects"] = {"bbox": [[20, 80, 200, 160]], "bbox_type": "real"}
             write_jsonl(folder / f"{split}.jsonl", [record])
-    write_json(root / "manifest.json", {"version": 2, "tasks": entries})
+    write_json(root / "manifest.json", {"format_version": 1, "datasets": list(entries.values()),
+        "repair_history": [{"run_id": "fixture-repair-v2.1"}], "require_page_disjoint": True,
+        "split_unit": "global_page_for_synthetic", "preparation_errors": []})
+    write_json(root / "repair_summary.json", {"run_id": "fixture-repair-v2.1", "check_status": "PASS",
+        "input_records": 18, "quarantined_records": 0, "clipped_records": 0, "clipped_boxes": 0,
+        "datasets": [{"dataset": t.task_key, "before_train": 1, "before_test": 1,
+                      "after_train": 1, "after_test": 1, "quarantined": 0,
+                      "moved_split": 2 if t.task_id >= 7 else 0} for t in UI9_TASKS]})
 
 
 def detector_fixture(root, task, split):
@@ -116,14 +128,15 @@ class UI14DataTests(unittest.TestCase):
         self.assertEqual(synthetic_boxes([{"rect_err": small, "rect_mbr": big}]), [small])
         self.assertEqual(synthetic_boxes({"rect1_shift": small, "rect2_shift": big, "rect_combine": [0,0,10,10]}), [small,big])
         self.assertEqual(synthetic_boxes({"rect2": big, "rect1": small}), [small,big])
-        self.assertEqual(source_boxes({"objects": {"bbox": [small,big], "bbox_type": ["real","real"]}}, 375,800,synthetic=False), [small,big])
+        self.assertEqual(source_boxes({"objects": {"bbox": [small,big], "bbox_type": "real"}}, 375,800,synthetic=False), [small,big])
         self.assertEqual(norm1000([10,10,10.001,10.001],750,1600),[13,6,14,7])
 
     def test_only_explicit_negative_can_use_reference_as_primary(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); image=root/"reference.png"; Image.new("RGB",(10,10)).save(image)
             with self.assertRaises(ValueError): main_image({"RawImgURL":str(image)},root,True)
-            self.assertEqual(main_image({"RawImgURL":str(image),"Objects":[]},root,True),image.resolve())
+            with self.assertRaises(ValueError): main_image({"RawImgURL":str(image),"Objects":[]},root,True)
+            self.assertEqual(main_image({"LocalImgURL":str(image),"Objects":[]},root,True),image.resolve())
 
     def test_single_sided_source_rotation_and_mixed_ratio(self):
         for positive in (True,False):
@@ -338,6 +351,7 @@ class UI14EvaluationTests(unittest.TestCase):
             self.assertEqual(str(env["UI_NUM_TASKS"]),"14")
             self.assertEqual(str(env["GRADIENT_ACCUMULATION_STEPS"]),"2")
             self.assertEqual(str(env["MAX_STEPS"]),"16000")
+            self.assertEqual(env["EVAL_FAIL_POLICY"],"stop")
 
 
 if __name__=="__main__": unittest.main()

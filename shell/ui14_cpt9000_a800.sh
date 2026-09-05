@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 export WORKSPACE="${WORKSPACE:-/mnt/bn/intelligent-service-yg/logging/sicheng_workspace}"
 export UI9_DATA_ROOT="${UI9_DATA_ROOT:-/mnt/bn/intelligent-service-yg/dataset/gui/ui9_datasets_v1}"
-export UI14_DATA_ROOT="${UI14_DATA_ROOT:-${WORKSPACE}/gui_data/ui14_cpt9000_v1}"
+export UI14_DATA_ROOT="${UI14_DATA_ROOT:-${WORKSPACE}/gui_data/ui14_cpt9000_repair_v2}"
 UI14_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UI14_PYTHON="${UI14_PYTHON:-${WORKSPACE}/conda_envs/LocateAnything/bin/python}"
 UI14_PROFILE="m32-cpt9000-ui14-v1"

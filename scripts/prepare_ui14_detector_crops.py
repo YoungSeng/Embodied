@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 from ui14_common import *
+from ui14_repair import validate_normalization
 
 
 def main():
@@ -20,6 +21,9 @@ def main():
     parser.add_argument("--gpus", default="0,1,2,3")
     args = parser.parse_args()
     root = Path(args.data_root).resolve(strict=True)
+    validate_normalization(root)
+    write_json(root / "cpu_check_report.json", {**read_json(root / "cpu_check_report.json"),
+               "ready": False, "stage": "cache_pending_final_cpu_check"})
     registry = load_registry(root / "task_registry.json")
     # Reuse the audited detector configuration, including its separate Paddle environment.
     config = read_json(Path(args.ui5_cache) / "detections" / "detector_config.json")
@@ -54,7 +58,8 @@ def main():
             if icon_model: command += ["--icon-model", icon_model]
             subprocess.run(command, check=True)
             from prepare_ui14_sft import crop_annotations
-            write_jsonl(paths["derived"], crop_annotations(root, task, split, records))
+            crop_annotations(root, task, split, records)
+    validate_normalization(root)
     return 0
 
 

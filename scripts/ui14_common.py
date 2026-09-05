@@ -12,7 +12,7 @@ from eaglevl.ui_task_registry import UI_TASKS, UI5_TASKS, UI9_TASKS, load_regist
 
 WORKSPACE = "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace"
 UI9_DATA_ROOT = "/mnt/bn/intelligent-service-yg/dataset/gui/ui9_datasets_v1"
-DATA_ROOT = WORKSPACE + "/gui_data/ui14_cpt9000_v1"
+DATA_ROOT = WORKSPACE + "/gui_data/ui14_cpt9000_repair_v2"
 CLUSTER_PROJECT = WORKSPACE + "/code/Eagle_LocateUI5_v4/Embodied-ui14-cpt9000"
 INIT_CHECKPOINT = WORKSPACE + "/gui_models/locany-3b-ui-cpt-v4-v3-h20x2-formal-segmented-eval/checkpoint-9000"
 UI5_AUDIT = WORKSPACE + "/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_crop_audit_20260825/crop_audit_v4_gt_repair"

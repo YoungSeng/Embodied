@@ -32,9 +32,20 @@ def render_formal_yaml(data_root):
     if not isinstance(parsed, dict): raise ValueError("Formal YAML did not parse")
     required = {"GPU_COUNT": 4, "GRADIENT_ACCUMULATION_STEPS": 2, "MAX_STEPS": 16000,
                 "INIT_CPT_STEP": 9000, "MAX_SEQ_LENGTH": 7268, "MAX_NUM_TOKENS_PER_SAMPLE": 7268,
-                "MAX_NUM_TOKENS": 12800, "RESOURCE_GROUP_ID": 2146, "SEED": 42}
+                "MAX_NUM_TOKENS": 12800, "RESOURCE_GROUP_ID": 2146, "SEED": 42,
+                "EVAL_FAIL_POLICY": "stop", "EVAL_INTERVAL_STEPS": 1000, "SAVE_STEPS": 4000}
     for key, expected in required.items():
         if str(runtime[key]) != str(expected): raise ValueError(f"Formal runtime drift: {key}")
+    resource = parsed["jobDefVersion"]["resource"]["arnoldConfig"]
+    roles = resource["roles"]
+    if (resource["groupIds"] != [2146] or len(roles) != 1 or roles[0]["num"] != 1
+        or roles[0]["gpu"] != 4 or roles[0]["gpuv"] != "A800_SXM_40GB"
+        or roles[0]["queueName"] != "compute-3302-yg-cloudnative-ai-aiai.locate-guarantee"):
+        raise ValueError("Rendered YAML resource does not describe one four-card A800 worker")
+    envs = parsed["jobRunParams"]["envsList"]
+    for key in ("INIT_CHECKPOINT", "UI14_DATA_ROOT", "UI_TASK_REGISTRY", "UI_EVAL_MANIFEST",
+                "META_PATH", "EVAL_FAIL_POLICY", "OUTPUT_DIR"):
+        if str(envs[key]) != str(runtime[key]): raise ValueError(f"Rendered YAML environment drift: {key}")
     if not runtime["BASE_MODEL"] == runtime["MODEL_PATH"] == runtime["INIT_CHECKPOINT"] == INIT_CHECKPOINT:
         raise ValueError("CPT initialization path drift")
     if runtime["PROJECT_ROOT"] != CLUSTER_PROJECT: raise ValueError("Formal project path drift")
