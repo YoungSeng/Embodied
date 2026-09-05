@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -102,6 +103,10 @@ def main() -> int:
             "init_checkpoint": str(base),
             "init_cpt_step": args.init_cpt_step,
         }
+        if os.environ.get("UI_TASK_REGISTRY"):
+            from eaglevl.ui_task_registry import load_registry
+            expected_signature["ui_task_registry"] = load_registry(os.environ["UI_TASK_REGISTRY"])
+            expected_signature["ui_num_tasks"] = len(expected_signature["ui_task_registry"])
         mismatches = {
             key: {"existing": existing_config.get(key), "requested": expected}
             for key, expected in expected_signature.items()

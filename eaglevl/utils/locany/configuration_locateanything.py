@@ -5,6 +5,7 @@
 # --------------------------------------------------------
 
 import copy
+from .ui_task_registry import configure_task_registry
 
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -104,6 +105,7 @@ class LocateAnythingConfig(PretrainedConfig):
             ui_relation_initialization_reason=None,
             **kwargs):
         super().__init__(**kwargs)
+        configure_task_registry(self)
 
         if vision_config is None:
             vision_config = {'model_type': 'moonvit'}

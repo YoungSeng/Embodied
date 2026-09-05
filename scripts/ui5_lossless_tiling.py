@@ -259,6 +259,36 @@ def detector_boundary_cut_count(
     return cuts
 
 
+def detector_task_context_bands(records, width, task):
+    """Keep adjacent detector text lines / containers / element pairs together.
+
+    Horizontal scan already preserves the full width. Protect vertical pairs
+    only when their horizontal extents overlap and their vertical gap is small.
+    The thresholds scale with screenshot width, independent of resolution/GT.
+    Raw detector containment and the original DP objective remain unchanged.
+    """
+    text_tasks = {"change_line_illegal_v3", "synth_loneword"}
+    boundary_tasks = {"synth_cropping", "synth_radius", "synth_inner_margin"}
+    pairwise_tasks = {"synth_occlusion", "synth_small_margin"}
+    if task not in text_tasks | boundary_tasks | pairwise_tasks:
+        return []
+    selected = [r for r in records if task not in text_tasks or r["source"] == "text"]
+    selected.sort(key=lambda r: (r["bbox"][1], r["bbox"][0], r["detector_index"]))
+    bands = set()
+    for i, left in enumerate(selected):
+        a = left["bbox"]
+        for right in selected[i + 1:]:
+            b = right["bbox"]
+            gap = b[1] - a[3]
+            # For text, two line heights covers a paragraph line break. For
+            # boundaries/pairs retain the nearby detector-defined container.
+            limit = max(width * .025, 2 * max(a[3]-a[1], b[3]-b[1])) if task in text_tasks else width * .08
+            overlap = min(a[2], b[2]) - max(a[0], b[0])
+            if gap <= limit and overlap >= .25 * min(a[2]-a[0], b[2]-b[0]):
+                bands.add((min(a[1], b[1]), max(a[3], b[3])))
+    return [list(band) for band in sorted(bands)]
+
+
 def generate_detector_scan_plan(
     width: int,
     height: int,
@@ -337,6 +367,11 @@ def generate_detector_scan_plan(
     safe_raw_edge_candidates = raw_geometry["safe_raw_edge_candidates"]
     unsafe_raw_edge_candidates = raw_geometry["unsafe_raw_edge_candidates"]
     edge_provenance = raw_geometry["edge_provenance"]
+    # New task context only removes existing raw-edge candidates. It never
+    # moves/expands a detector box, adds a seam, or inspects task annotations.
+    context_bands = detector_task_context_bands(raw_geometry["records"], width, task)
+    context_safe_edges = [edge for edge in safe_raw_edge_candidates
+                          if not any(top < edge < bottom for top, bottom in context_bands)]
     normalized_task = str(task or "").removeprefix("ui_")
     fallback_reason: str | None = None
     desired_tile_count = min(max_tiles, max(1, math.ceil(height / target_tile_height)))
@@ -368,7 +403,7 @@ def generate_detector_scan_plan(
             candidate_seams = _choose_raw_detector_edge_seams(
                 height=height,
                 count=candidate_count,
-                candidate_edges=safe_raw_edge_candidates,
+                candidate_edges=context_safe_edges,
                 minimum_core_height=minimum_core_height,
             )
             if candidate_seams is not None:
@@ -458,7 +493,10 @@ def generate_detector_scan_plan(
         "tile_count": len(tiles),
         "detector_box_count": len(boxes),
         "connected_band_count": 0,
-        "protected_vertical_bands": [],
+        "protected_vertical_bands": context_bands,
+        "task_context_policy": "ui14_detector_neighbors_v1" if context_bands or str(task or "").startswith(("synth_", "change_line_")) else None,
+        "task_context_key": task,
+        "context_safe_raw_detector_edge_candidates": context_safe_edges,
         "detector_margin_pixels": 0,
         "target_guard_ratio": 0.0,
         "target_guard_pixels_min": 0,

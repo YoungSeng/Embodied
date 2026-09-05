@@ -235,6 +235,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         if self.enable_ui_relation:
             detail_hidden_size = int(getattr(config, "relation_detail_hidden_size", 256))
             self.relation_pyramid = RelationConditionedDetailPyramid(
+                num_defect_types=int(getattr(config, "ui_num_tasks", 5)),
                 vision_hidden_size=vit_hidden_size,
                 detail_hidden_size=detail_hidden_size,
                 num_slots=int(getattr(config, "relation_num_slots", 8)),
@@ -262,6 +263,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             self.relation_pbd = RelationToPBD(
                 detail_hidden_size,
                 llm_hidden_size,
+                num_defect_types=int(getattr(config, "ui_num_tasks", 5)),
                 dynamic_slot=bool(getattr(config, "relation_dynamic_slot_pbd", False)),
                 overlap_adapter=bool(getattr(config, "relation_overlap_adapter", False)),
                 coordinate_bridge=bool(getattr(config, "relation_coordinate_bridge", False)),

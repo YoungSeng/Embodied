@@ -108,6 +108,9 @@ if [[ "${UI5_USE_DETECTION_CROPS}" == "1" || -n "${UI5_CROP_AUDIT_DIR}" ]]; then
     echo "[ERROR] Cannot find Python for crop marker validation." >&2
     exit 1
   fi
+  if [[ -n "${UI_TASK_REGISTRY:-}" ]]; then
+    "${UI5_AUDIT_PYTHON}" "${PROJECT_ROOT}/scripts/validate_ui14_ready.py"
+  else
   "${UI5_AUDIT_PYTHON}" "${PROJECT_ROOT}/scripts/validate_ui5_crop_training_ready.py" \
     --audit-dir "${UI5_CROP_AUDIT_DIR}" \
     --recipe "${UI5_CROP_META_PATH}" \
@@ -115,6 +118,7 @@ if [[ "${UI5_USE_DETECTION_CROPS}" == "1" || -n "${UI5_CROP_AUDIT_DIR}" ]]; then
       echo "[ERROR] Crop training-ready validation failed; refusing to start training." >&2
       exit 1
     }
+  fi
   META_PATH="${UI5_CROP_META_PATH}"
 elif [[ -n "${UI5_CROP_META_PATH}" ]]; then
   echo "[ERROR] UI5_CROP_META_PATH requires UI5_CROP_AUDIT_DIR." >&2

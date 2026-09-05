@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from locany_ui5_common import TASK_JSONL
 from ui5_lossless_tiling import (
     build_raw_detector_edge_geometry,
+    detector_task_context_bands,
     strict_vertical_partition_metrics,
 )
 
@@ -98,11 +99,12 @@ def validate_eval_detector_cache(
     require_strict_nonoverlap: bool = False,
     require_raw_detector_edge_alignment: bool = False,
     require_detector_unique_containment: bool = False,
+    expected_task_files: Mapping[str, Path] | None = None,
 ) -> dict[str, Any]:
     """Fail closed unless every dataset/detector/geometry digest still matches."""
 
     cache_dir = cache_dir.expanduser().resolve(strict=False)
-    if required_cache_scope in {"validation", "full_test"} and int(expected_unique_images) <= 0:
+    if required_cache_scope in {"validation", "full_test", "full_train"} and int(expected_unique_images) <= 0:
         raise ValueError(
             f"{required_cache_scope} cache validation requires an explicit positive expected_unique_images"
         )
@@ -134,7 +136,7 @@ def validate_eval_detector_cache(
             "schema-v5 marker must declare detector_bbox_unique_containment=true"
         )
     cache_scope = str(marker.get("cache_scope", ""))
-    if cache_scope not in {"preview", "validation", "full_test"}:
+    if cache_scope not in {"preview", "validation", "full_test", "full_train"}:
         raise RuntimeError("detector cache marker has no valid cache_scope")
     if required_cache_scope and cache_scope != required_cache_scope:
         raise RuntimeError(
@@ -143,7 +145,7 @@ def validate_eval_detector_cache(
     max_images_per_task = int(marker.get("max_images_per_task", -1))
     if cache_scope == "preview" and max_images_per_task <= 0:
         raise RuntimeError("preview detector cache must have max_images_per_task > 0")
-    if cache_scope in {"validation", "full_test"} and max_images_per_task != 0:
+    if cache_scope in {"validation", "full_test", "full_train"} and max_images_per_task != 0:
         raise RuntimeError(f"{cache_scope} detector cache requires max_images_per_task=0")
 
     dataset = marker.get("dataset") or {}
@@ -160,7 +162,8 @@ def validate_eval_detector_cache(
     ):
         raise RuntimeError("readonly cache task_files must be a list of file records")
     task_names = [str(record.get("task")) for record in task_records]
-    if len(task_records) != len(TASK_JSONL) or set(task_names) != set(TASK_JSONL):
+    expected_tasks = expected_task_files if expected_task_files is not None else TASK_JSONL
+    if len(task_records) != len(expected_tasks) or set(task_names) != set(expected_tasks):
         raise RuntimeError("readonly cache must bind exactly the five UI5 task JSONL files")
     for task_record in task_records:
         task = str(task_record.get("task"))
@@ -176,13 +179,13 @@ def validate_eval_detector_cache(
             cache_dir, task_record, label=f"task JSONL {task}"
         )
         actual_rows = count_jsonl(task_path)
-        if cache_scope == "full_test" and actual_rows != unique_count:
+        if expected_task_files is None and cache_scope == "full_test" and actual_rows != unique_count:
             raise RuntimeError(
                 f"full_test detector cache task JSONL row count mismatch for {task}: "
                 f"{actual_rows} != {unique_count}"
             )
-        if input_dir is not None:
-            expected_path = input_dir.expanduser().resolve(strict=True) / TASK_JSONL[task]
+        if input_dir is not None or expected_task_files is not None:
+            expected_path = Path(expected_task_files[task]) if expected_task_files is not None else input_dir.expanduser().resolve(strict=True) / TASK_JSONL[task]
             if task_path.resolve(strict=True) != expected_path.resolve(strict=True):
                 raise RuntimeError(
                     f"readonly cache dataset path mismatch for {task}: "
@@ -392,6 +395,14 @@ def validate_eval_detector_cache(
         ):
             raise RuntimeError(f"raw detector edge count changed: {row.get('image_id')}")
         seams = [int(value) for value in row.get("horizontal_seams", [])]
+        if config.get("task_context_policy"):
+            if config["task_context_policy"] != "ui14_detector_neighbors_v1" or row.get("tasks") != config.get("task_keys"):
+                raise RuntimeError("Task context policy/cache routing mismatch")
+            bands = detector_task_context_bands(raw_geometry["records"], int(row["width"]), row["tasks"][0])
+            allowed = [edge for edge in raw_geometry["safe_raw_edge_candidates"]
+                       if not any(top < edge < bottom for top, bottom in bands)]
+            if row.get("protected_vertical_bands") != bands or row.get("context_safe_raw_detector_edge_candidates") != allowed or any(seam not in allowed for seam in seams):
+                raise RuntimeError("Crop splits detector-defined task context")
         if any(seam not in raw_geometry["safe_raw_edge_candidates"] for seam in seams):
             raise RuntimeError(f"scan row contains a non-safe-raw-edge seam: {row.get('image_id')}")
         distances = [

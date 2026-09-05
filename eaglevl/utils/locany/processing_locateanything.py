@@ -325,6 +325,8 @@ class LocateAnythingProcessorKwargs(ProcessingKwargs, total=False):
 class LocateAnythingProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     valid_kwargs = [
+        "ui_task_registry",
+        "ui_num_tasks",
         "chat_template",
         "num_image_tokens",
         "image_token",
@@ -348,6 +350,8 @@ class LocateAnythingProcessor(ProcessorMixin):
         video_placeholder='video',
         image_start_token='<img>',
         image_end_token='</img>',
+        ui_task_registry=None,
+        ui_num_tasks=5,
         **kwargs,
     ):  
         self.image_token = tokenizer.image_token if hasattr(tokenizer, "image_token") else image_token
@@ -362,6 +366,8 @@ class LocateAnythingProcessor(ProcessorMixin):
             if getattr(tokenizer, "video_token_id", None)
             else tokenizer.convert_tokens_to_ids(self.video_token)
         )
+        from .ui_task_registry import configure_task_registry
+        configure_task_registry(self, ui_task_registry, ui_num_tasks)
         self.image_placeholder = image_placeholder
         self.video_placeholder = video_placeholder
         self.merge_kernel_size = merge_kernel_size

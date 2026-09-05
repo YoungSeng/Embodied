@@ -8,6 +8,8 @@ cannot drift independently.
 from __future__ import annotations
 
 from typing import Any, Sequence
+import os
+from eaglevl.ui_task_registry import configure_task_registry, load_registry
 
 import torch
 import torch.distributed as dist
@@ -143,6 +145,12 @@ def configure_ui5_model_config(
 ):
     """Apply the one authoritative UI5 configuration to a model config."""
 
+    registry_path = os.environ.get("UI_TASK_REGISTRY")
+    if registry_path:
+        rows = load_registry(registry_path)
+        configure_task_registry(config, rows, len(rows))
+    else:
+        configure_task_registry(config)
     config._attn_implementation = str(attn_implementation)
     config._attn_implementation_autoset = False
     config.text_config._attn_implementation = str(attn_implementation)

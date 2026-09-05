@@ -371,6 +371,7 @@ def collect_gate_metrics(
     prediction_dir: Path | None,
     gt_dir: Path | None,
     scorer_root: Path | None = None,
+    task_files: dict[str, Path] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Join per-image gate sidecars with the same GT parser used by scoring."""
 
@@ -378,6 +379,19 @@ def collect_gate_metrics(
         return {}
     ground_truth: dict[str, dict[str, bool]] = {}
     ground_truth_boxes: dict[str, dict[str, list[Any]]] = {}
+    if task_files is not None:
+        # UI9 inputs are normalized original-image annotations. Explicit source
+        # keys bypass UI5 filename, Figma and prompt-alias conventions.
+        for task, source in task_files.items():
+            labels, boxes_by_path = {}, {}
+            with Path(source).open(encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip(): continue
+                    sample = json.loads(line)
+                    image_path = str(Path(sample["source_image"]).resolve())
+                    labels[image_path] = bool(sample["boxes_px"])
+                    boxes_by_path[image_path] = sample["boxes_px"]
+            ground_truth[task], ground_truth_boxes[task] = labels, boxes_by_path
     if gt_dir is not None and gt_dir.is_dir():
         scorer_file = (
             scorer_root / "qwen3vl_merge_and_score_fixed_5tasks.py"
@@ -429,7 +443,7 @@ def collect_gate_metrics(
                 ground_truth_boxes[task] = boxes_by_path
 
     result: dict[str, dict[str, Any]] = {}
-    for task in TASKS:
+    for task in (task_files if task_files is not None else TASKS):
         gate_dir = prediction_dir / task / "gate"
         records = []
         if gate_dir.is_dir():

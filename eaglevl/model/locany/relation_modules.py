@@ -53,35 +53,21 @@ class UIRelationPromptSpec:
         )
 
 
-UI_RELATION_PROMPT_SPECS = (
-    UIRelationPromptSpec(
-        "text_overflow", "text_overflow", 0, 0, "text overflow",
-        ("text overflow", "文字溢出"),
-    ),
-    UIRelationPromptSpec(
-        "cropping", "element_cropping", 0, 1, "cropped element",
-        ("cropped element", "element cropping", "元素裁切"),
-    ),
-    UIRelationPromptSpec(
-        "occlusion", "element_overlap", 1, 2, "overlapping elements",
-        ("overlapping elements", "element overlap", "元素重叠"),
-    ),
-    UIRelationPromptSpec(
-        "text_ellipsis", "text_ellipsis", 2, 3, "abnormal text ellipsis",
-        ("abnormal text ellipsis", "ellipsis anomaly", "省略异常"),
-    ),
-    UIRelationPromptSpec(
-        "content_missing", "content_missing", 3, 4, "missing content",
-        ("missing content", "content missing", "内容缺失"),
-    ),
+from .ui_task_registry import UI_TASKS
+
+UI_RELATION_TASK_SPECS = tuple(
+    UIRelationPromptSpec(t.task_key, t.diagnostic_name, t.family_id, t.task_id,
+                        t.prompt_label, t.aliases) for t in UI_TASKS
 )
+
+UI_RELATION_PROMPT_SPECS = UI_RELATION_TASK_SPECS[:5]
 
 
 def match_ui_relation_prompt(text: str) -> Optional[UIRelationPromptSpec]:
     """Route the fixed UI5 prompts through one shared training/inference table."""
 
     normalized = str(text).lower()
-    for spec in UI_RELATION_PROMPT_SPECS:
+    for spec in UI_RELATION_PROMPT_SPECS[:5]:
         if any(alias.lower() in normalized for alias in spec.aliases):
             return spec
     return None
@@ -167,8 +153,8 @@ def class_balanced_focal_loss(
     defect_type: torch.Tensor,
     gamma: float = 2.0,
     beta: float = 0.999,
-    positive_counts: Sequence[int] = (742, 4480, 3068, 3267, 2125),
-    total_counts: Sequence[int] = (17604, 17604, 17604, 17604, 17604),
+    positive_counts: Sequence[int] = (742, 4480, 3068, 3267, 2125) + (5868,) * 9,
+    total_counts: Sequence[int] = (17604,) * 14,
 ) -> torch.Tensor:
     """Effective-number class-balanced focal loss.
 

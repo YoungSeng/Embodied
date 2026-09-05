@@ -507,6 +507,11 @@ run_evaluation() {
 has_successful_evaluation() {
   local step="$1"
   local checkpoint="${OUTPUT_DIR}/checkpoint-${step}"
+  if [[ -n "${UI_EVAL_MANIFEST:-}" ]]; then
+    "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/run_ui14_eval.py" --output-dir "${OUTPUT_DIR}" \
+      --step "${step}" --manifest "${UI_EVAL_MANIFEST}" --checkpoint "${checkpoint}"
+    return $?
+  fi
   "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/collect_ui5_metrics.py" \
     has-success --history-dir "${OUTPUT_DIR}/evaluation" --step "${step}" \
     --relation-gate-mode "${RELATION_GATE_MODE}" \

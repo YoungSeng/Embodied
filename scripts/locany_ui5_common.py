@@ -162,6 +162,9 @@ def resolve_runtime_config(
     """Resolve final runtime values with environment variables taking precedence."""
 
     env = os.environ if env is None else env
+    if env.get("UI_TRAIN_PROFILE") == "m32-cpt9000-ui14-v1":
+        from ui14_profile import profile_environment
+        env = {**profile_environment(project_root=env.get("PROJECT_ROOT"), data_root=env.get("UI14_DATA_ROOT")), **env}
     raw = load_machine_config(config_path)
     shared = raw["shared"]
 
@@ -664,6 +667,8 @@ def resolve_runtime_config(
         ),
         "PIPELINE_MODE": str(_env_value(env, "PIPELINE_MODE", "train")).lower(),
     }
+    for name in ("UI_TRAIN_PROFILE", "UI14_DATA_ROOT", "UI_TASK_REGISTRY", "UI_EVAL_MANIFEST", "UI14_CHECK_REPORT", "UI_NUM_TASKS", "LOGGING_STEPS", "SAMPLE_LOG_INTERVAL", "LOCANY_CPT_MODE"):
+        if name in env: resolved[name] = env[name]
     if resolved["PIPELINE_MODE"] not in {"train", "eval"}:
         raise ValueError("PIPELINE_MODE must be 'train' or 'eval'")
     if resolved["MAX_NUM_TOKENS"] < resolved["MAX_NUM_TOKENS_PER_SAMPLE"]:
@@ -738,6 +743,10 @@ def resolve_runtime_config(
             "UI5_UI_SAMPLING_MODE": "task_source_balanced_rotating",
             "INSTALL_SYSTEM_RUNTIME_DEPS": 1,
         }
+        if env.get("UI_TRAIN_PROFILE") == "m32-cpt9000-ui14-v1":
+            formal_exact.update(INIT_CPT_STEP=9000, EVAL_FAIL_POLICY="stop", RESOURCE_GROUP="aiai_locate", ATTN_IMPLEMENTATION="sdpa", UI_NUM_TASKS="14", LOCANY_CPT_MODE="0")
+            from ui14_common import INIT_CHECKPOINT as UI14_INIT_CHECKPOINT
+            formal_exact.update(BASE_MODEL=UI14_INIT_CHECKPOINT, MODEL_PATH=UI14_INIT_CHECKPOINT, INIT_CHECKPOINT=UI14_INIT_CHECKPOINT)
         drift = {
             name: {"expected": expected, "actual": resolved.get(name)}
             for name, expected in formal_exact.items()
@@ -784,7 +793,7 @@ def resolve_runtime_config(
             }
         if drift:
             raise ValueError(
-                "crop-only M32+CPT-3000 formal profile drift: "
+                f"{env.get('UI_TRAIN_PROFILE', 'crop-only M32+CPT-3000')} formal profile drift: "
                 + json.dumps(drift, ensure_ascii=False, sort_keys=True)
             )
     if not 1 <= resolved["EVAL_TILE_MAX_COUNT"] <= 10:

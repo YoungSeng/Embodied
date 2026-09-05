@@ -179,6 +179,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         if self.enable_ui_relation:
             detail_hidden_size = int(getattr(config, "relation_detail_hidden_size", 256))
             self.relation_pyramid = RelationConditionedDetailPyramid(
+                num_defect_types=int(getattr(config, "ui_num_tasks", 5)),
                 vision_hidden_size=vit_hidden_size,
                 detail_hidden_size=detail_hidden_size,
                 num_slots=int(getattr(config, "relation_num_slots", 8)),
@@ -206,6 +207,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             self.relation_pbd = RelationToPBD(
                 detail_hidden_size,
                 llm_hidden_size,
+                num_defect_types=int(getattr(config, "ui_num_tasks", 5)),
                 dynamic_slot=bool(getattr(config, "relation_dynamic_slot_pbd", False)),
                 overlap_adapter=bool(getattr(config, "relation_overlap_adapter", False)),
                 coordinate_bridge=bool(getattr(config, "relation_coordinate_bridge", False)),
@@ -500,6 +502,12 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         global_visual_cache = None
         relation_device = pixel_values.device if pixel_values is not None else input_ids.device
         enable_ui_relation = bool(getattr(self, "enable_ui_relation", False))
+        if enable_ui_relation and defect_type is not None and relation_family is None:
+            from .ui_task_registry import get_task
+            task_id = int(defect_type.item()) if torch.is_tensor(defect_type) else int(defect_type)
+            relation_family = get_task(task_id).family_id
+        if enable_ui_relation and int(getattr(self.config, "ui_num_tasks", 5)) > 5 and defect_type is None:
+            raise ValueError("UI14 inference requires explicit defect_type/task ID; prompt routing is ambiguous")
         if relation_family is None and enable_ui_relation:
             relation_family, inferred_defect_type = self._infer_ui_relation(
                 input_ids, tokenizer, relation_device

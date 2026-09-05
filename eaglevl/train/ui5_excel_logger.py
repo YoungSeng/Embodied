@@ -9,15 +9,18 @@ import os
 import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+from eaglevl.ui_task_registry import UI_TASKS, UI5_TASKS, UI9_TASKS, load_registry
 
 
-TRAIN_TASKS = (
+LEGACY_TRAIN_TASKS = (
     "text_overflow",
     "text_ellipsis",
     "element_overlap",
     "element_cropping",
     "content_missing",
 )
+
+TRAIN_TASKS = (*LEGACY_TRAIN_TASKS, *(t.diagnostic_name for t in UI9_TASKS))
 
 TRAIN_BASE_COLUMNS = (
     "step",
@@ -208,6 +211,7 @@ TRAIN_COLUMNS = (
     "config_hash",
     "base_learning_rate",
     "ui_relation_learning_rate",
+    "task_registry",
     "init_checkpoint",
     "init_cpt_step",
     "sft_step",
@@ -219,6 +223,7 @@ TRAIN_COLUMNS = (
 
 EVAL_COLUMNS = (
     "step",
+    "task_id", "task_key", "source_dataset", "source_version", "view_policy", "positive_count", "negative_count",
     "checkpoint",
     "evaluation_split",
     "cache_scope",
@@ -394,6 +399,7 @@ def _training_audit_context() -> dict[str, str | None]:
             "EVAL_INFERENCE_CROP_MODE"
         ),
         "scan_name": _first_environment_value("EVAL_SCAN_NAME"),
+        "task_registry": Path(os.environ["UI_TASK_REGISTRY"]).read_text(encoding="utf-8") if os.environ.get("UI_TASK_REGISTRY") else None,
         "recipe_digest": recipe_digest,
         "code_digest": _first_environment_value(
             "UI5_CODE_DIGEST", "CODE_DIGEST", "GIT_COMMIT"
@@ -406,10 +412,21 @@ class UI5ExcelLogger:
     """Append-only, resume-safe writer for the requested two diagnostic sheets."""
 
     path: Path | str
+    task_keys: Sequence[str] | None = None
 
     def __post_init__(self) -> None:
         self.path = Path(self.path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _expected_eval_pairs(self):
+        keys = self.task_keys
+        if keys is None:
+            registry_path = os.environ.get("UI_TASK_REGISTRY")
+            keys = [r["task_key"] for r in load_registry(registry_path)] if registry_path else [t.task_key for t in UI5_TASKS]
+        names = [t.diagnostic_name for t in UI_TASKS if t.task_key in keys]
+        aggregates = ["five_task_macro", "five_task_micro"]
+        if any(t.task_key in keys for t in UI9_TASKS): aggregates += ["ui9_macro", "ui9_micro"]
+        return {(task, kind) for task in [*names, *aggregates] for kind in ("image", "bbox")}
 
     def _new_workbook(self):
         openpyxl, Alignment, Font, PatternFill = _openpyxl()
@@ -548,12 +565,8 @@ class UI5ExcelLogger:
                 )
                 if row[0] is not None and int(row[0]) == int(step)
             ]
-            expected_pairs = {
-                (task, granularity)
-                for task in (*TRAIN_TASKS, "five_task_macro", "five_task_micro")
-                for granularity in ("image", "bbox")
-            }
-            return len(rows) == 14 and {
+            expected_pairs = self._expected_eval_pairs()
+            return len(rows) == len(expected_pairs) and {
                 (row.get("task"), row.get("granularity")) for row in rows
             } == expected_pairs
         finally:
@@ -635,15 +648,11 @@ class UI5ExcelLogger:
         rows = [dict(row) for row in task_metrics]
         for row in rows:
             row["step"] = step
-        expected_pairs = {
-            (task, granularity)
-            for task in (*TRAIN_TASKS, "five_task_macro", "five_task_micro")
-            for granularity in ("image", "bbox")
-        }
+        expected_pairs = self._expected_eval_pairs()
         actual_pairs = {(row.get("task"), row.get("granularity")) for row in rows}
-        if len(rows) != 14 or actual_pairs != expected_pairs:
+        if len(rows) != len(expected_pairs) or actual_pairs != expected_pairs:
             raise ValueError(
-                "eval_1000steps requires exactly five tasks plus macro/micro, each at image/bbox; "
+                "eval_1000steps requires the complete registered task set plus its group macro/micro, each at image/bbox; "
                 f"found={sorted(actual_pairs)}"
             )
 
@@ -676,9 +685,9 @@ class UI5ExcelLogger:
         ):
             workbook.close()
             raise ValueError(
-                "All 14 eval rows for one step must share the same audit identity"
+                "All eval rows for one step must share the same audit identity"
             )
-        if len(existing_for_step) == 14:
+        if len(existing_for_step) == len(expected_pairs):
             existing_pairs = {
                 (row.get("task"), row.get("granularity"))
                 for row in existing_for_step
@@ -747,7 +756,7 @@ class UI5ExcelLogger:
         return changed
 
 
-def build_eval_rows(
+def _build_group_eval_rows(
     *,
     step: int,
     checkpoint: str,
@@ -756,6 +765,8 @@ def build_eval_rows(
     raw_metrics: Mapping[str, Any] | None = None,
     metadata: Mapping[str, Any] | None = None,
     audit_context: Mapping[str, Any] | None = None,
+    task_specs=UI5_TASKS,
+    group_prefix="five_task",
 ) -> list[dict[str, Any]]:
     """Convert scorer and Gate summaries into task, macro, and micro rows.
 
@@ -764,13 +775,7 @@ def build_eval_rows(
     metrics never fall back to image-Gate metrics.
     """
 
-    scorer_to_diagnostic = {
-        "text_overflow": "text_overflow",
-        "text_ellipsis": "text_ellipsis",
-        "occlusion": "element_overlap",
-        "cropping": "element_cropping",
-        "content_missing": "content_missing",
-    }
+    scorer_to_diagnostic = {t.task_key: t.diagnostic_name for t in task_specs}
     gate_metrics = gate_metrics or {}
     metadata = dict(metadata or {})
     if raw_metrics is None:
@@ -1028,13 +1033,14 @@ def build_eval_rows(
                     "checkpoint": checkpoint,
                     "task": diagnostic_task,
                     "task_name": diagnostic_task,
-                    "defect_type": {
-                        "text_overflow": 0,
-                        "element_cropping": 1,
-                        "element_overlap": 2,
-                        "text_ellipsis": 3,
-                        "content_missing": 4,
-                    }[diagnostic_task],
+                    "defect_type": next(t.task_id for t in task_specs if t.diagnostic_name == diagnostic_task),
+                    "task_id": next(t.task_id for t in task_specs if t.diagnostic_name == diagnostic_task),
+                    "task_key": scorer_task,
+                    "source_dataset": task_values.get("source_dataset", next(t.source_dataset for t in task_specs if t.task_key == scorer_task)),
+                    "source_version": task_values.get("source_version"),
+                    "view_policy": next(t.view_policy for t in task_specs if t.task_key == scorer_task),
+                    "positive_count": task_values.get("positive_count", gate.get("positive_count")),
+                    "negative_count": task_values.get("negative_count", gate.get("negative_count")),
                     "granularity": granularity,
                     "precision": values.get("precision"),
                     "recall": values.get("recall"),
@@ -1161,8 +1167,8 @@ def build_eval_rows(
             **row_metadata,
             "step": step,
             "checkpoint": checkpoint,
-            "task": "five_task_macro",
-            "task_name": "five_task_macro",
+            "task": f"{group_prefix}_macro",
+            "task_name": f"{group_prefix}_macro",
             "defect_type": None,
             "granularity": granularity,
             "precision": values.get("precision", mean([row.get("precision") for row in source_rows])),
@@ -1260,8 +1266,8 @@ def build_eval_rows(
                 **row_metadata,
                 "step": step,
                 "checkpoint": checkpoint,
-                "task": "five_task_micro",
-                "task_name": "five_task_micro",
+                "task": f"{group_prefix}_micro",
+                "task_name": f"{group_prefix}_micro",
                 "defect_type": None,
                 "granularity": granularity,
                 **primary_micro,
@@ -1412,3 +1418,15 @@ def build_eval_rows(
             }
         )
     return rows
+
+
+def build_eval_rows(*, step, checkpoint, metrics, gate_metrics=None, raw_metrics=None, metadata=None, audit_context=None):
+    common = dict(step=step, checkpoint=checkpoint, gate_metrics=gate_metrics, metadata=metadata, audit_context=audit_context)
+    ui5 = _build_group_eval_rows(metrics=metrics, raw_metrics=raw_metrics, **common)
+    new_keys = {t.task_key for t in UI9_TASKS}
+    if new_keys & set(metrics.get("tasks", {})):
+        if not new_keys.issubset(metrics["tasks"]): raise ValueError("Incomplete UI9 evaluation")
+        subset = {"tasks": {k: metrics["tasks"][k] for k in new_keys}}
+        raw_subset = {"tasks": {k: raw_metrics["tasks"][k] for k in new_keys}} if raw_metrics else subset
+        ui5 += _build_group_eval_rows(metrics=subset, raw_metrics=raw_subset, task_specs=UI9_TASKS, group_prefix="ui9", **common)
+    return ui5

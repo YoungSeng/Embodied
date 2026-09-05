@@ -17,11 +17,13 @@ from pathlib import Path
 from typing import Any
 
 from locany_ui5_common import TASK_JSONL, TASKS, parse_gpu_devices
+from ui14_common import UI_TASKS, read_json
 from ui5_eval_detector_cache import validate_eval_detector_cache
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--eval-manifest", type=Path, default=None)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--processor-path", type=Path, required=True)
     parser.add_argument("--input-dir", type=Path, required=True)
@@ -35,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inference-script", type=Path, required=True)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--runtime-profile", type=Path, default=None)
-    parser.add_argument("--tasks", nargs="+", choices=TASKS, default=list(TASKS))
+    parser.add_argument("--tasks", nargs="+", choices=[t.task_key for t in UI_TASKS], default=None)
     parser.add_argument("--max-images-per-task", type=int, default=0)
     parser.add_argument(
         "--expected-images-per-task",
@@ -91,7 +93,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.evaluation_tasks = {r["task_key"]: r for r in read_json(args.eval_manifest)["tasks"]} if args.eval_manifest else {}
+    args.tasks = args.tasks or list(args.evaluation_tasks or TASKS)
+    return args
 
 
 def count_jsonl_records(path: Path) -> int:
@@ -253,6 +258,14 @@ def build_command(
         command.append("--load-only")
     if args.max_images_per_task:
         command.extend(["--max-images-per-task", str(args.max_images_per_task)])
+    if getattr(args, "eval_manifest", None):
+        spec = args.evaluation_tasks[task]
+        command += ["--eval-manifest", str(args.eval_manifest)]
+        command[command.index("--processor-path") + 1] = str(args.checkpoint)
+        command[command.index("--inference-crop-mode") + 1] = "detector_scan" if spec["view_policy"] == "crops" else "full_image"
+        if not spec["skip_figma"]: command.remove("--skip-figma")
+        if spec["view_policy"] == "crops":
+            command += ["--detector-crop-manifest", str(Path(spec["cache"]) / spec["scan_name"] / "detector_scan_crops.jsonl")]
     return command
 
 
@@ -361,13 +374,14 @@ def main() -> int:
     gpus = parse_gpu_devices(args.gpu_devices)
     counts: dict[str, int] = {}
     for task in args.tasks:
-        jsonl_path = args.input_dir / TASK_JSONL[task]
+        jsonl_path = Path(args.evaluation_tasks[task]["test"]) if args.eval_manifest else args.input_dir / TASK_JSONL[task]
         if not jsonl_path.is_file():
             raise FileNotFoundError(f"Missing test JSONL for {task}: {jsonl_path}")
         counts[task] = count_jsonl_records(jsonl_path)
         if counts[task] <= 0:
             raise RuntimeError(f"Test JSONL is empty for {task}: {jsonl_path}")
-        if expected_images_per_task and counts[task] != expected_images_per_task:
+        expected = args.evaluation_tasks[task]["expected_records"] if args.eval_manifest else expected_images_per_task
+        if expected and counts[task] != expected:
             raise RuntimeError(
                 "UI5 task JSONL row count mismatch before worker launch for "
                 f"{task}: {counts[task]} != {expected_images_per_task}"

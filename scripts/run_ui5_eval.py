@@ -380,6 +380,9 @@ def record_history(
 
 def main() -> int:
     args = parse_args()
+    if os.environ.get("UI_EVAL_MANIFEST"):
+        from run_ui14_eval import run
+        return run(args)
     if args.step < 0:
         raise ValueError("--step cannot be negative")
     if not 1 <= args.tile_max_count <= 10:

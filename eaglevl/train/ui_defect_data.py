@@ -1,5 +1,7 @@
 """UI-defect task parsing and deterministic class/label balancing."""
 
+from __future__ import annotations
+
 from collections import defaultdict
 import hashlib
 import math
@@ -7,9 +9,7 @@ import random
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-import torch
-
-from eaglevl.model.locany.relation_modules import UI_RELATION_PROMPT_SPECS
+from eaglevl.ui_task_registry import UI_TASKS, get_task
 
 
 BOX_PATTERN = re.compile(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>", re.IGNORECASE)
@@ -21,15 +21,12 @@ _TRAIN_TASK_NAMES = {
     "text_ellipsis": "ellipsis",
     "content_missing": "missing",
 }
-TASK_SPECS = tuple(
-    (
-        _TRAIN_TASK_NAMES.get(spec.task_name, spec.task_name),
-        spec.defect_type,
-        spec.relation_family,
-        spec.aliases,
-    )
-    for spec in UI_RELATION_PROMPT_SPECS
+UI_TASK_SPECS = tuple(
+    (_TRAIN_TASK_NAMES.get(t.task_key, t.task_key), t.task_id, t.family_id, t.aliases)
+    for t in UI_TASKS
 )
+TASK_SPECS = UI_TASK_SPECS[:5]  # Legacy public prompt table.
+
 
 
 def _conversation_text(record: dict, role: str) -> str:
@@ -43,53 +40,34 @@ def _conversation_text(record: dict, role: str) -> str:
 
 def identify_ui_defect_task(record: dict) -> Optional[Tuple[str, int, int]]:
     """Return (task_name, defect_type, relation_family), if this is a UI task."""
+    explicit = record.get("task_id", record.get("model_task_id", record.get("task_key")))
+    if explicit is not None:
+        task = get_task(explicit)
+        if record.get("task_key") is not None and get_task(record["task_key"]).task_id != task.task_id:
+            raise ValueError("Conflicting task_id/task_key")
+        if isinstance(record.get("defect_type"), int) and record["defect_type"] != task.task_id:
+            raise ValueError("Conflicting task_id/defect_type")
+        family = record.get("relation_family", task.family_id)
+        if family not in (task.family_id, task.relation_family):
+            raise ValueError("Conflicting task ID/relation family")
+        return UI_TASK_SPECS[task.task_id][:3]
     explicit_type = record.get("defect_type")
     explicit_family = record.get("relation_family")
     if (explicit_type is None) != (explicit_family is None):
-        raise ValueError(
-            "Explicit UI routing metadata must provide both defect_type and "
-            "relation_family"
-        )
+        raise ValueError("Explicit UI routing metadata must provide both defect_type and relation_family")
     if explicit_type is not None:
-        if isinstance(explicit_type, str) and not explicit_type.isdigit():
-            normalized = explicit_type.strip().lower()
-            defect_type = next(
-                (
-                    spec.defect_type
-                    for spec, train_spec in zip(UI_RELATION_PROMPT_SPECS, TASK_SPECS)
-                    if normalized
-                    in {
-                        spec.task_name.lower(),
-                        spec.diagnostic_name.lower(),
-                        train_spec[0].lower(),
-                    }
-                ),
-                None,
-            )
-            if defect_type is not None:
-                task_name, _, expected_family, _ = TASK_SPECS[defect_type]
-                if int(explicit_family) != expected_family:
-                    raise ValueError(
-                        "Explicit UI relation_family disagrees with the fixed "
-                        f"task table: defect_type={explicit_type!r}, "
-                        f"actual={explicit_family}, expected={expected_family}"
-                    )
-                return task_name, defect_type, expected_family
-            raise ValueError(f"Unknown explicit UI defect_type: {explicit_type}")
-        defect_type = int(explicit_type)
-        if not 0 <= defect_type < len(TASK_SPECS):
-            raise ValueError(f"Unknown explicit UI defect_type: {explicit_type}")
-        task_name, _, expected_family, _ = TASK_SPECS[defect_type]
-        if int(explicit_family) != expected_family:
-            raise ValueError(
-                "Explicit UI relation_family disagrees with the fixed task "
-                f"table: defect_type={defect_type}, actual={explicit_family}, "
-                f"expected={expected_family}"
-            )
-        return task_name, defect_type, expected_family
+        try:
+            task = get_task(explicit_type)
+        except ValueError:
+            task = next((t for t in UI_TASKS if t.diagnostic_name == explicit_type), None)
+            if task is None:
+                raise ValueError(f"Unknown explicit UI defect type: {explicit_type}")
+        if explicit_family not in (task.family_id, task.relation_family):
+            raise ValueError("Explicit UI relation_family disagrees with the fixed task table")
+        return UI_TASK_SPECS[task.task_id][:3]
 
     prompt = _conversation_text(record, "human").lower()
-    for task_name, defect_type, relation_family, aliases in TASK_SPECS:
+    for task_name, defect_type, relation_family, aliases in TASK_SPECS[:5]:
         if any(alias.lower() in prompt for alias in aliases):
             return task_name, defect_type, relation_family
     return None
@@ -100,6 +78,7 @@ def is_positive_ui_defect(record: dict) -> bool:
 
 
 def extract_ui_defect_targets(record: dict, max_boxes: int = 8) -> Dict[str, torch.Tensor]:
+    import torch
     task = identify_ui_defect_task(record)
     if task is None:
         defect_type = -1
@@ -163,10 +142,6 @@ def build_balanced_ui_indices(
     if not buckets:
         return list(range(len(records)))
 
-    expected_types = set(range(len(TASK_SPECS)))
-    if set(buckets) != expected_types:
-        missing = sorted(expected_types - set(buckets))
-        raise ValueError(f"UI balancing requires all five tasks; missing defect types: {missing}")
     if passthrough:
         raise ValueError(
             "UI balancing was enabled for a mixed dataset; move non-UI records to a separate recipe entry"
@@ -209,8 +184,8 @@ def build_balanced_ui_indices(
     for defect_type in sorted(buckets):
         positive = buckets[defect_type]["positive"]
         negative = buckets[defect_type]["negative"]
-        result.extend(sample_bucket(positive, positive_count))
-        result.extend(sample_bucket(negative, negative_count))
+        result.extend(sample_bucket(positive, positive_count if negative else records_per_class) if positive else [])
+        result.extend(sample_bucket(negative, negative_count if positive else records_per_class) if negative else [])
     rng.shuffle(result)
     required_indices = {
         index
@@ -254,13 +229,6 @@ def build_task_balanced_all_records_indices(
             "task_balanced_all_records was enabled for a mixed dataset; "
             "move non-UI records to a separate recipe entry"
         )
-    expected_types = set(range(len(TASK_SPECS)))
-    if set(buckets) != expected_types:
-        missing = sorted(expected_types - set(buckets))
-        raise ValueError(
-            "task_balanced_all_records requires all five tasks; "
-            f"missing defect types: {missing}"
-        )
     if any(not values for values in buckets.values()):
         raise ValueError("task_balanced_all_records cannot use an empty task stream")
 
@@ -302,7 +270,8 @@ def build_task_balanced_all_records_indices(
 
 def _ui_source_group_id(record: Mapping[str, Any]) -> str:
     value = (
-        record.get("_ui5_image_id")
+        record.get("source_image_id")
+        or record.get("_ui5_image_id")
         or record.get("_ui5_source_image")
         or record.get("image")
     )
@@ -368,21 +337,6 @@ def build_task_source_balanced_rotating_plan(
             "task_source_balanced_rotating was enabled for a mixed dataset; "
             "move non-UI records to a separate recipe entry"
         )
-    expected_types = set(range(len(TASK_SPECS)))
-    if set(buckets) != expected_types:
-        missing = sorted(expected_types - set(buckets))
-        raise ValueError(
-            "task_source_balanced_rotating requires all five tasks; "
-            f"missing defect types: {missing}"
-        )
-    for defect_type, polarities in buckets.items():
-        for polarity in ("positive", "negative"):
-            if not polarities[polarity]:
-                raise ValueError(
-                    "task_source_balanced_rotating requires non-empty positive and "
-                    f"negative source groups: task={defect_type}, polarity={polarity}"
-                )
-
     max_positive_sources = max(
         len(polarities["positive"]) for polarities in buckets.values()
     )
@@ -431,8 +385,17 @@ def build_task_source_balanced_rotating_plan(
         for defect_type, polarities in sorted(buckets.items())
     }
     per_task_records = positive_slots + negative_slots
+    task_slots = {
+        task: {"positive": positive_slots if p["negative"] else per_task_records,
+               "negative": negative_slots if p["positive"] else per_task_records}
+        for task, p in normalized_buckets.items()
+    }
+    for task, p in normalized_buckets.items():
+        if not p["positive"]: task_slots[task]["positive"] = 0
+        if not p["negative"]: task_slots[task]["negative"] = 0
     return {
         "buckets": normalized_buckets,
+        "slots_by_task": task_slots,
         "manual_indices": frozenset(manual_indices),
         "positive_slots_per_task": positive_slots,
         "negative_slots_per_task": negative_slots,
@@ -455,8 +418,8 @@ def build_task_source_balanced_rotating_plan(
         },
         "source_group_repeat_draws_per_epoch_by_task": {
             defect_type: {
-                "positive": max(0, positive_slots - len(polarities["positive"])),
-                "negative": max(0, negative_slots - len(polarities["negative"])),
+                "positive": max(0, task_slots[defect_type]["positive"] - len(polarities["positive"])),
+                "negative": max(0, task_slots[defect_type]["negative"] - len(polarities["negative"])),
             }
             for defect_type, polarities in normalized_buckets.items()
         },
@@ -536,6 +499,9 @@ def materialize_task_source_balanced_rotating_indices(
     manual_indices = plan["manual_indices"]
     task_streams: Dict[int, List[int]] = {}
     for defect_type, polarities in sorted(plan["buckets"].items()):
+        slots = plan.get("slots_by_task", {}).get(defect_type, {})
+        positive_slots = slots.get("positive", int(plan["positive_slots_per_task"]))
+        negative_slots = slots.get("negative", int(plan["negative_slots_per_task"]))
         positive = [
             _rotating_source_record(
                 source_groups=polarities["positive"],

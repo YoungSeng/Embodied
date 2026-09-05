@@ -27,6 +27,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Render and submit a LocateAnything UI5 v4 A800/H20 4/8-GPU job"
     )
+    parser.add_argument("--profile", choices=("m32-cpt9000-ui14-v1",), default=None)
+    parser.add_argument("--ui14-data-root", default=None)
     parser.add_argument("--machine", choices=("a800", "h20"), required=True)
     parser.add_argument(
         "--project-root",
@@ -465,6 +467,11 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
                 "EVAL_SKIP_PATCH": "1" if args.eval_skip_patch else "0",
             }
         )
+    if getattr(args, "profile", None):
+        if (args.machine, args.gpus, args.resource_group) != ("a800", 4, "aiai_locate"):
+            raise ValueError("UI14 formal profile requires --machine a800 --resource-group aiai_locate --gpus 4")
+        from ui14_profile import profile_environment
+        env.update(profile_environment(project_root=args.project_root, data_root=args.ui14_data_root))
     return env
 
 
@@ -493,10 +500,11 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "CUDA_DEVICES": "0,1,2,3,4,5,6,7",
         "EVAL_GPU_DEVICES": "0,1,2,3",
     }
-    assert_gpu_mode_consistency(
-        resolve_runtime_config(four_env, config_path=args.config),
-        resolve_runtime_config(eight_env, config_path=args.config),
-    )
+    if not getattr(args, "profile", None):
+        assert_gpu_mode_consistency(
+            resolve_runtime_config(four_env, config_path=args.config),
+            resolve_runtime_config(eight_env, config_path=args.config),
+        )
     runtime = resolve_runtime_config(submission_env, config_path=args.config)
     if re.fullmatch(r"[A-Za-z0-9._-]+", str(runtime["VERSION"])) is None:
         raise ValueError("VERSION may contain only letters, digits, '.', '_', and '-'")
@@ -612,6 +620,8 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "RUN_NAME",
         "PIPELINE_MODE",
     )
+    if getattr(args, "profile", None):
+        env_keys = (*env_keys, "UI_TRAIN_PROFILE", "UI14_DATA_ROOT", "UI_TASK_REGISTRY", "UI_EVAL_MANIFEST", "UI14_CHECK_REPORT", "UI_NUM_TASKS", "OUTPUT_DIR", "LOGGING_STEPS", "SAMPLE_LOG_INTERVAL", "LOCANY_CPT_MODE")
     if args.scorer_root:
         env_keys = (*env_keys, "SCORER_ROOT")
     if args.training_data_source_dir:
@@ -659,7 +669,9 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "ENVS_LIST": envs_list,
     }
     template = args.template.read_text(encoding="utf-8")
-    return render_template(template, replacements), runtime
+    rendered = render_template(template, replacements)
+    if getattr(args, "profile", None): rendered = rendered.replace("LocateAnything UI5", "LocateAnything UI14")
+    return rendered, runtime
 
 
 def main() -> int:
@@ -776,6 +788,9 @@ def main() -> int:
     if args.render_only:
         print("[RENDER ONLY] mlx was not invoked")
         return 0
+    if args.profile:
+        from ui14_profile import validate_prepared_profile
+        validate_prepared_profile(runtime)
     command = [args.mlx_bin, "job", "submitv2", "--path", str(output_yaml)]
     print("submit_command              :", " ".join(command))
     try:

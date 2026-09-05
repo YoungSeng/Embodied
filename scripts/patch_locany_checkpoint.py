@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -186,6 +187,14 @@ def validate_relation_weight_keys(
         for group in required
         if not any(group in key for key in keys)
     ]
+    if int((config or {}).get("ui_num_tasks", 5)) == 14:
+        banks = {}
+        for key in keys:
+            match = re.match(r"(.*\.(?:image_gate_heads|experts|heads))\.(\d+)\.", key)
+            if match: banks.setdefault(match[1], set()).add(int(match[2]))
+        for bank, indices in banks.items():
+            if indices != set(range(14)): missing.append(f"{bank} requires task indices 0..13; found {sorted(indices)}")
+        if not banks: missing.append("14-task parameter banks")
     return {
         "valid": not missing,
         "missing_groups": missing,
@@ -287,6 +296,9 @@ def patch_checkpoint(
     )
     if relation_source.is_file():
         selected_sources[relation_source.name] = relation_source
+    registry_source = project_root / "eaglevl" / "ui_task_registry.py"
+    if registry_source.is_file():
+        selected_sources["ui_task_registry.py"] = registry_source
     if not selected_sources:
         raise FileNotFoundError(
             f"No LocateAnything Python sources found under {base_model} or {project_root}"
@@ -332,6 +344,18 @@ def patch_checkpoint(
             )
     else:
         pbd_config_report = None
+    if config.get("ui_task_registry") is not None:
+        import sys
+        sys.path.insert(0, str(project_root))
+        from eaglevl.ui_task_registry import validate_registry
+        rows = validate_registry(config["ui_task_registry"], config.get("ui_num_tasks", 5))
+        atomic_write_json(checkpoint / "ui_task_registry.json", {"schema_version": 1, "tasks": rows})
+        processor_path = checkpoint / "processor_config.json"
+        if not processor_path.exists() and (base_model / "processor_config.json").exists():
+            shutil.copy2(base_model / "processor_config.json", processor_path)
+        processor_config = json.loads(processor_path.read_text(encoding="utf-8")) if processor_path.exists() else {"processor_class": "LocateAnythingProcessor"}
+        processor_config.update(ui_num_tasks=len(rows), ui_task_registry=rows)
+        atomic_write_json(processor_path, processor_config)
     config["auto_map"] = AUTO_MAP
     config_changed = config != original_config
     if config_changed:

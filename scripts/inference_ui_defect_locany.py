@@ -130,6 +130,8 @@ from ui5_lossless_tiling import (
 PROMPT_TEMPLATE = (
     "Locate all the instances that match the following description: {label}."
 )
+from ui14_common import UI_TASKS, get_task, read_json
+
 RELATION_SPEC_BY_TASK = {
     spec.task_name: spec for spec in UI_RELATION_PROMPT_SPECS
 }
@@ -223,7 +225,7 @@ def parse_optional_bool(value: str | bool) -> bool:
 
 
 def parse_args() -> argparse.Namespace:
-    task_choices = ["all", *[task.task_name for task in TASK_CONFIGS]]
+    task_choices = ["all", *[t.task_key for t in UI_TASKS]]
 
     parser = argparse.ArgumentParser(
         description=(
@@ -231,6 +233,7 @@ def parse_args() -> argparse.Namespace:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--eval-manifest", type=Path, default=None)
     parser.add_argument(
         "--checkpoint",
         "--model-path",
@@ -1346,6 +1349,12 @@ class LocateAnythingInferencer:
             "verbose": self.args.verbose_generation,
         }
 
+        active_task = getattr(self, "active_task", None)
+        if active_task is not None:
+            route = get_task(active_task)
+            if route.task_id >= int(getattr(self.model.config, "ui_num_tasks", 5)):
+                raise ValueError("Requested task is absent from checkpoint registry")
+            generate_kwargs.update(defect_type=route.task_id, relation_family=route.family_id)
         eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
         if eos_token_id is not None:
             generate_kwargs["eos_token_id"] = eos_token_id
@@ -1589,6 +1598,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "processor_path": args.processor_path or args.checkpoint,
         "prompt_template": PROMPT_TEMPLATE,
         "tasks": [asdict(task) | {"prompt": task.prompt} for task in TASK_CONFIGS],
+        "evaluation_manifest_digest": hashlib.sha256(Path(args.eval_manifest).read_bytes()).hexdigest() if getattr(args, "eval_manifest", None) else None,
         "generation": {
             "mode": args.generation_mode,
             "max_new_tokens": args.max_new_tokens,
@@ -1638,6 +1648,7 @@ def manifest_identity(manifest: dict[str, Any]) -> dict[str, Any]:
             "processor_path",
             "prompt_template",
             "tasks",
+            "evaluation_manifest_digest",
             "generation",
             "inference_crop",
             "output",
@@ -1678,7 +1689,7 @@ def clear_existing_task_artifacts(output_dir: Path) -> int:
 
 
 def check_and_write_manifest(args: argparse.Namespace) -> None:
-    path = args.output_dir / "_run_manifest.json"
+    path = args.output_dir / (f"_run_manifest_{args.tasks[0]}.json" if getattr(args, "eval_manifest", None) else "_run_manifest.json")
     current = build_manifest(args)
     existing_results = collect_existing_task_artifacts(args.output_dir)
     if path.is_file():
@@ -1963,6 +1974,11 @@ def run_one_task(
     work: TaskWork,
 ) -> dict[str, Any]:
     config = work.config
+    inferencer.active_task = config.task_name
+    source_records = {}
+    if getattr(args, "eval_manifest", None):
+        from ui14_common import read_jsonl
+        source_records = {str(Path(r["source_image"]).resolve()): r for r in read_jsonl(work.jsonl_path) if r.get("source_image")}
     print("\n" + "=" * 88)
     print(f"任务                 : {config.task_name}")
     print(f"输入 JSONL           : {work.jsonl_path}")
@@ -2022,7 +2038,7 @@ def run_one_task(
             if args.inference_crop_mode in {"lossless_tiling", "detector_scan"}:
                 tiles_override = None
                 if args.inference_crop_mode == "detector_scan":
-                    if config.task_name == "content_missing":
+                    if get_task(config.task_name).view_policy == "full_image":
                         # The global task keeps one complete view; it still uses
                         # no GT and shares the same detector cache validation.
                         tiles_override = [[0, 0, width, height]]
@@ -2114,6 +2130,15 @@ def run_one_task(
                     atomic_write_json(raw_path, raw_payload)
 
             gate_path = work.output_dir / "gate" / f"{stem}{suffix}.json"
+            route = get_task(config.task_name)
+            gate_diagnostics.update(task_id=route.task_id, task_key=route.task_key,
+                source_dataset=route.source_dataset, view_policy=route.view_policy,
+                init_checkpoint=getattr(inferencer.model.config, "init_checkpoint", ""),
+                init_cpt_step=getattr(inferencer.model.config, "init_cpt_step", 0),
+                sft_step=int(Path(args.checkpoint).name.split("-")[-1]) if Path(args.checkpoint).name.split("-")[-1].isdigit() else 0)
+            source_row = source_records.get(str(Path(image_path).resolve()), {})
+            for name in ("source_dataset", "source_version", "source_record_id", "source_record_ids", "source_image_id", "split"):
+                if name in source_row: gate_diagnostics[name] = source_row[name]
             gate_diagnostics.setdefault("p_defect", None)
             gate_diagnostics.setdefault("gate_mode", args.relation_gate_mode)
             gate_diagnostics.setdefault("threshold", args.relation_gate_threshold)
@@ -2263,6 +2288,26 @@ def print_preflight(args: argparse.Namespace, works: Sequence[TaskWork]) -> None
 
 def main() -> int:
     args = parse_args()
+    if args.eval_manifest:
+        global TASK_CONFIGS, TASK_BY_NAME
+        rows = read_json(args.eval_manifest)["tasks"]
+        selected = rows if args.tasks == ["all"] else [r for r in rows if r["task_key"] in args.tasks]
+        if len(selected) != (len(rows) if args.tasks == ["all"] else len(args.tasks)):
+            raise ValueError("Evaluation manifest is missing selected tasks")
+        if len(selected) != 1:
+            raise ValueError("Use one --tasks key per UI14 worker, or run_ui5_parallel_inference.py for the full queue")
+        spec = selected[0]
+        args.tasks = [spec["task_key"]]
+        args.skip_figma = bool(spec["skip_figma"])
+        args.processor_path = args.checkpoint
+        args.inference_crop_mode = "detector_scan" if spec["view_policy"] == "crops" else "full_image"
+        args.detector_crop_manifest = str(Path(spec["cache"]) / spec["scan_name"] / "detector_scan_crops.jsonl") if spec["view_policy"] == "crops" else None
+        old = {t.task_name: t for t in TASK_CONFIGS}
+        TASK_CONFIGS = [TaskConfig(r["task_key"], r["test"], r["class_id"],
+                         old[r["task_key"]].output_label if r["task_key"] in old else r["task_key"],
+                         r["prompt_label"]) for r in selected]
+        TASK_BY_NAME = {t.task_name: t for t in TASK_CONFIGS}
+
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     args.checkpoint = normalize_local_or_hub_path(args.checkpoint)
@@ -2311,6 +2356,7 @@ def main() -> int:
             set_sample_seed(
                 stable_sample_seed(args.seed, work.config.task_name, image_path)
             )
+            inferencer.active_task = work.config.task_name
             answer = inferencer.predict(image=image, question=work.config.prompt)
             print(
                 f"[MODEL FORWARD PREFLIGHT] generation passed, answer_chars={len(answer)}",

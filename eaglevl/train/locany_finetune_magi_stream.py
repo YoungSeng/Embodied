@@ -118,6 +118,7 @@ from eaglevl.train.ui_defect_data import (
     materialize_task_source_balanced_rotating_indices,
 )
 from eaglevl.train.ui5_excel_logger import UI5ExcelLogger, TRAIN_TASKS
+from eaglevl.ui_task_registry import UI_TASKS
 from eaglevl.train.ui5_checkpoint_utils import atomic_save_with_fsync, validate_checkpoint
 from eaglevl.train.ui5_sampling_coverage import (
     is_monotonic_coverage,
@@ -492,7 +493,7 @@ class LazySupervisedDatasetMTP(Dataset):
                 if kind == "crop" and len(examples[source]) < 3:
                     examples[source].append(str(record.get("image", "")))
             crop_count = int(record_kind_counts.get("crop", 0))
-            if crop_count <= 0:
+            if crop_count <= 0 and meta.get("view_policy") != "full_image":
                 raise RuntimeError(
                     f"[{self.ds_name}] audited crop recipe contains zero crop records"
                 )
@@ -508,6 +509,9 @@ class LazySupervisedDatasetMTP(Dataset):
         if self.ui_sampling_mode == "task_source_balanced_rotating":
             candidate_indices = list(self.active_indices)
             index_records = [self.lazy_loader[index] for index in candidate_indices]
+            if meta.get("task_id") is not None:
+                if {identify_ui_defect_task(record)[1] for record in index_records} != {int(meta["task_id"])}:
+                    raise ValueError(f"[{self.ds_name}] explicit recipe task_id does not match its records")
             plan = build_task_source_balanced_rotating_plan(
                 index_records,
                 negative_to_positive_ratio=ui_negative_to_positive_ratio,
@@ -576,7 +580,7 @@ class LazySupervisedDatasetMTP(Dataset):
             # Validation and the first deterministic epoch are intentionally
             # performed before training starts so an incomplete recipe fails closed.
             first_epoch = build_task_balanced_all_records_indices(index_records)
-            buckets = {defect_type: [] for defect_type in range(5)}
+            buckets = defaultdict(list)
             for logical_index, record in enumerate(index_records):
                 task = identify_ui_defect_task(record)
                 if task is None:
@@ -693,10 +697,7 @@ class LazySupervisedDatasetMTP(Dataset):
                 len(selected_manual_gt_keys),
                 len(required_manual_gt_keys),
             )
-            self._balanced_logical_buckets = {
-                defect_type: {"positive": [], "negative": []}
-                for defect_type in range(5)
-            }
+            self._balanced_logical_buckets = defaultdict(lambda: {"positive": [], "negative": []})
             for logical_index, raw_index in enumerate(self.active_indices):
                 # ``raw_index`` addresses LazyJsonlLoader, not the compact
                 # ``index_records`` list (which may already be exclusion-filtered).
@@ -2505,15 +2506,10 @@ class StreamPackingMTPTrainer(Trainer):
         "expert_task_2_grad_norm",
         "expert_task_3_grad_norm",
         "expert_task_4_grad_norm",
+        *(f"expert_task_{i}_grad_norm" for i in range(5, len(UI_TASKS))),
         "cross_task_shared_gradient_cosine",
     )
-    _DEFECT_TO_DIAGNOSTIC_TASK = {
-        0: "text_overflow",
-        1: "element_cropping",
-        2: "element_overlap",
-        3: "text_ellipsis",
-        4: "content_missing",
-    }
+    _DEFECT_TO_DIAGNOSTIC_TASK = {t.task_id: t.diagnostic_name for t in UI_TASKS}
 
     def __init__(
         self,
@@ -4028,7 +4024,7 @@ class StreamPackingMTPTrainer(Trainer):
                 if self._ui5_last_grad_seen_global.get(group) != global_step:
                     self._add_ui5_scalar(f"{group}_grad_seen_steps", 1.0)
                     self._ui5_last_grad_seen_global[group] = global_step
-        for defect_id in range(5):
+        for defect_id in range(len(UI_TASKS)):
             group = f"expert_task_{defect_id}"
             square = self._ui5_hook_squares.get(group)
             if square is not None:
@@ -4642,7 +4638,7 @@ class StreamPackingMTPTrainer(Trainer):
                         )
                     missing_expert_gradients = [
                         defect_id
-                        for defect_id in range(5)
+                        for defect_id in range(int(getattr(self.model.config, "ui_num_tasks", 5)))
                         if self._ui5_scalar[
                             f"expert_task_{defect_id}_grad_norm"
                         ]["count"] <= 0
@@ -4650,7 +4646,7 @@ class StreamPackingMTPTrainer(Trainer):
                     if missing_expert_gradients:
                         logger.warning(
                             "[%s diagnostic] step-20 window did not activate all "
-                            "five task experts; missing=%s",
+                            "registered task experts; missing=%s",
                             stage, missing_expert_gradients,
                         )
                     missing_losses = [
@@ -4782,6 +4778,12 @@ def build_stream_packed_dataset_mtp(
 ) -> StreamPackedDatasetMTP:
     """Build StreamPackedDatasetMTP."""
     ds_collections = json.loads(open(data_args.meta_path).read())
+    if os.environ.get("UI_TASK_REGISTRY"):
+        from eaglevl.ui_task_registry import load_registry
+        registered = load_registry(os.environ["UI_TASK_REGISTRY"])
+        actual = [meta.get("task_id") for meta in ds_collections.values()]
+        if sorted(actual, key=str) != sorted([r["task_id"] for r in registered], key=str):
+            raise ValueError("Joint recipe must contain each registered task exactly once")
     
     datasets = []
     dataset_weights = []
@@ -4811,6 +4813,10 @@ def build_stream_packed_dataset_mtp(
             datasets.append(ds)
             
             weight = resolve_dataset_sampling_weight(meta, len(ds))
+            if os.environ.get("UI_TASK_REGISTRY"):
+                if meta.get("task_id") is None or meta.get("sampling_weight") is None:
+                    raise ValueError("UI14 recipe entries require explicit task_id and sampling_weight")
+                weight = float(meta["sampling_weight"])
             dataset_weights.append(weight)
             cpt_sampling_tasks.append(
                 {
@@ -5223,6 +5229,8 @@ def main():
     # Build dataset
     logger.info("Building stream packed MTP dataset...")
     t_start = time.time()
+    processor.ui_num_tasks = model.config.ui_num_tasks
+    processor.ui_task_registry = model.config.ui_task_registry
     train_dataset = build_stream_packed_dataset_mtp(model_args, data_args, processor, base_seed=training_args.seed)
     logger.info(f"Dataset built in {time.time() - t_start:.2f}s")
 
@@ -5432,6 +5440,7 @@ def main():
             )
             if osp.isfile(relation_module_src):
                 shutil.copy2(relation_module_src, osp.join(output_dir, 'relation_modules.py'))
+                shutil.copy2(osp.join(osp.dirname(osp.dirname(osp.dirname(relation_module_src))), 'ui_task_registry.py'), osp.join(output_dir, 'ui_task_registry.py'))
                 logger.info("Copied self-contained UI relation module to checkpoint")
 
             config_path = osp.join(output_dir, 'config.json')

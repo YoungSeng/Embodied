@@ -69,6 +69,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="all",
     )
     parser.add_argument("--input-dir", type=Path, default=None)
+    parser.add_argument("--task-input-manifest", type=Path, default=None)
+    parser.add_argument("--data-split", choices=("train", "test"), default="test")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--parser-root", type=Path, required=True)
     parser.add_argument("--gpus", default="0,1,2,3")
@@ -95,7 +97,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--scan-name", default="horizontal_scan_v5_raw_detector_edge_aligned"
     )
     parser.add_argument(
-        "--cache-scope", choices=("auto", "preview", "validation", "full_test"), default="auto"
+        "--cache-scope", choices=("auto", "preview", "validation", "full_test", "full_train"), default="auto"
     )
     parser.add_argument(
         "--expected-full-test-unique-images",
@@ -212,7 +214,11 @@ def prepare_manifest(args: argparse.Namespace) -> list[dict[str, Any]]:
     if args.input_dir is None:
         raise ValueError("--input-dir is required for --stage prepare/all")
     input_dir = args.input_dir.expanduser().resolve(strict=True)
-    task_files = {task: input_dir / TASK_JSONL[task] for task in TASKS}
+    task_files = (
+        {task: Path(path).resolve(strict=True) for task, path in json.loads(args.task_input_manifest.read_text(encoding="utf-8")).items()}
+        if getattr(args, "task_input_manifest", None)
+        else {task: input_dir / TASK_JSONL[task] for task in TASKS}
+    )
     missing = [path for path in task_files.values() if not path.is_file()]
     if missing:
         raise FileNotFoundError("missing test JSONL: " + ", ".join(map(str, missing)))
@@ -223,7 +229,7 @@ def prepare_manifest(args: argparse.Namespace) -> list[dict[str, Any]]:
             limit=args.max_images_per_task,
             skip_figma=args.skip_figma,
         )
-        for task in TASKS
+        for task in task_files
     }
     total_selected = sum(len(paths) for paths in selected_by_task.values())
     reporter = ProgressReporter(
@@ -238,7 +244,7 @@ def prepare_manifest(args: argparse.Namespace) -> list[dict[str, Any]]:
     task_rows: list[dict[str, Any]] = []
     path_info: dict[str, tuple[str, int, int]] = {}
     completed = 0
-    for task in TASKS:
+    for task in task_files:
         for task_index, image_path in enumerate(selected_by_task[task]):
             info = path_info.get(str(image_path))
             if info is None:
@@ -298,6 +304,8 @@ def prepare_manifest(args: argparse.Namespace) -> list[dict[str, Any]]:
         "content_id_digest": digest_ids(row["content_id"] for row in unique),
     }
     identity_path = paths.manifest / "selection_config.json"
+    if getattr(args, "task_input_manifest", None):
+        selection["data_split"] = args.data_split
     if identity_path.is_file() and args.resume:
         existing = json.loads(identity_path.read_text(encoding="utf-8"))
         if existing != selection:
@@ -852,7 +860,7 @@ def _resolve_cache_scope(
     args: argparse.Namespace, selection: Mapping[str, Any], unique_count: int
 ) -> tuple[str, int, int]:
     max_images_per_task = int(selection.get("max_images_per_task", 0))
-    inferred = "preview" if max_images_per_task > 0 else "full_test"
+    inferred = "preview" if max_images_per_task > 0 else ("full_train" if selection.get("data_split") == "train" else "full_test")
     requested = str(getattr(args, "cache_scope", "auto"))
     cache_scope = inferred if requested == "auto" else requested
     if cache_scope != inferred and not (
@@ -894,7 +902,7 @@ def _write_cache_ready_marker(
         args, selection, len(rows)
     )
     task_files = []
-    for task in TASKS:
+    for task in selection["task_files"]:
         path = Path(selection["task_files"][task])
         task_files.append(
             {
@@ -1080,6 +1088,10 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
         "schema_version": GEOMETRY_SCHEMA_VERSION,
         "gt_used": False,
     }
+    task_manifest = getattr(args, "task_input_manifest", None)
+    if task_manifest:
+        geometry_config["task_context_policy"] = "ui14_detector_neighbors_v1"
+        geometry_config["task_keys"] = sorted(json.loads(Path(task_manifest).read_text(encoding="utf-8")))
     crop_root = args.output_dir / args.scan_name
     state_path = crop_root / "scan_state.json"
     scan_manifest_path = crop_root / "detector_scan_crops.jsonl"
@@ -1172,6 +1184,7 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
             int(detected["width"]),
             int(detected["height"]),
             detector_items,
+            task=manifest["tasks"][0] if task_manifest else None,
             max_tiles=args.scan_max_crops,
             target_tile_height=args.scan_target_height,
             overlap_ratio=args.scan_overlap_ratio,
@@ -1223,7 +1236,7 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
         for density in ("sparse", "medium", "dense")
     }
     by_task: dict[str, Any] = {}
-    for task in TASKS:
+    for task in sorted({task for row in rows for task in row["tasks"]}):
         task_rows = [row for row in rows if task in row["tasks"]]
         if task == "content_missing":
             # The inference worker intentionally overrides these task-agnostic
