@@ -207,3 +207,22 @@ CUDA_VISIBLE_DEVICES="" /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_wo
 scheduler、RNG、sampler 和 global step；首批就失败且尚无完整滚动 checkpoint 时从原 crop
 模型启动。不要删除或重置已有 checkpoint，也不要使用仅适用于 caption 拒绝的提交重试入口。
 提交 YAML 中的 `CODE_REVISION` 和入口 SHA 检查需要同步更新到修复后的提交。
+
+如果使用的是前述自动准备/提交命令，不用猜带时间戳的 RUN_NAME：以下入口沿旧提交目录的
+`snapshot-switch-submit.started` 和已有 `caption-retry.started` 找到实际任务，确认最近训练
+日志中的此类断言、非零退出码和主调度器终止日志，再只提交一次修复后的新任务：
+
+```bash
+WORKSPACE=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace
+cd "$WORKSPACE/code/Embodied-ui5-curriculum" &&
+git pull --ff-only origin codex/ui5-crop-rollout4-curriculum-hard114 &&
+"$WORKSPACE/conda_envs/LocateAnything/bin/python" -u \
+  scripts/restart_ui5_after_detail_audit.py \
+  --previous-submission-dir \
+  "$WORKSPACE/gui_logs/ui5_curriculum/locany-ui5-crop-rollout4-curriculum-hour009-h20x2-sdpa7268-20260904T204242Z-276590"
+```
+
+该入口只适用于已终止、尚无 optimizer checkpoint 的本次 step-0 失败。存在滚动/临时
+checkpoint 或非零训练/评测进度时拒绝启动，避免丢弃续训状态。课程和全部 crop PNG 原地
+复用，不重新冻结或构建；按正式规范创建新的 RUN_NAME/OUTPUT_DIR，因此 step-0 baseline
+会重新评测。旧运行目录和日志完整保留。新的 `detail-audit-restart.started` 防止重复提交。
