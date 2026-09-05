@@ -61,6 +61,8 @@ class SnapshotPrepareTests(unittest.TestCase):
             (destination / "_SUCCESS.json").write_text(json.dumps({
                 "complete": True, "identity_digest": "identity",
             }))
+        if command[0] == "/bin/mlx":
+            kwargs["stdout"].write('{"code": 0, "data": {"jobRunId": "test-job-123"}}\n')
         return mock.Mock(returncode=0)
 
     def execute(self, side_effect=None):
@@ -100,6 +102,9 @@ class SnapshotPrepareTests(unittest.TestCase):
         self.assertNotIn("run_ui5_train_rollouts_h20x2.sh", job["jobRunParams"]["entrypointFullScript"])
         state = json.loads((path.parent / "snapshot-switch.json").read_text())
         self.assertEqual(state["status"], "submitted")
+        self.assertEqual(state["submission_result"]["job_ids"], ["test-job-123"])
+        self.assertTrue((path.parent / "mlx-submit.log").is_file())
+        self.assertTrue((path.parent / "submission-result.json").is_file())
         self.assertTrue((self.previous / "snapshot-switch-submit.started").is_file())
 
     def test_second_invocation_cannot_submit_again_with_new_run_name(self):
@@ -209,6 +214,197 @@ class SnapshotPrepareTests(unittest.TestCase):
         self.template["jobDefVersion"]["resource"]["arnoldConfig"]["roles"][0]["gpu"] = 4
         with self.assertRaisesRegex(RuntimeError, "H20x2"):
             prepare.render_job(self.template, {}, "test")
+
+    def test_real_91_character_caption_is_now_below_platform_limit(self):
+        name = "ui5-curriculum-hour021-20260905T065342Z-f8d36a"
+        self.assertEqual(len("UI5 Crop Rollout4 Curriculum - reused PNGs - " + name), 91)
+        job = prepare.render_job(self.template, {"PROJECT_ROOT": "/code", "CODE_REVISION": "abc"}, name)
+        self.assertEqual(len(job["caption"]), 56)
+        with self.assertRaisesRegex(ValueError, "caption exceeds"):
+            prepare.render_job(self.template, {}, "a" * 100)
+
+    def test_zero_exit_platform_error_is_not_reported_as_submitted(self):
+        def reject(command, **kwargs):
+            if command[0] == "/bin/mlx":
+                self.calls.append((command, kwargs))
+                kwargs["stdout"].write('提交任务失败，failed to submit mlx lab job, err: '
+                                       '{"code":0,"errCode":"JobRunCaptionExceedMaxLen",'
+                                       '"errMsg":"job run caption is too long, max len: 90"}\n')
+                return mock.Mock(returncode=0)
+            return self.run_command(command, **kwargs)
+        with self.assertRaisesRegex(RuntimeError, "submission_rejected"):
+            self.execute(reject)
+        state_path = next((self.workspace / "gui_logs/ui5_curriculum").glob("*/snapshot-switch.json"))
+        state = json.loads(state_path.read_text())
+        self.assertEqual(state["status"], "submission_rejected")
+        self.assertEqual(state["submission_result"]["error_codes"], [prepare.CAPTION_REJECTION])
+        self.assertTrue((state_path.parent / "submission-attempt.started").exists())
+        self.assertIn("JobRunCaptionExceedMaxLen", (state_path.parent / "mlx-submit.log").read_text(encoding="utf-8"))
+
+    def make_legacy_caption_failure(self):
+        """The old version neither captured stdout nor wrote a real receipt."""
+        job_path = self.execute()
+        state_path = job_path.parent / "snapshot-switch.json"
+        job = yaml.safe_load(job_path.read_text())
+        job["caption"] = "UI5 Crop Rollout4 Curriculum - reused PNGs - ui5-curriculum-hour021-20260905T065342Z-f8d36a"
+        job_path.write_text(yaml.safe_dump(job))
+        state = json.loads(state_path.read_text())
+        state.pop("submission_result")
+        state.pop("submission_log")
+        state_path.write_text(json.dumps(state))
+        (job_path.parent / "submission-result.json").unlink()
+        (job_path.parent / "mlx-submit.log").unlink()
+        env = state["runtime"]
+        frozen = Path(env["FROZEN_SELECTION"])
+        frozen.mkdir(parents=True)
+        summary_path = frozen / "summary.json"
+        summary_path.write_text(json.dumps({"formal_crop_hard_groups": 17}))
+        (frozen / "_SUCCESS").write_text("complete")
+        data_dir = Path(env["CURRICULUM_DATA_DIR"])
+        manifest_path = data_dir / "curriculum_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest.pop("identity_digest")
+        manifest["inputs"] = {"frozen_selection_summary": {
+            "path": str(summary_path.resolve()),
+            "sha256": prepare.hashlib.sha256(summary_path.read_bytes()).hexdigest(),
+        }}
+        manifest["identity_digest"] = prepare.hashlib.sha256(json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+        manifest_path.write_text(json.dumps(manifest))
+        (data_dir / "_SUCCESS.json").write_text(json.dumps({
+            "complete": True, "identity_digest": manifest["identity_digest"],
+        }))
+        self.calls.clear()
+        return state_path
+
+    def execute_retry(self, state_path, side_effect=None):
+        args = prepare.parse_args(["--retry-caption-rejected-state", str(state_path)])
+        with mock.patch.object(prepare, "PROJECT_ROOT", self.project), \
+             mock.patch.object(prepare.shutil, "which", return_value="/bin/mlx"), \
+             mock.patch.object(prepare.subprocess, "check_output", return_value="b" * 40), \
+             mock.patch.object(prepare.subprocess, "run", side_effect=side_effect or self.run_command), \
+             contextlib.redirect_stdout(io.StringIO()):
+            return prepare.retry_caption_rejected(args)
+
+    def test_caption_retry_reuses_completed_curriculum_without_freeze_build_or_png_relink(self):
+        old_state_path = self.make_legacy_caption_failure()
+        before = old_state_path.read_bytes()
+        old_state = json.loads(before)
+        old_yaml = Path(old_state["job_yaml"]).read_bytes()
+        job_path = self.execute_retry(old_state_path)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][0], ["/bin/mlx", "job", "submitv2", "--path", str(job_path)])
+        job = yaml.safe_load(job_path.read_text())
+        env = job["jobRunParams"]["envsList"]
+        for key in ("CURRICULUM_DATA_DIR", "FROZEN_SELECTION", "MODEL_PATH", "PROCESSOR_PATH",
+                    "EVAL_DETECTOR_MANIFEST", "ROLLOUT_BUNDLE_ROOT"):
+            self.assertEqual(env[key], old_state["runtime"][key])
+        self.assertNotEqual(env["RUN_NAME"], old_state["runtime"]["RUN_NAME"])
+        self.assertNotEqual(env["OUTPUT_DIR"], old_state["runtime"]["OUTPUT_DIR"])
+        self.assertEqual(env["CODE_REVISION"], "b" * 40)
+        self.assertIn("b" * 40, job["jobRunParams"]["entrypointFullScript"])
+        self.assertEqual(job["jobDefVersion"]["resource"], self.template["jobDefVersion"]["resource"])
+        self.assertEqual(old_state_path.read_bytes(), before)
+        self.assertEqual(Path(old_state["job_yaml"]).read_bytes(), old_yaml)
+        self.assertTrue((old_state_path.parent / "caption-retry.started").exists())
+        self.assertTrue((old_state_path.parent / "submission-attempt.started").exists())
+        self.assertTrue((self.previous / "snapshot-switch-submit.started").exists())
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "retry was already reserved"):
+            self.execute_retry(old_state_path)
+        self.assertEqual(self.calls, [])
+
+    def test_retry_does_not_rebuild_corrupt_or_changed_curriculum(self):
+        state_path = self.make_legacy_caption_failure()
+        env = json.loads(state_path.read_text())["runtime"]
+        manifest_path = Path(env["CURRICULUM_DATA_DIR"]) / "curriculum_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["hard_groups"] = 999
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(RuntimeError, "identity/publication/reuse"):
+            self.execute_retry(state_path)
+        self.assertEqual(self.calls, [])
+        self.assertFalse((state_path.parent / "caption-retry.started").exists())
+
+    def test_retry_refuses_changed_frozen_selection(self):
+        state_path = self.make_legacy_caption_failure()
+        env = json.loads(state_path.read_text())["runtime"]
+        (Path(env["FROZEN_SELECTION"]) / "summary.json").write_text('{"formal_crop_hard_groups":999}')
+        with self.assertRaisesRegex(RuntimeError, "frozen summary"):
+            self.execute_retry(state_path)
+        self.assertEqual(self.calls, [])
+
+    def test_retry_refuses_known_success_or_uncertain_receipts(self):
+        state_path = self.make_legacy_caption_failure()
+        for status in ("submitted", "submission_unconfirmed", "submission_failed"):
+            receipt = {"status": status, "error_codes": [], "job_ids": []}
+            (state_path.parent / "submission-result.json").write_text(json.dumps(receipt))
+            with self.subTest(status=status), self.assertRaisesRegex(RuntimeError, "successful/uncertain"):
+                self.execute_retry(state_path)
+        self.assertEqual(self.calls, [])
+
+    def test_retry_refuses_nonempty_gpu_output(self):
+        state_path = self.make_legacy_caption_failure()
+        env = json.loads(state_path.read_text())["runtime"]
+        output = Path(env["OUTPUT_DIR"])
+        output.mkdir(parents=True)
+        (output / "run.json").write_text("{}")
+        with self.assertRaisesRegex(RuntimeError, "GPU job may have started"):
+            self.execute_retry(state_path)
+        self.assertEqual(self.calls, [])
+
+    def test_unconfirmed_retry_keeps_attempt_locks_and_never_submits_again(self):
+        state_path = self.make_legacy_caption_failure()
+        def no_receipt(command, **kwargs):
+            self.calls.append((command, kwargs))
+            return mock.Mock(returncode=0)
+        with self.assertRaisesRegex(RuntimeError, "submission_unconfirmed"):
+            self.execute_retry(state_path, no_receipt)
+        new_state_path = Path((state_path.parent / "caption-retry.started").read_text().strip())
+        self.assertEqual(json.loads(new_state_path.read_text())["status"], "submission_unconfirmed")
+        self.assertTrue((new_state_path.parent / "submission-attempt.started").exists())
+        with self.assertRaisesRegex(RuntimeError, "retry was already reserved"):
+            self.execute_retry(state_path)
+        self.assertEqual(len(self.calls), 1)
+
+
+class SubmissionReceiptTests(unittest.TestCase):
+    def test_positive_job_receipts_or_explicit_success(self):
+        for output in ('{"code":0,"data":{"jobRunId":"12345"}}',
+                       '{"code":200,"error":null,"jobRunId":"12345"}',
+                       '{"job_id":"run-123"}', 'job run id: abc-123',
+                       '提交任务成功', 'Job submitted successfully'):
+            with self.subTest(output=output):
+                self.assertEqual(prepare.submission_result(0, output)["status"], "submitted")
+
+    def test_zero_exit_code_is_not_enough(self):
+        for output in ("", "Sending request...", '{"code":0}', "https://example.invalid/jobs", "job id: 0"):
+            with self.subTest(output=output):
+                self.assertEqual(prepare.submission_result(0, output)["status"], "submission_unconfirmed")
+
+    def test_failure_beats_success_messages_and_job_ids(self):
+        for output in ('failed to submit mlx lab job', '提交任务失败',
+                       '{"code":0,"errCode":"SomeError","jobRunId":"123"}',
+                       '{"code":400,"jobRunId":"123"}',
+                       '{"error":"request rejected","jobRunId":"123"}',
+                       'Not submitted successfully',
+                       '提交成功\nERROR server rejected request', '{"success":false}'):
+            with self.subTest(output=output):
+                self.assertEqual(prepare.submission_result(0, output)["status"], "submission_failed")
+        self.assertEqual(prepare.submission_result(1, "Submitted successfully")["status"], "submission_failed")
+
+    def test_caption_rejection_is_explicit_and_distinct_from_unknown_failure(self):
+        result = prepare.submission_result(0, '提交任务失败，failed to submit mlx lab job, err: '
+                                           '{"code":0,"errCode":"JobRunCaptionExceedMaxLen",'
+                                           '"errMsg":"job run caption is too long, max len: 90"}')
+        self.assertEqual(result["status"], "submission_rejected")
+        self.assertEqual(result["error_codes"], [prepare.CAPTION_REJECTION])
+        self.assertEqual(result["job_ids"], [])
+
+    def test_retry_mode_cannot_accidentally_run_snapshot_preparation(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            prepare.parse_args(["--retry-caption-rejected-state", "state.json", "--snapshot", "snapshot"])
 
 
 class ProcessDescriptorTests(unittest.TestCase):

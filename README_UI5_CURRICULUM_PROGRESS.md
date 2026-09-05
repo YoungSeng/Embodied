@@ -147,3 +147,35 @@ step 0 baseline 和 200-step 训练/评测循环。没有指标早停或 Magi �
 
 跨快照复用省掉的是重新裁图/编码/写入图片内容，仍有哈希校验、链接和索引生成。
 不要把当前阶段 ETA 理解为整个切换或训练完成 ETA，也不保证获配 GPU 后的校验一定只需几分钟。
+
+### 数据构建完成，但提交被 caption 长度限制拒绝
+
+旧 caption 的真实长度是 91，平台最多允许 90。现在使用短 caption（本次为 56），并在
+提交前检查长度。MLX 在平台返回错误时可能仍退出 0，因此不再仅依赖退出码：保存
+`mlx-submit.log` 原始输出和 `submission-result.json`，API 错误优先于成功文字；只有明确
+成功回执（任务 ID 或提交成功信息）才写入 `submitted` 并打印 `[SUBMITTED]`。
+无明确回执时记录 `submission_unconfirmed`，报错退出并保留全部提交保护标记，不自动重试。
+CLI 执行期间输出写入日志，返回后显示在前台终端；成功提交不代表 GPU 已分配或训练已开始。
+
+对于已经明确返回 `JobRunCaptionExceedMaxLen` 的本次 hour021 任务，使用以下**前台、只重试提交**命令：
+
+```bash
+WORKSPACE=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace
+cd "$WORKSPACE/code/Embodied-ui5-curriculum" &&
+git pull --ff-only origin codex/ui5-crop-rollout4-curriculum-hard114 &&
+"$WORKSPACE/conda_envs/LocateAnything/bin/python" -u \
+  scripts/prepare_ui5_curriculum_snapshot.py \
+  --retry-caption-rejected-state \
+  "$WORKSPACE/gui_logs/ui5_curriculum/locany-ui5-crop-rollout4-curriculum-hour021-h20x2-sdpa7268-20260905T065342Z-f8d36a/snapshot-switch.json"
+```
+
+此参数明确确认旧任务被 caption 校验拒绝，仅用于该错误；不要用于超时、未知返回或已经
+成功提交的任务。旧版误记的 `submitted` 仅在旧 YAML 确实超长、没有成功回执、没有已运行
+输出且用户显式指定此模式时允许恢复。已有成功/不确定回执时拒绝再次提交。
+
+重试直接使用已发布的 frozen selection 和课程目录，只校验课程 manifest 的身份摘要、
+成功标记及冻结 summary 绑定，不扫描 PNG，不重新冻结、裁图或创建硬链接。345 个 hard
+groups 仍取自本次冻结 summary，不写死数量。GPU 启动后的原有完整数据校验仍保留。
+重试生成新的 RUN_NAME、OUTPUT_DIR、job YAML，并绑定 pull 后的当前代码 SHA；镜像、资源、
+模型、评测配置和课程参数保持不变。旧 YAML、状态及标记全部保留，新增独占
+`caption-retry.started` 防止同一个旧提交被重复恢复。

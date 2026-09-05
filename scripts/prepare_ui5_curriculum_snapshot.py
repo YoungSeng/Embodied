@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import copy
 import ctypes
+import hashlib
 import json
 import os
 import platform
@@ -42,6 +43,8 @@ FORMAL_ENV = {
     "SEED": "42", "NNODES": "1", "NODE_RANK": "0",
     "CURRICULUM_PROGRESS_INTERVAL_SECONDS": "10", "UI5_EVAL_HEARTBEAT_SECONDS": "30",
 }
+CAPTION_REJECTION = "JobRunCaptionExceedMaxLen"
+MAX_CAPTION_LENGTH = 90
 
 
 def log(message: str) -> None:
@@ -235,7 +238,9 @@ def render_job(template: dict, env: dict[str, str], name: str) -> dict:
     if (len(roles) != 1 or roles[0].get("num") != 1
             or roles[0].get("gpu") != 2 or roles[0].get("gpuv") != "NVIDIA_H20"):
         raise RuntimeError("submission template is not one H20x2 worker")
-    job["caption"] = "UI5 Crop Rollout4 Curriculum - reused PNGs - " + name
+    job["caption"] = "UI5 H20x2 " + name
+    if len(job["caption"].encode("utf-8")) > MAX_CAPTION_LENGTH:
+        raise ValueError(f"job caption exceeds {MAX_CAPTION_LENGTH} bytes")
     job["jobDefVersion"]["name"] = name
     job["jobDefVersion"]["gitRepo"] = {"mnt": env["PROJECT_ROOT"]}
     job["jobRunParams"] = {
@@ -250,15 +255,231 @@ def render_job(template: dict, env: dict[str, str], name: str) -> dict:
     return job
 
 
+def submission_result(returncode: int, output: str) -> dict[str, Any]:
+    """MLX can exit 0 on API errors. Absence of errors is not a receipt."""
+    clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", output)
+    errors, job_ids = [], []
+
+    def inspect(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized = key.replace("_", "").lower()
+                if normalized in {"errcode", "errorcode"} and item not in (None, "", 0, "0"):
+                    errors.append(str(item))
+                if normalized in {"code", "statuscode"} and isinstance(item, (str, int)):
+                    if str(item).isdigit() and int(item) not in (0, 200):
+                        errors.append(f"{key}={item}")
+                if normalized == "error" and item not in (None, "", 0, False, [], {}):
+                    errors.append(str(item))
+                if normalized in {"jobrunid", "jobid"} and isinstance(item, (str, int)) and not isinstance(item, bool):
+                    if str(item).strip() not in {"", "0"}:
+                        job_ids.append(str(item).strip())
+                if normalized == "success" and item is False:
+                    errors.append("success=false")
+                inspect(item)
+        elif isinstance(value, list):
+            for item in value:
+                inspect(item)
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", clean):
+        try:
+            value, _ = decoder.raw_decode(clean[match.start():])
+        except ValueError:
+            continue
+        inspect(value)
+    if CAPTION_REJECTION in clean:
+        errors.append(CAPTION_REJECTION)
+    # Accept labelled job receipts as well as structured JSON. A bare URL or
+    # an exit code alone cannot prove that the server accepted a job.
+    job_ids.extend(re.findall(r"\bjob[_ ]?(?:run[_ ]?)?id\s*[:=]\s*([A-Za-z0-9_-]+)", clean, re.I))
+    job_ids = [value for value in job_ids if value.lower() not in {"0", "-1", "none", "null", "false"}]
+    failed_text = bool(re.search(
+        r"提交任务失败|任务提交失败|提交失败|提交不成功|failed\s+to\s+submit|submit[^\n]*\bfailed\b|"
+        r"\b(?:not|never)\s+(?:successfully\s+)?submitted\b|"
+        r"Traceback \(most recent call last\)|(?:^|\n)[^\n{]*\b(?:ERROR|FATAL)\b", clean, re.I,
+    ))
+    accepted_text = bool(re.search(
+        r"提交任务成功|任务提交成功|提交成功|\bsubmitted\s+successfully\b|"
+        r"\bsuccessfully\s+submitted\b|\bsubmit(?:ted)?(?:\s+\w+){0,3}\s+success(?:ful(?:ly)?)?\b",
+        clean, re.I,
+    ))
+    if errors or failed_text or returncode != 0:
+        status = "submission_rejected" if CAPTION_REJECTION in errors and not job_ids else "submission_failed"
+    elif job_ids or accepted_text:
+        status = "submitted"
+    else:
+        status = "submission_unconfirmed"
+    return {"status": status, "returncode": returncode, "error_codes": sorted(set(errors)),
+            "job_ids": sorted(set(job_ids)), "explicit_success_message": accepted_text}
+
+
+def submit_job(mlx: str, job_path: Path, state_path: Path, state: dict) -> None:
+    """One attempt, with durable CLI output and positive acknowledgement checks."""
+    job = yaml.safe_load(job_path.read_text(encoding="utf-8"))
+    if not job.get("caption") or len(job["caption"].encode("utf-8")) > MAX_CAPTION_LENGTH:
+        raise ValueError("refusing to submit an empty/overlength job caption")
+    marker = state_path.parent / "submission-attempt.started"
+    marker.touch(exist_ok=False)
+    transcript = state_path.parent / "mlx-submit.log"
+    state.update({"status": "submission_attempted", "job_yaml": str(job_path),
+                  "submission_log": str(transcript)})
+    write_state(state_path, state)
+    log(f"[SUBMIT START] caption_length={len(job['caption'])} log={transcript}; one attempt only")
+    try:
+        # The file retains the CLI output even if this Python process is
+        # interrupted; do not trust MLX's exit status as an API success flag.
+        with transcript.open("x", encoding="utf-8") as handle:
+            completed = subprocess.run([mlx, "job", "submitv2", "--path", str(job_path)],
+                                       cwd=PROJECT_ROOT, stdout=handle, stderr=subprocess.STDOUT, check=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        output = transcript.read_text(encoding="utf-8", errors="replace")
+        if output:
+            log(output.rstrip())
+        result = submission_result(completed.returncode, output)
+        result["log_sha256"] = hashlib.sha256(transcript.read_bytes()).hexdigest()
+        state.update({"status": result["status"], "submission_result": result})
+        write_state(state_path.parent / "submission-result.json", result)
+        write_state(state_path, state)
+    except BaseException as exc:
+        state.update({"status": "submission_unconfirmed", "error": f"{type(exc).__name__}: {exc}"})
+        write_state(state_path, state)
+        raise
+    if result["status"] != "submitted":
+        log(f"[SUBMIT NOT CONFIRMED] status={result['status']} errors={result['error_codes']} "
+            f"log={transcript}; do not automatically retry")
+        raise RuntimeError(f"MLX {result['status']}; inspect {transcript} and the platform before retrying")
+    log(f"[SUBMITTED] job_ids={result['job_ids']} output={state['runtime']['OUTPUT_DIR']} state={state_path}")
+
+
+def verify_prepared_curriculum(env: dict[str, str]) -> dict:
+    """Metadata-only retry check. Do not walk, link, decode or rebuild PNGs."""
+    data_dir = Path(env["CURRICULUM_DATA_DIR"]).resolve(strict=True)
+    manifest = json.loads((data_dir / "curriculum_manifest.json").read_text(encoding="utf-8"))
+    success = json.loads((data_dir / "_SUCCESS.json").read_text(encoding="utf-8"))
+    payload = dict(manifest)
+    identity = payload.pop("identity_digest", None)
+    digest = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                      separators=(",", ":")).encode("utf-8")).hexdigest()
+    audit = manifest.get("crop_asset_reuse", {})
+    if (not identity or identity != digest or success.get("identity_digest") != identity
+            or success.get("complete") is not True or not manifest.get("crop_assets")
+            or audit.get("generated_crop_assets") != 0
+            or audit.get("reused_crop_assets") != len(manifest["crop_assets"])):
+        raise RuntimeError("prepared curriculum identity/publication/reuse check failed; refusing rebuild")
+    frozen = Path(env["FROZEN_SELECTION"]).resolve(strict=True)
+    frozen_state = manifest["inputs"]["frozen_selection_summary"]
+    summary_path = frozen / "summary.json"
+    if (Path(frozen_state["path"]).resolve() != summary_path
+            or hashlib.sha256(summary_path.read_bytes()).hexdigest() != frozen_state["sha256"]):
+        raise RuntimeError("prepared curriculum is not bound to the selected frozen summary")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if summary.get("formal_crop_hard_groups") != manifest.get("hard_groups"):
+        raise RuntimeError("prepared hard-group count differs from frozen summary")
+    if not (frozen / "_SUCCESS").is_file():
+        raise RuntimeError("frozen selection is not published")
+    return manifest
+
+
+def retry_caption_rejected(args) -> Path:
+    """Explicit recovery for the known 91-character legacy caption rejection."""
+    old_state_path = args.retry_caption_rejected_state.resolve(strict=True)
+    old_state = json.loads(old_state_path.read_text(encoding="utf-8"))
+    old_job_path = Path(old_state["job_yaml"]).resolve(strict=True)
+    if old_job_path.parent != old_state_path.parent:
+        raise RuntimeError("old job YAML is outside its submission directory")
+    old_job = yaml.safe_load(old_job_path.read_text(encoding="utf-8"))
+    receipt = old_state.get("submission_result")
+    receipt_path = old_state_path.parent / "submission-result.json"
+    if receipt_path.is_file():
+        saved_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if receipt is not None and receipt != saved_receipt:
+            raise RuntimeError("saved submission receipts disagree; reconcile the platform job first")
+        receipt = saved_receipt
+    transcript = old_state_path.parent / "mlx-submit.log"
+    if receipt is None and transcript.is_file():
+        receipt = submission_result(0, transcript.read_text(encoding="utf-8", errors="replace"))
+    if receipt is not None and (receipt.get("status") != "submission_rejected"
+                               or CAPTION_REJECTION not in receipt.get("error_codes", [])
+                               or receipt.get("job_ids")):
+        raise RuntimeError("previous submission is successful/uncertain, not a confirmed caption rejection")
+    if len(str(old_job.get("caption", "")).encode("utf-8")) <= MAX_CAPTION_LENGTH:
+        raise RuntimeError("old caption is not overlength; refusing caption-rejection retry")
+    if receipt is None and old_state.get("status") != "submitted":
+        raise RuntimeError("not the legacy false-success case; reconcile the platform job first")
+    # The flag is the user's explicit confirmation of the reported API error
+    # when the old version did not retain its CLI output. Preserve old evidence.
+    env = dict(old_job["jobRunParams"]["envsList"])
+    if any(env.get(key) != value for key, value in old_state["runtime"].items()):
+        raise RuntimeError("old YAML runtime differs from its saved submission state")
+    if any(env.get(key) != value for key, value in FORMAL_ENV.items()):
+        raise RuntimeError("old job does not match the formal H20x2 curriculum profile")
+    if Path(env["PROJECT_ROOT"]).resolve() != PROJECT_ROOT.resolve():
+        raise RuntimeError("run retry from the same project checkout as the prepared job")
+    old_output = Path(env["OUTPUT_DIR"])
+    if old_output.exists() and (not old_output.is_dir() or next(old_output.iterdir(), None) is not None):
+        raise RuntimeError("old output is nonempty; a GPU job may have started, reconcile it first")
+    lock = old_state_path.parent / "caption-retry.started"
+    if lock.exists():
+        raise RuntimeError(f"a caption retry was already reserved; inspect {lock}, do not repeat")
+    mlx = shutil.which(args.mlx_bin)
+    if not mlx:
+        raise RuntimeError("mlx is missing; run on the authenticated CPU development host")
+    log("[RETRY CHECK] validating published curriculum metadata only; no freeze/build/PNG scan")
+    manifest = verify_prepared_curriculum(env)
+    snapshot_name = Path(old_state["snapshot"]).name
+    if not re.fullmatch(r"hour_\d{3}_\d{8}T\d{6}Z", snapshot_name):
+        raise RuntimeError("saved snapshot identity is invalid")
+    hour = snapshot_name.split("_")[1]
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
+    name = f"locany-ui5-crop-rollout4-curriculum-hour{hour}-h20x2-sdpa7268-{stamp}"
+    submission = old_state_path.parent.parent / name
+    submission.mkdir(exist_ok=False)
+    state_path = submission / "snapshot-switch.json"
+    env.update({"RUN_NAME": name, "OUTPUT_DIR": str(old_output.parent / name),
+                "CODE_REVISION": subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                                         cwd=PROJECT_ROOT, text=True).strip()})
+    job = render_job(old_job, env, f"ui5-curriculum-hour{hour}-{stamp}")
+    job_path = submission / "formal.yaml"
+    with job_path.open("x", encoding="utf-8") as handle:
+        yaml.safe_dump(job, handle, sort_keys=False)
+    state = {"status": "prepared_submission_retry", "retry_of": str(old_state_path),
+             "confirmed_rejection": CAPTION_REJECTION, "legacy_user_confirmation": receipt is None,
+             "snapshot": old_state["snapshot"], "source": old_state.get("source"),
+             "runtime": env, "job_yaml": str(job_path), "curriculum_identity": manifest["identity_digest"],
+             "reused_crop_assets": len(manifest["crop_assets"]), "generated_crop_assets": 0}
+    write_state(state_path, state)
+    # Keep all old attempt markers; one exclusive additional marker guards
+    # concurrent/manual retries, including cases with an uncertain CLI result.
+    with lock.open("x", encoding="utf-8") as handle:
+        handle.write(str(state_path) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    log(f"[RETRY SUBMIT ONLY] hard_groups={manifest['hard_groups']} "
+        f"reused={len(manifest['crop_assets'])} generated=0 curriculum={env['CURRICULUM_DATA_DIR']}")
+    submit_job(mlx, job_path, state_path, state)
+    return job_path
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--snapshot", type=Path, required=True)
-    parser.add_argument("--reuse-crops-from", type=Path, required=True)
+    parser.add_argument("--snapshot", type=Path)
+    parser.add_argument("--reuse-crops-from", type=Path)
+    parser.add_argument("--retry-caption-rejected-state", type=Path,
+                        help="submit prepared data only; explicitly confirms the old job was rejected "
+                             "with JobRunCaptionExceedMaxLen, never use for an uncertain/successful job")
     parser.add_argument("--previous-submission-dir", type=Path)
     parser.add_argument("--take-over-builder-pid", type=int)
     parser.add_argument("--workspace", type=Path, default=WORKSPACE)
     parser.add_argument("--mlx-bin", default="mlx")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.retry_caption_rejected_state:
+        if args.snapshot or args.reuse_crops_from or args.previous_submission_dir or args.take_over_builder_pid:
+            parser.error("caption-rejection retry cannot be combined with snapshot preparation/takeover")
+    elif not args.snapshot or not args.reuse_crops_from:
+        parser.error("preparation requires --snapshot and --reuse-crops-from")
+    return args
 
 
 def prepare(args) -> Path:
@@ -352,20 +573,17 @@ def prepare(args) -> Path:
                 handle.write(str(state_path) + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-        marker = submission / "submission-attempt.started"
-        marker.touch(exist_ok=False)
-        state.update({"status": "submission_attempted", "job_yaml": str(job_path), "runtime": env,
+        state.update({"status": "prepared", "job_yaml": str(job_path), "runtime": env,
                       "reused_crop_assets": audit["reused_crop_assets"], "generated_crop_assets": 0})
         write_state(state_path, state)
         log(f"[4/4 SUBMIT] frozen={frozen} hard_groups={manifest['hard_groups']} "
             f"reused={audit['reused_crop_assets']} generated=0")
-        subprocess.run([mlx, "job", "submitv2", "--path", str(job_path)], cwd=PROJECT_ROOT, check=True)
-        state["status"] = "submitted"
-        write_state(state_path, state)
-        log(f"[SUBMITTED] output={output} state={state_path}")
+        submit_job(mlx, job_path, state_path, state)
         return job_path
     except BaseException as exc:
-        state.update({"status": "failed_or_interrupted", "error": f"{type(exc).__name__}: {exc}"})
+        if not state.get("status", "").startswith("submission_"):
+            state["status"] = "failed_or_interrupted"
+        state["error"] = f"{type(exc).__name__}: {exc}"
         write_state(state_path, state)
         if parent and process_active(parent):
             log(f"[HOLD RETAINED] old submitter PID={parent['pid']} remains held; source builder was NOT stopped")
@@ -375,7 +593,11 @@ def prepare(args) -> Path:
 
 def main(argv=None) -> int:
     try:
-        prepare(parse_args(argv))
+        args = parse_args(argv)
+        if args.retry_caption_rejected_state:
+            retry_caption_rejected(args)
+        else:
+            prepare(args)
         return 0
     except KeyboardInterrupt:
         return 130
