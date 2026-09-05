@@ -70,3 +70,69 @@ tail -F /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_data
 ```
 
 独立 preflight 仍会构建临时课程并执行原有检查。CPU 永久构建完成后，可直接交给正式 launcher 校验和复用，无须为复用目的再运行一次独立 preflight。
+
+## 切换快照并复用全部 PNG（hour009 → hour018）
+
+新增 `--reuse-crops-from`，从已经完整发布的 v4 课程目录导入图片资产。
+新快照仍须重新冻结、从新 summary 读取 hard ID/数量、匹配 anchor、重建三池索引。
+不会复用旧快照的标签分组、训练状态、评测结果或 best checkpoint 记录。
+
+复用严格要求同一个不可变 bundle、完整相同的 crop ID 集，以及逐项相同的源图
+SHA256、sample ID、crop 坐标和尺寸。旧 manifest、`crop_assets.jsonl`、成功标记、
+PNG 大小/哈希均参与验证。图片使用硬链接，源文件不移动、不重新裁剪、不重新编码。
+因此源/目标必须在支持硬链接的同一个文件系统；不支持、缺文件、损坏、身份不符时直接
+失败，没有复制或重新裁图的自动降级。源数据已经全量覆盖 bundle，所以同一 bundle 的
+后续快照可以复用所有 crop，不受 hard/anchor/global replay 归属变化影响。
+
+完成旧构建后，构建器可单独运行：
+
+```bash
+CUDA_VISIBLE_DEVICES="" "$PYTHON_BIN" -u scripts/build_ui5_curriculum_recipe.py \
+  --rollout-difficulty "$NEW_FROZEN_SELECTION/complete8.jsonl" \
+  --rollout-bundle-root "$ROLLOUT_BUNDLE_ROOT" \
+  --output-dir "$NEW_CURRICULUM_DATA_DIR" \
+  --reuse-crops-from "$WORKSPACE/gui_data/ui5_curriculum/hour009-s42-v1" \
+  --seed 42 --progress-interval-seconds 10
+```
+
+控制台会显示 `stage="reuse_crop_pngs"` 和 `[CROP ASSETS] total=... reused=... generated=0`。
+课程 manifest 中的 `crop_asset_reuse` 记录复用来源、来源身份和复用数量，并参与新课程身份
+计算。正式 launcher / preflight 对应环境变量为 `CURRICULUM_REUSE_CROPS_FROM`。
+完整目标目录再次启动时走原有完整性校验，不重复链接。preflight 在复用模式下默认把临时
+目录放在源课程的父目录，以保持同一个文件系统；不要显式指定另一文件系统的临时目录。
+
+### 当前旧前台流程仍在裁图：在同一开发机另开一个终端执行
+
+新入口在前台等待，不使用 nohup 或后台启动。`--take-over-builder-pid` 指定的是
+旧裁图子进程，而不是父进程：它核对命令行、输出目录、父子关系和内核进程身份后，
+只对旧的 `python -u -` 自动提交包装器发送 SIGSTOP。裁图子进程保持运行，旧窗口应保持连接。
+待源课程完整发布且裁图子进程退出，再终止旧包装器，防止其继续提交 hour009。
+随后冻结指定快照、CPU 构建新的复用课程、提交 H20×2。代码不自动停止已提交到平台的作业。
+
+```bash
+cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Embodied-ui5-curriculum
+git pull --ff-only origin codex/ui5-crop-rollout4-curriculum-hard114
+
+/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python -u \
+  scripts/prepare_ui5_curriculum_snapshot.py \
+  --snapshot /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_rollouts/ui5-train-rollout8-h20x2-v6-20260904/snapshots/hour_018_20260905T030758Z \
+  --reuse-crops-from /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_data/ui5_curriculum/hour009-s42-v1 \
+  --previous-submission-dir /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_logs/ui5_curriculum/locany-ui5-crop-rollout4-curriculum-hour009-h20x2-sdpa7268-20260904T204242Z-276590 \
+  --take-over-builder-pid 1883296
+```
+
+`1883296` 是本次日志中的旧构建 PID，不是长期固定值。如果 PID/父进程身份不符，脚本拒绝
+发信号，不会猜测要停止哪个进程。需要 Linux/Python 的 pidfd 支持。若源目录已完整发布，
+且没有正在运行的旧构建/自动提交器，可以不传 `--take-over-builder-pid`。
+
+每次切换使用新的 frozen 目录、课程目录、RUN_NAME、OUTPUT_DIR 和评测身份。
+资源沿用现有 H20×2 的 Arnold 镜像/队列/挂载；GPU 作业开始后先校验完整课程，再进入
+step 0 baseline 和 200-step 训练/评测循环。没有指标早停或 Magi 降级。
+
+提交状态写入打印出的 `snapshot-switch.json`。旧流程已尝试提交、任意校验失败或出现
+复用之外的新生成 PNG，都会阻止提交；提交失败也不自动重试，避免不确定状态下重复申请。
+切换失败/中断时，已经暂停的旧自动提交器保持暂停，以免意外提交 hour009；状态文件记录
+其 PID 和启动身份。不要盲目 SIGCONT 或重复启动，请先检查源构建与平台任务状态。
+
+跨快照复用省掉的是重新裁图/编码/写入图片内容，仍有哈希校验、链接和索引生成。
+不要把当前阶段 ETA 理解为整个切换或训练完成 ETA，也不保证获配 GPU 后的校验一定只需几分钟。

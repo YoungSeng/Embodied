@@ -28,6 +28,7 @@ import re
 import shutil
 import tempfile
 from collections import Counter, defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
@@ -65,6 +66,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rollout-difficulty", type=Path, required=True)
     parser.add_argument("--rollout-bundle-root", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--reuse-crops-from", type=Path,
+        help=(
+            "Reuse ALL verified PNGs from a completed schema-v4 curriculum for the "
+            "same immutable bundle. Hard-link only; missing/mismatched assets or "
+            "cross-filesystem links fail, never fall back to recropping."
+        ),
+    )
     parser.add_argument(
         "--expected-hard-groups",
         type=int,
@@ -1724,9 +1733,124 @@ def _selected_crop_supervision(
     return output, assets
 
 
+def _load_crop_reuse_inventory(
+    source_dir: Path, output_dir: Path, bundle_state: Mapping[str, Any],
+    assets: Sequence[Mapping[str, Any]], progress: BuildProgress | None,
+) -> dict[str, Any]:
+    """Import only pixel assets, never the old selection, labels or pool membership."""
+    source_dir = source_dir.resolve(strict=True)
+    output_dir = output_dir.resolve()
+    if source_dir == output_dir or source_dir in output_dir.parents or output_dir in source_dir.parents:
+        raise ValueError("crop reuse requires separate, non-nested curriculum directories")
+    manifest_path = source_dir / "curriculum_manifest.json"
+    success_path = source_dir / "_SUCCESS.json"
+    if not manifest_path.is_file() or not success_path.is_file():
+        raise RuntimeError("crop reuse source is incomplete; wait for its _SUCCESS.json")
+    with (progress.stage("load_crop_reuse_inventory", unit="files")
+          if progress else nullcontext()):
+        signatures = {p.name: _sha256_file(p) for p in (manifest_path, success_path)}
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        success = json.loads(success_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or not isinstance(success, dict):
+            raise RuntimeError("crop reuse source has invalid publication metadata")
+        if manifest.get("schema_version") != SCHEMA_VERSION or success.get("schema_version") != SCHEMA_VERSION:
+            raise RuntimeError("crop reuse source schema differs from the verified v4 crop contract")
+        identity_payload = dict(manifest)
+        identity = identity_payload.pop("identity_digest", None)
+        if (
+            success.get("complete") is not True
+            or identity != _json_digest(identity_payload)
+            or success.get("identity_digest") != identity
+        ):
+            raise RuntimeError("crop reuse source publication identity mismatch")
+        old_bundle = (manifest.get("inputs") or {}).get("rollout_bundle")
+        if not isinstance(old_bundle, Mapping) or any(
+            old_bundle.get(key) != bundle_state.get(key)
+            for key in ("root", "manifest_sha256")
+        ):
+            raise RuntimeError("crop reuse source bundle identity differs; no recropping fallback")
+        policy = manifest.get("training_view_policy") or {}
+        if policy.get("tile_selection_uses_gt") is not False or policy.get("partial_gt_allowed") is not False:
+            raise RuntimeError("crop reuse source has an incompatible crop policy")
+        rows = manifest.get("crop_assets")
+        if not isinstance(rows, list) or not rows:
+            raise RuntimeError("crop reuse source has no crop inventory")
+        source_by_id: dict[str, dict[str, Any]] = {}
+        source_relatives: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                raise RuntimeError("invalid crop reuse inventory row")
+            crop_id = str(row.get("crop_id") or "")
+            relative = Path(str(row.get("relative_path") or ""))
+            if (
+                not crop_id or crop_id in source_by_id
+                or relative.is_absolute() or len(relative.parts) != 2
+                or not relative.parts[0].startswith("training_crops-")
+                or relative.as_posix() != _asset_relative_path(relative.parts[0], crop_id)
+                or relative.as_posix() in source_relatives
+            ):
+                raise RuntimeError("unsafe or duplicate crop reuse inventory path/ID")
+            _validated_sha256(row.get("sha256"), label="reused PNG sha256")
+            _validated_sha256(row.get("source_image_sha256"), label="reused source image sha256")
+            source_by_id[crop_id] = row
+            source_relatives.add(relative.as_posix())
+        files = success.get("files")
+        non_image_files = {
+            "ui5_crop_rollout4_curriculum.json", "hard.jsonl", "matched_anchor.jsonl",
+            "global_replay.jsonl", "hard_groups.jsonl", "matched_anchor_groups.jsonl",
+            "crop_assets.jsonl",
+        }
+        if not isinstance(files, dict) or set(files) != non_image_files | source_relatives:
+            raise RuntimeError("crop reuse source success file inventory differs")
+        for relative in _progress_items(
+            progress, "verify_crop_reuse_metadata", sorted(non_image_files), unit="files",
+            detail=str,
+        ):
+            path = source_dir / relative
+            metadata = files[relative]
+            if (
+                not isinstance(metadata, dict) or not path.is_file()
+                or path.stat().st_size != metadata.get("bytes")
+                or _sha256_file(path) != metadata.get("sha256")
+            ):
+                raise RuntimeError(f"crop reuse source artifact changed: {path}")
+        if _read_jsonl(source_dir / "crop_assets.jsonl") != rows:
+            raise RuntimeError("crop reuse JSONL differs from the bound manifest inventory")
+        if success.get("recipe_sha256") != files["ui5_crop_rollout4_curriculum.json"]["sha256"]:
+            raise RuntimeError("crop reuse source recipe digest differs")
+        expected_ids = {str(row["crop_id"]) for row in assets}
+        if len(expected_ids) != len(assets) or expected_ids != set(source_by_id):
+            raise RuntimeError("crop reuse ID set differs from the complete target bundle; no recropping fallback")
+        for raw in assets:
+            old = source_by_id[str(raw["crop_id"])]
+            expected = {
+                "sample_id": str(raw["sample_id"]),
+                "source_image_sha256": str(raw["source_image_sha256"]),
+                "crop_xyxy": list(raw["crop_xyxy"]),
+                "width": raw["crop_size"][0], "height": raw["crop_size"][1],
+            }
+            if any(old.get(key) != value for key, value in expected.items()):
+                raise RuntimeError(f"crop reuse geometry/source mismatch: {raw['crop_id']}")
+            if files[old["relative_path"]] != {"bytes": old["bytes"], "sha256": old["sha256"]}:
+                raise RuntimeError(f"crop reuse PNG digest is not bound by success: {raw['crop_id']}")
+        if any(_sha256_file(source_dir / name) != value for name, value in signatures.items()):
+            raise RuntimeError("crop reuse publication changed during validation")
+        return {
+            "root": source_dir, "by_id": source_by_id,
+            "audit": {
+                "mode": "verified_hardlink_all", "source_curriculum_dir": str(source_dir),
+                "source_curriculum_identity": identity,
+                "source_manifest_sha256": signatures[manifest_path.name],
+                "source_success_sha256": signatures[success_path.name],
+                "reused_crop_assets": len(assets), "generated_crop_assets": 0,
+            },
+        }
+
+
 def _materialize_crop_assets(
     output_dir: Path, asset_namespace: str, assets: Sequence[Mapping[str, Any]],
     progress: BuildProgress | None = None,
+    reuse: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Publish every selected crop as one atomically-renamed image tree."""
 
@@ -1740,7 +1864,7 @@ def _materialize_crop_assets(
     try:
         seen_relative: set[str] = set()
         for raw in _progress_items(
-            progress, "materialize_crop_pngs",
+            progress, "reuse_crop_pngs" if reuse else "materialize_crop_pngs",
             sorted(assets, key=lambda row: str(row["relative_path"])), unit="crops",
             detail=lambda row: f"crop_id={row['crop_id']} source={row['source_image']}",
         ):
@@ -1750,27 +1874,45 @@ def _materialize_crop_assets(
             if relative.as_posix() in seen_relative:
                 raise ValueError(f"duplicate crop asset path: {relative}")
             seen_relative.add(relative.as_posix())
-            source = Path(str(raw["source_image"])).resolve(strict=True)
-            if _sha256_file(source) != str(raw["source_image_sha256"]):
-                raise RuntimeError(f"verified source image changed: {source}")
             crop = [int(value) for value in raw["crop_xyxy"]]
             destination = staging / relative.name
-            with Image.open(source) as handle:
-                handle.load()
-                if list(map(int, handle.size)) != list(raw["source_size"]):
+            if reuse:
+                old = reuse["by_id"][str(raw["crop_id"])]
+                source_png = (reuse["root"] / old["relative_path"]).resolve(strict=True)
+                if not source_png.is_relative_to(reuse["root"]):
+                    raise RuntimeError(f"crop reuse path escapes source directory: {source_png}")
+                if source_png.stat().st_size != old["bytes"] or _sha256_file(source_png) != old["sha256"]:
+                    raise RuntimeError(f"crop reuse PNG changed: {source_png}")
+                try:
+                    os.link(source_png, destination)
+                except OSError as exc:
                     raise RuntimeError(
-                        f"verified source image dimensions changed: {source}"
-                    )
-                materialized = handle.crop(tuple(crop))
-                if materialized.mode not in {"1", "L", "LA", "P", "RGB", "RGBA", "I", "I;16"}:
-                    materialized = materialized.convert("RGB")
-                materialized.save(destination, format="PNG")
-            with destination.open("rb+") as handle:
-                handle.flush()
-                os.fsync(handle.fileno())
+                        "crop reuse requires hard-link support on the same filesystem; "
+                        "no copy/recropping fallback"
+                    ) from exc
+            else:
+                source = Path(str(raw["source_image"])).resolve(strict=True)
+                if _sha256_file(source) != str(raw["source_image_sha256"]):
+                    raise RuntimeError(f"verified source image changed: {source}")
+                with Image.open(source) as handle:
+                    handle.load()
+                    if list(map(int, handle.size)) != list(raw["source_size"]):
+                        raise RuntimeError(
+                            f"verified source image dimensions changed: {source}"
+                        )
+                    materialized = handle.crop(tuple(crop))
+                    if materialized.mode not in {"1", "L", "LA", "P", "RGB", "RGBA", "I", "I;16"}:
+                        materialized = materialized.convert("RGB")
+                    materialized.save(destination, format="PNG")
+                with destination.open("rb+") as handle:
+                    handle.flush()
+                    os.fsync(handle.fileno())
             expected_size = tuple(int(value) for value in raw["crop_size"])
             with Image.open(destination) as handle:
-                handle.load()
+                # Reused bytes already match a fully decoded, published PNG.
+                # Check its header dimensions without decoding the image again.
+                if not reuse:
+                    handle.load()
                 if tuple(map(int, handle.size)) != expected_size:
                     raise RuntimeError(
                         f"materialized crop size mismatch: {relative.as_posix()}"
@@ -1788,6 +1930,11 @@ def _materialize_crop_assets(
                     "sha256": _sha256_file(destination),
                 }
             )
+            if reuse and (
+                inventory[-1]["bytes"] != old["bytes"]
+                or inventory[-1]["sha256"] != old["sha256"]
+            ):
+                raise RuntimeError(f"crop reuse PNG changed while linking: {source_png}")
 
         expected_names = {Path(row["relative_path"]).name for row in inventory}
         if target_dir.exists():
@@ -2494,8 +2641,20 @@ def _build(args: argparse.Namespace, progress: BuildProgress, status: Any) -> di
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    reuse = None
+    if getattr(args, "reuse_crops_from", None) is not None:
+        reuse = _load_crop_reuse_inventory(
+            args.reuse_crops_from, output_dir, bundle_state, crop_assets, progress,
+        )
     asset_inventory = _materialize_crop_assets(
-        output_dir, asset_namespace, crop_assets, progress,
+        output_dir, asset_namespace, crop_assets, progress, reuse=reuse,
+    )
+    print(
+        f"[CROP ASSETS] total={len(asset_inventory)} "
+        f"reused={len(asset_inventory) if reuse else 0} "
+        f"generated={0 if reuse else len(asset_inventory)} "
+        f"mode={'verified_hardlink_all' if reuse else 'materialize'}",
+        file=os.sys.stderr, flush=True,
     )
     status.set_detail("binding generated crop assets to training annotations")
     assets_by_relative = {
@@ -2657,6 +2816,8 @@ def _build(args: argparse.Namespace, progress: BuildProgress, status: Any) -> di
             "crop_asset_namespace": asset_namespace,
         },
     }
+    if reuse:
+        summary["crop_asset_reuse"] = reuse["audit"]
     summary["identity_digest"] = _json_digest(summary)
     _atomic_json(output_dir / "curriculum_manifest.json", summary)
 

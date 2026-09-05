@@ -38,6 +38,7 @@ FROZEN_SELECTION="${FROZEN_SELECTION:-}"
   "FROZEN_SELECTION must name one immutable selection produced by merge_ui5_rollout_selections.py"
 ROLLOUT_DIFFICULTY="${FROZEN_SELECTION}/complete8.jsonl"
 CURRICULUM_SOURCE_RECIPE="${CURRICULUM_SOURCE_RECIPE:-}"
+CURRICULUM_REUSE_CROPS_FROM="${CURRICULUM_REUSE_CROPS_FROM:-}"
 CURRICULUM_PROGRESS_INTERVAL_SECONDS="${CURRICULUM_PROGRESS_INTERVAL_SECONDS:-10}"
 EVAL_INPUT_DIR="${EVAL_INPUT_DIR:-${WORKSPACE}/data}"
 EVAL_SCAN_NAME="${EVAL_SCAN_NAME:-horizontal_scan_v5_raw_detector_edge_aligned}"
@@ -133,6 +134,10 @@ export ROLLING_CHECKPOINT_PATH
 export NNODES NODE_RANK
 export ATTN_IMPLEMENTATION MAX_SEQ_LENGTH MAX_NUM_TOKENS_PER_SAMPLE MAX_NUM_TOKENS
 
+# A reuse preflight must link on the same filesystem as the source crops.
+if [[ -n "${CURRICULUM_REUSE_CROPS_FROM}" && -z "${PREFLIGHT_TMP_ROOT:-}" ]]; then
+  PREFLIGHT_TMP_ROOT="$(dirname -- "${CURRICULUM_REUSE_CROPS_FROM}")"
+fi
 PREFLIGHT_TMP_ROOT="${PREFLIGHT_TMP_ROOT:-${TMPDIR:-/tmp}}"
 [[ -d "${PREFLIGHT_TMP_ROOT}" ]] || locany_die 3 "Temporary root is missing: ${PREFLIGHT_TMP_ROOT}"
 PREFLIGHT_WORK_DIR="$(mktemp -d "${PREFLIGHT_TMP_ROOT%/}/ui5-curriculum-preflight.XXXXXX")"
@@ -192,7 +197,7 @@ if os.environ.get("CUDA_VISIBLE_DEVICES") != "":
     raise SystemExit("CUDA_VISIBLE_DEVICES is not empty")
 
 versions = {"python": sys.version.split()[0]}
-for name in ("numpy", "scipy", "openpyxl", "PIL", "torch", "transformers", "accelerate"):
+for name in ("numpy", "scipy", "openpyxl", "PIL", "yaml", "torch", "transformers", "accelerate"):
     module = importlib.import_module(name)
     versions[name] = str(getattr(module, "__version__", "present"))
 openpyxl_version = tuple(
@@ -349,6 +354,7 @@ relative_paths = (
     "eaglevl/train/ui5_curriculum.py",
     "eaglevl/train/ui5_curriculum_artifacts.py",
     "scripts/build_ui5_curriculum_recipe.py",
+    "scripts/prepare_ui5_curriculum_snapshot.py",
     "scripts/ui5_curriculum_progress.py",
     "scripts/inference_ui_defect_locany.py",
     "scripts/locany_ui5_checkpoint.py",
@@ -365,6 +371,8 @@ relative_paths = (
     "tests/test_ui5_curriculum_evaluation.py",
     "tests/test_ui5_curriculum_pipeline.py",
     "tests/test_ui5_curriculum_recipe.py",
+    "tests/test_ui5_curriculum_crop_reuse.py",
+    "tests/test_ui5_curriculum_snapshot_prepare.py",
     "tests/test_ui5_curriculum_recipe_progress.py",
     "tests/test_ui5_curriculum_progress.py",
     "tests/test_ui5_curriculum_status.py",
@@ -403,6 +411,9 @@ build_recipe_dry_run() {
   )
   if [[ -n "${CURRICULUM_SOURCE_RECIPE}" ]]; then
     command+=(--base-recipe "${CURRICULUM_SOURCE_RECIPE}")
+  fi
+  if [[ -n "${CURRICULUM_REUSE_CROPS_FROM}" ]]; then
+    command+=(--reuse-crops-from "${CURRICULUM_REUSE_CROPS_FROM}")
   fi
   "${command[@]}"
 
@@ -581,6 +592,8 @@ run_lightweight_tests() {
     tests.test_ui5_curriculum_artifacts \
     tests.test_ui5_curriculum_evaluation \
     tests.test_ui5_curriculum_recipe \
+    tests.test_ui5_curriculum_crop_reuse \
+    tests.test_ui5_curriculum_snapshot_prepare \
     tests.test_ui5_curriculum_recipe_progress \
     tests.test_ui5_curriculum_progress \
     tests.test_ui5_curriculum_diagnostics \
