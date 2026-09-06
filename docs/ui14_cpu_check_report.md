@@ -195,6 +195,40 @@ python -m unittest tests.test_ui14_verification_retry tests.test_ui14_parallel_c
 
 本次仅执行本地 CPU 验证，未执行真实集群恢复、GPU 检测或提交。数据、裁剪/模型策略与正式训练配置未变；更新代码后在原输出目录重新运行 cache-prepare，不需要重跑 normalize 或删除缓存。
 
+## 2026-09-07 GPU detector 每卡多进程与分片续跑
+
+增量基线 `670d6701f2f136b97792b0921fa74385d2476ac6`。UI14 cache 默认每 GPU 4 个 detector worker，`UI14_DETECTOR_WORKERS_PER_GPU=5` 使用每 GPU 5 个；text 与 icon 均适用。旧 UI5 独立 detector 默认每卡 1 个，训练周期评测保持每卡 2 个推理 worker。四卡正式训练配置、YAML、GT-free 几何及数据身份算法均未修改。
+
+本地 CPU 回归 **125 项全部通过，96.261 秒**；5 个 Python 文件 AST、Bash 入口语法与 `git diff --check` 通过。本轮新增 5 个测试方法，其中多组参数化构造分别验证 4/5 进程和 text/icon；阶段交接测试同步扩展。
+
+修改文件：
+
+- `scripts/prepare_ui14_detector_crops.py`、`shell/ui14_cpt9000_a800.sh`：环境变量/CLI 接入，GPU 阶段传递并发及每 worker 两个图片加载线程；CPU handoff 的配置不变。
+- `scripts/prepare_ui5_eval_detector_crops.py`、`scripts/run_ui5_crop_audit.py`：1–5 进程参数及子进程转发、延迟模型加载、有界图片预加载、退出时回收同轮 worker、清理过时进度、新增图片吞吐统计。
+- `tests/test_ui14_detector_workers.py`、`tests/test_ui14_cache_stages.py`：CPU 构造测试及完整 UI14 阶段交接回归。
+- 本报告与 `docs/ui14_cpt9000_a800.md`：并发调整、分片复用和停止后续跑命令。
+
+验证覆盖：
+
+- 每卡 4/5 个进程，四卡分配 16/20 个互斥 worker 索引；PP-OCRv5 和 OmniParser 的命令保持各自 Python 环境。旧双进程参数仍兼容。
+- 每组构造 27 张小图和 27 个分片，预先完成 3 个，另留 1 个未完成输出；新增 24 张恰好各检测一次。text/icon × 4/5 进程四组均通过。再次改变并发后全部复用，禁止加载模型和原图仍通过。
+- 已完成分片、标记、输入 manifest、分片成员和 detector_config 的文件字节与 mtime 保持不变；已有完整 stage_summary 不重写。以上是 CPU 构造复用数量，不是集群真实缓存统计。
+- GPU 阶段仍只调度全部 14 个 split 的 text 和 icon；将并发 4 改为 5 不要求重做 cache-prepare，禁止扫描/解码原图仍通过交接检查。
+- 旧进度文件不能计入新一轮 ETA；新阶段汇总 `reused_images=3`、`new_images=24`，吞吐只用本轮 24 张除以本轮耗时。
+- 构造 worker 失败和启动中断，其他已启动 worker 均收到 terminate 并回收，完成分片保持原样，无成功 summary。
+- 两线程预加载最多持有 4 张图片，保持 100 张输入的顺序；关闭生成器后所有未消费图片被释放。
+
+```bash
+python -m unittest tests.test_ui14_detector_workers tests.test_ui14_verification_retry \
+  tests.test_ui14_parallel_crops tests.test_ui14_cache_stages tests.test_ui14_progress \
+  tests.test_ui14_normalize_resume tests.test_ui14_repair tests.test_ui14_pipeline \
+  tests.test_ui5_eval_detector_scan tests.test_ui5_eval_detector_scan_v5 \
+  tests.test_ui14_inference_workers
+bash -n shell/ui14_cpt9000_a800.sh
+```
+
+用户日志的 3,000/53,047、19.81 images/s、约 42 分钟 ETA 属于 synth_occlusion/train 的旧并发 text 阶段；本地未连接 A800，没有每卡 4/5 个进程的真实吞吐、峰值显存或全量剩余时间测量，也未启动训练提交。远端完整分片继续复用，未写 `.done.json` 的当前分片需重算（默认最多 750 张/片）。实际复用数量和新吞吐由续跑日志及各 split 的 `detections/{text,icon}/stage_summary.json` 给出。
+
 ## 实际数据统计的产生位置
 
 派生根目录：

@@ -169,6 +169,18 @@ class StageSeparationTests(unittest.TestCase):
         self.assertEqual(stages, ["text"] * 14 + ["icon"] * 14)
         for call in worker.call_args_list:
             self.assertIn("--resume", call.args[0]); self.assertTrue(call.kwargs["check"])
+            self.assertEqual(call.args[0][call.args[0].index("--workers-per-gpu") + 1], "4")
+            self.assertEqual(call.args[0][call.args[0].index("--image-loader-threads") + 1], "2")
+            self.assertIn("--allow-multiple-processes-per-gpu", call.args[0])
+        # Worker count is not part of the prepared detector configuration.
+        self.args.detector_workers_per_gpu = 5
+        with mock.patch.object(Image, "open", side_effect=AssertionError("driver decoded image")), \
+             mock.patch.object(metadata, "stat_signature", side_effect=AssertionError("driver scanned image")), \
+             mock.patch.object(pipeline.subprocess, "run") as worker:
+            pipeline.run(self.args)
+        self.assertEqual(worker.call_count, 28)
+        for call in worker.call_args_list:
+            self.assertEqual(call.args[0][call.args[0].index("--workers-per-gpu") + 1], "5")
 
     def test_missing_final_prepare_marker_recovers_without_rebuilding_manifests_or_images(self):
         self.prepare()

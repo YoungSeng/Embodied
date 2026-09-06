@@ -17,6 +17,8 @@ def main():
     parser.add_argument("--stage", choices=("prepare", "detect", "crops", "all"), default="detect",
                         help="prepare/crops are CPU-only; detect never scans images before GPU workers")
     parser.add_argument("--prepare-workers", type=int, default=int(os.environ.get("UI14_PREPARE_WORKERS", "16")))
+    parser.add_argument("--detector-workers-per-gpu", type=int, choices=range(1, 6),
+                        default=int(os.environ.get("UI14_DETECTOR_WORKERS_PER_GPU", "4")))
     parser.add_argument("--data-root", default=DATA_ROOT)
     parser.add_argument("--parser-root", default=WORKSPACE + "/code/Eagle_LocateUI5_v4/ui-region-parser")
     parser.add_argument("--ui5-cache", default=WORKSPACE + "/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v5")
@@ -57,12 +59,15 @@ def _run(args):
     jobs = [(get_task(spec["task_id"]), split) for spec in registry[5:]
             if get_task(spec["task_id"]).view_policy == "crops" for split in ("train", "test")]
     stage = getattr(args, "stage", "detect")
+    detector_workers = getattr(args, "detector_workers_per_gpu", int(os.environ.get("UI14_DETECTOR_WORKERS_PER_GPU", "4")))
+    if detector_workers not in range(1, 6): raise ValueError("UI14_DETECTOR_WORKERS_PER_GPU must be in 1..5")
 
     def options(paths, split, step, count=1):
+        workers = detector_workers if step in ("text", "icon") else 1
         command = ["--stage", step, "--input-dir", str(paths["detector_input"].parent),
                 "--task-input-manifest", str(paths["detector_inputs"]), "--data-split", split,
                 "--output-dir", str(paths["cache"]), "--parser-root", args.parser_root,
-                "--gpus", args.gpus, "--workers-per-gpu", "1", "--scan-name", SCAN_NAME,
+                "--gpus", args.gpus, "--workers-per-gpu", str(workers), "--scan-name", SCAN_NAME,
                 "--cache-scope", "full_test" if split == "test" else "full_train",
                 "--expected-unique-images", str(count), "--no-skip-figma", "--resume",
                 "--progress-interval-seconds", str(args.progress_interval_seconds)]
@@ -77,6 +82,8 @@ def _run(args):
         if icon_model: command += ["--icon-model", icon_model]
         if step in ("text", "icon"):
             command += ["--text-python", text_python, "--icon-python", args.icon_python]
+            if workers > 1:
+                command += ["--allow-multiple-processes-per-gpu", "--image-loader-threads", "2"]
         return command
 
     import prepare_ui5_eval_detector_crops as detector

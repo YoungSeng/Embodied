@@ -237,8 +237,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Named CPU audit directory under --output-dir; detector outputs remain shared/read-only",
     )
     parser.add_argument("--gpus", default="0,1,2,3")
-    parser.add_argument("--workers-per-gpu", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--workers-per-gpu", type=int, choices=range(1, 6), default=1)
     parser.add_argument("--allow-two-processes-per-gpu", action="store_true")
+    parser.add_argument("--allow-multiple-processes-per-gpu", action="store_true")
     parser.add_argument(
         "--text-python",
         default=os.environ.get("TEXT_PYTHON"),
@@ -932,9 +933,11 @@ def _loaded_images(rows: Sequence[Mapping[str, Any]], threads: int) -> Iterator[
     def load(row: Mapping[str, Any]) -> tuple[Mapping[str, Any], Image.Image]:
         image = open_raw_image(Path(str(row["image_path"])))
         if image.size != (int(row["width"]), int(row["height"])):
+            actual_size = image.size
+            image.close()
             raise ValueError(
                 f"image dimensions changed for {row['image_id']}: manifest "
-                f"{row['width']}x{row['height']}, current {image.width}x{image.height}"
+                f"{row['width']}x{row['height']}, current {actual_size}"
             )
         return row, image
 
@@ -942,8 +945,33 @@ def _loaded_images(rows: Sequence[Mapping[str, Any]], threads: int) -> Iterator[
         for row in rows:
             yield load(row)
         return
+    # executor.map eagerly queues a whole shard. With 16/20 GPU processes that
+    # can retain thousands of decoded screenshots while inference is slower.
+    from collections import deque
+    iterator = iter(rows)
     with ThreadPoolExecutor(max_workers=threads) as executor:
-        yield from executor.map(load, rows)
+        pending = deque()
+        try:
+            for _ in range(2 * threads):
+                row = next(iterator, None)
+                if row is None:
+                    break
+                pending.append(executor.submit(load, row))
+            while pending:
+                yield pending.popleft().result()
+                row = next(iterator, None)
+                if row is not None:
+                    pending.append(executor.submit(load, row))
+        finally:
+            for future in pending:
+                future.cancel()
+            for future in pending:
+                if not future.cancelled():
+                    try:
+                        _, image = future.result()
+                    except Exception:
+                        continue
+                    image.close()
 
 
 def normalize_detector_items(items: Iterable[Mapping[str, Any]], width: int, height: int) -> list[dict[str, Any]]:
@@ -975,10 +1003,13 @@ def run_detector_worker(args: argparse.Namespace) -> None:
     paths = AuditPaths(args.output_dir)
     config = detector_config(args)
     ensure_detector_config(paths.detector_config, config)
-    module = load_parser_module(args.parser_root, "ui_region_parser")
-    if stage == "text":
-        settings = config["text"]
-        detector = module.PaddleTextDetector(
+    settings = config[stage]
+
+    def create_detector():
+        module = load_parser_module(args.parser_root, "ui_region_parser")
+        if stage == "icon":
+            return module.OmniParserYOLOv9Detector(Path(settings["model"]), "cuda:0")
+        return module.PaddleTextDetector(
             model_name=settings["model_name"],
             model_dir=Path(settings["model_dir"]) if settings["model_dir"] else None,
             device="cuda:0",
@@ -993,10 +1024,6 @@ def run_detector_worker(args: argparse.Namespace) -> None:
             min_width=0,
             min_height=0,
         )
-    else:
-        settings = config["icon"]
-        detector = module.OmniParserYOLOv9Detector(Path(settings["model"]), "cuda:0")
-
     shard_paths = sorted(paths.shards.glob("shard_*.jsonl"))
     assigned = [
         path for index, path in enumerate(shard_paths) if index % args.worker_count == args.worker_index
@@ -1032,6 +1059,7 @@ def run_detector_worker(args: argparse.Namespace) -> None:
 
     write_worker_progress(status="starting")
     worker_final_status = "failed"
+    detector = None
     try:
         for shard in assigned:
             output_path = output_dir / shard.name
@@ -1039,6 +1067,8 @@ def run_detector_worker(args: argparse.Namespace) -> None:
             if args.resume and completed_shard_valid(shard, output_path, done_path, stage):
                 print(f"[{stage}] resume skip {shard.name}", flush=True)
                 continue
+            if detector is None:
+                detector = create_detector()
             rows = read_jsonl(shard)
             outputs = []
             write_worker_progress(
@@ -1154,6 +1184,10 @@ def detection_worker_command(args: argparse.Namespace, stage: str, worker_index:
         command.extend(("--text-python", str(args.text_python)))
     if getattr(args, "icon_python", None):
         command.extend(("--icon-python", str(args.icon_python)))
+    if getattr(args, "allow_multiple_processes_per_gpu", False):
+        command.append("--allow-multiple-processes-per-gpu")
+    if getattr(args, "allow_two_processes_per_gpu", False):
+        command.append("--allow-two-processes-per-gpu")
     if args.resume:
         command.append("--resume")
     if args.enable_mkldnn:
@@ -1377,7 +1411,35 @@ print("UI5_TEXT_RUNTIME=" + json.dumps(payload, ensure_ascii=False))
     return payload
 
 
+def validate_detector_worker_count(args: argparse.Namespace) -> None:
+    count = args.workers_per_gpu
+    if count not in range(1, 6):
+        raise ValueError("--workers-per-gpu must be in [1, 5]")
+    allowed = getattr(args, "allow_multiple_processes_per_gpu", False)
+    allowed = allowed or (count == 2 and getattr(args, "allow_two_processes_per_gpu", False))
+    if count > 1 and not allowed:
+        raise ValueError("Multiple workers/GPU requires --allow-multiple-processes-per-gpu")
+
+
+def stop_detector_workers(processes: Sequence[tuple[int, str, Any]]) -> None:
+    """Reap this coordinator's workers on interruption, launch failure or OOM."""
+    running = [process for _, _, process in processes if process.poll() is None]
+    for process in running:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 10.0
+    for process in running:
+        try:
+            process.wait(timeout=max(0.01, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
 def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
+    validate_detector_worker_count(args)
     paths = AuditPaths(args.output_dir)
     unique = read_jsonl(paths.unique_images)
     baseline_completed = 0
@@ -1415,11 +1477,6 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
         )
         return
     print_stage_preflight(args, unique_count=len(unique), detector_stage=stage)
-    if args.workers_per_gpu == 2 and not args.allow_two_processes_per_gpu:
-        raise ValueError(
-            "2 processes/GPU requires --allow-two-processes-per-gpu after the 2,000-image "
-            "benchmark confirms GPU <40%, memory <12GB, and higher throughput"
-        )
     gpus = [gpu.strip() for gpu in args.gpus.split(",") if gpu.strip()]
     if not gpus:
         raise ValueError("--gpus must name at least one GPU")
@@ -1472,14 +1529,21 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
     )
     reporter.update(
         baseline_completed,
-        detail=f"启动 {len(slots)} 个常驻 GPU worker",
+        detail=(f"启动 {len(slots)} 个常驻 GPU worker ({args.workers_per_gpu}/GPU); "
+                f"reused={baseline_completed}, pending={len(unique) - baseline_completed}"),
         force=True,
     )
-    for worker_index, (gpu, _slot) in enumerate(slots):
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = gpu
-        command = detection_worker_command(args, stage, worker_index, len(slots))
-        processes.append((worker_index, gpu, subprocess.Popen(command, env=env)))
+    # Worker indices change when concurrency changes. Progress from a previous
+    # invocation must not be added to this invocation's speed or ETA.
+    for progress_path in (paths.stage_dir(stage) / "progress").glob("worker_*.json"):
+        progress_path.unlink()
+    for shard in sorted(paths.shards.glob("shard_*.jsonl")):
+        output_path = paths.stage_dir(stage) / shard.name
+        done_path = paths.stage_dir(stage) / (shard.stem + ".done.json")
+        if done_path.is_file() and not (
+            args.resume and completed_shard_valid(shard, output_path, done_path, stage)
+        ):
+            done_path.unlink()
     def observed_completed() -> int:
         done_shards: set[str] = set()
         completed = 0
@@ -1501,39 +1565,57 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
                 completed += int(progress.get("current_shard_completed", 0))
         return min(len(unique), completed)
 
-    while any(process.poll() is None for _, _, process in processes):
-        reporter.update(observed_completed())
-        time.sleep(min(1.0, args.progress_interval_seconds))
-    failures = [
-        (worker_index, gpu, int(process.returncode))
-        for worker_index, gpu, process in processes
-        if process.returncode
-    ]
-    if failures:
+    try:
+        for worker_index, (gpu, _slot) in enumerate(slots):
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = gpu
+            if args.workers_per_gpu > 1:
+                for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+                    env.setdefault(name, "1")
+            command = detection_worker_command(args, stage, worker_index, len(slots))
+            processes.append((worker_index, gpu, subprocess.Popen(command, env=env)))
+        while True:
+            states = [(index, gpu, process.poll()) for index, gpu, process in processes]
+            failures = [(index, gpu, code) for index, gpu, code in states if code not in (None, 0)]
+            if failures:
+                raise RuntimeError(f"{stage} detector workers failed: {failures}")
+            if all(code == 0 for _, _, code in states):
+                break
+            reporter.update(observed_completed())
+            time.sleep(min(1.0, args.progress_interval_seconds))
+    except BaseException:
+        stop_detector_workers(processes)
         reporter.update(
             observed_completed(),
             status="failed",
-            detail=f"GPU worker 失败：{failures}",
+            detail="检测中断/失败，已停止本轮 worker；完整 shard 可续跑",
             force=True,
         )
-        raise RuntimeError(f"{stage} detector workers failed: {failures}")
+        raise
     stage_rows = [
         row
         for path in sorted(paths.stage_dir(stage).glob("shard_*.jsonl"))
         for row in read_jsonl(path)
     ]
+    if (len(stage_rows) != len(unique)
+            or {row["image_id"] for row in stage_rows} != {row["image_id"] for row in unique}):
+        raise ValueError(f"{stage} completed workers left missing, duplicate or unexpected images")
     total_inference_ms = sum(float(row.get("inference_ms", 0.0)) for row in stage_rows)
     wall_seconds = time.perf_counter() - wall_started
+    new_images = len(stage_rows) - baseline_completed
     atomic_write_json(
         paths.stage_dir(stage) / "stage_summary.json",
         {
             "stage": stage,
             "images": len(stage_rows),
+            "reused_images": baseline_completed,
+            "new_images": new_images,
             "workers": len(slots),
             "workers_per_gpu": args.workers_per_gpu,
             "runtime": runtime,
             "wall_seconds": round(wall_seconds, 3),
-            "throughput_images_per_second": round(len(stage_rows) / wall_seconds, 6) if wall_seconds else 0.0,
+            "throughput_images_per_second": round(new_images / wall_seconds, 6) if wall_seconds else 0.0,
+            "throughput_scope": "new_images_this_invocation",
             "sum_inference_ms": round(total_inference_ms, 3),
             "mean_inference_ms": round(total_inference_ms / len(stage_rows), 3) if stage_rows else 0.0,
         },
@@ -1541,7 +1623,7 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
     reporter.update(
         len(stage_rows),
         status="completed",
-        detail=f"{len(slots)} 个 worker 已退出，检测结果已落盘",
+        detail=f"{len(slots)} 个 worker 已退出；reused={baseline_completed}, built={new_images}, pending=0",
         force=True,
     )
 

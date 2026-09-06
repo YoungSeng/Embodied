@@ -74,8 +74,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--parser-root", type=Path, required=True)
     parser.add_argument("--gpus", default="0,1,2,3")
-    parser.add_argument("--workers-per-gpu", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--workers-per-gpu", type=int, choices=range(1, 6), default=1)
     parser.add_argument("--allow-two-processes-per-gpu", action="store_true")
+    parser.add_argument("--allow-multiple-processes-per-gpu", action="store_true")
     parser.add_argument("--text-python", default=os.environ.get("TEXT_PYTHON"))
     parser.add_argument("--icon-python", default=os.environ.get("ICON_PYTHON"))
     parser.add_argument("--image-loader-threads", type=int, default=4)
@@ -1483,8 +1484,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--expected-full-test-unique-images must be positive")
     if args.shard_size <= 0 or args.image_loader_threads <= 0:
         raise ValueError("--shard-size and --image-loader-threads must be positive")
-    if args.workers_per_gpu == 2 and not args.allow_two_processes_per_gpu:
-        raise ValueError("2 processes/GPU requires --allow-two-processes-per-gpu")
+    from run_ui5_crop_audit import validate_detector_worker_count
+    validate_detector_worker_count(args)
     args.output_dir = args.output_dir.expanduser().resolve(strict=False)
     args.parser_root = args.parser_root.expanduser().resolve(strict=args.stage in {"all", "text", "icon", "_worker"})
     args.icon_model = args.icon_model.expanduser().resolve(strict=False) if args.icon_model else None
