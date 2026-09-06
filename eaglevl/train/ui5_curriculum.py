@@ -17,6 +17,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from eaglevl.train.ui5_curriculum_profiles import profile_env
 
 
 CURRICULUM_STATE_VERSION = 1
@@ -390,6 +391,8 @@ _CONTINUITY_IMPLEMENTATION_FILES = (
     "eaglevl/train/locany_finetune_magi_stream.py",
     "eaglevl/train/ui5_checkpoint_utils.py",
     "eaglevl/train/ui5_curriculum.py",
+    "eaglevl/train/ui5_curriculum_profiles.py",
+    "eaglevl/train/ui5_token_contract.py",
     "eaglevl/model/locany/modeling_locateanything.py",
     "eaglevl/model/locany/relation_modules.py",
     "eaglevl/model/locany/ui_relation_setup.py",
@@ -940,17 +943,18 @@ class UI5CurriculumSchedule:
             raise ValueError("CURRICULUM_MODE must be 'scheduled' or 'none'")
         total_steps = int(environment.get("TOTAL_STEPS", default_total_steps))
         expected_text = str(environment.get("EXPECTED_HARD_GROUPS", "")).strip()
+        defaults = profile_env(environment.get("UI5_CURRICULUM_PROFILE", "scheduled_v2"))
         return cls(
             total_steps=total_steps,
             hard_ratios=_parse_csv(
-                "HARD_RATIOS", environment.get("HARD_RATIOS", "0.60,0.45,0.30")
+                "HARD_RATIOS", environment.get("HARD_RATIOS", defaults["HARD_RATIOS"])
             ),
             matched_anchor_ratios=_parse_csv(
-                "ANCHOR_RATIOS", environment.get("ANCHOR_RATIOS", "0.25,0.35,0.30")
+                "ANCHOR_RATIOS", environment.get("ANCHOR_RATIOS", defaults["ANCHOR_RATIOS"])
             ),
             global_replay_ratios=_parse_csv(
                 "GLOBAL_REPLAY_RATIOS",
-                environment.get("GLOBAL_REPLAY_RATIOS", "0.15,0.20,0.40"),
+                environment.get("GLOBAL_REPLAY_RATIOS", defaults["GLOBAL_REPLAY_RATIOS"]),
             ),
             llm_lrs=_parse_csv(
                 "LLM_LRS", environment.get("LLM_LRS", "1e-6,7e-7,5e-7")

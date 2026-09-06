@@ -405,7 +405,8 @@ def decode_ref(
     return torch.cat([start_t, final_text_ids])
 
 
-def handle_pattern(x0, token_ids: Dict[str, int], generation_mode: str = 'hybrid'):
+def handle_pattern(x0, token_ids: Dict[str, int], generation_mode: str = 'hybrid',
+                   decoder_policy: str = 'legacy'):
     """
     Args:
         x0: Token ID list of length 6
@@ -421,6 +422,20 @@ def handle_pattern(x0, token_ids: Dict[str, int], generation_mode: str = 'hybrid
     ref_end_token_id = token_ids['ref_end_token_id']
     
     x0 = x0.tolist()
+
+    if decoder_policy not in {'legacy', 'boundary_v3'}:
+        raise ValueError(f"Unknown decoder policy: {decoder_policy}")
+    if decoder_policy == 'boundary_v3' and generation_mode == 'hybrid':
+        # MTP's text slots are parallel predictions, not an autoregressive ref.
+        # Real step-200 raw contains <ref>none</box> and mixed ref/box fragments.
+        # Commit one sampled text token and condition subsequent AR predictions
+        # on it. Never synthesize a ref, box, coordinate, empty answer, or EOS.
+        if x0[0] not in {box_start_token_id, im_end_token_id}:
+            return {"type": "text_ar", "tokens": x0[:1],
+                    "need_switch_to_ar": True, "is_terminal": False}
+        if x0[:2] == [box_start_token_id, none_token_id] and x0[2] != box_end_token_id:
+            return {"type": "error_box", "tokens": x0[:2],
+                    "need_switch_to_ar": True, "is_terminal": False}
 
     if x0[0] == null_token_id:
         return {

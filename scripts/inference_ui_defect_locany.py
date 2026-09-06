@@ -286,6 +286,7 @@ def parse_args() -> argparse.Namespace:
         default="hybrid",
         help="LocateAnything 生成模式",
     )
+    parser.add_argument("--decoder-policy", choices=("legacy", "boundary_v3"), default="legacy")
     parser.add_argument(
         "--max-new-tokens",
         "--max_new_tokens",
@@ -428,6 +429,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--hard-rollout-output-dir", default=None)
     parser.add_argument("--expected-hard-task-count", type=int, default=None)
+    parser.add_argument("--anchor-groups-jsonl", type=Path, default=None)
+    parser.add_argument("--expected-anchor-task-count", type=int, default=None)
     parser.add_argument("--rollout-scorer-script", default=None)
     parser.add_argument("--hard-rollout-iou-threshold", type=float, default=0.10)
     parser.add_argument(
@@ -582,6 +585,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("hard rollout worker 必须只运行一个具体任务")
     if args.expected_hard_task_count is not None and args.expected_hard_task_count < 0:
         parser.error("--expected-hard-task-count 不能小于 0")
+    if args.anchor_groups_jsonl is not None and (
+            args.hard_groups_jsonl is None or args.expected_anchor_task_count is None
+            or args.expected_anchor_task_count < 0):
+        parser.error("anchor inference requires the same single-task mining worker and its published group count")
 
     return args
 
@@ -1167,6 +1174,14 @@ class LocateAnythingInferencer:
             args.vision_attn_implementation,
         )
         self.model = self.model.to(self.device).eval()
+        self.token_contract = None
+        if os.environ.get("UI5_CURRICULUM_PROFILE") == "global_replay_v3":
+            from eaglevl.train.ui5_token_contract import tokenizer_contract
+            self.token_contract = tokenizer_contract(self.tokenizer, self.model.config,
+                                                      getattr(self.processor, "tokenizer", None))
+            print("[TOKEN CONTRACT] " + json.dumps(self.token_contract), flush=True)
+            if not self.token_contract["valid"]:
+                raise RuntimeError("Tokenizer/model token IDs differ: " + str(self.token_contract["errors"]))
         backend_report = attention_backend_report(self.model)
         print(f"attention top config    : {backend_report['top_config']}")
         print(f"attention text config   : {backend_report['text_config']}")
@@ -1290,6 +1305,7 @@ class LocateAnythingInferencer:
             "max_new_tokens": self.args.max_new_tokens,
             "use_cache": True,
             "generation_mode": self.args.generation_mode,
+            "decoder_policy": getattr(self.args, "decoder_policy", "legacy"),
             "relation_gate_mode": self.args.relation_gate_mode,
             "relation_gate_threshold": self.args.relation_gate_threshold,
             "repetition_penalty": self.args.repetition_penalty,
@@ -1317,6 +1333,9 @@ class LocateAnythingInferencer:
         }
         raw_output = self.model.generate(**generate_kwargs)
         self._capture_ui_diagnostics()
+        self.last_ui_diagnostics["decode_trace"] = getattr(self.model, "_last_decode_trace", None)
+        contract = getattr(self, "token_contract", None)
+        self.last_ui_diagnostics["token_contract_sha256"] = contract["sha256"] if contract else None
         return decode_generation_output(
             raw_output=raw_output,
             input_ids=input_ids,
@@ -1541,6 +1560,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "tasks": [asdict(task) | {"prompt": task.prompt} for task in TASK_CONFIGS],
         "generation": {
             "mode": args.generation_mode,
+            "decoder_policy": getattr(args, "decoder_policy", "legacy"),
             "max_new_tokens": args.max_new_tokens,
             "n_future_tokens": args.n_future_tokens,
             "temperature": args.temperature,
@@ -1700,6 +1720,7 @@ def build_raw_record(
         "processor_path": args.processor_path or args.checkpoint,
         "generation": {
             "mode": args.generation_mode,
+            "decoder_policy": getattr(args, "decoder_policy", "legacy"),
             "max_new_tokens": args.max_new_tokens,
             "n_future_tokens": args.n_future_tokens,
             "temperature": args.temperature,
@@ -1964,7 +1985,7 @@ def _load_python_module(path: Path, name: str) -> Any:
 
 
 def load_hard_task_rows(
-    args: argparse.Namespace, config: TaskConfig
+    args: argparse.Namespace, config: TaskConfig, *, expected_crop_correct_count: int = 0
 ) -> list[dict[str, Any]]:
     if args.hard_groups_jsonl is None:
         return []
@@ -1994,9 +2015,10 @@ def load_hard_task_rows(
             seen.add(record_id)
             if row.get("crop_complete4") is not True or int(
                 row.get("crop_correct_count", -1)
-            ) != 0:
-                raise ValueError(f"hard group {record_id} is not an authoritative crop 0/4 group")
-            _paired_baseline_crop_rollouts(row, args.hard_rollout_seeds)
+            ) != expected_crop_correct_count:
+                raise ValueError(f"mining group {record_id} is not an authoritative crop {expected_crop_correct_count}/4 group")
+            if expected_crop_correct_count == 0:
+                _paired_baseline_crop_rollouts(row, args.hard_rollout_seeds)
             image_path = Path(str(row.get("_resolved_image_path") or "")).resolve(
                 strict=True
             )
@@ -2433,6 +2455,63 @@ def save_error_record(
     }
     atomic_write_json(error_path, record)
     return error_path
+
+
+def run_anchor_inference(args, inferencer, config):
+    """One fixed-seed prediction per published anchor; no frozen score substitution."""
+    import copy
+    if getattr(args, "anchor_groups_jsonl", None) is None:
+        return {}
+    anchor_args = copy.copy(args)
+    anchor_args.hard_groups_jsonl = args.anchor_groups_jsonl
+    anchor_args.expected_hard_task_count = args.expected_anchor_task_count
+    rows = load_hard_task_rows(anchor_args, config, expected_crop_correct_count=4)
+    scorer = _load_python_module(Path(args.rollout_scorer_script), f"ui5_anchor_scorer_{os.getpid()}")
+    outputs = []
+    started = time.time()
+    for index, row in enumerate(rows, 1):
+        record_id = str(row["record_id"])
+        sample_seed = stable_sample_seed(args.seed, config.task_name, record_id)
+        set_sample_seed(sample_seed)
+        with Image.open(row["_resolved_image_path"]) as opened:
+            image = opened.convert("RGB")
+        try:
+            begin = time.time()
+            if config.task_name == "content_missing":
+                answer, parsed, _, boxes, gate, tiles = predict_with_direct_full_image(
+                    args=args, inferencer=inferencer, image=image, task=config,
+                    sample_seed=sample_seed, question=row["prompt"])
+            else:
+                if image.size != (row["_base_plan_width"], row["_base_plan_height"]):
+                    raise ValueError(f"anchor image geometry changed: {record_id}")
+                assert_lossless_coverage(image.width, image.height, row["_base_tiles"])
+                answer, parsed, _, boxes, gate, tiles = predict_with_lossless_tiles(
+                    args=args, inferencer=inferencer, image=image, task=config,
+                    sample_seed=sample_seed, question=row["prompt"],
+                    tiles_override=row["_base_tiles"], crop_mode="anchor_base_scan")
+            score = _score_hard_prediction(scorer, row["gt_global"], boxes,
+                                          parsed.status, args.hard_rollout_iou_threshold, image.size)
+            outputs.append({"record_id": record_id, "sample_id": row["sample_id"],
+                            "task": config.task_name, "sample_seed": sample_seed,
+                            "evaluation_identity_digest": args.evaluation_identity_digest,
+                            "scope": "train/mining anchor", "raw_output": answer,
+                            "parse_status": parsed.status, "runtime_error": None,
+                            "gt_global": row["gt_global"], "pred_global": boxes,
+                            "tiles": tiles, "gate": gate,
+                            "latency_seconds": time.time() - begin, **score})
+            print(f"[ANCHOR INFERENCE] task={config.task_name} completed={index}/{len(rows)} "
+                  f"exact_correct={score['exact_correct']} parse_status={parsed.status}", flush=True)
+        finally:
+            image.close()
+    root = Path(args.hard_rollout_output_dir).parent / "anchor_inference"
+    _atomic_write_jsonl(root / "predictions.jsonl", outputs)
+    summary = {"scope": "train/mining anchor", "group_count": len(outputs), "seed": args.seed,
+               "evaluation_identity_digest": args.evaluation_identity_digest,
+               "exact_correct": sum(row["exact_correct"] is True for row in outputs),
+               "parse_errors": sum(row["parse_status"] == "parse_error" for row in outputs),
+               "runtime_errors": 0, "elapsed_seconds": time.time() - started}
+    atomic_write_json(root / "summary.json", summary)
+    return summary
 
 
 def run_one_task(
@@ -2889,6 +2968,7 @@ def main() -> int:
         if args.hard_groups_jsonl is not None
         else {}
     )
+    anchor_summary = run_anchor_inference(args, inferencer, works[0].config)
 
     summary = {
         "checkpoint": args.checkpoint,
@@ -2897,6 +2977,8 @@ def main() -> int:
         "evaluation_identity_digest": args.evaluation_identity_digest,
         "tasks": all_stats,
         "hard_rollout": hard_summary,
+        "anchor_inference": anchor_summary,
+        "token_contract": getattr(inferencer, "token_contract", None),
         "totals": {
             key: sum(int(stats[key]) for stats in all_stats)
             for key in (

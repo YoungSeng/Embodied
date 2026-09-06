@@ -4,12 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import tempfile
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from eaglevl.train.ui5_curriculum_profiles import curriculum_phases
 
 
 TASKS = (
@@ -69,6 +75,7 @@ def _atomic_json(path: Path, value: Any) -> None:
 
 
 def _phase_for_step(step: int, total_steps: int) -> tuple[int, tuple[float, ...]]:
+    RATIOS = curriculum_phases()
     if total_steps <= 0 or total_steps % len(RATIOS):
         raise ValueError("total steps must be positive and divisible by three")
     if step < 0 or step > total_steps:
@@ -109,6 +116,7 @@ def train_curve_rows(
             continue
         phase, ratios = _phase_for_step(row_step, total_steps)
         by_step[row_step] = {
+            **dict(raw),
             "step": row_step,
             "phase": phase + 1,
             "learning_rate": raw.get("learning_rate", ratios[3]),
@@ -121,6 +129,11 @@ def train_curve_rows(
             "anchor_samples": raw.get("curriculum_anchor_samples"),
             "global_replay_samples": raw.get("curriculum_global_replay_samples"),
         }
+        counts = [raw.get(key) for key in ("curriculum_hard_samples", "curriculum_anchor_samples",
+                                           "curriculum_global_replay_samples")]
+        total = sum(counts) if all(isinstance(n, (float, int)) for n in counts) else 0
+        for name, count in zip(("hard", "anchor", "global_replay"), counts):
+            by_step[row_step][f"actual_{name}_ratio_cumulative"] = count / total if total else None
     if step == 0 and 0 not in by_step:
         _, ratios = _phase_for_step(0, total_steps)
         by_step[0] = {
@@ -136,6 +149,17 @@ def train_curve_rows(
             "anchor_samples": None,
             "global_replay_samples": None,
         }
+    previous_counts, previous_step = [0, 0, 0], 0
+    for key in sorted(by_step):
+        row = by_step[key]
+        current_counts = [row.get(name + "_samples") for name in ("hard", "anchor", "global_replay")]
+        if all(isinstance(n, (int, float)) for n in current_counts):
+            deltas = [now - old for now, old in zip(current_counts, previous_counts)]
+            denominator = sum(deltas) if min(deltas) >= 0 else 0
+            row["sampling_window_start_step"] = previous_step
+            for name, delta in zip(("hard", "anchor", "global_replay"), deltas):
+                row[f"actual_{name}_ratio_window"] = delta / denominator if denominator else None
+            previous_counts, previous_step = current_counts, key
     return [by_step[key] for key in sorted(by_step)]
 
 
@@ -213,7 +237,7 @@ def hard_transition_rows(*, step: int, evaluation_dir: Path) -> list[dict[str, A
     return result
 
 
-def anchor_retention_rows(*, step: int, curriculum_dir: Path) -> list[dict[str, Any]]:
+def anchor_data_coverage_rows(*, step: int, curriculum_dir: Path) -> list[dict[str, Any]]:
     groups_path = curriculum_dir / "matched_anchor_groups.jsonl"
     records_path = curriculum_dir / "matched_anchor.jsonl"
     groups = _read_jsonl(groups_path)
@@ -287,18 +311,59 @@ def anchor_retention_rows(*, step: int, curriculum_dir: Path) -> list[dict[str, 
     for task in TASKS:
         total = len(expected[task])
         retained = len(expected[task] & present[task])
-        score = retained / total if total else 1.0
+        score = retained / total if total else None
         result.append(
             {
                 "step": step,
                 "task": f"ui_{task}",
-                "samples": total,
-                "baseline_score": 1.0,
-                "current_score": score,
-                "delta": score - 1.0,
-                "retained": retained == total,
+                "scope": "train manifest coverage; NOT inference retention",
+                "pool": "matched_anchor", "expected_groups": total,
+                "covered_groups": retained, "data_coverage": score,
             }
         )
+    return result
+
+
+def anchor_retention_rows(*, step: int, evaluation_dir: Path) -> list[dict[str, Any]]:
+    baseline = evaluation_dir if step == 0 else evaluation_dir.parent / "step-000000"
+    result = []
+    for task in TASKS:
+        suffix = Path(f"ui_{task}") / "anchor_inference" / "predictions.jsonl"
+        current_rows, baseline_rows = _read_jsonl(evaluation_dir / suffix), _read_jsonl(baseline / suffix)
+        current = {r["record_id"]: r for r in current_rows}
+        previous = {r["record_id"]: r for r in baseline_rows}
+        if len(current) != len(current_rows) or len(previous) != len(baseline_rows) or set(current) != set(previous):
+            raise ValueError("anchor retention requires exactly the same fixed group IDs as step 0")
+        if any(r["sample_seed"] != previous[key]["sample_seed"] for key, r in current.items()):
+            raise ValueError("anchor seeds differ from this run step 0")
+        baseline_correct = sum(_correct(r) for r in previous.values())
+        correct = sum(_correct(r) for r in current.values())
+        kept = sum(_correct(r) and _correct(previous[key]) for key, r in current.items())
+        total = len(current)
+        row = {"step": step, "task": f"ui_{task}", "scope": "train/mining anchor inference",
+               "samples": total, "baseline_correct": baseline_correct, "current_correct": correct,
+               "baseline_score": baseline_correct / total if total else None,
+               "current_score": correct / total if total else None,
+               "delta": (correct - baseline_correct) / total if total else None,
+               "baseline_correct_retained": kept,
+               "retention_rate": kept / baseline_correct if baseline_correct else None,
+               "image_invalid": sum(r["parse_status"] == "parse_error" for r in current.values()),
+               "inference_seconds": sum(r["latency_seconds"] for r in current.values())}
+        for prefix, items in (("baseline", previous.values()), ("current", current.values())):
+            tp, fp, fn = [sum(r[key] for r in items) for key in ("TP_box", "FP_box", "FN_box")]
+            row.update({f"{prefix}_bbox_tp": tp, f"{prefix}_bbox_fp": fp, f"{prefix}_bbox_fn": fn,
+                        f"{prefix}_bbox_precision": tp / (tp + fp) if tp + fp else 0.0,
+                        f"{prefix}_bbox_recall": tp / (tp + fn) if tp + fn else 0.0,
+                        f"{prefix}_bbox_f1": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.0})
+            if any(r.get("image_confusion") not in {"TP", "FP", "FN", "TN"} for r in items):
+                raise ValueError("anchor result lacks actual image confusion classification")
+            tp, fp, fn, tn = [sum(r["image_confusion"] == key for r in items) for key in ("TP", "FP", "FN", "TN")]
+            row.update({f"{prefix}_image_tp": tp, f"{prefix}_image_fp": fp,
+                        f"{prefix}_image_fn": fn, f"{prefix}_image_tn": tn,
+                        f"{prefix}_image_precision": tp / (tp + fp) if tp + fp else 0.,
+                        f"{prefix}_image_recall": tp / (tp + fn) if tp + fn else 0.,
+                        f"{prefix}_image_f1": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.})
+        result.append(row)
     return result
 
 
@@ -334,11 +399,53 @@ def run(args: argparse.Namespace) -> dict[str, str]:
             )
         },
         "anchor_retention": {
-            "anchor_retention": anchor_retention_rows(
-                step=args.step, curriculum_dir=curriculum_dir
-            )
+            "anchor_retention": (anchor_retention_rows(step=args.step, evaluation_dir=evaluation_dir)
+                                 if os.environ.get("UI5_CURRICULUM_PROFILE") == "global_replay_v3" else [])
         },
     }
+    extra = {"data_coverage": anchor_data_coverage_rows(step=args.step, curriculum_dir=curriculum_dir)}
+    for row in payloads["hard_transition"]["hard_transition"]:
+        row["scope"] = "train/mining frozen 0/4, NOT held-out UI5"
+        row["baseline_source"] = "frozen mining rollouts; not the new decoder step-0"
+    if os.environ.get("UI5_CURRICULUM_PROFILE") == "global_replay_v3":
+        from scripts.ui5_output_validity import audit_evaluation
+        audit = audit_evaluation(evaluation_dir)
+        _atomic_json(output_dir / "raw_output_audit.json", audit)
+        extra["output_validity"] = [{"step": args.step, **r} for r in audit["rows"]]
+        identity = json.loads((evaluation_dir / "evaluation_manifest.json").read_text(encoding="utf-8"))
+        extra["provenance"] = [{"step": args.step, "code_sha": os.environ.get("CODE_REVISION"),
+                                 "curriculum_profile": identity["curriculum_profile"],
+                                 "evaluation_identity_path": str(evaluation_dir / "evaluation_manifest.json"),
+                                 "evaluation_identity_sha256": hashlib.sha256(
+                                     (evaluation_dir / "evaluation_manifest.json").read_bytes()).hexdigest(),
+                                 "generation": identity["generation"],
+                                 "frozen_selection_sha256": identity["frozen_selection"]["summary_sha256"],
+                                 "loss_missing_policy": "null, never synthetic zero"}]
+        run_root = evaluation_dir.parent.parent
+        preparation = json.loads((run_root / "diagnostics/v3_preparation.json").read_text(encoding="utf-8"))
+        extra["data_coverage"].extend({"step": args.step, **row} for row in preparation["pool_coverage"])
+        comparison = json.loads((run_root / "diagnostics/decoder_comparison.json").read_text(encoding="utf-8"))
+        if comparison.get("complete") is not True:
+            raise ValueError("formal decoder comparison is not complete")
+        extra["decoder_comparison"] = [
+            {"step": args.step, "model": cell["model"], "mode": cell["mode"],
+             "decoder_policy": cell["decoder_policy"],
+             "scope": "fixed held-out diagnostic subset; NOT full UI5 or training data",
+             **cell["metrics"]["overall"],
+             "image_invalid": sum(r.get("image_invalid", 0) for r in cell["raw_audit"]["rows"]),
+             "output": cell["output"]} for cell in comparison["cells"]]
+        extra["inference_fix_gain"] = [{"step": args.step, **row} for row in comparison["inference_fix_gain"]]
+        current_metrics = json.loads((evaluation_dir / "ui5_metrics.json").read_text())["overall"]
+        base_dir = evaluation_dir.parent / "step-000000"
+        base_metrics = json.loads((base_dir / "ui5_metrics.json").read_text())["overall"]
+        extra["training_vs_baseline"] = [
+            {"step": args.step, "metric": key, "baseline_step": 0,
+             "baseline_score": base_metrics[key], "current_score": current_metrics[key],
+             "training_delta": current_metrics[key] - base_metrics[key],
+             "decoder_policy": "boundary_v3",
+             "interpretation": "training delta versus new FULL step-0; decoder gain reported separately on paired subset"}
+            for key in ("image_macro_f1", "bbox_macro_f1", "joint_score")]
+    payloads["extra_diagnostics"] = extra
     outputs: dict[str, str] = {}
     for name, payload in payloads.items():
         path = output_dir / f"{name}.json"

@@ -19,6 +19,7 @@ from eaglevl.train.ui5_curriculum_artifacts import (  # noqa: E402
     train_curve_rows_from_trainer_state,
     update_curriculum_artifacts,
 )
+from eaglevl.train.ui5_curriculum_profiles import curriculum_phases
 
 
 CURRICULUM_PHASES = (
@@ -94,10 +95,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-curve-json", type=Path, default=None)
     parser.add_argument("--hard-transition-json", type=Path, default=None)
     parser.add_argument("--anchor-retention-json", type=Path, default=None)
+    parser.add_argument("--extra-diagnostics-json", type=Path, default=None)
     return parser.parse_args()
 
 
 def _phase_profile(step: int, total_steps: int) -> tuple[int | str, tuple[float, ...]]:
+    CURRICULUM_PHASES = curriculum_phases()
     if total_steps <= 0 or total_steps % len(CURRICULUM_PHASES):
         raise ValueError("total_steps must be positive and divisible by three")
     if step < 0 or step > total_steps:
@@ -326,6 +329,7 @@ def main() -> int:
         anchor_retention_rows=_read_rows(
             args.anchor_retention_json, "anchor_retention"
         ),
+        extra_diagnostics=_read_json(args.extra_diagnostics_json) if args.extra_diagnostics_json else None,
         expected_ranks=args.expected_ranks,
     )
     status = build_curriculum_status(

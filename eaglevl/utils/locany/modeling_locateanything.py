@@ -429,6 +429,9 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             image_grid_hws = torch.from_numpy(image_grid_hws).to(pixel_values.device, dtype=torch.int32)
 
         batch_size, seq_len = input_ids.shape
+        # Observe decisions only; do not repair predictions or change sampling.
+        self._last_decode_trace = {"policy": "legacy_observed_v3", "events": [],
+                                   "decision_counts": {}, "termination_reason": "not_started"}
         assert batch_size == 1, 'only batch size = 1 is supported now'
         assert generate_kwargs.get('use_cache', False), "Only use_cache=True is supported."
 
@@ -519,6 +522,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             )
             would_pass = gate_override is None
             if gate_mode == "hard" and gate_override is not None:
+                self._last_decode_trace["termination_reason"] = "relation_gate_override"
                 response = gate_override
                 self._last_ui_defect_interface = {
                     "relation_tokens": relation_output.relation_tokens,
@@ -558,6 +562,10 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         # 'slow'   : AR only, pure auto-regressive decoding
         # 'hybrid' : MTP first, fall back to AR on error, switch back on box_end
         generation_mode = generate_kwargs.get('generation_mode', 'hybrid')
+        decoder_policy = generate_kwargs.get('decoder_policy', 'legacy')
+        if decoder_policy not in {'legacy', 'boundary_v3'}:
+            raise ValueError(f"Unknown decoder policy: {decoder_policy}")
+        self._last_decode_trace['policy'] = decoder_policy
         assert generation_mode in ('fast', 'slow', 'hybrid'), \
             f"Unsupported generation_mode='{generation_mode}'. Use 'fast', 'slow', or 'hybrid'."
 
@@ -642,11 +650,22 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             is_box_empty = (box_avg[0] == 0).all()
             new_tokens = x0[0] if is_box_empty else box_avg[0]
 
-            out_pattern = handle_pattern(new_tokens, self.token_ids, generation_mode)
+            if decoder_policy == 'boundary_v3' and generation_mode == 'hybrid':
+                if int(new_tokens[0]) != self.token_ids['box_start_token_id']:
+                    # Ref/text must use the actually sampled first token, not
+                    # decode_ref's independently chosen future text slots.
+                    new_tokens = x0[0]
+
+            out_pattern = handle_pattern(new_tokens, self.token_ids, generation_mode, decoder_policy)
             out_type = out_pattern['type']
             out_token = torch.tensor(out_pattern['tokens'], dtype=x0.dtype, device=x0.device)
 
-            return out_type, out_token
+            decision = {"reason": ("mtp_null_as_eos" if decoder_policy == 'legacy' else "mtp_null_to_ar")
+                        if int(new_tokens[0]) == self.token_ids['null_token_id']
+                        else "sampled_eos" if out_type == "im_end" else out_type,
+                        "mode": "mtp", "sampled_token_ids": x0[0].tolist(),
+                        "selected_token_ids": new_tokens.tolist()}
+            return out_type, out_token, decision
 
 
         def _sample_token_in_ar(generated, outputs):
@@ -668,7 +687,14 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
 
             if generation_mode == 'hybrid':
                 # Hybrid AR phase: detect box boundaries to switch back to MTP
-                if token_val == box_end_token_id:
+                if decoder_policy == 'boundary_v3':
+                    if token_val == im_end_token_id:
+                        out_type = 'im_end'
+                    elif token_val in {box_end_token_id, self.token_ids['ref_end_token_id']}:
+                        out_type = 'boundary_ar'
+                    # All other actual tokens, including null, stay visible and
+                    # continue AR. Non-EOS tokens must not terminate generation.
+                elif token_val == box_end_token_id:
                     out_type = 'box_end_ar'
                 elif coord_start_token_id <= token_val <= coord_end_token_id or token_val == none_token_id:
                     out_type = 'coord_ar'
@@ -679,7 +705,10 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 if token_val == im_end_token_id:
                     out_type = 'im_end'
 
-            return out_type, out_token
+            decision = {"reason": "sampled_eos" if token_val == im_end_token_id
+                        else "hybrid_unexpected_ar_token" if out_type == "im_end" else out_type,
+                        "mode": "ar", "sampled_token_ids": [token_val]}
+            return out_type, out_token, decision
 
 
         # Generate loop
@@ -761,24 +790,36 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
 
             # Step 3: Sample tokens
             if use_mtp:
-                out_type, out_token = _sample_token_in_mtp(generated, outputs)
+                out_type, out_token, decision = _sample_token_in_mtp(generated, outputs)
             else:
-                out_type, out_token = _sample_token_in_ar(generated, outputs)
+                out_type, out_token, decision = _sample_token_in_ar(generated, outputs)
+
+            trace = self._last_decode_trace
+            decision["emitted_token_ids"] = out_token.tolist()
+            trace["events"].append(decision)
+            trace["events"] = trace["events"][-32:]
+            counts = trace["decision_counts"]
+            counts[decision["reason"]] = counts.get(decision["reason"], 0) + 1
 
             if verbose:
                 sampling_history.append(('ar' if 'ar' in out_type else 'mtp', tokenizer.decode(out_token, skip_special_tokens=False)))
 
+            if decoder_policy == 'boundary_v3':
+                remaining = total_gen_length - generated.size(1)
+                out_token = out_token[:remaining]
+                decision['emitted_token_ids'] = out_token.tolist()
             generated = torch.cat([generated, out_token.unsqueeze(0)], dim=1)
 
             # Step 4: Mode switching & termination
             if out_type == 'im_end':
+                trace["termination_reason"] = decision["reason"]
                 break
 
             if generation_mode == 'hybrid':
-                if out_type == 'error_box':
+                if out_type in {'error_box', 'text_ar'}:
                     use_mtp = False
                     switch_to_ar_count += 1
-                elif out_type == 'box_end_ar':
+                elif out_type in {'box_end_ar', 'boundary_ar'}:
                     use_mtp = True
             # fast mode: use_mtp stays True always
             # slow mode: use_mtp stays False always
@@ -788,6 +829,13 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
 
         # Decode and return
         generated_ids = generated[:, seq_len:]
+        self._last_decode_trace.update({"generation_mode": generation_mode,
+                                       "generated_token_count": int(generated_ids.size(1)),
+                                       "effective_token_budget": int(total_gen_length - seq_len),
+                                       "length_limit_reached": generated.size(1) >= total_gen_length,
+                                       "mtp_to_ar_count": switch_to_ar_count})
+        if self._last_decode_trace["termination_reason"] == "not_started":
+            self._last_decode_trace["termination_reason"] = "length_limit"
         response = tokenizer.batch_decode(generated_ids, skip_special_tokens=False)
 
         if relation_output is not None:

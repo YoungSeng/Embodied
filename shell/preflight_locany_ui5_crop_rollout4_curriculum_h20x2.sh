@@ -358,6 +358,12 @@ relative_paths = (
     "scripts/prepare_ui5_curriculum_snapshot.py",
     "scripts/restart_ui5_after_detail_audit.py",
     "scripts/restart_ui5_after_storage_failure.py",
+    "scripts/ui5_curriculum_v3.py",
+    "scripts/ui5_output_validity.py",
+    "eaglevl/train/ui5_curriculum_profiles.py",
+    "eaglevl/train/ui5_token_contract.py",
+    "eaglevl/utils/locany/generate_utils.py",
+    "eaglevl/utils/locany/modeling_locateanything.py",
     "scripts/ui5_curriculum_progress.py",
     "scripts/inference_ui_defect_locany.py",
     "scripts/locany_ui5_checkpoint.py",
@@ -372,6 +378,7 @@ relative_paths = (
     "tests/test_ui5_detail_scale_audit.py",
     "tests/test_ui5_detail_audit_restart.py",
     "tests/test_ui5_storage_restart.py",
+    "tests/test_ui5_curriculum_v3.py",
     "tests/test_ui5_curriculum_artifacts.py",
     "tests/test_ui5_curriculum_diagnostics.py",
     "tests/test_ui5_curriculum_evaluation.py",
@@ -398,6 +405,8 @@ check_bash_syntax() {
     "${PROJECT_ROOT}/shell/run_locany_ui5_crop_rollout4_curriculum_h20x2.sh"
     "${PROJECT_ROOT}/shell/train_locany_ui_defect.sh"
     "${PROJECT_ROOT}/shell/preflight_locany_ui5_crop_rollout4_curriculum_h20x2.sh"
+    "${PROJECT_ROOT}/shell/run_ui5_crop_curriculum_v3_h20x2.sh"
+    "${PROJECT_ROOT}/shell/ui5_curriculum_profile.sh"
   )
   for path in "${paths[@]}"; do
     bash -n "${path}"
@@ -593,7 +602,8 @@ check_resume_checkpoint_contract() {
 }
 
 run_lightweight_tests() {
-  "${PYTHON_BIN}" -B -m unittest \
+  UI5_CURRICULUM_PROFILE=scheduled_v2 "${PYTHON_BIN}" -B -m unittest \
+    tests.test_ui5_curriculum_v3 \
     tests.test_ui5_detail_scale_audit \
     tests.test_ui5_detail_audit_restart \
     tests.test_ui5_storage_restart \

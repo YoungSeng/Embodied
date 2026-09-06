@@ -17,6 +17,7 @@ from pathlib import Path
 import shutil
 import uuid
 from typing import Any
+from eaglevl.train.ui5_curriculum_profiles import curriculum_phases
 
 
 TASK_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -83,6 +84,8 @@ UI5_OVERALL_COLUMNS = (
     "bbox_micro_precision",
     "bbox_micro_recall",
     "bbox_micro_f1",
+    "image_tp", "image_fp", "image_fn", "image_tn",
+    "bbox_tp", "bbox_fp", "bbox_fn", "bbox_tn",
     "joint_score",
     "candidate_checkpoint",
     "evaluation_seconds",
@@ -164,6 +167,7 @@ def _finite_float(value: Any, label: str, *, bounded: bool = False) -> float:
 def _curriculum_phase(
     step: int, *, total_steps: int
 ) -> tuple[int, tuple[float, float, float, float]]:
+    _CURRICULUM_PHASES = curriculum_phases()
     if total_steps <= 0 or total_steps % len(_CURRICULUM_PHASES):
         raise ValueError("total_steps must be positive and divisible by three")
     if step < 0 or step > total_steps:
@@ -962,6 +966,8 @@ def _overall_rows(state: Mapping[str, Any]) -> list[dict[str, Any]]:
                     for name in ("precision", "recall", "f1")
                 },
                 "joint_score": evaluation["joint_score"],
+                **{f"{granularity}_{name}": metrics["micro"][granularity].get(name)
+                   for granularity in GRANULARITIES for name in ("tp", "fp", "fn", "tn")},
                 "candidate_checkpoint": evaluation["candidate_checkpoint"],
                 "evaluation_seconds": evaluation["evaluation_seconds"],
             }
@@ -1051,6 +1057,10 @@ def write_curriculum_workbook(
         ),
         SHEET_CHECKPOINTS: (_checkpoint_rows(state), list(CHECKPOINT_COLUMNS)),
     }
+    for name, rows in state.get("extra_diagnostics", {}).items():
+        if name in tables or not name or len(name) > 31:
+            raise ValueError(f"invalid extra diagnostic sheet: {name}")
+        tables[name] = ([dict(row) for row in rows], _ordered_columns(rows, ("step",)))
 
     workbook = openpyxl.Workbook()
     workbook.remove(workbook.active)
@@ -1072,7 +1082,8 @@ def write_curriculum_workbook(
         "global_replay_ratio",
         "invalid_prediction_rate",
     }
-    for sheet_name in SHEET_ORDER:
+    sheet_order = tuple(tables)
+    for sheet_name in sheet_order:
         rows, columns = tables[sheet_name]
         sheet = workbook.create_sheet(sheet_name)
         sheet.append(columns)
@@ -1126,11 +1137,11 @@ def write_curriculum_workbook(
             temporary, read_only=True, data_only=False
         )
         try:
-            if tuple(verification.sheetnames) != SHEET_ORDER:
+            if tuple(verification.sheetnames) != sheet_order:
                 raise RuntimeError(
                     f"workbook sheet verification failed: {verification.sheetnames}"
                 )
-            for sheet_name in SHEET_ORDER:
+            for sheet_name in sheet_order:
                 expected_rows, expected_columns = tables[sheet_name]
                 sheet = verification[sheet_name]
                 actual_rows = list(sheet.iter_rows())
@@ -1195,6 +1206,7 @@ def update_curriculum_artifacts(
     train_curve_rows: Sequence[Mapping[str, Any]] | None = None,
     hard_transition_rows: Sequence[Mapping[str, Any]] | None = None,
     anchor_retention_rows: Sequence[Mapping[str, Any]] | None = None,
+    extra_diagnostics: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     validate_candidate: bool = True,
     expected_ranks: int | None = None,
 ) -> dict[str, Any]:
@@ -1321,6 +1333,11 @@ def update_curriculum_artifacts(
     ):
         incoming = _normalize_auxiliary_rows(rows, default_step=step)
         state[name] = _merge_auxiliary_rows(state.get(name, []), incoming)
+
+    for name, rows in (extra_diagnostics or {}).items():
+        extras = state.setdefault("extra_diagnostics", {})
+        incoming = _normalize_auxiliary_rows(rows, default_step=step)
+        extras[name] = _merge_auxiliary_rows(extras.get(name, []), incoming)
 
     _atomic_write_json(state_path, state)
     write_curriculum_workbook(workbook_path, state)

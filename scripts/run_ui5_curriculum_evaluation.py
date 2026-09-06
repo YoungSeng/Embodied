@@ -33,6 +33,10 @@ from typing import Any, Iterator, Mapping, Sequence
 from ui5_lossless_tiling import assert_lossless_coverage
 from ui5_frozen_selection import resolve_frozen_selection
 
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from eaglevl.train.ui5_curriculum_profiles import curriculum_phases
+
 
 TASKS = (
     "occlusion",
@@ -102,6 +106,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--total-steps", type=int, default=env_int("TOTAL_STEPS", 1200)
     )
     parser.add_argument("--hard-groups-jsonl", type=Path, required=True)
+    parser.add_argument("--anchor-groups-jsonl", type=Path)
+    parser.add_argument("--evaluation-purpose", choices=("ui5_full", "decoder_comparison"), default="ui5_full")
     parser.add_argument("--rollout-bundle-root", type=Path, required=True)
     parser.add_argument("--curriculum-manifest", type=Path, required=True)
     parser.add_argument("--frozen-selection", type=Path, required=True)
@@ -144,6 +150,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--generation-mode", choices=("fast", "slow", "hybrid"), default="hybrid"
     )
+    parser.add_argument("--decoder-policy", choices=("legacy", "boundary_v3"),
+                        default="boundary_v3" if os.environ.get("UI5_CURRICULUM_PROFILE") == "global_replay_v3" else "legacy")
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--n-future-tokens", type=int, default=6)
     parser.add_argument("--temperature", type=float, default=0.7)
@@ -437,6 +445,7 @@ def resolve_hard_groups(
     hard_path: Path,
     bundle_root: Path,
     expected_count: int,
+    *, expected_crop_correct_count: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, int], Path]:
     rows = read_jsonl(hard_path)
     if len(rows) != expected_count:
@@ -469,8 +478,8 @@ def resolve_hard_groups(
             )
         if row.get("crop_complete4") is not True:
             raise ValueError(f"hard group {record_id} is not crop_complete4=true")
-        if int(row.get("crop_correct_count", -1)) != 0:
-            raise ValueError(f"hard group {record_id} is not a crop 0/4 group")
+        if int(row.get("crop_correct_count", -1)) != expected_crop_correct_count:
+            raise ValueError(f"mining group {record_id} is not a crop {expected_crop_correct_count}/4 group")
         prompt = str(row.get("prompt") or "").strip()
         if not prompt:
             raise ValueError(f"hard group {record_id} has no prompt")
@@ -667,6 +676,7 @@ def clean_owned_outputs(output_dir: Path, score_run_name: str = "ui5_score") -> 
         "evaluation_manifest.json",
         "evaluation_status.json",
         "resolved_hard_groups.jsonl",
+        "resolved_anchor_groups.jsonl",
         "ui5_metrics.json",
         "hard_transition.jsonl",
         "hard_rollout4_summary.json",
@@ -731,6 +741,8 @@ def build_worker_specs(
             args.vision_attn_implementation,
             "--generation-mode",
             args.generation_mode,
+            "--decoder-policy",
+            getattr(args, "decoder_policy", "legacy"),
             "--max-new-tokens",
             str(args.max_new_tokens),
             "--n-future-tokens",
@@ -782,6 +794,14 @@ def build_worker_specs(
         ]
         if args.greedy:
             command.append("--greedy")
+        if getattr(args, "evaluation_purpose", "ui5_full") == "decoder_comparison":
+            # Same inference/crop/scorer path; this paired held-out comparison
+            # does not reevaluate the unrelated training/mining pools.
+            start, stop = command.index("--hard-groups-jsonl"), command.index("--evaluation-identity-file")
+            del command[start:stop]
+        if getattr(args, "anchor_groups_jsonl", None) is not None:
+            command.extend(["--anchor-groups-jsonl", str(args.resolved_anchor_path),
+                            "--expected-anchor-task-count", str(args.anchor_counts[task])])
         if args.relation_gate_threshold is not None:
             command.extend(["--relation-gate-threshold", str(args.relation_gate_threshold)])
         if args.inference_crop_mode == "detector_scan":
@@ -983,6 +1003,7 @@ def validate_worker_results(
     rollout_seeds: Sequence[int],
     identity_digest: str,
     fake_worker: bool,
+    require_mining: bool = True,
 ) -> None:
     result_by_task = {str(row["task"]): row for row in results}
     if set(result_by_task) != set(TASKS):
@@ -1058,6 +1079,8 @@ def validate_worker_results(
                 f"worker {spec.task} prediction file set mismatch: "
                 f"unexpected={sorted(set(actual_prediction_files) - matched_prediction_files)}"
             )
+        if not require_mining:
+            continue
         hard = summary.get("hard_rollout") or {}
         if int(hard.get("group_count", -1)) != expected_hard[spec.task]:
             raise RuntimeError(f"worker {spec.task} hard group count changed")
@@ -1110,6 +1133,11 @@ def validate_worker_results(
 
 
 def validate_identity_unchanged(args: argparse.Namespace, identity: Mapping[str, Any]) -> None:
+    anchor = identity.get("anchor_inference")
+    if anchor:
+        for key in ("source", "resolved_source"):
+            if file_sha256(Path(anchor[key])) != anchor[key + "_sha256"]:
+                raise RuntimeError("anchor inference source changed while workers were running")
     if directory_inventory(args.checkpoint) != identity["candidate"]:
         raise RuntimeError("candidate checkpoint changed while UI5 workers were running")
     if directory_inventory(args.processor_path) != identity["processor"]:
@@ -1354,6 +1382,7 @@ def evaluation_status_payload(
     evaluation_seconds: float,
     hard_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    CURRICULUM_PHASES = curriculum_phases()
     step = args.step
     if step == 0:
         phase: int | str | None = "baseline"
@@ -1605,6 +1634,15 @@ def run_scorer(
 
 def run(args: argparse.Namespace) -> int:
     started = time.monotonic()
+    purpose = getattr(args, "evaluation_purpose", "ui5_full")
+    if (os.environ.get("UI5_CURRICULUM_PROFILE") == "global_replay_v3" and purpose == "ui5_full"
+            and getattr(args, "decoder_policy", "boundary_v3") != "boundary_v3"):
+        raise ValueError("v3 full step-0 and all later checkpoints must use boundary_v3 decoding")
+    if purpose == "decoder_comparison" and getattr(args, "anchor_groups_jsonl", None):
+        raise ValueError("decoder comparison must not run mining/anchor evaluations")
+    if os.environ.get("UI5_CURRICULUM_PROFILE") == "global_replay_v3" and purpose == "ui5_full":
+        if args.max_images_per_task != 0 or not getattr(args, "anchor_groups_jsonl", None):
+            raise ValueError("v3 full nodes require all UI5 images plus real anchor inference")
     args.project_root = args.project_root.expanduser().resolve(strict=True)
     args.checkpoint = args.checkpoint.expanduser().resolve(strict=True)
     args.processor_path = args.processor_path.expanduser().resolve(strict=True)
@@ -1674,6 +1712,30 @@ def run(args: argparse.Namespace) -> int:
         expected_hard_groups=args.expected_hard_groups,
     )
     hard_artifact = curriculum_identity["hard_groups_artifact"]
+    anchor_identity = None
+    resolved_anchor_rows = []
+    if getattr(args, "anchor_groups_jsonl", None) is not None:
+        args.anchor_groups_jsonl = args.anchor_groups_jsonl.resolve(strict=True)
+        publication = json.loads(args.curriculum_manifest.read_text(encoding="utf-8"))
+        success = json.loads(args.curriculum_manifest.with_name("_SUCCESS.json").read_text(encoding="utf-8"))
+        recorded = success["files"]["matched_anchor_groups.jsonl"]
+        if (args.anchor_groups_jsonl != args.curriculum_manifest.with_name("matched_anchor_groups.jsonl")
+                or file_sha256(args.anchor_groups_jsonl) != recorded["sha256"]
+                or args.anchor_groups_jsonl.stat().st_size != recorded["bytes"]):
+            raise ValueError("anchor groups must be the immutable curriculum publication")
+        resolved_anchor_rows, args.anchor_counts, _ = resolve_hard_groups(
+            args.anchor_groups_jsonl, args.rollout_bundle_root,
+            int(publication["matched_anchor_groups"]), expected_crop_correct_count=4)
+        args.resolved_anchor_path = args.output_dir / "resolved_anchor_groups.jsonl"
+        if {r["sample_id"] for r in resolved_anchor_rows} & {r["sample_id"] for r in resolved_rows}:
+            raise ValueError("hard and anchor inference groups overlap")
+        anchor_identity = {"scope": "train/mining; NOT UI5 held-out evaluation",
+                           "source": str(args.anchor_groups_jsonl),
+                           "source_sha256": file_sha256(args.anchor_groups_jsonl),
+                           "resolved_source": str(args.resolved_anchor_path),
+                           "resolved_source_sha256": jsonl_rows_sha256(resolved_anchor_rows),
+                           "group_counts": args.anchor_counts, "seed": args.seed,
+                           "comparison": "same fixed groups and seed versus this run step 0"}
     if (
         args.hard_groups_jsonl.stat().st_size != hard_artifact["bytes"]
         or file_sha256(args.hard_groups_jsonl) != hard_artifact["sha256"]
@@ -1728,6 +1790,11 @@ def run(args: argparse.Namespace) -> int:
     identity = {
         "schema_version": 1,
         "step": args.step,
+        "curriculum_profile": os.environ.get("UI5_CURRICULUM_PROFILE", "scheduled_v2"),
+        "code_sha": os.environ.get("CODE_REVISION"),
+        "evaluation_purpose": purpose,
+        "curriculum_phases": [list(phase) for phase in curriculum_phases()],
+        "anchor_inference": anchor_identity,
         "orchestrator": {
             "path": str(orchestrator_implementation),
             "sha256": file_sha256(orchestrator_implementation),
@@ -1742,6 +1809,7 @@ def run(args: argparse.Namespace) -> int:
             "sha256": file_sha256(args.worker_script),
         },
         "generation": {
+            "decoder_policy": getattr(args, "decoder_policy", "legacy"),
             "dtype": args.dtype,
             "attn_implementation": args.attn_implementation,
             "vision_attn_implementation": args.vision_attn_implementation,
@@ -1889,6 +1957,10 @@ def run(args: argparse.Namespace) -> int:
             "or --overwrite"
         )
     atomic_write_jsonl(resolved_hard_path, resolved_rows)
+    if anchor_identity:
+        atomic_write_jsonl(args.resolved_anchor_path, resolved_anchor_rows)
+        if file_sha256(args.resolved_anchor_path) != anchor_identity["resolved_source_sha256"]:
+            raise RuntimeError("resolved anchor group publication changed")
     if file_sha256(resolved_hard_path) != resolved_hard_sha256:
         raise RuntimeError("resolved hard-group publication digest mismatch")
     atomic_write_json(identity_path, identity)
@@ -1961,10 +2033,23 @@ def run(args: argparse.Namespace) -> int:
         rollout_seeds=rollout_seeds,
         identity_digest=identity_digest,
         fake_worker=args.fake_worker,
+        require_mining=purpose == "ui5_full",
     )
-    hard_summary = merge_hard_rollout_outputs(
-        args.output_dir, hard_counts, expected_hard_ids, identity_digest
-    )
+    hard_summary = (merge_hard_rollout_outputs(args.output_dir, hard_counts, expected_hard_ids, identity_digest)
+                    if purpose == "ui5_full" else {})
+    if anchor_identity:
+        for spec in specs:
+            root = spec.output_dir / "anchor_inference"
+            summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
+            rows = read_jsonl(root / "predictions.jsonl")
+            expected = {r["record_id"] for r in resolved_anchor_rows if r["task"] == spec.task}
+            if (len(rows) != len(expected) or {r["record_id"] for r in rows} != expected
+                    or summary["group_count"] != len(expected) or summary["runtime_errors"] != 0
+                    or summary["evaluation_identity_digest"] != identity_digest
+                    or summary["seed"] != args.seed
+                    or any(r["evaluation_identity_digest"] != identity_digest or r.get("runtime_error")
+                           or r["task"] != spec.task or not isinstance(r["exact_correct"], bool) for r in rows)):
+                raise RuntimeError(f"anchor inference incomplete or identity-mismatched: {spec.task}")
     status["status"] = "hard_rollouts_merged"
     status["hard_rollout"] = hard_summary
     atomic_write_json(status_path, status)

@@ -105,11 +105,11 @@ class CurriculumDiagnosticsTests(unittest.TestCase):
             )
             self.assertEqual(recovered["samples"], 1)
             anchors = json.loads(
-                Path(outputs["anchor_retention"]).read_text()
-            )["anchor_retention"]
+                Path(outputs["extra_diagnostics"]).read_text()
+            )["data_coverage"]
             occlusion = next(row for row in anchors if row["task"] == "ui_occlusion")
-            self.assertTrue(occlusion["retained"])
-            self.assertEqual(occlusion["current_score"], 1.0)
+            self.assertEqual(occlusion["covered_groups"], 1)
+            self.assertEqual(occlusion["data_coverage"], 1.0)
 
     def test_phase_switches_after_global_step_400(self) -> None:
         phase400, ratios400 = diagnostics._phase_for_step(400, 1200)
@@ -158,13 +158,13 @@ class CurriculumDiagnosticsTests(unittest.TestCase):
                 ],
             )
 
-            rows = diagnostics.anchor_retention_rows(
+            rows = diagnostics.anchor_data_coverage_rows(
                 step=200, curriculum_dir=curriculum
             )
             occlusion = next(row for row in rows if row["task"] == "ui_occlusion")
-            self.assertEqual(occlusion["samples"], 1)
-            self.assertEqual(occlusion["current_score"], 0.0)
-            self.assertEqual(occlusion["retained"], False)
+            self.assertEqual(occlusion["expected_groups"], 1)
+            self.assertEqual(occlusion["data_coverage"], 0.0)
+            self.assertEqual(occlusion["covered_groups"], 0)
 
     def test_anchor_retention_rejects_duplicate_ids_and_task_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -178,7 +178,7 @@ class CurriculumDiagnosticsTests(unittest.TestCase):
             )
             write_jsonl(curriculum / "matched_anchor.jsonl", [])
             with self.assertRaisesRegex(ValueError, "duplicate matched-anchor"):
-                diagnostics.anchor_retention_rows(step=200, curriculum_dir=curriculum)
+                diagnostics.anchor_data_coverage_rows(step=200, curriculum_dir=curriculum)
 
         with tempfile.TemporaryDirectory() as temporary:
             curriculum = Path(temporary)
@@ -196,7 +196,7 @@ class CurriculumDiagnosticsTests(unittest.TestCase):
                 ],
             )
             with self.assertRaisesRegex(ValueError, "conflicts with its expected"):
-                diagnostics.anchor_retention_rows(step=200, curriculum_dir=curriculum)
+                diagnostics.anchor_data_coverage_rows(step=200, curriculum_dir=curriculum)
 
         with tempfile.TemporaryDirectory() as temporary:
             curriculum = Path(temporary)
@@ -206,7 +206,7 @@ class CurriculumDiagnosticsTests(unittest.TestCase):
             )
             write_jsonl(curriculum / "matched_anchor.jsonl", [])
             with self.assertRaisesRegex(ValueError, "lacks a stable sample_id"):
-                diagnostics.anchor_retention_rows(step=200, curriculum_dir=curriculum)
+                diagnostics.anchor_data_coverage_rows(step=200, curriculum_dir=curriculum)
 
         with tempfile.TemporaryDirectory() as temporary:
             curriculum = Path(temporary)
@@ -222,7 +222,7 @@ class CurriculumDiagnosticsTests(unittest.TestCase):
                 ],
             )
             with self.assertRaisesRegex(ValueError, "belongs to multiple tasks"):
-                diagnostics.anchor_retention_rows(step=200, curriculum_dir=curriculum)
+                diagnostics.anchor_data_coverage_rows(step=200, curriculum_dir=curriculum)
 
 
 if __name__ == "__main__":

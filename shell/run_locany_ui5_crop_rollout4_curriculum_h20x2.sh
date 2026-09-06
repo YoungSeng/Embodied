@@ -9,6 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 # shellcheck source=shell/bash_error_report.sh
 source "${SCRIPT_DIR}/bash_error_report.sh"
+source "${SCRIPT_DIR}/ui5_curriculum_profile.sh"
 
 WORKSPACE="${WORKSPACE:-/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace}"
 ENV_DIR="${ENV_DIR:-${WORKSPACE}/conda_envs/LocateAnything}"
@@ -63,9 +64,9 @@ CHECKPOINT_SAVE_POLICY="${CHECKPOINT_SAVE_POLICY:-best_only}"
 UI5_GPU0_WORKERS="${UI5_GPU0_WORKERS:-2}"
 UI5_GPU1_WORKERS="${UI5_GPU1_WORKERS:-3}"
 UI5_EVAL_HEARTBEAT_SECONDS="${UI5_EVAL_HEARTBEAT_SECONDS:-30}"
-HARD_RATIOS="${HARD_RATIOS:-0.60,0.45,0.30}"
-ANCHOR_RATIOS="${ANCHOR_RATIOS:-0.25,0.35,0.30}"
-GLOBAL_REPLAY_RATIOS="${GLOBAL_REPLAY_RATIOS:-0.15,0.20,0.40}"
+HARD_RATIOS="${HARD_RATIOS:-${PROFILE_HARD_RATIOS}}"
+ANCHOR_RATIOS="${ANCHOR_RATIOS:-${PROFILE_ANCHOR_RATIOS}}"
+GLOBAL_REPLAY_RATIOS="${GLOBAL_REPLAY_RATIOS:-${PROFILE_GLOBAL_REPLAY_RATIOS}}"
 LLM_LRS="${LLM_LRS:-1e-6,7e-7,5e-7}"
 SEED="${SEED:-42}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
@@ -98,9 +99,9 @@ require_equal ROLLING_CHECKPOINT_DIR "${ROLLING_CHECKPOINT_DIR}" resume/latest
 require_equal CHECKPOINT_SAVE_POLICY "${CHECKPOINT_SAVE_POLICY}" best_only
 require_equal UI5_GPU0_WORKERS "${UI5_GPU0_WORKERS}" 2
 require_equal UI5_GPU1_WORKERS "${UI5_GPU1_WORKERS}" 3
-require_equal HARD_RATIOS "${HARD_RATIOS}" 0.60,0.45,0.30
-require_equal ANCHOR_RATIOS "${ANCHOR_RATIOS}" 0.25,0.35,0.30
-require_equal GLOBAL_REPLAY_RATIOS "${GLOBAL_REPLAY_RATIOS}" 0.15,0.20,0.40
+require_equal HARD_RATIOS "${HARD_RATIOS}" "${PROFILE_HARD_RATIOS}"
+require_equal ANCHOR_RATIOS "${ANCHOR_RATIOS}" "${PROFILE_ANCHOR_RATIOS}"
+require_equal GLOBAL_REPLAY_RATIOS "${GLOBAL_REPLAY_RATIOS}" "${PROFILE_GLOBAL_REPLAY_RATIOS}"
 require_equal LLM_LRS "${LLM_LRS}" 1e-6,7e-7,5e-7
 require_equal SEED "${SEED}" 42
 require_equal CUDA_VISIBLE_DEVICES "${CUDA_VISIBLE_DEVICES}" 0,1
@@ -228,7 +229,14 @@ fi
 if [[ -n "${CURRICULUM_REUSE_CROPS_FROM}" ]]; then
   recipe_command+=(--reuse-crops-from "${CURRICULUM_REUSE_CROPS_FROM}")
 fi
-"${recipe_command[@]}"
+if [[ "${UI5_CURRICULUM_PROFILE}" == global_replay_v3 ]]; then
+  # V3 reuses the existing immutable publication. Never invoke the builder,
+  # create/relink PNGs, or write progress files into the older curriculum.
+  export CURRICULUM_DATA_DIR
+  "${PYTHON_BIN}" -c 'import os; from scripts.prepare_ui5_curriculum_snapshot import verify_prepared_curriculum; m=verify_prepared_curriculum(os.environ); print("[V3 REUSE ONLY] hard=%s anchor=%s generated_pngs=0" % (m["hard_groups"], m["matched_anchor_groups"]), flush=True)'
+else
+  "${recipe_command[@]}"
+fi
 [[ -s "${META_PATH}" && -s "${HARD_GROUPS_JSONL}" ]] || \
   locany_die 30 "Curriculum recipe publication is incomplete"
 "${PYTHON_BIN}" - "${CURRICULUM_DATA_DIR}/curriculum_manifest.json" <<'PY'
@@ -285,7 +293,9 @@ import json
 import sys
 from pathlib import Path
 
-from eaglevl.train.ui5_curriculum_artifacts import CHECKPOINT_COLUMNS, SHEET_ORDER
+from eaglevl.train.ui5_curriculum_artifacts import (
+    CHECKPOINT_COLUMNS, SHEET_ORDER, _ordered_columns, _excel_value, _same_excel_value,
+)
 from openpyxl import load_workbook
 
 path, workbook_path, step = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
@@ -299,8 +309,18 @@ if step not in expected_steps:
 try:
     workbook = load_workbook(workbook_path, read_only=True, data_only=False)
     try:
-        if tuple(workbook.sheetnames) != SHEET_ORDER:
+        extra = state.get("extra_diagnostics", {})
+        if set(workbook.sheetnames) != set(SHEET_ORDER) | set(extra):
             raise ValueError("workbook sheet set is stale")
+        for name, rows in extra.items():
+            actual = list(workbook[name].iter_rows(values_only=True))
+            columns = _ordered_columns(rows, ("step",))
+            if not actual or tuple(actual[0]) != tuple(columns) or len(actual) != len(rows) + 1:
+                raise ValueError(f"{name} diagnostic sheet is stale")
+            for cells, row in zip(actual[1:], rows):
+                if any(not _same_excel_value(value, _excel_value(row.get(key)))
+                       for value, key in zip(cells, columns)):
+                    raise ValueError(f"{name} diagnostic values are stale")
         checkpoint_rows = list(workbook["checkpoints"].iter_rows(values_only=True))
         if not checkpoint_rows or tuple(checkpoint_rows[0]) != CHECKPOINT_COLUMNS:
             raise ValueError("checkpoints sheet schema is stale")
@@ -412,6 +432,9 @@ evaluate_and_register() {
     --tile-nms-iou "${EVAL_TILE_NMS_IOU:-0.50}"
     --evaluator-iou-threshold "${EVAL_IOU_THRESHOLD:-0.10}"
   )
+  if [[ "${UI5_CURRICULUM_PROFILE}" == global_replay_v3 ]]; then
+    eval_command+=(--anchor-groups-jsonl "${CURRICULUM_DATA_DIR}/matched_anchor_groups.jsonl")
+  fi
   if evaluation_recorded "${step}"; then
     eval_command+=(--verify-existing-identity)
     echo "[EVAL REUSE CHECK] step=${step} verifying checkpoint/curriculum/selection/eval identity"
@@ -454,6 +477,7 @@ evaluate_and_register() {
     --eval-interval-steps "${EVAL_INTERVAL_STEPS}" \
     --train-curve-json "${diagnostics_dir}/train_curve.json" \
     --hard-transition-json "${diagnostics_dir}/hard_transition.json" \
+    --extra-diagnostics-json "${diagnostics_dir}/extra_diagnostics.json" \
     --anchor-retention-json "${diagnostics_dir}/anchor_retention.json"
   echo "[EVAL DURABLE] step=${step} Excel/checkpoints.json updated"
 }

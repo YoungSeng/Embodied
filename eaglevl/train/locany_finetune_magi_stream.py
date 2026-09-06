@@ -3279,11 +3279,11 @@ class StreamPackingMTPTrainer(Trainer):
         if gate_loss_value is not None:
             self._add_ui5_scalar("weighted_gate_loss", gate_weight * gate_loss_value)
         else:
-            self._add_ui5_scalar("weighted_gate_loss", 0.0)
+            self._add_ui5_scalar("weighted_gate_loss", None)
         slot_gate_loss_value = self._tensor_float(getattr(outputs, "slot_gate_loss", None))
         self._add_ui5_scalar(
             "weighted_slot_gate_loss",
-            slot_gate_weight * slot_gate_loss_value if slot_gate_loss_value is not None else 0.0,
+            slot_gate_weight * slot_gate_loss_value if slot_gate_loss_value is not None else None,
         )
         attention_loss_value = self._tensor_float(
             getattr(outputs, "attention_loss", None)
@@ -3294,7 +3294,7 @@ class StreamPackingMTPTrainer(Trainer):
                 attention_weight * attention_loss_value,
             )
         else:
-            self._add_ui5_scalar("weighted_attention_loss", 0.0)
+            self._add_ui5_scalar("weighted_attention_loss", None)
 
         for output_name, metric_name in (
             ("loss_lm_contribution", "loss_lm_contribution"),
@@ -4318,6 +4318,20 @@ def main():
             relation_focal_gamma=model_args.relation_focal_gamma,
         )
         logger.info(f'Text attn: {model_args.attn_implementation}, Vision attn: flash_attention_2')
+        if os.environ.get("UI5_CURRICULUM_PROFILE") == "global_replay_v3":
+            from eaglevl.train.ui5_token_contract import tokenizer_contract
+            audit_processor = AutoTokenizer.from_pretrained(os.environ["PROCESSOR_PATH"],
+                                                           trust_remote_code=True, use_fast=False)
+            token_audit = tokenizer_contract(tokenizer, config, audit_processor)
+            logger.warning("[TRAIN TOKEN CONTRACT] %s", json.dumps(token_audit, sort_keys=True))
+            token_audit_dir = osp.join(training_args.output_dir, "diagnostics")
+            os.makedirs(token_audit_dir, exist_ok=True)
+            token_audit_path = osp.join(token_audit_dir, f"training_token_contract_rank{get_rank()}.json")
+            with open(token_audit_path + ".tmp", "w", encoding="utf-8") as handle:
+                json.dump(token_audit, handle, sort_keys=True, indent=2)
+            os.replace(token_audit_path + ".tmp", token_audit_path)
+            if not token_audit["valid"]:
+                raise RuntimeError("Training/inference tokenizer contract failed: " + str(token_audit["errors"]))
 
         loaded_model = LocateAnythingForConditionalGeneration.from_pretrained(
             model_args.model_name_or_path, 

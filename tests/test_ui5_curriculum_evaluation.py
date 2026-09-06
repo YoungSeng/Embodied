@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import hashlib
 import importlib.util
 import io
@@ -1099,7 +1100,15 @@ class EvaluationBarrierAndMetricsTest(unittest.TestCase):
         )
         self.assertEqual(json.loads(structured), status)
 
-    def test_process_level_fake_worker_and_scorer_smoke(self) -> None:
+    def test_v3_five_process_anchor_barrier_and_identity_reuse(self) -> None:
+        with mock.patch.dict(os.environ, {"UI5_CURRICULUM_PROFILE": "global_replay_v3"}):
+            self.test_process_level_fake_worker_and_scorer_smoke(with_anchor=True)
+
+    def test_v3_decoder_comparison_uses_formal_five_workers_without_mining(self):
+        with mock.patch.dict(os.environ, {"UI5_CURRICULUM_PROFILE": "global_replay_v3"}):
+            self.test_process_level_fake_worker_and_scorer_smoke(with_comparison=True)
+
+    def test_process_level_fake_worker_and_scorer_smoke(self, with_anchor=False, with_comparison=False) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkpoint = root / "checkpoint"
@@ -1155,6 +1164,21 @@ class EvaluationBarrierAndMetricsTest(unittest.TestCase):
                 hard_groups_path=hard,
             )
             worker = root / "fake_worker.py"
+            if with_anchor:
+                anchors = curriculum.with_name("matched_anchor_groups.jsonl")
+                write_jsonl(anchors, [{**row, "record_id": row["record_id"] + "-anchor",
+                                      "sample_id": row["sample_id"] + "-anchor", "crop_correct_count": 4}
+                                     for row in hard_rows])
+                published = json.loads(curriculum.read_text())
+                published.pop("identity_digest")
+                published["matched_anchor_groups"] = len(hard_rows)
+                published["identity_digest"] = evaluation._canonical_json_sha256(published)
+                curriculum.write_text(json.dumps(published))
+                success_path = curriculum.with_name("_SUCCESS.json")
+                success = json.loads(success_path.read_text())
+                success["identity_digest"] = published["identity_digest"]
+                success["files"]["matched_anchor_groups.jsonl"] = {"bytes": anchors.stat().st_size, "sha256": _sha256(anchors)}
+                success_path.write_text(json.dumps(success))
             worker.write_text(
                 """
 import argparse, hashlib, json, time
@@ -1165,6 +1189,7 @@ p.add_argument('--summary-path'); p.add_argument('--tasks'); p.add_argument('--h
 p.add_argument('--hard-rollout-output-dir'); p.add_argument('--expected-hard-task-count', type=int)
 p.add_argument('--evaluation-identity-file')
 p.add_argument('--hard-rollout-seeds', nargs=4, type=int)
+p.add_argument('--anchor-groups-jsonl'); p.add_argument('--seed', type=int)
 a,_=p.parse_known_args()
 root=Path(a.output_dir); marks=root/'_fake_started'; marks.mkdir(parents=True, exist_ok=True)
 (marks/a.tasks).write_text('started', encoding='utf-8')
@@ -1174,10 +1199,22 @@ while len(list(marks.iterdir())) < 5:
     time.sleep(0.02)
 task_out=Path(a.single_task_output_dir); task_out.mkdir(parents=True, exist_ok=True)
 (task_out/'eval.json').write_text('[]\\n', encoding='utf-8')
+if not a.hard_groups_jsonl:
+    digest=hashlib.sha256(Path(a.evaluation_identity_file).read_bytes()).hexdigest()
+    summary={'evaluation_identity_digest':digest,'tasks':[{'task':a.tasks,'dataset_images':1,'processed':1,'skipped_existing':0,'inference_error':0}]}
+    Path(a.summary_path).parent.mkdir(parents=True,exist_ok=True)
+    Path(a.summary_path).write_text(json.dumps(summary))
+    raise SystemExit(0)
 hard=[json.loads(line) for line in Path(a.hard_groups_jsonl).read_text(encoding='utf-8').splitlines() if line.strip()]
 hard=[row for row in hard if row['task']==a.tasks]
 rollout=Path(a.hard_rollout_output_dir); rollout.mkdir(parents=True, exist_ok=True)
 digest=hashlib.sha256(Path(a.evaluation_identity_file).read_bytes()).hexdigest()
+if a.anchor_groups_jsonl:
+    anchors=[json.loads(line) for line in Path(a.anchor_groups_jsonl).read_text().splitlines() if line.strip()]
+    anchors=[{**row,'evaluation_identity_digest':digest,'exact_correct':True,'runtime_error':None,'sample_seed':a.seed} for row in anchors if row['task']==a.tasks]
+    anchor_out=task_out/'anchor_inference'; anchor_out.mkdir()
+    (anchor_out/'predictions.jsonl').write_text(''.join(json.dumps(row)+'\\n' for row in anchors))
+    (anchor_out/'summary.json').write_text(json.dumps({'group_count':len(anchors),'runtime_errors':0,'seed':a.seed,'evaluation_identity_digest':digest}))
 for rid in range(4):
     rows=[{**row,'rollout_id':rid,'rollout_seed':a.hard_rollout_seeds[rid],'evaluation_identity_digest':digest,'runtime_error':None,'parse_status':'ok','exact_correct':False} for row in hard]
     (rollout/f'rollout_{rid}.jsonl').write_text(''.join(json.dumps(row)+'\\n' for row in rows), encoding='utf-8')
@@ -1245,6 +1282,10 @@ out=Path(a.output_root)/a.run_name; out.mkdir(parents=True)
                 "--python",
                 sys.executable,
             ]
+            if with_anchor:
+                command += ["--anchor-groups-jsonl", str(anchors)]
+            if with_comparison:
+                command += ["--evaluation-purpose", "decoder_comparison"]
             completed = subprocess.run(command, capture_output=True, text=True, check=False)
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
             self.assertEqual(len(list((output / "_fake_started").iterdir())), 5)
@@ -1255,14 +1296,13 @@ out=Path(a.output_root)/a.run_name; out.mkdir(parents=True)
             self.assertTrue(status["success"])
             self.assertEqual(status["metrics_sha256"], _sha256(output / "ui5_metrics.json"))
             self.assertEqual(metrics["overall"]["joint_score"], 1.0)
-            transitions = (output / "hard_transition.jsonl").read_text(
-                encoding="utf-8"
-            ).splitlines()
-            self.assertEqual(len(transitions), 5)
-            hard_summary = json.loads(
-                (output / "hard_rollout4_summary.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(hard_summary["group_count"], 5)
+            if not with_comparison:
+                transitions = (output / "hard_transition.jsonl").read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(transitions), 5)
+                hard_summary = json.loads((output / "hard_rollout4_summary.json").read_text(encoding="utf-8"))
+                self.assertEqual(hard_summary["group_count"], 5)
+            else:
+                self.assertFalse((output / "hard_transition.jsonl").exists())
 
             verified = subprocess.run(
                 [*command, "--verify-existing-identity"],

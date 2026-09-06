@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from eaglevl.train.ui5_curriculum_artifacts import (  # noqa: E402
     train_curve_rows_from_trainer_state,
 )
+from eaglevl.train.ui5_curriculum_profiles import curriculum_phases
 
 
 PHASES = (
@@ -37,6 +38,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def build_status(args: argparse.Namespace) -> dict[str, Any]:
+    PHASES = curriculum_phases()
     if args.total_steps <= 0 or args.total_steps % len(PHASES):
         raise ValueError("--total-steps must be positive and divisible by three")
     if not 0 <= args.start_step < args.target_step <= args.total_steps:
