@@ -144,6 +144,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--save-preview-crops", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--worker-index", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-count", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--assigned-shard", dest="assigned_shards", action="append", help=argparse.SUPPRESS)
     parser.add_argument("--detector-stage", choices=("text", "icon"), help=argparse.SUPPRESS)
     # Accepted only because the shared audit worker still emits them for its own entrypoint.
     parser.add_argument("--source-dir", type=Path, default=None, help=argparse.SUPPRESS)

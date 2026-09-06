@@ -229,6 +229,27 @@ bash -n shell/ui14_cpt9000_a800.sh
 
 用户日志的 3,000/53,047、19.81 images/s、约 42 分钟 ETA 属于 synth_occlusion/train 的旧并发 text 阶段；本地未连接 A800，没有每卡 4/5 个进程的真实吞吐、峰值显存或全量剩余时间测量，也未启动训练提交。远端完整分片继续复用，未写 `.done.json` 的当前分片需重算（默认最多 750 张/片）。实际复用数量和新吞吐由续跑日志及各 split 的 `detections/{text,icon}/stage_summary.json` 给出。
 
+## 2026-09-07 小 split 与零散剩余分片的 GPU 分配修复
+
+增量基线 `36b161fb95b7b5aed502bce10f66881d090189e4`。用户日志为 synth_occlusion/test text，5,907 张图片。按现有 750 张/片共 8 个分片；上一版按 GPU 分组排列 16 个 worker 槽位，前 8 个 worker 对应 GPU 0/1，所以 GPU 2/3 无任务。该原因已从代码确认；本地未读取远端 GPU 进程。
+
+本次相关 CPU 回归 **54 项全部通过，20.289 秒**，3 个 Python 文件 AST 和 `git diff --check` 通过。验证命令：
+
+```bash
+python -m unittest tests.test_ui14_detector_workers tests.test_ui5_eval_detector_scan_v5 \
+  tests.test_ui5_eval_detector_scan tests.test_ui14_inference_workers
+```
+
+`scripts/run_ui5_crop_audit.py` 改为父进程统一计算 pending 分片快照，按 GPU 轮流分配活跃 worker，只启动有任务的进程；`scripts/prepare_ui5_eval_detector_crops.py` 和旧 audit 入口接收显式 `--assigned-shard` 名单。未完成分片不再由各 worker 独立过滤/重新编号，完成其他 worker 的任务不会导致漏项或重复。原有直接 worker 调用仍支持旧模运算分配。分片、detector 配置、完成标记格式保持兼容；正常续跑只传递原分片文件名。旧完整 summary 不改写，新 summary 记录每卡实际 worker 数和各 worker 的分片分配。
+
+`tests/test_ui14_detector_workers.py` 新增 3 个 CPU 回归方法：
+
+- 每卡上限 4/5 × text/icon × 8 个待处理分片/零散续跑共 8 组构造。8 片时四卡各 2 个 worker；原编号 0/4/16/20 的 4 个剩余分片四卡各 1 个 worker。每张待处理图片恰好检测一次，完成分片、manifest、配置的字节和 mtime 均不变。
+- 对 0/1/2/3/4/8/16/19/23/71 个分片以及每卡 1/4/5 上限检查 GPU 轮换、非连续 GPU 编号、进程上限和分片集合无缺失无重复。新旧子进程 CLI 均传递显式名单。
+- 重复、越界路径和未知分片名在加载模型前拒绝。
+
+CPU 构造图片不用于声明 A800 性能。真实续跑日志将显示 `pending_shards`、各卡进程及 `reused`/`pending`；仅有 8 个待处理分片时最多启动 8 个有效 worker。少于四个分片或最后收尾阶段允许部分 GPU 空闲，未引入重切分片或跨 split 混写。
+
 ## 实际数据统计的产生位置
 
 派生根目录：

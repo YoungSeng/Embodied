@@ -34,17 +34,17 @@ class DetectorWorkersTests(unittest.TestCase):
             "--resume", "--image-loader-threads", "2",
         ])
 
-    def fixture(self, args, stage):
+    def fixture(self, args, stage, image_count=27, completed_ids=(0, 1, 2)):
         paths = audit.AuditPaths(args.output_dir)
         unique = []
-        for index in range(27):
+        for index in range(image_count):
             image_path = self.root / f"image{index}.png"
             Image.new("RGB", (12, 24), (index, 0, 0)).save(image_path)
             row = {"image_id": str(index), "image_path": str(image_path), "width": 12, "height": 24}
             unique.append(row)
             shard = paths.shards / f"shard_{index:05d}.jsonl"
             audit.atomic_write_jsonl(shard, [row])
-            if index < 3:
+            if index in completed_ids:
                 audit.atomic_write_jsonl(paths.stage_dir(stage) / shard.name, [
                     {**row, f"{stage}_detections": [], "inference_ms": 10}])
                 audit.atomic_write_json(paths.stage_dir(stage) / f"{shard.stem}.done.json", {
@@ -55,7 +55,8 @@ class DetectorWorkersTests(unittest.TestCase):
                      *paths.stage_dir(stage).glob("shard_*")]
         before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in protected}
         # An interrupted shard with no completion marker must be recomputed.
-        audit.atomic_write_jsonl(paths.stage_dir(stage) / "shard_00003.jsonl", [])
+        if image_count > 3 and 3 not in completed_ids:
+            audit.atomic_write_jsonl(paths.stage_dir(stage) / "shard_00003.jsonl", [])
         return paths, before
 
     def fake_module(self, seen):
@@ -148,7 +149,7 @@ class DetectorWorkersTests(unittest.TestCase):
                      mock.patch.object(audit.time, "perf_counter", side_effect=itertools.count()), \
                      mock.patch.object(audit.subprocess, "Popen", side_effect=launch):
                     audit.run_detection_stage(args, "text")
-                self.assertEqual(launched, [(i, 4 * count, str(i // count)) for i in range(4 * count)])
+                self.assertEqual(launched, [(i, 4 * count, str(i % 4)) for i in range(4 * count)])
                 self.assertEqual(sorted(seen), list(range(3, 27)))
                 self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in before})
                 summary_path = paths.stage_dir("text") / "stage_summary.json"
@@ -191,6 +192,70 @@ class DetectorWorkersTests(unittest.TestCase):
                     process.wait.assert_called_once()
                 self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in before})
                 self.assertFalse((paths.stage_dir("text") / "stage_summary.json").exists())
+
+    def test_small_split_and_sparse_resume_use_all_four_gpus(self):
+        for count, stage, sparse in itertools.product((4, 5), ("text", "icon"), (False, True)):
+            with self.subTest(count=count, stage=stage, sparse=sparse):
+                args = self.args(count)
+                args.output_dir = self.root / f"balanced-{count}-{stage}-{sparse}"
+                # 5907 images / 750 => 8 shards. Tiny CPU fixtures retain that
+                # topology; sparse resume also defeats merely reordering GPUs
+                # while keeping the old index % worker_count assignment.
+                image_count = 27 if sparse else 8
+                pending_ids = [0, 4, 16, 20] if sparse else list(range(8))
+                completed = set(range(image_count)) - set(pending_ids)
+                paths, before = self.fixture(args, stage, image_count, completed)
+                seen, launched, dispatched = [], [], []
+
+                def launch(command, env):
+                    child = entry.parse_args(command[2:])
+                    self.assertTrue(child.assigned_shards)
+                    launched.append(env["CUDA_VISIBLE_DEVICES"])
+                    dispatched.extend(child.assigned_shards)
+                    audit.run_detector_worker(child)
+                    return SimpleNamespace(poll=lambda: 0, returncode=0)
+
+                with mock.patch.object(audit, "print_stage_preflight"), \
+                     mock.patch.object(audit.shutil, "which", return_value="nvidia-smi"), \
+                     mock.patch.object(audit.subprocess, "run", return_value=SimpleNamespace(stdout="0\n1\n2\n3\n")), \
+                     mock.patch.object(audit, f"preflight_{stage}_runtime", return_value={}), \
+                     mock.patch.object(audit, "load_parser_module", return_value=self.fake_module(seen)), \
+                     mock.patch.object(audit.subprocess, "Popen", side_effect=launch):
+                    audit.run_detection_stage(args, stage)
+                self.assertEqual(launched, ["0", "1", "2", "3"] * (1 if sparse else 2))
+                self.assertEqual(sorted(dispatched), [f"shard_{i:05d}.jsonl" for i in pending_ids])
+                self.assertEqual(sorted(seen), pending_ids)
+                self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in before})
+                summary = json.loads((paths.stage_dir(stage) / "stage_summary.json").read_text())
+                self.assertEqual(summary["active_workers_per_gpu"], {str(i): 1 if sparse else 2 for i in range(4)})
+                self.assertEqual(summary["new_images"], len(pending_ids))
+                self.assertEqual(summary["reused_images"], len(completed))
+                self.assertEqual(len(summary["worker_assignments"]), len(pending_ids))
+
+    def test_dispatch_balances_slots_and_keeps_every_pending_shard_exactly_once(self):
+        gpus = ["2", "5", "7", "9"]
+        for count, size in itertools.product((1, 4, 5), (0, 1, 2, 3, 4, 8, 16, 19, 23, 71)):
+            pending = [Path(f"shard_{i * 16:05d}.jsonl") for i in range(size)]
+            plan = audit.detector_worker_assignments(gpus, count, pending)
+            self.assertEqual(len(plan), min(size, count * 4))
+            self.assertEqual([gpu for gpu, _, _ in plan], [gpus[i % 4] for i in range(len(plan))])
+            self.assertTrue(all(slot < count and shards for _, slot, shards in plan))
+            self.assertEqual(sorted(p for _, _, shards in plan for p in shards), pending)
+        args = self.args()
+        command = audit.detection_worker_command(args, "text", 0, 4, [Path("shard_00016.jsonl")])
+        # Both the legacy audit and detector-only entrypoints accept explicit dispatch.
+        legacy = audit.parse_args(command[2:] + ["--source-dir", ".", "--locany-data-dir", "."])
+        self.assertEqual(legacy.assigned_shards, ["shard_00016.jsonl"])
+
+    def test_worker_rejects_duplicate_or_unknown_assigned_shards(self):
+        args = self.args()
+        self.fixture(args, "text")
+        args.detector_stage, args.worker_index, args.worker_count = "text", 0, 4
+        for names in (["shard_00003.jsonl"] * 2, ["../shard_00003.jsonl"], ["shard_99999.jsonl"]):
+            args.assigned_shards = names
+            with mock.patch.object(audit, "load_parser_module", side_effect=AssertionError("model loaded")):
+                with self.assertRaisesRegex(ValueError, "assigned shards"):
+                    audit.run_detector_worker(args)
 
 
 class ImagePrefetchTests(unittest.TestCase):
