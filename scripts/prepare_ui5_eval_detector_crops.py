@@ -210,7 +210,7 @@ def _task_paths(path: Path, *, limit: int, skip_figma: bool) -> list[Path]:
     return selected
 
 
-def prepare_manifest(args: argparse.Namespace) -> list[dict[str, Any]]:
+def prepare_manifest(args: argparse.Namespace, *, image_info_loader=None) -> list[dict[str, Any]]:
     if args.input_dir is None:
         raise ValueError("--input-dir is required for --stage prepare/all")
     input_dir = args.input_dir.expanduser().resolve(strict=True)
@@ -242,7 +242,12 @@ def prepare_manifest(args: argparse.Namespace) -> list[dict[str, Any]]:
     reporter.update(0, detail="读取测试图片内容指纹并按内容去重", force=True)
     by_content: dict[str, dict[str, Any]] = {}
     task_rows: list[dict[str, Any]] = []
-    path_info: dict[str, tuple[str, int, int]] = {}
+    # UI14 prepares this GT-free metadata in a bounded CPU thread pool with a
+    # persistent image journal. The legacy UI5 entry keeps its existing path.
+    path_info: dict[str, tuple[str, int, int]] = (
+        image_info_loader(list(dict.fromkeys(p for paths in selected_by_task.values() for p in paths)))
+        if image_info_loader is not None else {}
+    )
     completed = 0
     for task in task_files:
         for task_index, image_path in enumerate(selected_by_task[task]):
@@ -1479,7 +1484,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.workers_per_gpu == 2 and not args.allow_two_processes_per_gpu:
         raise ValueError("2 processes/GPU requires --allow-two-processes-per-gpu")
     args.output_dir = args.output_dir.expanduser().resolve(strict=False)
-    args.parser_root = args.parser_root.expanduser().resolve(strict=True)
+    args.parser_root = args.parser_root.expanduser().resolve(strict=args.stage in {"all", "text", "icon", "_worker"})
     args.icon_model = args.icon_model.expanduser().resolve(strict=False) if args.icon_model else None
     args.text_model_dir = args.text_model_dir.expanduser().resolve(strict=False) if args.text_model_dir else None
     if args.stage in {"all", "text"} and not args.text_python:

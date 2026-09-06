@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Four production stages. Run cache on an allocated A800 node with four GPUs.
+# Prepare and finalize caches on CPU; reserve four A800 GPUs only for cache.
 set -Eeuo pipefail
 export WORKSPACE="${WORKSPACE:-/mnt/bn/intelligent-service-yg/logging/sicheng_workspace}"
 export UI9_DATA_ROOT="${UI9_DATA_ROOT:-/mnt/bn/intelligent-service-yg/dataset/gui/ui9_datasets_v1}"
@@ -17,7 +17,15 @@ case "${1:-}" in
     ;;
   cache)
     exec "${UI14_PYTHON}" scripts/prepare_ui14_detector_crops.py \
-      --data-root "${UI14_DATA_ROOT}" --gpus 0,1,2,3
+      --stage detect --data-root "${UI14_DATA_ROOT}" --gpus 0,1,2,3
+    ;;
+  cache-prepare)
+    exec "${UI14_PYTHON}" scripts/prepare_ui14_detector_crops.py \
+      --stage prepare --data-root "${UI14_DATA_ROOT}" --prepare-workers "${UI14_PREPARE_WORKERS:-16}"
+    ;;
+  cache-finalize)
+    exec "${UI14_PYTHON}" scripts/prepare_ui14_detector_crops.py \
+      --stage crops --data-root "${UI14_DATA_ROOT}"
     ;;
   finalize)
     exec "${UI14_PYTHON}" scripts/prepare_ui14_sft.py --stage finalize \
@@ -28,5 +36,5 @@ case "${1:-}" in
       --profile "${UI14_PROFILE}" --machine a800 --resource-group aiai_locate --gpus 4 \
       --ui14-data-root "${UI14_DATA_ROOT}" --output-yaml "${UI14_DATA_ROOT}/formal_job.yaml"
     ;;
-  *) printf 'Usage: bash shell/ui14_cpt9000_a800.sh {normalize|cache|finalize|submit}\n' >&2; exit 2 ;;
+  *) printf 'Usage: bash shell/ui14_cpt9000_a800.sh {normalize|cache-prepare|cache|cache-finalize|finalize|submit}\n' >&2; exit 2 ;;
 esac

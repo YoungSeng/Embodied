@@ -1389,6 +1389,16 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
     if args.resume and unique and baseline_completed == len(unique):
         # A fully completed stage must not import or initialize its model again.
         # This also lets merge/crop reuse immutable detections after GPU envs are released.
+        summary_path = paths.stage_dir(stage) / "stage_summary.json"
+        if not summary_path.is_file():
+            # The parent can be killed after the last worker commits its shard
+            # but before writing this summary. Recover metadata without a GPU.
+            atomic_write_json(summary_path, {
+                "stage": stage, "images": len(unique), "workers": 0,
+                "workers_per_gpu": args.workers_per_gpu,
+                "runtime": {"python": detection_python(args, stage)},
+                "restored_from_completed_shards": True,
+            })
         print_stage_preflight(args, unique_count=len(unique), detector_stage=None)
         reporter = ProgressReporter(
             stage=stage,

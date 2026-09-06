@@ -4,7 +4,7 @@
 分支：`codex/m32-cpt9000-ui14-v1`。
 
 **本地代码回归已通过；实际 UI9 数据扫描、GPU detector 缓存和 mlx 提交由远程开发机执行。**
-用户确认该环境不能从本地连接、代码只进不出。本报告不填写真实样本数、实际解析影响数量、缓存完成率或任务 ID；这些值由随代码交付的四步入口写入正式派生目录。
+用户确认该环境不能从本地连接、代码只进不出。本报告不填写真实样本数、实际解析影响数量、缓存完成率或任务 ID；这些值由随代码交付的分阶段入口写入正式派生目录。
 
 ## 已执行的 CPU 验证
 
@@ -106,6 +106,26 @@ python -m unittest tests.test_ui14_normalize_resume tests.test_ui14_repair \
 
 **真实集群 normalize/cache/finalize/submit 均未在本地执行，未产生提交任务 ID。** 用户提供的原运行统计为 130,567 条中成功 120,010、EXIF=0 失败 10,557。由该统计计算，本次目标为复用 16 split / 111,007 条，重建对齐 train 17,604 条、test 1,956 条（合计 19,560），最终 normalized=130,567、failed=0；这些是远端验收目标，不是本地实测结果。实际续跑数量由远端 `cpu_check_report.json.normalization_resume` 和进度日志给出。
 
+## cache 的 CPU/GPU 阶段拆分与并行续跑
+
+增量基线：`cb8d67d6cc3496ec95c3fda8533bb389e7caf870`。87 项 CPU 回归全部通过（88.892 秒），包含新增的 10 项缓存阶段回归；6 个 Python 文件 AST、Shell `bash -n`、新入口 `--help` 和 `git diff --check` 通过。正式配置及已提交 YAML 没有改动。本地只执行 CPU 构造验证，没有执行真实集群 detector 或训练，也没有测量真实数据吞吐提升倍数。
+
+- cache-prepare 默认 16 线程，受控并发验证实际使用多个线程；原图指纹和方向后尺寸与旧消费者一致（覆盖 EXIF 0/1/6）。旧清单、分片及已完成 detector 结果的摘要逐项保持一致，旧 GPU 分片仍可通过 resume 校验。
+- 图片 journal 落盘后重新打开可全部复用，禁用图片打开和重新哈希仍通过；文件变化只重新扫描对应图片；半截末行会被安全丢弃，已完成记录保留，异常退出后可继续。
+- CPU prepare 不要求 Paddle、icon Python 或 parser 目录存在，不启动任何 detector 子进程。14 个 split 的 CPU 构造结果：首次 scanned=14，再次 reused=14/scanned=0（非真实 UI9 数量）。
+- GPU 调度只派发全部 14 split 的 text 和 icon，共 28 个阶段调用。主进程禁用原图打开、原图 stat、prepare 和裁剪函数仍通过；真实 GPU worker 在该检查中使用 mock。缺少最后一个 split、分片摘要变化或误用旧五任务注册表时，在任何 GPU 子进程启动前失败。
+- GPU 子进程失败仍停止；所有分片完成但 stage_summary 缺失时，可以不加载 GPU 模型而补齐汇总。
+- CPU 收尾只派发 merge/crop 和任务标签。使用固定检测框，通过真实 CPU 子进程为 synth_cropping 的构造 train/test 完成合并、几何计划、crop PNG、覆盖统计和标签 marker；无需 Paddle Python。
+- 原 EXIF=0/normalize 续跑、375 投影、UI14 recipe/评分/评测补齐/Excel、UI5 几何与正式 YAML 回归均通过；CPT-9000、4×A800、两评测 worker/GPU 和 EVAL_FAIL_POLICY=stop 保持原值。
+
+```bash
+python -m unittest tests.test_ui14_cache_stages tests.test_ui14_progress \
+  tests.test_ui14_normalize_resume tests.test_ui14_repair \
+  tests.test_ui14_pipeline tests.test_ui5_eval_detector_scan
+```
+
+当前旧 cache 进程需结束后再更新代码和运行新入口，同一输出目录不能并发写。已完成 normalize 不重跑；先在 CPU 完成 `cache-prepare`，再申请四卡 A800 运行 `cache`，检测完成释放调试 GPU，最后在 CPU 上运行 `cache-finalize` 和 `finalize`。第一次升级仍需建立图片 journal，已有 GPU 缓存继续复用。迁移命令见 [运行文档](ui14_cpt9000_a800.md)。
+
 ## 实际数据统计的产生位置
 
 派生根目录：
@@ -114,10 +134,12 @@ python -m unittest tests.test_ui14_normalize_resume tests.test_ui14_repair \
 | 远端阶段 | 将产生的实际证据 |
 |---|---|
 | normalize（CPU） | 当前 manifest、repair_summary、18 份 JSONL 和图片可读性；source_snapshot.json、九项规范化 train/test、normalization_stats.json、ui9_page_split.json、ui9_image_overlap.json、parser_compatibility_issues.jsonl；cpu_check_report.json 的 normalization_complete，ready=false |
-| cache（GPU） | 仅新增七项 crop 任务的 train/test detector 与横向计划；派生标签、crop PNG、ui14_label_cache_ready.json。周期评测不运行 detector |
+| cache-prepare（CPU） | 默认 16 线程图片指纹/尺寸扫描、去重、稳定分片；image_info.jsonl 续跑日志、summary.json 计数和各 split 的 ui14_prepare_ready.json |
+| cache（GPU） | 仅新增七项 crop 任务的 train/test PP-OCRv5/OmniParser 检测，复用完成分片；不运行 prepare、merge、crop 或标签生成 |
+| cache-finalize（CPU） | 合并检测、横向计划、派生标签、crop PNG、ui14_label_cache_ready.json。周期评测不运行 detector |
 | finalize（CPU） | 复用旧 UI5 审核 recipe/test cache；生成 training_recipe.json、evaluation_manifest.json、14 项连接检查、sampling_stats、完整 image_overlap、formal_job.yaml/formal_runtime.json；全部通过后 cpu_check_report.ready=true |
 | submit | 摘要校验通过后执行既有 mlx job submitv2。任务 ID 以远端 mlx 返回为准，本地未提交 |
 
-报告的 post_repair_sources（normalize 时为 tasks）含每份文件的实际记录数、正负数、格式数量、GT 字段及修复数量。parser_comparison 分开给出 legacy_parse_failure_records、legacy_consumer_failure_records、parse_result_difference_records；页面统计覆盖 UI9 跨来源的 train/test 归属。完整字段解释和四步命令见 [运行文档](ui14_cpt9000_a800.md)。
+报告的 post_repair_sources（normalize 时为 tasks）含每份文件的实际记录数、正负数、格式数量、GT 字段及修复数量。parser_comparison 分开给出 legacy_parse_failure_records、legacy_consumer_failure_records、parse_result_difference_records；页面统计覆盖 UI9 跨来源的 train/test 归属。完整字段解释和分阶段命令见 [运行文档](ui14_cpt9000_a800.md)。
 
 参考 YAML 已提交为 [locany_m32_cpt9000_ui14_a800x4.yaml](../jobs/rendered/locany_m32_cpt9000_ui14_a800x4.yaml)。远端 finalize 会用同一渲染函数在派生根目录产生本次实际提交 YAML，并将其摘要绑定到 CPU 报告。

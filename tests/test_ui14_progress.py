@@ -185,12 +185,16 @@ class PreparationProgressTests(unittest.TestCase):
             args = SimpleNamespace(data_root=root / "data", ui5_cache=root / "old_cache", parser_root=str(root),
                 text_python=sys.executable, icon_python=sys.executable, gpus="0,1,2,3",
                 text_model_dir=None, icon_model=None, progress_interval_seconds=5)
-            expected = [(t.task_key, s) for t in UI9_TASKS if t.view_policy == "crops" for s in ("train", "test")]
-            with mock.patch.object(cache.subprocess, "run") as worker, mock.patch.object(prepare, "crop_annotations") as labels:
+            args.stage = "detect"
+            with mock.patch.object(cache.subprocess, "run") as worker, \
+                 mock.patch.object(prepare, "crop_annotations") as labels, \
+                 mock.patch.object(cache, "validate_prepared", return_value=1):
                 with progress.ProgressSession("cache", args.data_root):
                     cache.run(args)
-                self.assertEqual([(call.args[1].task_key, call.args[2]) for call in labels.call_args_list], expected)
-                self.assertEqual(worker.call_count, 14)
+                labels.assert_not_called()
+                self.assertEqual(worker.call_count, 28)
+                self.assertEqual([call.args[0][call.args[0].index("--stage") + 1] for call in worker.call_args_list],
+                                 ["text"] * 14 + ["icon"] * 14)
                 for call in worker.call_args_list:
                     command = call.args[0]
                     self.assertEqual(command[1], "-u")
@@ -199,7 +203,8 @@ class PreparationProgressTests(unittest.TestCase):
                     self.assertTrue(call.kwargs["check"])
                     self.assertIn("--resume", command)
             with mock.patch.object(cache.subprocess, "run", side_effect=subprocess.CalledProcessError(3, "detector")) as worker, \
-                 mock.patch.object(prepare, "crop_annotations") as labels:
+                 mock.patch.object(prepare, "crop_annotations") as labels, \
+                 mock.patch.object(cache, "validate_prepared", return_value=1):
                 with self.assertRaises(subprocess.CalledProcessError), progress.ProgressSession("cache", args.data_root):
                     cache.run(args)
                 self.assertEqual(worker.call_count, 1)
