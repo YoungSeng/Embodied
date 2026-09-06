@@ -126,6 +126,49 @@ python -m unittest tests.test_ui14_cache_stages tests.test_ui14_progress \
 
 当前旧 cache 进程需结束后再更新代码和运行新入口，同一输出目录不能并发写。已完成 normalize 不重跑；先在 CPU 完成 `cache-prepare`，再申请四卡 A800 运行 `cache`，检测完成释放调试 GPU，最后在 CPU 上运行 `cache-finalize` 和 `finalize`。第一次升级仍需建立图片 journal，已有 GPU 缓存继续复用。迁移命令见 [运行文档](ui14_cpt9000_a800.md)。
 
+## 2026-09-07 并行裁图、原图级续跑与快速 finalize
+
+本增量基线 `75fc54a67f1ce07fa19c5e93db5611000679285a`。本地执行 111 项 CPU 回归，全部通过，耗时 72.633 秒；13 个修改/新增 Python 文件 AST、Shell `bash -n`、`git diff --check` 通过。使用现有正式 profile 重新渲染 YAML，与已提交 `jobs/rendered/locany_m32_cpt9000_ui14_a800x4.yaml` 解析后的内容完全一致。CPT-9000、4×A800、16k SFT、14 项评测、两评测 worker/GPU、EVAL_FAIL_POLICY=stop 均保持原值。
+
+实际执行范围是本地 CPU 构造数据及固定 detector 输出上的回归，包括真实 PNG 写入、CPU merge/crop 子进程、finalize/check 和 YAML 渲染。未连接开发机/A800，未执行真实 130,567 条数据的准备、GPU 检测或 mlx 提交；未测量挂载盘吞吐、旧约 950 张半成品的实际复用量或真实剩余 ETA，没有任务 ID。
+
+| 验证 | 实际结果 |
+|---|---|
+| 并行及顺序 | 3 张唯一原图、4 条记录（含重复原图记录），实际 2 个 worker；输出 8 条 crop 记录，原记录/tile 顺序稳定 |
+| 旧半成品接入 | 构造 1 张原图对应的 2 个旧 PNG，首次 migrated=1、built=2（4 个新 PNG）；旧 PNG 字节及摘要保持不变 |
+| 全部复用 | 再次运行 reused=3、built=0；禁用 Image.open 和 PNG 编码、改变压缩级别仍可成功 |
+| 像素/GT | 新旧解码 RGB 像素、bbox、定位输出、正负标签与逐记录覆盖统计一致；包含跨 tile GT 和 EXIF=0 |
+| 中断与坏文件 | 完成记录在异常后保留；截断 journal 末行可恢复；损坏一个 PNG 只补写该 PNG，其他 2 张原图复用 |
+| 局部失效 | 仅改标注不读图片；改一张原图的几何只重建该原图；真实截图内容与 normalized 身份不符时停止，规范化/计划对应更新后只重建该图 |
+| CPU 准备 | EXIF 0–8 尺寸检查禁止整图解码/转置仍通过；完整 split 不重新准备原图，已有 detector ID 和分片保留 |
+| GPU 分片 | 构造 2 个已完成分片，更新单图后仅其所在分片失效，另一分片的字节和 mtime 不变且 resume 校验通过；GPU 入口仍只派发 text/icon |
+| finalize/check | 完整 14 任务构造链路通过；重复 finalize 与启动前校验禁止图片打开、禁止裁图仍成功；独立全量复核读取像素并拒绝坏 crop |
+| 完成计量 | 500 张 built 采样门槛不计 migrated/reused，保留各 split 的 pending/ETA；性能采样不会停止正式准备 |
+| 单协调进程 | 同一输出根目录第二个准备进程不能获取锁 |
+
+验证命令（CPU）：
+
+```bash
+python -m unittest tests.test_ui14_parallel_crops tests.test_ui14_cache_stages \
+  tests.test_ui14_progress tests.test_ui14_normalize_resume tests.test_ui14_repair \
+  tests.test_ui14_pipeline tests.test_ui5_eval_detector_scan \
+  tests.test_ui5_eval_detector_scan_v5 tests.test_ui14_inference_workers
+bash -n shell/ui14_cpt9000_a800.sh
+```
+
+修改文件：
+
+- `scripts/ui14_crop_materialization.py`（新增）：有界线程池、低压缩 PNG、原图完成索引、标签绑定、旧 PNG 接入、实际新裁图计量。
+- `scripts/ui14_verification.py`（新增）：按文件属性绑定的验证 journal、首次并行内容检查、结构验证记录、准备锁。
+- `scripts/prepare_ui14_sft.py`：并行裁图接入，finalize 只消费完成产物，增量 check、`--full-verify` 与图片证据绑定。
+- `scripts/prepare_ui14_detector_crops.py`、`scripts/ui14_cache_prepare.py`、`scripts/prepare_ui5_eval_detector_crops.py`：已完成准备/几何复用，图片头读取和局部分片更新。
+- `scripts/ui14_common.py`、`scripts/ui5_eval_detector_cache.py`、`scripts/ui14_profile.py`：摘要/结构检查复用及提交、训练启动前验证。
+- `shell/ui14_cpt9000_a800.sh`：UI14_CROP_WORKERS、UI14_PNG_COMPRESS_LEVEL、check-full。
+- `tests/test_ui14_parallel_crops.py`（新增）以及 `tests/test_ui14_cache_stages.py`、`tests/test_ui14_pipeline.py`、`tests/test_ui14_repair.py`：回归与更新后的阶段契约。
+- 本报告及 `docs/ui14_cpt9000_a800.md`：分资源运行命令、迁移和计量说明。
+
+真实运行会在现有派生根目录保存 `crop_performance/first_500_built.json`、`crop_performance/latest.json` 和每次 run_id 的快照。报告记录新原图/s、crop/s、实际并发、读取/解码/编码/写入时间、CPU/RSS、逐 split 复用/新建/待处理数量与裁图 ETA。0.79 原图/s 是用户给出的旧日志基线；8 原图/s 是目标，不能用本地小图回归速度宣称达到。无需新增 smoke 训练。
+
 ## 实际数据统计的产生位置
 
 派生根目录：
@@ -136,7 +179,7 @@ python -m unittest tests.test_ui14_cache_stages tests.test_ui14_progress \
 | normalize（CPU） | 当前 manifest、repair_summary、18 份 JSONL 和图片可读性；source_snapshot.json、九项规范化 train/test、normalization_stats.json、ui9_page_split.json、ui9_image_overlap.json、parser_compatibility_issues.jsonl；cpu_check_report.json 的 normalization_complete，ready=false |
 | cache-prepare（CPU） | 默认 16 线程图片指纹/尺寸扫描、去重、稳定分片；image_info.jsonl 续跑日志、summary.json 计数和各 split 的 ui14_prepare_ready.json |
 | cache（GPU） | 仅新增七项 crop 任务的 train/test PP-OCRv5/OmniParser 检测，复用完成分片；不运行 prepare、merge、crop 或标签生成 |
-| cache-finalize（CPU） | 合并检测、横向计划、派生标签、crop PNG、ui14_label_cache_ready.json。周期评测不运行 detector |
+| cache-finalize（CPU） | 合并检测、横向计划、派生标签、crop PNG、ui14_label_cache_ready.json、crop_index/images.jsonl、ui14_crop_complete.json、crop_performance 报告。周期评测不运行 detector |
 | finalize（CPU） | 复用旧 UI5 审核 recipe/test cache；生成 training_recipe.json、evaluation_manifest.json、14 项连接检查、sampling_stats、完整 image_overlap、formal_job.yaml/formal_runtime.json；全部通过后 cpu_check_report.ready=true |
 | submit | 摘要校验通过后执行既有 mlx job submitv2。任务 ID 以远端 mlx 返回为准，本地未提交 |
 

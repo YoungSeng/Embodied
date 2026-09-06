@@ -22,6 +22,9 @@ GEOMETRY_SCHEMA_VERSION = 5
 
 
 def sha256_file(path: Path) -> str:
+    from ui14_verification import current_checks
+    checks = current_checks()
+    if checks is not None: return checks.sha256(path)
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         with file_activity(path, os.fstat(handle.fileno()).st_size) as progress:
@@ -92,7 +95,7 @@ def _validate_file_record(
     return path
 
 
-def validate_eval_detector_cache(
+def _validate_eval_detector_cache(
     cache_dir: Path,
     *,
     scan_name: str,
@@ -475,3 +478,19 @@ def validate_eval_detector_cache(
     ):
         raise RuntimeError("geometry-state digest mismatch")
     return marker
+
+
+def validate_eval_detector_cache(cache_dir, **kwargs):
+    from ui14_verification import current_checks
+    checks = current_checks()
+    if checks is None: return _validate_eval_detector_cache(cache_dir, **kwargs)
+    ready = Path(cache_dir) / kwargs["scan_name"] / "eval_detector_cache_ready.json"
+    if not ready.exists(): return _validate_eval_detector_cache(cache_dir, **kwargs)
+    key = {"validator": sha256_file(Path(__file__)), "cache": str(Path(cache_dir).absolute()),
+           "geometry_validator": sha256_file(Path(__file__).with_name("ui5_lossless_tiling.py")),
+           "marker": sha256_file(ready),
+           "inventory": sorted(str(p.relative_to(cache_dir)) for folder in (
+               Path(cache_dir) / "manifest/shards", Path(cache_dir) / "detections/text", Path(cache_dir) / "detections/icon")
+               for p in folder.glob("shard_*")),
+           "kwargs": json.loads(json.dumps(kwargs, default=str))}
+    return checks.validated_call(key, lambda: _validate_eval_detector_cache(cache_dir, **kwargs))

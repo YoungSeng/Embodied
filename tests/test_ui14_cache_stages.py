@@ -241,7 +241,7 @@ class StageSeparationTests(unittest.TestCase):
             output = Path(command[command.index("--output-dir") + 1])
             return cpu_run(command, **kwargs) if output.parent.name == task.task_key else subprocess.CompletedProcess(command, 0)
 
-        def labels(root, current, split, rows):
+        def labels(root, current, split, rows, **kwargs):
             return label_run(root, current, split, rows) if current == task else []
 
         with mock.patch.object(pipeline.subprocess, "run", side_effect=worker), \

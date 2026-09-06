@@ -210,7 +210,7 @@ def _task_paths(path: Path, *, limit: int, skip_figma: bool) -> list[Path]:
     return selected
 
 
-def prepare_manifest(args: argparse.Namespace, *, image_info_loader=None) -> list[dict[str, Any]]:
+def prepare_manifest(args: argparse.Namespace, *, image_info_loader=None, allow_selection_refresh=False) -> list[dict[str, Any]]:
     if args.input_dir is None:
         raise ValueError("--input-dir is required for --stage prepare/all")
     input_dir = args.input_dir.expanduser().resolve(strict=True)
@@ -313,17 +313,19 @@ def prepare_manifest(args: argparse.Namespace, *, image_info_loader=None) -> lis
         selection["data_split"] = args.data_split
     if identity_path.is_file() and args.resume:
         existing = json.loads(identity_path.read_text(encoding="utf-8"))
-        if existing != selection:
+        if existing != selection and not allow_selection_refresh:
             raise RuntimeError("evaluation detector cache selection changed; use a new --output-dir")
     atomic_write_jsonl(paths.unique_images, unique)
     atomic_write_jsonl(paths.task_samples, task_rows)
-    for stale in paths.shards.glob("shard_*.jsonl"):
-        stale.unlink()
-    for start in range(0, len(unique), args.shard_size):
-        atomic_write_jsonl(
-            paths.shards / f"shard_{start // args.shard_size:05d}.jsonl",
-            unique[start : start + args.shard_size],
-        )
+    if allow_selection_refresh:
+        from ui14_cache_prepare import refresh_stable_shards
+        refresh_stable_shards(paths, unique, args.shard_size)
+    else:
+        for stale in paths.shards.glob("shard_*.jsonl"):
+            stale.unlink()
+        for start in range(0, len(unique), args.shard_size):
+            atomic_write_jsonl(paths.shards / f"shard_{start // args.shard_size:05d}.jsonl",
+                               unique[start : start + args.shard_size])
     atomic_write_json(identity_path, selection)
     ensure_detector_config(paths.detector_config, detector_config(args))
     print(

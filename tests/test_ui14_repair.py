@@ -225,7 +225,8 @@ class RepairedIntakeTests(unittest.TestCase):
     def test_finalization_failure_keeps_real_intake_statistics_in_cpu_report(self):
         self.normalize()
         self.args.stage = "finalize"
-        with self.assertRaises(OSError): prepare.run_stage(self.args)  # audited UI5 recipe unavailable in fixture
+        with self.assertRaisesRegex(RuntimeError, "cache-finalize first"):
+            prepare.run_stage(self.args)  # crop completion is checked before unavailable UI5 recipe
         report = read_json(self.data / "cpu_check_report.json")
         self.assertFalse(report["ready"])
         self.assertEqual(report["repair_run_id"], "fixture-repair-v2.1")

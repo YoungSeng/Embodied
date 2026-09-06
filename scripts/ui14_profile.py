@@ -20,6 +20,15 @@ def profile_environment(*, project_root=None, data_root=None):
 
 
 def validate_prepared_profile(runtime):
+    from ui14_verification import verification_session, preparation_lock
+    with preparation_lock(runtime["UI14_DATA_ROOT"]), verification_session(runtime["UI14_DATA_ROOT"]) as checks:
+        _validate_prepared_profile(runtime)
+        evidence = Path(runtime["UI14_DATA_ROOT"]) / "verification/image_evidence.jsonl"
+        if not evidence.exists(): raise RuntimeError("Missing image verification evidence; run finalize on CPU")
+        checks.validate_images(evidence)
+
+
+def _validate_prepared_profile(runtime):
     # Full checks run explicitly before rendering; launch validates the digest-bound report.
     root = Path(runtime["UI14_DATA_ROOT"])
     report = read_json(root / "cpu_check_report.json")
@@ -32,6 +41,8 @@ def validate_prepared_profile(runtime):
     for name, expected in report.get("artifact_digests", {}).items():
         if file_digest(root / name) != expected: raise RuntimeError(f"Prepared UI14 artifact changed: {name}")
     if not report.get("artifact_digests"): raise RuntimeError("CPU check has no artifact digests")
+    if "verification/image_evidence.jsonl" not in report["artifact_digests"]:
+        raise RuntimeError("CPU report lacks bound image verification evidence; run finalize on CPU")
     for path, expected in report.get("external_digests", {}).items():
         if file_digest(path) != expected: raise RuntimeError(f"UI14 source/cache changed since CPU check: {path}")
     from ui14_repair import validate_normalization

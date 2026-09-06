@@ -15,6 +15,16 @@ from eaglevl.train.ui_defect_data import (identify_ui_defect_task, is_positive_u
 from locany_ui5_common import TASK_JSONL
 from ui14_progress import ProgressSession, phase, phase_function, track
 from ui14_normalize_resume import SplitResume, save_split_state
+from ui14_verification import verification_session, current_checks, preparation_lock
+from functools import wraps
+
+
+def verified_output(function):
+    @wraps(function)
+    def wrapped(args):
+        with verification_session(args.output_dir, full=getattr(args, "full_verify", False)):
+            return function(args)
+    return wrapped
 
 
 def rebuild_normalized_split(root, snapshot, task, split, spec, identity_cache, image_info):
@@ -238,48 +248,9 @@ def validate_task_cache(root, task, split, expected):
 
 
 @phase_function("生成或核对 crop PNG 与标签")
-def crop_annotations(root, task, split, records):
-    from PIL import Image, ImageOps
-    paths = paths_for(root, task.task_key, split)
-    validate_task_cache(root, task, split, len({file_digest(r["source_image"]) for r in track(
-        records, f"{task.task_key}/{split} detector 图片摘要", unit="原图")}))
-    plans = list(read_jsonl(paths["cache"] / SCAN_NAME / "detector_scan_crops.jsonl"))
-    index = {str(Path(p).resolve()): row for row in plans for p in row["image_paths"]}
-    derived, coverage = [], []
-    for row in track(records, f"{task.task_key}/{split} 原图 → crop PNG/标签", unit="原图",
-                     detail=lambda r: r["source_image"]):
-        plan = index[row["source_image"]]
-        if (plan["width"], plan["height"]) != (row["width"], row["height"]):
-            raise ValueError("Crop cache screenshot dimensions changed")
-        covered = set()
-        with Image.open(row["source_image"]) as raw:
-            image = ImageOps.exif_transpose(raw).convert("RGB")
-            for i, tile in enumerate(plan["tiles"]):
-                crop = tile
-                crop_id = f"scan-{i:03d}"
-                target = paths["crop_images"] / f"{row['source_image_id']}-{crop_id}.png"
-                target.parent.mkdir(parents=True, exist_ok=True)
-                expected_crop = image.crop(crop)
-                if target.exists():
-                    with Image.open(target) as saved:
-                        if saved.size != expected_crop.size or saved.convert("RGB").tobytes() != expected_crop.tobytes():
-                            raise ValueError(f"Stale training crop content: {target}; use a new data root or remove this derived crop")
-                else:
-                    expected_crop.save(target)
-                boxes, complete = crop_boxes(row["boxes_px"], crop)
-                covered.update(complete)
-                record = training_record(row, task, target, boxes, crop[2]-crop[0], crop[3]-crop[1], crop_id)
-                record.update(crop_box=crop, crop_width=crop[2]-crop[0], crop_height=crop[3]-crop[1],
-                              detector_plan_gt_used=False, crop_boxes_px=boxes, crop_image_sha256=file_digest(target))
-                derived.append(record)
-        coverage.append({"source_record_id": row["source_record_id"], "gt_count": len(row["boxes_px"]),
-                         "fully_contained_gt": len(covered), "uncontained_gt": sorted(set(range(len(row["boxes_px"]))) - covered)})
-    write_json(paths["derived"].with_suffix(".coverage.json"), coverage)
-    write_jsonl(paths["derived"], derived)
-    # Detector geometry may be unchanged by repair; labels and this completion
-    # marker always belong to the current annotations and actual file split.
-    write_json(paths["cache"] / "ui14_label_cache_ready.json", cache_label_binding(root, task, split))
-    return derived
+def crop_annotations(root, task, split, records, *, meter=None):
+    from ui14_crop_materialization import materialize_split
+    return materialize_split(root, task, split, records, meter=meter)
 
 
 @phase_function("复用 UI5 审核样本与人工修复")
@@ -295,7 +266,6 @@ def legacy_train(args):
     source_by_sample = {r["sample_id"]: r["canonical_path"] for r in task_samples}
     source_by_image = {r["image_id"]: r["canonical_path"] for r in task_samples}
     groups = defaultdict(list)
-    identities = {}
     for entry in recipe.values():
         exclusions = set()
         if entry.get("excluded_samples"):
@@ -326,18 +296,24 @@ def legacy_train(args):
                           or source_by_image.get(row.get("_ui5_image_id")))
                 if not source: raise ValueError("Audited UI5 record lacks source image path")
                 source = str(Path(source) if Path(source).is_absolute() else base / source)
-                if source not in identities: identities[source] = image_identity(source)[0]
                 row.update(task_id=task.task_id, task_key=task.task_key, split="train",
                            source_dataset="ui5", source_version="crop_audit_v4_gt_repair",
-                           source_image=source, source_image_id=identities[source],
+                           source_image=source,
                            source_record_id=str(row.get("_ui5_sample_id", row.get("id", ""))),
                            crop_id=str(row.get("crop_id", row.get("_ui5_crop_id", Path(row["image"]).stem))),
                            view_policy=task.view_policy)
                 groups[task.task_key].append(row)
+    checks = current_checks()
+    sources = {r["source_image"] for rows in groups.values() for r in rows}
+    if checks: checks.prefetch_images(sources)
+    identities = {source: image_identity(source)[0] for source in sources}
+    for rows in groups.values():
+        for row in rows: row["source_image_id"] = identities[row["source_image"]]
     if set(groups) != {t.task_key for t in UI5_TASKS}: raise ValueError("Legacy recipe does not contain all UI5 tasks")
     return groups
 
 
+@verified_output
 def finalize(args):
     root = Path(args.output_dir).resolve()
     write_json(root / "cpu_check_report.json", {**read_json(root / "cpu_check_report.json"),
@@ -345,6 +321,12 @@ def finalize(args):
     snapshot = validate_normalization(root)
     registry_document = read_json(root / "task_registry.json")
     registry = load_registry(root / "task_registry.json")
+    for task in UI9_TASKS:
+        if task.view_policy == "crops":
+            for split in ("train", "test"):
+                marker = paths_for(root, task.task_key, split)["cache"] / "ui14_crop_complete.json"
+                if not marker.exists():
+                    raise RuntimeError(f"Missing crop completion: {task.task_key}/{split}; run cache-finalize first")
     legacy = legacy_train(args)
     recipe, evaluation, stats, all_sources = {}, [], {}, []
     for task in track(UI_TASKS, "finalize 1/2 组装联合 recipe 与评测清单", unit="任务",
@@ -371,11 +353,12 @@ def finalize(args):
                 normalized = list(read_jsonl(paths["normalized"]))
                 all_sources.extend(normalized)
                 if task.view_policy == "crops":
-                    records = crop_annotations(root, task, split, normalized)
+                    from ui14_crop_materialization import load_completed
+                    records = load_completed(root, task, split, normalized)
                 else:
                     records = [training_record(r, task, r["source_image"], r["boxes_px"], r["width"], r["height"])
                                for r in track(normalized, f"{task.task_key}/{split} 全图标注", unit="原图")]
-                write_jsonl(paths["derived"], records)
+                if task.view_policy != "crops": write_jsonl(paths["derived"], records)
                 if split == "train": train = records
             original_test = list(read_jsonl(paths_for(root, task.task_key, "test")["normalized"]))
             by_image = {}
@@ -420,6 +403,7 @@ def finalize(args):
 
 
 @phase_function("完整 CPU 检查（finalize 2/2）")
+@verified_output
 def check(args):
     root = Path(args.output_dir).resolve()
     write_json(root / "cpu_check_report.json", {**read_json(root / "cpu_check_report.json"),
@@ -446,11 +430,31 @@ def check(args):
         try:
             train = list(read_jsonl(recipe[task.task_key]["annotation"]))
             if not train: raise ValueError("Empty training stream")
+            if task.view_policy == "crops":
+                current_checks().prefetch_images((r["image"] for r in train), "sha256")
             for row in track(train, f"{task.task_key}/train 路径与路由", unit="训练样本"):
                 if row["split"] != "train" or identify_ui_defect_task(row)[1] != task.task_id: raise ValueError("Recipe route/split mismatch")
                 if not Path(row["image"]).is_file(): raise FileNotFoundError(row["image"])
+                # First check establishes byte evidence for legacy crops, too.
+                if task.view_policy == "crops": file_digest(row["image"])
             if recipe[task.task_key]["sampling_weight"] != 1.0: raise ValueError("Formal task sampling weights must all be one")
             bound_artifacts.add(str(Path(spec["train"]).relative_to(root)))
+            if task.task_id < 5:
+                # Standalone check/check-full must bind UI5 originals too;
+                # finalize's identity reads are not assumed to have run here.
+                current_checks().prefetch_images(r["source_image"] for r in train)
+                for row in train:
+                    if image_identity(row["source_image"])[0] != row["source_image_id"]:
+                        raise ValueError("Audited UI5 source image changed")
+                from qwen3vl_merge_and_score_fixed_5tasks import extract_image_path, is_figma_sample
+                test_images = []
+                for record in read_jsonl(spec["test"]):
+                    if is_figma_sample(record): continue
+                    image = extract_image_path(record)
+                    if not image: raise ValueError("Missing UI5 test screenshot")
+                    image = Path(image)
+                    test_images.append(image if image.is_absolute() else Path(spec["test"]).parent / image)
+                current_checks().prefetch_images(test_images)
             if task.task_id >= 5:
                 bound_artifacts.add(str(Path(spec["test"]).relative_to(root)))
                 for split in ("train", "test"):
@@ -463,6 +467,7 @@ def check(args):
                     original_stat = read_json(root / "normalization_stats.json")["tasks"][f"{task.task_key}/{split}"]
                     if external_digests[str(source_path)] != original_stat["input_sha256"]:
                         raise ValueError("Original export changed after normalization")
+                    current_checks().prefetch_images(r["source_image"] for r in records)
                     for row in track(records, f"{task.task_key}/{split} 原图内容与归属", unit="原图",
                                      detail=lambda r: r["source_image"]):
                         if row.get("normalization_id") != snapshot["normalization_id"] or row["split"] != split:
@@ -491,8 +496,12 @@ def check(args):
                         if derived["conversations"] != [{"from": "human", "value": "<image>\n" + task.prompt}, {"from": "gpt", "value": expected_answer}]:
                             raise ValueError("Prompt or crop-coordinate annotation drift")
                     if task.view_policy == "crops":
-                        validate_task_cache(root, task, split, len({file_digest(r["source_image"]) for r in track(
-                            records, f"{task.task_key}/{split} detector 图片摘要", unit="原图")}))
+                        from ui14_crop_materialization import load_completed
+                        load_completed(root, task, split, records, full=getattr(args, "full_verify", False))
+                        count = sum(1 for _ in read_jsonl(p["cache"] / "manifest/unique_images.jsonl"))
+                        validate_task_cache(root, task, split, count)
+                        for name in ("ui14_crop_complete.json", "crop_index/images.jsonl"):
+                            bound_artifacts.add(str((p["cache"] / name).relative_to(root)))
                         coverage = read_json(p["derived"].with_suffix(".coverage.json"))
                         coverage_results[f"{task.task_key}/{split}"] = {
                             "gt_count": sum(r["gt_count"] for r in coverage),
@@ -531,6 +540,9 @@ def check(args):
         if external_digests[registry_doc["input_manifest"]] != registry_doc["input_manifest_sha256"]:
             raise ValueError("Source manifest changed after normalization")
     except (OSError, ValueError, RuntimeError, KeyError) as exc: errors.append(str(exc))
+    checks = current_checks()
+    checks.export_images(root / "verification/image_evidence.jsonl")
+    bound_artifacts.add("verification/image_evidence.jsonl")
     overlaps = read_json(root / "image_overlap.json")
     # Frozen exports are never silently resplit or filtered. Surface every original-image overlap.
     report = {"cpu_only": True, "gpu_loaded": False, "stage": "complete", "tasks": results, "errors": errors,
@@ -545,6 +557,8 @@ def check(args):
               "init_checkpoint": str(args.init_checkpoint), "init_cpt_step": 9000,
               "initialization": locals().get("checkpoint_report"), "sft_start_step": 0,
               "crop_coverage": coverage_results,
+              "verification": {"mode": "full" if checks.full else "stat-bound incremental", **checks.counts},
+              "crop_performance": str(root / "crop_performance/latest.json"),
               "yaml": str(root / "formal_job.yaml"), "formal_runtime": str(root / "formal_runtime.json"),
               "artifact_digests": {name: file_digest(root / name) for name in track(sorted(bound_artifacts),
                   "绑定最终产物摘要", unit="文件", detail=str)},
@@ -558,6 +572,7 @@ def check(args):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=("normalize", "finalize", "check"), required=True)
+    parser.add_argument("--full-verify", action="store_true", help="CPU: re-read image contents and compare crop pixels")
     parser.add_argument("--ui9-data-root", default=UI9_DATA_ROOT)
     parser.add_argument("--output-dir", default=DATA_ROOT)
     parser.add_argument("--ui5-recipe", default=UI5_RECIPE)
@@ -584,5 +599,5 @@ def run_stage(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    with ProgressSession(args.stage, args.output_dir, args.progress_interval_seconds):
+    with preparation_lock(args.output_dir), ProgressSession(args.stage, args.output_dir, args.progress_interval_seconds):
         run_stage(args)

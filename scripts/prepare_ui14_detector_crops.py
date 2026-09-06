@@ -9,6 +9,7 @@ from ui14_common import *
 from ui14_repair import validate_normalization
 from ui14_progress import ProgressSession, detector_status, phase, track
 from ui14_cache_prepare import ImageInfoJournal, publish_prepared, validate_prepared
+from ui14_verification import verification_session, preparation_lock
 
 
 def main():
@@ -28,11 +29,19 @@ def main():
                         default=os.environ.get("UI14_PROGRESS_INTERVAL_SECONDS", "10"))
     args = parser.parse_args()
     name = {"prepare": "cache-prepare", "detect": "cache", "crops": "cache-finalize", "all": "cache-all"}[args.stage]
-    with ProgressSession(name, args.data_root, args.progress_interval_seconds):
+    with preparation_lock(args.data_root), ProgressSession(name, args.data_root, args.progress_interval_seconds):
         return run(args)
 
 
 def run(args):
+    # GPU handoff reads only prepared JSON/JSONL, not the potentially large CPU
+    # image-evidence journal. Individual detector workers retain shard resume.
+    if getattr(args, "stage", "detect") == "detect": return _run(args)
+    with verification_session(args.data_root):
+        return _run(args)
+
+
+def _run(args):
     root = Path(args.data_root).resolve(strict=True)
     binding = validate_normalization(root)
     write_json(root / "cpu_check_report.json", {**read_json(root / "cpu_check_report.json"),
@@ -81,10 +90,22 @@ def run(args):
                 expected_config = configs[task.task_key, split]
                 # Reject incompatible legacy detector settings before touching its manifests.
                 detector.ensure_detector_config(paths["cache"] / "detections/detector_config.json", expected_config)
+                journal.expected_dimensions.update({r["source_image"]: (r["width"], r["height"])
+                    for r in read_jsonl(paths["normalized"])})
                 marker = paths["cache"] / "manifest/ui14_prepare_ready.json"
+                try:
+                    count = validate_prepared(paths, binding["normalization_id"], expected_config)
+                    existing = list(read_jsonl(paths["cache"] / "manifest/unique_images.jsonl"))
+                    info = journal.load([p for row in existing for p in row["image_paths"]])
+                    if all(info[p] == (row["content_id"], row["width"], row["height"])
+                           for row in existing for p in row["image_paths"]):
+                        print(f"[cache-prepare reused] {task.task_key}/{split}: {count} images; manifests/shards unchanged", flush=True)
+                        continue
+                except RuntimeError:
+                    pass  # Missing/stale handoff: CPU-only migration or targeted refresh.
                 marker.unlink(missing_ok=True)
                 prepared_args = detector.parse_args(options(paths, split, "prepare"))
-                rows = detector.prepare_manifest(prepared_args, image_info_loader=journal.load)
+                rows = detector.prepare_manifest(prepared_args, image_info_loader=journal.load, allow_selection_refresh=True)
                 publish_prepared(paths, binding["normalization_id"], expected_config, len(rows))
                 print(f"[cache-prepare ready] {task.task_key}/{split}: {len(rows)} unique images", flush=True)
         write_json(root / "cache_preparation/summary.json", {**binding, **journal.totals, "splits": len(plans), "cpu_only": True})
@@ -99,20 +120,41 @@ def run(args):
                 if not Path(path).exists(): raise FileNotFoundError(f"Detector runtime is unreadable: {path}")
         phases = (["text", "icon"] if stage == "detect" else ["merge", "crop"] if stage == "crops"
                   else ["text", "icon", "merge", "crop"])
+        from ui14_crop_materialization import CropMeter, crop_settings
+        meter = CropMeter(root, *crop_settings())
+        if stage in ("crops", "all"):
+            meter.pending = {f"{task.task_key}/{split}": len({r["source_image_id"] for r in read_jsonl(paths["normalized"])})
+                             for task, split, paths in plans}
+        geometry_ready = set()
         # Finish GPU work for every split before starting any CPU geometry.
         for step in phases:
             for task, split, paths in track(plans, f"{step}: 七个 crop 任务 × train/test", unit="任务/split", estimate=False):
-                with phase(f"{task.task_key}/{split} {step}"), detector_status(paths["cache"] / "run_status.json"):
-                    command = [args.icon_python, "-u", str(PROJECT_ROOT / "scripts/prepare_ui5_eval_detector_crops.py")]
-                    command += options(paths, split, step, counts[task.task_key, split])
-                    subprocess.run(command, check=True)
+                key = (task.task_key, split)
+                if step == "merge" and (paths["cache"] / SCAN_NAME / "eval_detector_cache_ready.json").exists():
+                    from prepare_ui14_sft import validate_task_cache
+                    try:
+                        validate_task_cache(root, task, split, counts[key])
+                        geometry_ready.add(key)
+                    except (OSError, ValueError, RuntimeError, KeyError):
+                        pass  # Only stale geometry is rebuilt; completed detector shards remain.
+                if step in ("merge", "crop") and key in geometry_ready:
+                    print(f"[cache-finalize reused] {task.task_key}/{split}: detector merge + geometry", flush=True)
+                else:
+                    run_cpu_or_gpu(args, options(paths, split, step, counts[key]), paths, task, split, step)
                 if step == "crop":
                     from prepare_ui14_sft import crop_annotations
-                    crop_annotations(root, task, split, list(read_jsonl(paths["normalized"])))
+                    crop_annotations(root, task, split, list(read_jsonl(paths["normalized"])), meter=meter)
     validate_normalization(root)
     if stage == "detect":
         print("[cache] GPU detection complete. Release the GPU allocation; run cache-finalize and finalize on CPU.", flush=True)
     return 0
+
+
+def run_cpu_or_gpu(args, options, paths, task, split, step):
+    with phase(f"{task.task_key}/{split} {step}"), detector_status(paths["cache"] / "run_status.json"):
+        command = [args.icon_python, "-u", str(PROJECT_ROOT / "scripts/prepare_ui5_eval_detector_crops.py")]
+        command += options
+        subprocess.run(command, check=True)
 
 
 if __name__ == "__main__":

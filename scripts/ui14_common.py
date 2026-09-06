@@ -62,6 +62,9 @@ def digest(value):
 
 
 def file_digest(path):
+    from ui14_verification import current_checks
+    checks = current_checks()
+    if checks is not None: return checks.sha256(path)
     value = hashlib.sha256()
     with Path(path).open("rb") as handle:
         with file_activity(path, os.fstat(handle.fileno()).st_size) as progress:
@@ -72,6 +75,9 @@ def file_digest(path):
 
 
 def image_identity(path):
+    from ui14_verification import current_checks
+    checks = current_checks()
+    if checks is not None: return checks.rgb_identity(path)
     from PIL import Image, ImageOps
     with Image.open(path) as raw:
         image = ImageOps.exif_transpose(raw).convert("RGB")

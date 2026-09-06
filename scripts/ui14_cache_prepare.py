@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import time
 
-from PIL import Image, ImageOps
+from PIL import Image
 
 from ui14_common import digest, file_digest, read_json, write_json
 from ui14_progress import phase
@@ -30,9 +30,9 @@ def inspect_image(path, signature):
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             value.update(chunk)
     with Image.open(path) as opened:
-        oriented = ImageOps.exif_transpose(opened)
-        width, height = oriented.size
-        oriented.close()
+        width, height = opened.size
+        if opened.getexif().get(274) in (5, 6, 7, 8):
+            width, height = height, width
     if stat_signature(path) != signature:
         raise ValueError(f"Image changed during CPU preparation: {path}")
     return {"version": IMAGE_INFO_VERSION, "path": str(path), "stat": signature,
@@ -51,6 +51,7 @@ class ImageInfoJournal:
             raise ValueError("CPU prepare workers must be positive")
         self.path, self.workers = Path(path), workers
         self.entries = {}
+        self.invocation_cache, self.expected_dimensions = {}, {}
         self.totals = {"reused_images": 0, "scanned_images": 0}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.is_file():
@@ -73,9 +74,17 @@ class ImageInfoJournal:
 
     def _load_one(self, path, previous):
         signature = stat_signature(path)
+        if path in self.invocation_cache and self.invocation_cache[path]["stat"] == signature:
+            previous = self.invocation_cache[path]
         if previous is not None and previous["stat"] == signature:
-            return previous, True
-        return inspect_image(path, signature), False
+            row, reused = previous, True
+        else:
+            row, reused = inspect_image(path, signature), False
+        expected = self.expected_dimensions.get(path)
+        if expected and (row["width"], row["height"]) != tuple(expected):
+            raise ValueError(f"Normalized dimensions changed: {path}; normalize this source before cache preparation")
+        self.invocation_cache[path] = row
+        return row, reused
 
     def load(self, paths):
         paths = list(dict.fromkeys(str(p) for p in paths))
@@ -128,6 +137,41 @@ def prepared_files(cache):
     return [cache / "manifest" / name for name in (
         "selection_config.json", "unique_images.jsonl", "task_samples.jsonl")
     ] + sorted((cache / "manifest/shards").glob("shard_*.jsonl")) + [cache / "detections/detector_config.json"]
+
+
+def refresh_stable_shards(paths, unique, shard_size):
+    """Keep old shard slots; replace changed paths locally, append new images.
+
+    Existing GPU completion checks compare each shard's ordered IDs. Unchanged
+    shards retain their bytes; a changed image does not shift all later shards.
+    """
+    from run_ui5_crop_audit import atomic_write_jsonl
+    from ui14_common import read_jsonl
+    by_id = {r["image_id"]: r for r in unique}
+    by_path = {p: r for r in unique for p in r["image_paths"]}
+    claimed, last = set(), -1
+    for path in sorted(paths.shards.glob("shard_*.jsonl")):
+        last = max(last, int(path.stem.split("_")[-1]))
+        original, updated = list(read_jsonl(path)), []
+        for row in original:
+            replacement = by_id.get(row["image_id"])
+            if replacement is None:
+                replacement = next((by_path[p] for p in row["image_paths"] if p in by_path), None)
+            if replacement and replacement["image_id"] not in claimed:
+                claimed.add(replacement["image_id"]); updated.append(replacement)
+        if updated:
+            if updated != original: atomic_write_jsonl(path, updated)
+        else:
+            path.unlink()
+            # Removed shards must not be consumed by merge/publication.
+            for stage in ("text", "icon"):
+                for old in (paths.stage_dir(stage) / path.name,
+                            paths.stage_dir(stage) / (path.stem + ".done.json")):
+                    old.unlink(missing_ok=True)
+    pending = [r for r in unique if r["image_id"] not in claimed]
+    for start in range(0, len(pending), shard_size):
+        last += 1
+        atomic_write_jsonl(paths.shards / f"shard_{last:05d}.jsonl", pending[start:start + shard_size])
 
 
 def preparation_binding(paths, normalization_id, config):

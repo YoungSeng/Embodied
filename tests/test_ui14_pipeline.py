@@ -284,13 +284,19 @@ class UI14EvaluationTests(unittest.TestCase):
             prepare.normalize(args)
             for task in UI9_TASKS:
                 if task.view_policy=="crops":
-                    for split in ("train","test"): detector_fixture(data,task,split)
+                    for split in ("train","test"):
+                        detector_fixture(data,task,split)
+                        prepare.crop_annotations(data,task,split,list(read_jsonl(paths_for(data,task.task_key,split)["normalized"])))
             def validate(*a,**kw):
                 return {} if Path(a[0])==root/"ui5_cache" else real_validate(*a,**kw)
             from ui14_progress import ProgressSession
             with mock.patch("run_ui5_crop_audit.validate_training_ready_marker",return_value={"crop_train_mode":"crop_only"}) as audited, mock.patch("ui5_eval_detector_cache.validate_eval_detector_cache",side_effect=validate), ProgressSession("finalize", data, .1):
                 prepare.finalize(args)
                 audited.assert_called_once()
+                with mock.patch.object(Image, "open", side_effect=AssertionError("repeat finalize opened image")), \
+                     mock.patch.object(prepare, "crop_annotations", side_effect=AssertionError("repeat finalize materialized crops")):
+                    prepare.finalize(args)
+                    validate_prepared_profile({"UI14_DATA_ROOT":str(data)})
             report=read_json(data/"cpu_check_report.json")
             self.assertEqual(read_json(data/"progress/finalize.json")["status"],"completed")
             self.assertFalse(any("progress" in p for p in report["artifact_digests"]))
