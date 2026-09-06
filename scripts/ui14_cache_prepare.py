@@ -189,6 +189,89 @@ def publish_prepared(paths, normalization_id, config, unique_images):
     write_json(paths["cache"] / "manifest/ui14_prepare_ready.json", {**payload, "digest": digest(payload)})
 
 
+def recover_prepared(paths, normalization_id, config, journal):
+    """CPU-only recovery after manifests/shards finished but ready publication failed.
+
+    Check source selection, every task/path/ID/dimension and shard member before
+    accepting old manifests. Image journal entries still require live stat;
+    unchanged originals are not read or decoded. Never rewrite manifests here.
+    """
+    from ui14_common import read_jsonl
+    from prepare_ui5_eval_detector_crops import DETECTOR_MANIFEST_FORMAT_VERSION, digest_ids
+    cache = paths["cache"]
+    required = prepared_files(cache)
+    if not all(p.is_file() for p in required) or not list((cache / "manifest/shards").glob("shard_*.jsonl")):
+        return None
+    try:
+        before = {str(p): file_digest(p) for p in required}
+        input_binding = preparation_binding(paths, normalization_id, config)
+        task_files = read_json(paths["detector_inputs"])
+        if len(task_files) != 1: raise ValueError("expected one isolated task")
+        task, input_name = next(iter(task_files.items()))
+        if Path(input_name).resolve() != paths["detector_input"].resolve():
+            raise ValueError("task input path differs")
+        selected = list(dict.fromkeys(r["image"] for r in read_jsonl(paths["detector_input"])))
+        if not selected or not all(isinstance(p, str) and Path(p).is_absolute() for p in selected):
+            raise ValueError("recovery requires canonical normalized image paths")
+        rows = list(read_jsonl(cache / "manifest/unique_images.jsonl"))
+        by_id, by_path = {}, {}
+        for row in rows:
+            image_id = row["image_id"]
+            if (image_id in by_id or image_id != "eval_" + row["content_id"][:20]
+                    or row["tasks"] != [task] or not row["image_paths"]
+                    or row["image_path"] != row["image_paths"][0]):
+                raise ValueError("unique image identity/role differs")
+            by_id[image_id] = row
+            for path in row["image_paths"]:
+                if path in by_path: raise ValueError("duplicate unique-manifest image path")
+                by_path[path] = row
+        if set(by_path) != set(selected): raise ValueError("manifest image paths differ from current inputs")
+        expected_selection = {"format_version": DETECTOR_MANIFEST_FORMAT_VERSION,
+            "input_dir": str(paths["detector_input"].parent.resolve()),
+            "task_files": {task: str(paths["detector_input"].resolve())},
+            "task_file_digests": {task: file_digest(paths["detector_input"])},
+            "max_images_per_task": 0, "skip_figma": False, "unique_images": len(rows),
+            "image_id_digest": digest_ids(row["image_id"] for row in rows),
+            "content_id_digest": digest_ids(row["content_id"] for row in rows),
+            "data_split": paths["normalized"].stem}
+        if read_json(cache / "manifest/selection_config.json") != expected_selection:
+            raise ValueError("selection/source digest differs")
+        samples = list(read_jsonl(cache / "manifest/task_samples.jsonl"))
+        if len(samples) != len(selected): raise ValueError("incomplete task samples")
+        for index, (sample, path) in enumerate(zip(samples, selected)):
+            row = by_path[path]
+            if sample != {"task": task, "task_index": index, "image_id": row["image_id"],
+                          "content_id": row["content_id"], "image_path": path}:
+                raise ValueError("task sample order or image identity differs")
+        seen = set()
+        for shard in sorted((cache / "manifest/shards").glob("shard_*.jsonl")):
+            members = list(read_jsonl(shard))
+            if not members: raise ValueError("empty shard")
+            for row in members:
+                if row["image_id"] in seen or by_id.get(row["image_id"]) != row:
+                    raise ValueError("stale/duplicate shard member")
+                seen.add(row["image_id"])
+        if seen != set(by_id): raise ValueError("incomplete shard membership")
+        if read_json(cache / "detections/detector_config.json") != config:
+            raise ValueError("detector config differs")
+        info = journal.load(selected)
+        if any(info[p] != (row["content_id"], row["width"], row["height"]) for p, row in by_path.items()):
+            raise ValueError("image bytes/dimensions changed since manifest generation")
+        after = {str(p): file_digest(p) for p in prepared_files(cache)}
+        if before != after or input_binding != preparation_binding(paths, normalization_id, config):
+            raise ValueError("manifest/source changed during recovery")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # Do not turn a persistently unstable storage read into a giant rebuild.
+        from ui14_verification import FileChangedDuringVerification
+        if isinstance(exc, FileChangedDuringVerification): raise
+        print(f"[cache-prepare recovery unavailable] {task_files if 'task_files' in locals() else cache}: {exc}", flush=True)
+        return None
+    publish_prepared(paths, normalization_id, config, len(rows))
+    print(f"[cache-prepare recovered] {task}/{paths['normalized'].stem}: "
+          f"{len(selected)} task-images, {len(rows)} unique images; manifests/shards unchanged; ready marker published", flush=True)
+    return len(rows)
+
+
 def validate_prepared(paths, normalization_id, config):
     """GPU handoff: only JSON/JSONL hashes, never image stat/read/decode/hash."""
     marker = paths["cache"] / "manifest/ui14_prepare_ready.json"
@@ -208,5 +291,7 @@ def validate_prepared(paths, normalization_id, config):
             raise ValueError("invalid unique image count")
         return count
     except (OSError, ValueError, KeyError, TypeError) as exc:
+        from ui14_verification import FileChangedDuringVerification
+        if isinstance(exc, FileChangedDuringVerification): raise
         raise RuntimeError(f"CPU preparation missing/stale at {marker}: {exc}. "
                            "Run bash shell/ui14_cpt9000_a800.sh cache-prepare on CPU first.") from exc

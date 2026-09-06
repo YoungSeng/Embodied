@@ -8,7 +8,7 @@ from pathlib import Path
 from ui14_common import *
 from ui14_repair import validate_normalization
 from ui14_progress import ProgressSession, detector_status, phase, track
-from ui14_cache_prepare import ImageInfoJournal, publish_prepared, validate_prepared
+from ui14_cache_prepare import ImageInfoJournal, publish_prepared, validate_prepared, recover_prepared
 from ui14_verification import verification_session, preparation_lock
 
 
@@ -93,6 +93,9 @@ def _run(args):
                 journal.expected_dimensions.update({r["source_image"]: (r["width"], r["height"])
                     for r in read_jsonl(paths["normalized"])})
                 marker = paths["cache"] / "manifest/ui14_prepare_ready.json"
+                if not marker.exists():
+                    recovered = recover_prepared(paths, binding["normalization_id"], expected_config, journal)
+                    if recovered is not None: continue
                 try:
                     count = validate_prepared(paths, binding["normalization_id"], expected_config)
                     existing = list(read_jsonl(paths["cache"] / "manifest/unique_images.jsonl"))

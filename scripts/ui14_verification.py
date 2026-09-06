@@ -18,7 +18,43 @@ def checksum(value):
 
 def signature(path):
     s = Path(path).stat()
+    return stat_values(s)
+
+
+def stat_values(s):
     return [s.st_size, s.st_mtime_ns, s.st_ctime_ns]
+
+
+class FileChangedDuringVerification(ValueError):
+    """Only this transient condition permits a bounded content-read retry."""
+    def __init__(self, path, before, after):
+        super().__init__(f"File changed during verification: {path}; "
+                         f"before={before}; after={after}; stat=[size,mtime_ns,ctime_ns]")
+
+
+def stable_sha256(path):
+    """Hash one opened file; reject writes or atomic replacement while reading."""
+    before = signature(path)
+    h = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        opened = os.fstat(stream.fileno())
+        count = 0
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(block); count += len(block)
+        finished = os.fstat(stream.fileno())
+        current = Path(path).stat()
+        # Compare ctime across reads of the same API. Some Windows runtimes
+        # expose different ctime semantics through stat and fstat; cross-API
+        # equality is required only for size/mtime, plus the device/inode pair.
+        if (before != stat_values(current) or stat_values(opened) != stat_values(finished)
+                or before[:2] != stat_values(opened)[:2] or count != before[0]
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)):
+            raise FileChangedDuringVerification(path, before, {
+                "opened": stat_values(opened), "finished": stat_values(finished),
+                "current": stat_values(current), "bytes_read": count,
+                "opened_file_id": [opened.st_dev, opened.st_ino],
+                "current_file_id": [current.st_dev, current.st_ino]})
+    return h.hexdigest(), before
 
 
 class Journal:
@@ -84,7 +120,7 @@ class Verification:
     def remember(self, path, kind, value, measured_stat=None):
         path = str(Path(path).absolute()); state = signature(path)
         if measured_stat is not None and measured_stat != state:
-            raise ValueError(f"File changed during verification: {path}")
+            raise FileChangedDuringVerification(path, measured_stat, state)
         key = kind + ":" + path
         if kind == "rgb_identity" or Path(path).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"):
             self.image_keys.add(key)
@@ -96,10 +132,21 @@ class Verification:
     def sha256(self, path):
         value = self.get(path, "sha256")
         if value is None:
-            state = signature(path); h = hashlib.sha256()
-            with Path(path).open("rb") as f:
-                for block in iter(lambda: f.read(1024 * 1024), b""): h.update(block)
-            value = self.remember(path, "sha256", h.hexdigest(), state)
+            # Newly published files can briefly expose different attributes
+            # between stat/open/read. Re-read only this file; never cache the
+            # digest from an unstable attempt or waive the metadata comparison.
+            for attempt in range(4):
+                try:
+                    measured, state = stable_sha256(path)
+                    value = self.remember(path, "sha256", measured, state)
+                    break
+                except FileChangedDuringVerification as exc:
+                    if attempt == 3:
+                        raise FileChangedDuringVerification(path, "4 unstable read attempts",
+                            f"{exc}; check other writers/storage; no digest accepted") from exc
+                    delay = (.5, 1, 2)[attempt]
+                    print(f"[verification retry {attempt + 1}/3] {exc}; re-read this file after {delay}s", flush=True)
+                    time.sleep(delay)
         for collector in self.collectors: collector[str(Path(path).absolute())] = value
         return value
 

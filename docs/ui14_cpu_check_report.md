@@ -169,6 +169,32 @@ bash -n shell/ui14_cpt9000_a800.sh
 
 真实运行会在现有派生根目录保存 `crop_performance/first_500_built.json`、`crop_performance/latest.json` 和每次 run_id 的快照。报告记录新原图/s、crop/s、实际并发、读取/解码/编码/写入时间、CPU/RSS、逐 split 复用/新建/待处理数量与裁图 ETA。0.79 原图/s 是用户给出的旧日志基线；8 原图/s 是目标，不能用本地小图回归速度宣称达到。无需新增 smoke 训练。
 
+## 2026-09-07 准备完成标记发布失败的恢复修复
+
+增量基线 `1d6f6c147711d3eb22e9014d945fc0d54ffb1c4e`。用户远端日志显示 synth_occlusion/train 已完成 56,000 task-images、53,047 张内容唯一图片及 71 个分片，随后在 `publish_prepared` 核验 unique_images.jsonl 时发现属性变化并退出。这些数量来自用户日志，本地未读取该集群目录；旧日志没有 before/after 属性值，不能确认具体变化原因。
+
+修复文件为 `scripts/ui14_verification.py`、`scripts/ui14_cache_prepare.py` 和 `scripts/prepare_ui14_detector_crops.py`。SHA256 对不稳定的同一文件最多读取 4 次，不缓存失败尝试的摘要；核对路径和文件描述符各自前后属性、大小/mtime、读取字节数及设备/inode。路径 stat 和描述符 fstat 的 ctime 各自在同一种 API 内比较，兼容本地 Windows 运行时的不同返回语义；不取消 ctime 变化检查。持续变化仍报错并展示前后属性。
+
+缺少最后 ready 标记时，CPU 恢复核对来源摘要、唯一图片、任务样本顺序、全部分片成员及图片 journal，再只补发布标记。正常完成的 split 仍 reused；恢复的 split 输出 `[cache-prepare recovered]`。缺分片、错误 split/selection 等不会被当作完成，持续不稳定的读取不会触发整份清单重建。
+
+新增 9 项 CPU 回归，连同现有回归共 **120 项全部通过，78.210 秒**；5 个 Python 文件 AST 和 `git diff --check` 通过。
+
+- 短暂属性变化只重读对应文件，稳定后才保存摘要；下一次可复用。
+- hash 后、保存验证记录前发生真实内容变化，旧摘要不会写入 journal。
+- 连续 4 次变化仍失败，缺文件不做无效重试；同尺寸/时间戳下的文件替换由设备/inode 检查拒绝。
+- stat/fstat 的固定 ctime 差异不会误报；描述符自身 ctime 在读取期间变化仍被拒绝。
+- 构造完整准备产物后删除最后标记，禁止打开原图、禁止重建清单仍可恢复；manifest、分片与已有 detector 完成文件的字节和 mtime 不变。
+- 截断分片及过时 selection 均不能补发成功标记。
+
+```bash
+python -m unittest tests.test_ui14_verification_retry tests.test_ui14_parallel_crops \
+  tests.test_ui14_cache_stages tests.test_ui14_progress tests.test_ui14_normalize_resume \
+  tests.test_ui14_repair tests.test_ui14_pipeline tests.test_ui5_eval_detector_scan \
+  tests.test_ui5_eval_detector_scan_v5 tests.test_ui14_inference_workers
+```
+
+本次仅执行本地 CPU 验证，未执行真实集群恢复、GPU 检测或提交。数据、裁剪/模型策略与正式训练配置未变；更新代码后在原输出目录重新运行 cache-prepare，不需要重跑 normalize 或删除缓存。
+
 ## 实际数据统计的产生位置
 
 派生根目录：

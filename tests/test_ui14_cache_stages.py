@@ -170,6 +170,41 @@ class StageSeparationTests(unittest.TestCase):
         for call in worker.call_args_list:
             self.assertIn("--resume", call.args[0]); self.assertTrue(call.kwargs["check"])
 
+    def test_missing_final_prepare_marker_recovers_without_rebuilding_manifests_or_images(self):
+        self.prepare()
+        task, split = self.jobs[4]
+        paths = paths_for(self.data, task.task_key, split)
+        (paths["cache"] / "manifest/ui14_prepare_ready.json").unlink()
+        # An existing detector shard must remain untouched by CPU recovery.
+        write_json(paths["cache"] / "detections/text/shard_00000.done.json", {"fixture": "preserve"})
+        files = metadata.prepared_files(paths["cache"]) + [paths["cache"] / "detections/text/shard_00000.done.json"]
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in files}
+        with mock.patch.object(Image, "open", side_effect=AssertionError("recovery decoded image")), \
+             mock.patch.object(metadata, "inspect_image", side_effect=AssertionError("recovery hashed original")), \
+             mock.patch.object(detector, "prepare_manifest", side_effect=AssertionError("recovery rebuilt manifests")), \
+             mock.patch.object(pipeline, "recover_prepared", wraps=metadata.recover_prepared) as recovered:
+            self.prepare()
+        recovered.assert_called_once()
+        self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in files})
+        self.assertTrue((paths["cache"] / "manifest/ui14_prepare_ready.json").is_file())
+
+    def test_recovery_rejects_truncated_shards_and_stale_selection(self):
+        self.prepare()
+        task, split = self.jobs[4]; paths = paths_for(self.data, task.task_key, split)
+        marker = paths["cache"] / "manifest/ui14_prepare_ready.json"; marker.unlink()
+        config = read_json(paths["cache"] / "detections/detector_config.json")
+        normalization_id = read_json(self.data / "source_snapshot.json")["normalization_id"]
+        journal = metadata.ImageInfoJournal(self.data / "cache_preparation/image_info.jsonl")
+        shard = next((paths["cache"] / "manifest/shards").glob("*.jsonl"))
+        payload = shard.read_bytes(); shard.write_bytes(b"")
+        self.assertIsNone(metadata.recover_prepared(paths, normalization_id, config, journal))
+        self.assertFalse(marker.exists())
+        shard.write_bytes(payload)
+        selection = paths["cache"] / "manifest/selection_config.json"
+        value = read_json(selection); value["data_split"] = "wrong-split"; write_json(selection, value)
+        self.assertIsNone(metadata.recover_prepared(paths, normalization_id, config, journal))
+        self.assertFalse(marker.exists())
+
     def test_missing_or_tampered_last_split_fails_before_any_gpu_work(self):
         self.prepare(); self.args.stage = "detect"
         task, split = self.jobs[-1]
