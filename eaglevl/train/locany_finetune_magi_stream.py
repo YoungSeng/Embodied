@@ -1341,7 +1341,8 @@ class LazySupervisedDatasetMTP(Dataset):
             )
 
     def multi_modal_get_item(
-        self, messages: list, ui_targets: Optional[Dict[str, torch.Tensor]] = None
+        self, messages: list, ui_targets: Optional[Dict[str, torch.Tensor]] = None,
+        audit_negative: bool = False,
     ) -> Dict[str, torch.Tensor]:
         message_text = self.processor.py_apply_chat_template(messages, tokenize=False)
         image_inputs, video_inputs = self.processor.process_vision_info(messages)
@@ -1383,9 +1384,13 @@ class LazySupervisedDatasetMTP(Dataset):
         )
         if ui_targets is not None:
             result.update(ui_targets)
+        if audit_negative:
+            from eaglevl.train.ui5_token_contract import negative_mtp_contract
+            result["negative_supervision_audit"] = negative_mtp_contract(
+                input_ids, labels_dict, self.processor.tokenizer, self.block_size)
         return result
 
-    def _materialize_logical_index(self, logical_index: int) -> Dict[str, torch.Tensor]:
+    def _materialize_logical_index(self, logical_index: int, audit_negative: bool = False) -> Dict[str, torch.Tensor]:
         real_idx = self.active_indices[int(logical_index)]
         data_item = self.lazy_loader[real_idx]
         ui_targets = extract_ui_defect_targets(data_item, max_boxes=8)
@@ -1394,7 +1399,7 @@ class LazySupervisedDatasetMTP(Dataset):
             self.target_fps, self.video_total_pixels,
             visual_prompt=self.visual_prompt,
         )
-        return self.multi_modal_get_item(data_item, ui_targets=ui_targets)
+        return self.multi_modal_get_item(data_item, ui_targets=ui_targets, audit_negative=audit_negative)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         retry_count = 0
@@ -4091,6 +4096,11 @@ def build_stream_packed_dataset_mtp(
 ) -> StreamPackedDatasetMTP:
     """Build StreamPackedDatasetMTP."""
     ds_collections = json.loads(open(data_args.meta_path).read())
+    if os.environ.get("UI5_CURRICULUM_PROFILE") == "global_replay_v3":
+        from scripts.ui5_curriculum_text_revision import verify_revision
+        verify_revision(Path(data_args.meta_path).resolve().parent,
+                        expected_recipe_sha=os.environ["UI5_TRAIN_RECIPE_SHA256"],
+                        expected_identity=os.environ["UI5_TRAIN_TEXT_IDENTITY"])
     curriculum_schedule = UI5CurriculumSchedule.from_environment(
         os.environ,
         default_total_steps=int(total_steps),
@@ -4483,6 +4493,9 @@ def main():
         total_steps=training_args.max_steps,
     )
     train_dataset.configure_num_workers(training_args.dataloader_num_workers)
+    if os.environ.get("UI5_CURRICULUM_PROFILE") == "global_replay_v3":
+        from eaglevl.train.ui5_token_contract import audit_training_negative_pools
+        audit_training_negative_pools(train_dataset, training_args.output_dir, get_rank(), data_args.meta_path)
     logger.info(f"Dataset built in {time.time() - t_start:.2f}s")
 
     # Freeze params

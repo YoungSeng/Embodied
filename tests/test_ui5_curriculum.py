@@ -414,6 +414,8 @@ class CurriculumScheduleTest(unittest.TestCase):
             "eaglevl/train/ui5_curriculum.py",
             "eaglevl/train/ui5_curriculum_profiles.py",
             "eaglevl/train/ui5_token_contract.py",
+            "eaglevl/train/ui5_supervision.py",
+            "scripts/ui5_curriculum_text_revision.py",
             "eaglevl/model/locany/modeling_locateanything.py",
             "eaglevl/model/locany/relation_modules.py",
             "eaglevl/model/locany/ui_relation_setup.py",

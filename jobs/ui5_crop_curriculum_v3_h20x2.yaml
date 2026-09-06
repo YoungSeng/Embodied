@@ -1,5 +1,7 @@
 # Formal H20x2 resource/profile template. The foreground v3 renderer binds the
-# existing hour021 publication, fresh output paths, code SHA and actual old raw.
+# hour021 selection/PNGs + NEW text-v3-1 JSONLs, recipe/text hashes, fresh output,
+# code SHA and actual old raw. UI5_TRAIN_TEXT_IDENTITY / UI5_TRAIN_RECIPE_SHA256 /
+# META_PATH / CURRICULUM_DATA_DIR are required and filled by the renderer.
 # Submit with scripts/ui5_curriculum_v3.py --previous-submission-dir ... --submit.
 # Submit the GENERATED formal.yaml, not this unbound resource template.
 caption: UI5 Crop Curriculum v3 H20x2

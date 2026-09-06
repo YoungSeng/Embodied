@@ -393,6 +393,8 @@ _CONTINUITY_IMPLEMENTATION_FILES = (
     "eaglevl/train/ui5_curriculum.py",
     "eaglevl/train/ui5_curriculum_profiles.py",
     "eaglevl/train/ui5_token_contract.py",
+    "eaglevl/train/ui5_supervision.py",
+    "scripts/ui5_curriculum_text_revision.py",
     "eaglevl/model/locany/modeling_locateanything.py",
     "eaglevl/model/locany/relation_modules.py",
     "eaglevl/model/locany/ui_relation_setup.py",
@@ -580,6 +582,12 @@ def curriculum_artifact_identity(
     declared_files = success.get("files")
     if not isinstance(declared_files, dict) or not declared_files:
         raise RuntimeError("Curriculum _SUCCESS.json has no file hash inventory")
+    asset_root = recipe.parent
+    if manifest.get("text_revision"):
+        from scripts.ui5_curriculum_text_revision import verify_revision
+        verify_revision(recipe.parent, expected_recipe_sha=actual_recipe_hash,
+                        expected_identity=declared_identity)
+        asset_root = Path(manifest["outputs"]["crop_asset_root"]).resolve(strict=True)
     crop_assets: list[Any] | None = None
     if artifact_schema >= 3:
         raw_crop_assets = manifest.get("crop_assets")
@@ -601,6 +609,8 @@ def curriculum_artifact_identity(
             "crop_assets.jsonl",
             *asset_names,
         }
+        if manifest.get("text_revision"):
+            expected_file_names.add("supervision_format.json")
         if (
             len(asset_names) != len(crop_assets)
             or "" in asset_names
@@ -612,7 +622,7 @@ def curriculum_artifact_identity(
         relative = Path(str(name))
         if relative.is_absolute() or ".." in relative.parts:
             raise RuntimeError(f"Curriculum inventory path is unsafe: {name}")
-        path = recipe.parent / relative
+        path = (asset_root if artifact_schema >= 3 and str(name) in asset_names else recipe.parent) / relative
         if not path.is_file():
             raise RuntimeError(f"Curriculum inventory file is missing: {path}")
         if artifact_schema >= 3:

@@ -379,6 +379,10 @@ def verify_prepared_curriculum(env: dict[str, str]) -> dict:
         raise RuntimeError("prepared hard-group count differs from frozen summary")
     if not (frozen / "_SUCCESS").is_file():
         raise RuntimeError("frozen selection is not published")
+    if env.get("UI5_TRAIN_TEXT_IDENTITY") or env.get("UI5_CURRICULUM_PROFILE") == "global_replay_v3":
+        from scripts.ui5_curriculum_text_revision import verify_revision
+        verify_revision(data_dir, expected_recipe_sha=env.get("UI5_TRAIN_RECIPE_SHA256"),
+                        expected_identity=env.get("UI5_TRAIN_TEXT_IDENTITY"))
     return manifest
 
 

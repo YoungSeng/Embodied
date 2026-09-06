@@ -1,8 +1,61 @@
 # UI5 Crop Curriculum v3 — H20×2
 
 分支：`codex/ui5-crop-curriculum-v3`。这是新的实验，不保证 F1 提升。
-仅 UI5；复用 hour021 已发布的 frozen selection、课程 manifest 和 PNG。
-不重跑 rollout、不调用课程 builder、不重新生成或复制 crop PNG、不修改旧运行。
+仅 UI5；复用 hour021 已发布的 frozen selection、课程分组和 PNG。
+当前版本先发布独立的 `text-v3-1` 训练文本/recipe/manifest，再提交新运行。
+不重跑 rollout、不调用课程 builder、不重新生成或复制 crop PNG、不修改旧运行或旧文本。
+
+## 负例监督修正：text-v3-1
+
+所有池统一按当前训练视图的 GT 判断正负，不能用原图是否有缺陷代替：
+
+- crop 使用 `_ui5_crop_gt_local_1000`；content_missing 整图使用 `_ui5_union_gt_1000`。
+- 空 GT 的完整答案严格为 `<box>none</box>`，不含 `<ref>`、空白、EOS 或额外标签。
+- 非空 GT 为 `<ref>该任务的原有英文标签</ref>` 后接全部 norm1000 框，保持 GT 原顺序。
+- 数据 JSONL 不手写 EOS；真实训练 chat template 添加 `<|im_end|>`。
+
+修复了 builder 将原图 `<ref>` 无条件带到无缺陷 crop 的逻辑；三个池和整图走同一格式化规则。
+正式入口还会读取已有 JSONL，生成独立版本，而不是只更新 builder 后继续使用旧文本。
+只改需要修正的 assistant 答案：样本 ID、GT、样本数、prompt、图片字段完全保留；
+已经正确的 JSONL 行按原字节复制。无法核实独立 GT 时直接报错，不从答案猜 GT，不填补坐标。
+此修正不改变评测 parser、invalid 处罚、解码器、loss 权重或课程比例。
+
+默认的新训练文本目录（`<hash12>` 绑定旧发布身份及修正实现，入口会打印完整路径）：
+
+```text
+/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_data/ui5_curriculum/
+  hour021-s42-reuse-20260905T065342Z-f8d36a-text-v3-1-<hash12>/
+    hard.jsonl
+    matched_anchor.jsonl
+    global_replay.jsonl
+    ui5_crop_rollout4_curriculum.json
+    curriculum_manifest.json
+    supervision_format.json
+    _SUCCESS.json
+```
+
+recipe 的三条 annotation 都指向上面新 JSONL 的绝对路径。
+PNG 不搬迁、不遍历生成，新 manifest 的 `crop_asset_root` 继续指向原图片目录。
+冻结 hard/anchor 分组文件按原字节保留；新 manifest/SUCCESS、正式 YAML、训练读取及 checkpoint
+连续性身份绑定新 recipe 和文本 SHA256。改回旧 annotation、篡改文本或使用旧 manifest 都会被拒绝。
+相同输入/实现再次准备可校验后复用已经发布的新文本；不覆盖未完成的发布目录。
+
+`supervision_audit()` 逐条比较完整答案与当前视图 GT，包括任务 ref、全部坐标、顺序及尾部内容，
+不再只数标签。`supervision_format.json` 分池记录 ref 负例修正前/后数量、总修改数、
+原图正→crop 负数量、样例 sample/crop ID、修改前后文本、新旧路径和 SHA。
+正式训练构造真实 dataset 后，每池选定第一个实际负例，执行同一个 processor、图像预处理、
+chat template、tokenizer、截断和 `get_targets_flag_with_mtp`，检查：
+
+```text
+AR:         <box> none </box> EOS
+MTP block1: <box> none </box> <null> <null> <null>
+MTP block2: EOS   <null> <null> <null> <null> <null>
+```
+
+审计不推进 sampler，完整恢复 Python/NumPy/Torch/CUDA RNG，实际 token ID 写入
+`diagnostics/negative_mtp_audit_rank*.json` 并打印 `[NEGATIVE MTP PASS]`。
+新全量 step 0 发生在训练前，因此该节点的实际 MTP 审计尚不可用；从 step 200 起必须有真实报告，
+不会把 CPU mock 测试结果冒充 H20 tokenizer 实测。
 
 ## 已核实的旧运行证据
 
@@ -53,7 +106,9 @@ legacy 仅用于同权重配对测量；正式全量 step 0 和所有训练后�
 ## 提交：开发机当前窗口一次执行
 
 先确认旧训练已结束，不要在旧任务仍运行时切换其共享代码 checkout。
-以下命令只提交一次新任务；保留所有旧提交记录，不删除任何 restart reservation。
+以下命令只提交一次新的 text-v3-1 任务；保留所有旧提交记录，不删除任何 restart reservation。
+新的 `curriculum-v3-text-v3-1.started` 与之前的 `curriculum-v3.started` 独立，
+已经提交过旧 v3 不妨碍本次文本修正版；同一修正版重复提交仍会被阻止。
 
 ```bash
 bash <<'BASH'
@@ -73,7 +128,8 @@ BASH
 
 CPU 准备阶段读取旧 `snapshot-switch.json`/`formal.yaml`，检查二者一致，
 原样继承真实资源、processor、batch/梯度累积和目录配置。
-metadata/hash 检查后只扫描已有训练文本及旧 raw，不解码训练图片，不构建数据。
+metadata/hash 检查后扫描已有训练文本及旧 raw，发布答案修正版本，不解码训练图片，不生成 PNG。
+准备阶段打印 `[TEXT PROGRESS]` 和各池 `[TEXT FIX]`，只有文本发布、完整格式审计通过才提交。
 为原模型建立新目录的私有代码/config/tokenizer 副本及同挂载硬链接权重，
 不会复制 optimizer/scheduler/trainer_state 或写入原模型目录。
 原模型固定为：
@@ -99,7 +155,7 @@ hard/anchor 数来自已发布 manifest，不写死。五任务及池级正负�
 各 task/polarity 的真实 group 数（包括 0）列入 data_coverage；global replay 核验全部十个 strata。
 不为补齐 frozen hard/anchor 中某个细分空格而制造/更换样本。
 SDPA，三个 token/sequence 限制均 7268，batch 沿用单卡 1、梯度累积继承旧运行。
-所有架构、训练 loss 权重和 LR 保留，主要训练变量是课程比例。
+所有架构、训练 loss 权重和 LR 保留；在既有 v3 配比基础上修正负例监督格式。
 
 流程：配对解码比较 → 新全量 step 0 → DDP 训练 200 → 退出 DDP →
 GPU0 同时 occlusion/cropping，GPU1 同时 text_overflow/text_ellipsis/content_missing →
@@ -117,11 +173,12 @@ hard 转移明确标为 train/mining、相对冻结 0/4；不能当作 held-out 
 每次 `[V3 READY]` 打印实际 RUN_NAME、OUTPUT_DIR、正式 YAML 路径。
 
 ```text
-$WORKSPACE/gui_models/Embodied-ui5-det-crop/ui5-crop-curriculum-v3-h20x2-<UTC>-<unique>/
+$WORKSPACE/gui_models/Embodied-ui5-det-crop/ui5-crop-curriculum-v3-text-v3-1-h20x2-<UTC>-<unique>/
   diagnostics/v3_preparation.json                 数据/旧 raw/负例监督/存储检查
   diagnostics/decoder_comparison.json             同权重旧/新解码收益、hybrid/slow
   diagnostics/decoder_comparison/*/               比较 raw、worker 日志及正式 scorer 输出
   diagnostics/training_token_contract_rank*.json  训练 token ID 核验
+  diagnostics/negative_mtp_audit_rank*.json         实际新 dataset/processor/MTP 负例标签
   diagnostics/ui5_crop_rollout4_curriculum_evaluation.xlsx
   evaluation/step-000000/... → step-001200/...     全量 UI5 raw/指标/anchor/hard
   checkpoints.json                               所有节点及 best 指针
@@ -132,7 +189,8 @@ $WORKSPACE/gui_logs/ui5_curriculum/<RUN_NAME>/formal.yaml
 ```
 
 Excel 包含 train_curve、ui5_overall、ui5_by_task、hard_transition、anchor_retention、checkpoints，
-以及 data_coverage、output_validity、provenance、decoder_comparison、inference_fix_gain、training_vs_baseline。
+以及 data_coverage、output_validity、provenance、decoder_comparison、inference_fix_gain、training_vs_baseline、
+supervision_format、training_text_identity、negative_mtp_supervision。
 记录实际采样累计/窗口比例、实际 loss 分量（缺失为 null/空白，不填 0）、总体和五任务混淆计数、
 invalid image/tile 分类、代码 SHA、数据 hash、解码配置及推理耗时。
 bbox TN 沿用 evaluator 定义：不可用则空白，不发明目标框级 true-negative 总数。
@@ -145,7 +203,8 @@ WORKSPACE=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace
 cd "$WORKSPACE/code/Embodied-ui5-curriculum"
 CUDA_VISIBLE_DEVICES="" UI5_CURRICULUM_PROFILE=scheduled_v2 "$WORKSPACE/conda_envs/LocateAnything/bin/python" -B -m unittest -b \
   tests.test_ui5_curriculum_v3 tests.test_ui5_curriculum_evaluation \
-  tests.test_ui5_curriculum_pipeline tests.test_ui5_curriculum_artifacts
+  tests.test_ui5_curriculum_pipeline tests.test_ui5_curriculum_artifacts \
+  tests.test_ui5_supervision_revision
 ```
 
 证据包只读复核（不解压、不执行包内内容、不改变预测）：

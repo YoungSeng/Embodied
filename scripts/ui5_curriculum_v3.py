@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
-import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -24,6 +23,7 @@ from scripts.ui5_output_validity import audit_evaluation
 from eaglevl.train.ui5_checkpoint_utils import validate_checkpoint
 from eaglevl.train.ui5_curriculum_profiles import profile_env
 from scripts.restart_ui5_after_storage_failure import check_storage
+from scripts.ui5_curriculum_text_revision import publish_revision, supervision_audit, verify_revision, sha
 
 ORIGINAL_MODEL_RELATIVE = "gui_models/Embodied-ui5-det-crop/locany-ui5-v5-croponly-sourcebalanced-a800x4-20260830/checkpoint-12000"
 
@@ -44,45 +44,6 @@ def pool_coverage(manifest):
                     raise ValueError(f"immutable pool {pool} lacks {task}/{polarity}; cannot fabricate coverage or change frozen IDs")
                 rows.append({"pool": pool, "task": "ui_" + task, "polarity": polarity,
                              "group_count": count, "sampling_unit": "sample_group", "scope": "train-only immutable pool"})
-    return rows
-
-
-def supervision_audit(directory):
-    """Inspect real training text only, not held-out GT or image pixels."""
-    rows = []
-    for filename in ("hard.jsonl", "matched_anchor.jsonl", "global_replay.jsonl"):
-        total = negative = 0
-        examples = []
-        source = directory / filename
-        with source.open(encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, 1):
-                if not line.strip():
-                    continue
-                record = json.loads(line)
-                messages = record.get("messages") or record.get("conversations") or []
-                answers = []
-                for message in messages:
-                    if message.get("role", message.get("from")) not in {"assistant", "gpt"}:
-                        continue
-                    value = message.get("content", message.get("value"))
-                    answer = value if isinstance(value, str) else "".join(
-                        item.get("text", "") for item in value or [] if isinstance(item, dict))
-                    answers.append(answer)
-                if not answers:
-                    raise ValueError(f"training record has no assistant supervision: {source}:{line_number}")
-                for answer in answers:
-                    total += 1
-                    if "<box>" not in answer or answer.count("<box>") != answer.count("</box>"):
-                        raise ValueError(f"unclosed/missing training box supervision: {source}:{line_number}")
-                    if re.search(r"<box>\s*none\s*</box>", answer):
-                        negative += 1
-                        if len(examples) < 3:
-                            examples.append({"line": line_number, "assistant_text": answer})
-        if not negative:
-            raise ValueError(f"training pool lacks <box>none</box> supervision: {source}")
-        rows.append({"pool": source.stem, "source": str(source), "assistant_targets": total,
-                     "negative_box_none_targets": negative, "negative_examples": examples,
-                     "eos_supervision": "training chat template <|im_end|>; see token contract and decoder traces"})
     return rows
 
 
@@ -172,7 +133,7 @@ def frozen_eval_subset(source: Path, destination: Path, seed: int, count: int):
 
 def prepare(args):
     old_path = resolve_source(args.previous_submission_dir)
-    reservation = old_path.parent / "curriculum-v3.started"
+    reservation = old_path.parent / "curriculum-v3-text-v3-1.started"
     if args.submit and reservation.exists():
         raise RuntimeError(f"v3 submission already reserved: {reservation}; inspect its target, do not repeat")
     old = json.loads(old_path.read_text(encoding="utf-8"))
@@ -189,7 +150,6 @@ def prepare(args):
         raise ValueError("v3 must reuse the existing hour021 selection, not refreeze another snapshot")
     curriculum = preparation.verify_prepared_curriculum(env)
     coverage = pool_coverage(curriculum)
-    supervision = supervision_audit(Path(env["CURRICULUM_DATA_DIR"]))
     previous_output = Path(env["OUTPUT_DIR"]).resolve(strict=True)
     # Read the actual raw/worker summaries before preparing any new experiment.
     audits = {str(step): audit_evaluation(previous_output / "evaluation" / f"step-{step:06d}")
@@ -198,8 +158,15 @@ def prepare(args):
     original = workspace / ORIGINAL_MODEL_RELATIVE
     storage = check_storage(previous_output.parent, old_path.parent.parent,
                             previous_output / "resume/latest", original)
+    text_source = env["CURRICULUM_DATA_DIR"]
+    text_directory, curriculum = publish_revision(text_source)
+    supervision = supervision_audit(text_directory)
+    env.update({"CURRICULUM_DATA_DIR": str(text_directory),
+                "META_PATH": str(text_directory / "ui5_crop_rollout4_curriculum.json"),
+                "UI5_TRAIN_TEXT_IDENTITY": curriculum["identity_digest"],
+                "UI5_TRAIN_RECIPE_SHA256": curriculum["training_text"]["recipe_sha256"]})
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
-    name = "ui5-crop-curriculum-v3-h20x2-" + stamp
+    name = "ui5-crop-curriculum-v3-text-v3-1-h20x2-" + stamp
     output = previous_output.parent / name
     submission = old_path.parent.parent / name
     output.mkdir(exist_ok=False)
@@ -233,6 +200,11 @@ def prepare(args):
               "storage_check": storage,
               "pool_coverage": coverage,
               "training_supervision_audit": supervision,
+              "training_text": {"source_directory": text_source, "directory": str(text_directory),
+                                "recipe_path": env["META_PATH"], "identity_digest": curriculum["identity_digest"],
+                                "manifest_sha256": sha(text_directory / "curriculum_manifest.json"),
+                                **curriculum["training_text"]},
+              "supervision_format": json.loads((text_directory / "supervision_format.json").read_text(encoding="utf-8")),
               "batch_profile": {"per_device_train_batch_size": 1,
                                 "gradient_accumulation_steps": env["GRADIENT_ACCUMULATION_STEPS"]},
               "degraded_status": "available" if degraded_view else "step-200 checkpoint unavailable; NOT replaced by later weights",
@@ -258,7 +230,8 @@ def prepare(args):
     state_path = submission / "snapshot-switch.json"
     preparation.write_state(state_path, state)
     print(f"[V3 READY] yaml={job_path} output={output} hard={curriculum['hard_groups']} "
-          f"anchor={curriculum['matched_anchor_groups']} PNG_generation=0", flush=True)
+          f"anchor={curriculum['matched_anchor_groups']} training_text={text_directory} "
+          f"recipe_sha256={env['UI5_TRAIN_RECIPE_SHA256']} PNG_generation=0", flush=True)
     if args.submit:
         mlx = shutil.which(args.mlx_bin)
         if not mlx:
@@ -275,6 +248,8 @@ def compare():
     env = os.environ
     output = Path(env["OUTPUT_DIR"])
     manifest = preparation.verify_prepared_curriculum(env)
+    verify_revision(env["CURRICULUM_DATA_DIR"], expected_recipe_sha=env["UI5_TRAIN_RECIPE_SHA256"],
+                    expected_identity=env["UI5_TRAIN_TEXT_IDENTITY"])
     cells = []
     candidates = {"original": env["MODEL_PATH"]}
     if env.get("UI5_V3_DEGRADED_MODEL"):

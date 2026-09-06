@@ -423,6 +423,20 @@ def run(args: argparse.Namespace) -> dict[str, str]:
                                  "loss_missing_policy": "null, never synthetic zero"}]
         run_root = evaluation_dir.parent.parent
         preparation = json.loads((run_root / "diagnostics/v3_preparation.json").read_text(encoding="utf-8"))
+        extra["supervision_format"] = [{"step": args.step, **row} for row in preparation["supervision_format"]["pools"]]
+        extra["training_text_identity"] = [{"step": args.step, **preparation["training_text"]}]
+        mtp_reports = sorted((run_root / "diagnostics").glob("negative_mtp_audit_rank*.json"))
+        extra["negative_mtp_supervision"] = []
+        for path in mtp_reports:
+            mtp = json.loads(path.read_text(encoding="utf-8"))
+            if (mtp["recipe_sha256"] != preparation["training_text"]["recipe_sha256"]
+                    or mtp["recipe_path"] != preparation["training_text"]["recipe_path"]
+                    or {r["pool"] for r in mtp["pools"]} != {"hard", "matched_anchor", "global_replay"}
+                    or any(r.get("valid") is not True for r in mtp["pools"])):
+                raise ValueError("real MTP audit differs from the new training text or has invalid labels")
+            extra["negative_mtp_supervision"].extend({"step": args.step, "report": str(path), **row} for row in mtp["pools"])
+        if args.step > 0 and {p.name for p in mtp_reports} != {"negative_mtp_audit_rank0.json", "negative_mtp_audit_rank1.json"}:
+            raise ValueError("v3 training requires both H20 ranks' real processor/MTP negative supervision audits")
         extra["data_coverage"].extend({"step": args.step, **row} for row in preparation["pool_coverage"])
         comparison = json.loads((run_root / "diagnostics/decoder_comparison.json").read_text(encoding="utf-8"))
         if comparison.get("complete") is not True:

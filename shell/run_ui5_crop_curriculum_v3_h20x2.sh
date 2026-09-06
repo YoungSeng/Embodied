@@ -15,6 +15,8 @@ cd "${PROJECT_ROOT}"
 : "${OUTPUT_DIR:?use the v3 submission renderer}"
 : "${MODEL_PATH:?private original-crop model view required}"
 : "${PYTHON_BIN:?Python runtime must be inherited from the working H20 profile}"
+: "${UI5_TRAIN_TEXT_IDENTITY:?corrected text publication must be bound by the v3 renderer}"
+: "${UI5_TRAIN_RECIPE_SHA256:?corrected recipe hash must be bound by the v3 renderer}"
 [[ -s "${OUTPUT_DIR}/diagnostics/v3_preparation.json" ]]
 [[ "${MODEL_PATH}" == "${OUTPUT_DIR}/initial_model" ]]
 # A v3 job starts fresh; only the in-job 200-step loop may resume its optimizer.

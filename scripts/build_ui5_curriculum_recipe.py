@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 from collections import Counter, defaultdict
 from contextlib import nullcontext
@@ -33,6 +34,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from PIL import Image
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from eaglevl.train.ui5_supervision import FORMAT_VERSION, canonical_answer
 
 try:
     from ui5_curriculum_progress import BuildProgress
@@ -1189,7 +1193,6 @@ def _canonical_selected_supervision(
 
     if all(has_source_metadata):
         global_to_norm: dict[tuple[int, int, int, int], tuple[int, int, int, int]] = {}
-        prefixes: set[str] = set()
         prompts: set[str] = set()
         media: set[str] = set()
         source_record_ids: set[str] = set()
@@ -1215,7 +1218,7 @@ def _canonical_selected_supervision(
                     f"selected sample {sample_id} source {source_record_id} has "
                     "mismatched global/norm1000 GT counts"
                 )
-            prefix, answer_boxes = _answer_contract(
+            _, answer_boxes = _answer_contract(
                 _assistant_text(record),
                 label=f"selected sample {sample_id} source {source_record_id} answer",
             )
@@ -1224,7 +1227,6 @@ def _canonical_selected_supervision(
                     f"selected sample {sample_id} source {source_record_id} answer "
                     "does not match its declared norm1000 GT"
                 )
-            prefixes.add(prefix)
             prompts.add(_human_text(record))
             media.add(_media_signature(record))
             for global_box, norm_box in zip(global_boxes, norm_boxes):
@@ -1238,10 +1240,10 @@ def _canonical_selected_supervision(
                     )
                 global_to_norm[global_key] = norm_key
 
-        if len(prefixes) != 1 or len(prompts) != 1 or "" in prompts or len(media) != 1:
+        if len(prompts) != 1 or "" in prompts or len(media) != 1:
             raise ValueError(
                 f"selected sample {sample_id} cannot form one lossless union "
-                "record because source prompt/ref/media differ"
+                "record because source prompt/media differ"
             )
         authoritative_keys = [tuple(box) for box in authoritative_gt]
         if set(global_to_norm) != set(authoritative_keys):
@@ -1256,15 +1258,7 @@ def _canonical_selected_supervision(
             raise ValueError(
                 f"selected sample {sample_id} has non-bijective global/norm1000 GT"
             )
-        prefix = next(iter(prefixes))
-        answer = prefix + (
-            "".join(
-                f"<box><{box[0]}><{box[1]}><{box[2]}><{box[3]}></box>"
-                for box in norm_union
-            )
-            if norm_union
-            else "<box>none</box>"
-        )
+        answer = canonical_answer(records[0].get("_ui5_task") or rollout_row.get("task"), norm_union)
         output = _replace_assistant_text(records[0], answer)
         for key in metadata_keys:
             # Do not leave the representative source subset next to the union
@@ -1652,7 +1646,7 @@ def _selected_crop_supervision(
     asset_namespace: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     prompt = _human_text(canonical)
-    prefix, _ = _answer_contract(
+    _answer_contract(
         _assistant_text(canonical), label=f"selected group {sample_id} union answer"
     )
     rows = _validated_selected_crop_rows(
@@ -1662,14 +1656,7 @@ def _selected_crop_supervision(
     assets: list[dict[str, Any]] = []
     for row in rows:
         norm_boxes = row["gt_local_1000"]
-        answer = prefix + (
-            "".join(
-                f"<box><{box[0]}><{box[1]}><{box[2]}><{box[3]}></box>"
-                for box in norm_boxes
-            )
-            if norm_boxes
-            else "<box>none</box>"
-        )
+        answer = canonical_answer(canonical.get("_ui5_task") or rollout_row.get("task"), norm_boxes)
         record = _replace_assistant_text(canonical, answer)
         source_image = record.get("image")
         if not isinstance(source_image, str) or any(
@@ -1978,6 +1965,9 @@ def _global_view_supervision(
     canonical: Mapping[str, Any], *, retention: bool
 ) -> dict[str, Any]:
     record = json.loads(json.dumps(canonical, ensure_ascii=False))
+    boxes = canonical["_ui5_union_gt_1000"]
+    record = _replace_assistant_text(record, canonical_answer(
+        record.get("_ui5_task") or record.get("task"), boxes))
     record.update(
         {
             "_ui5_record_kind": "full_image" if retention else "global_view",
@@ -2363,6 +2353,9 @@ def _build(args: argparse.Namespace, progress: BuildProgress, status: Any) -> di
         status.set_detail("complete curriculum found; verifying identity for reuse (no crop generation)")
         existing = json.loads(existing_manifest_path.read_text(encoding="utf-8"))
         success = json.loads(existing_success_path.read_text(encoding="utf-8"))
+        if existing.get("answer_format_version") != FORMAT_VERSION:
+            raise RuntimeError("existing curriculum has legacy assistant answers; use the v3 text-revision "
+                               "publisher to keep old files/PNGs, not a silent cached recipe reuse")
         if int(existing.get("schema_version", -1)) != SCHEMA_VERSION or int(
             success.get("schema_version", -1)
         ) != SCHEMA_VERSION:
@@ -2723,6 +2716,7 @@ def _build(args: argparse.Namespace, progress: BuildProgress, status: Any) -> di
 
     summary = {
         "schema_version": SCHEMA_VERSION,
+        "answer_format_version": FORMAT_VERSION,
         "seed": int(args.seed),
         "hard_definition": (
             "exact formal_crop_hard membership bound to frozen summary.json and "

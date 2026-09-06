@@ -204,6 +204,12 @@ class TokenContractTests(unittest.TestCase):
         self.assertEqual(output["labels"][15:21].tolist(), [2, 4, 3, 9, 9, 9])
         self.assertEqual(output["labels"][21:27].tolist(), [10, 9, 9, 9, 9, 9])
         self.assertEqual(output["labels"][9:13].tolist(), [2, 4, 3, 10])
+        from eaglevl.train.ui5_token_contract import negative_mtp_contract
+        tokenizer.encode = lambda *a, **kw: [2, 4, 3]
+        self.assertTrue(negative_mtp_contract(inputs, output, tokenizer, 6)["valid"])
+        output["labels"][21] = 9
+        with self.assertRaisesRegex(ValueError, "separate EOS"):
+            negative_mtp_contract(inputs, output, tokenizer, 6)
 
     def setup_tokenizer(self):
         tokens = {token: index + 1 for index, token in enumerate(TOKEN_FIELDS.values())}
@@ -317,13 +323,28 @@ class V3SubmissionTests(unittest.TestCase):
         manifest["bundle_group_selection"] = {"selected_pool_strata": {
             pool: {task: {"positive": 1, "negative": 1} for task in v3.evaluation.TASKS}
             for pool in ("hard", "matched_anchor", "global_replay")}}
+        from scripts.ui5_curriculum_text_revision import metadata, RECIPE, SIDECARS
+        source = manifest_path.parent
+        recipe = {}
+        manifest["outputs"] = {"recipe": str(source / RECIPE)}
+        manifest["pools"] = {}
+        for pool in ("hard", "matched_anchor", "global_replay"):
+            manifest["pools"][pool] = {"training_records": 1}
+            recipe[pool] = {"curriculum_pool": pool, "root": "", "annotation": [pool + ".jsonl"],
+                            "paths_relative_to_meta": True}
+            write_jsonl(source / (pool + ".jsonl"), [{"_ui5_sample_id": pool, "_ui5_task": "occlusion",
+                "_ui5_record_kind": "crop", "_ui5_crop_gt_local_1000": [],
+                "messages": [{"role": "assistant", "content": "<ref>overlapping elements</ref><box>none</box>"}]}])
+        (source / RECIPE).write_text(json.dumps(recipe))
+        for filename in SIDECARS:
+            write_jsonl(source / filename, [{"sample_id": "unchanged"}])
         manifest.pop("identity_digest")
         manifest["identity_digest"] = hashlib.sha256(json.dumps(manifest, ensure_ascii=False, sort_keys=True,
                                                               separators=(",", ":")).encode()).hexdigest()
         manifest_path.write_text(json.dumps(manifest))
-        manifest_path.with_name("_SUCCESS.json").write_text(json.dumps({"complete": True, "identity_digest": manifest["identity_digest"]}))
-        for filename in ("hard.jsonl", "matched_anchor.jsonl", "global_replay.jsonl"):
-            write_jsonl(manifest_path.with_name(filename), [{"messages": [{"role": "assistant", "content": "<box>none</box>"}]}])
+        manifest_path.with_name("_SUCCESS.json").write_text(json.dumps({"complete": True,
+            "identity_digest": manifest["identity_digest"], "recipe_sha256": metadata(source / RECIPE)["sha256"],
+            "files": {n: metadata(source / n) for n in (RECIPE, *SIDECARS, "hard.jsonl", "matched_anchor.jsonl", "global_replay.jsonl")}}))
         original = self.fixture.fixture.workspace / v3.ORIGINAL_MODEL_RELATIVE
         (original / "config.json").write_text('{}')
         (original / "model.safetensors").write_bytes(b"source-weights")
@@ -361,8 +382,15 @@ class V3SubmissionTests(unittest.TestCase):
         job = v3.preparation.yaml.safe_load(job_path.read_text())
         env = job["jobRunParams"]["envsList"]
         self.assertNotEqual(env["OUTPUT_DIR"], self.env["OUTPUT_DIR"])
-        for key in ("CURRICULUM_DATA_DIR", "FROZEN_SELECTION", "PROCESSOR_PATH"):
+        for key in ("FROZEN_SELECTION", "PROCESSOR_PATH"):
             self.assertEqual(env[key], self.env[key])
+        self.assertNotEqual(env["CURRICULUM_DATA_DIR"], self.env["CURRICULUM_DATA_DIR"])
+        new_recipe = json.loads(Path(env["META_PATH"]).read_text())
+        for entry in new_recipe.values():
+            annotation = Path(entry["annotation"][0])
+            self.assertEqual(annotation.parent, Path(env["CURRICULUM_DATA_DIR"]))
+            self.assertEqual(json.loads(annotation.read_text())["messages"][0]["content"], "<box>none</box>")
+        self.assertEqual(v3.sha(Path(env["META_PATH"])), env["UI5_TRAIN_RECIPE_SHA256"])
         for key, value in profile_env("global_replay_v3").items():
             self.assertEqual(env[key], value)
         self.assertEqual(env["ATTN_IMPLEMENTATION"], "sdpa")
@@ -417,6 +445,43 @@ class V3SubmissionTests(unittest.TestCase):
             rows = v3.evaluation.read_jsonl(selected / filename)
             self.assertEqual(rows[0]["answer"], "untouched GT")
         self.assertEqual(self.calls, [])
+
+    def test_corrected_text_statistics_and_identity_reach_real_workbook(self):
+        from tests import test_ui5_curriculum_artifacts as artifacts
+        from openpyxl import load_workbook
+        job = v3.preparation.yaml.safe_load(self.execute(submit=False).read_text())
+        env = job["jobRunParams"]["envsList"]
+        run_root = Path(env["OUTPUT_DIR"])
+        evaluation = run_root / "evaluation/step-000000"
+        v3.evaluation.atomic_write_json(evaluation / "evaluation_manifest.json", {
+            "curriculum_profile": "global_replay_v3", "generation": {"decoder_policy": "boundary_v3"},
+            "frozen_selection": {"summary_sha256": "f" * 64}})
+        v3.evaluation.atomic_write_json(evaluation / "ui5_metrics.json", {
+            "overall": {"image_macro_f1": .5, "bbox_macro_f1": .4, "joint_score": .45}})
+        v3.evaluation.atomic_write_json(run_root / "diagnostics/decoder_comparison.json", {
+            "complete": True, "cells": [], "inference_fix_gain": []})
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(diagnostics, "hard_transition_rows", return_value=[]), \
+             mock.patch.object(diagnostics, "anchor_retention_rows", return_value=[]), \
+             mock.patch.object(diagnostics, "anchor_data_coverage_rows", return_value=[]), \
+             mock.patch("scripts.ui5_output_validity.audit_evaluation", return_value={"rows": [{"image_invalid": 1}]}):
+            outputs = diagnostics.run(SimpleNamespace(step=0, evaluation_dir=evaluation,
+                curriculum_dir=Path(env["CURRICULUM_DATA_DIR"]), trainer_state=None, total_steps=1200, output_dir=None))
+        extra = json.loads(Path(outputs["extra_diagnostics"]).read_text())
+        self.assertEqual([r["training_delta"] for r in extra["training_vs_baseline"]], [0, 0, 0])
+        self.assertEqual([r["ref_negative_before"] for r in extra["supervision_format"]], [1, 1, 1])
+        artifact_fixture = artifacts.ArtifactTests()
+        result = artifact_fixture.update(run_root, step=0, metrics=artifacts.uniform_metrics(.5, .4),
+            checkpoint=Path(env["MODEL_PATH"]), extra_diagnostics=extra)
+        workbook = load_workbook(result["workbook"], read_only=True)
+        try:
+            for name in ("supervision_format", "training_text_identity", "output_validity", "training_vs_baseline"):
+                self.assertIn(name, workbook.sheetnames)
+            rows = list(workbook["training_text_identity"].values)
+            self.assertIn(env["META_PATH"], rows[1])
+            self.assertIn(env["UI5_TRAIN_RECIPE_SHA256"], rows[1])
+        finally:
+            workbook.close()
 
 
 if __name__ == "__main__":

@@ -833,7 +833,7 @@ class CurriculumRecipeTests(unittest.TestCase):
             )
             self.assertEqual(
                 selected["conversations"][-1]["value"],
-                "<box><10><20><20><40></box><box><30><60><40><80></box>",
+                "<ref>overlapping elements</ref><box><10><20><20><40></box><box><30><60><40><80></box>",
             )
             selected_rows = [
                 row for row in hard_records if row["_ui5_sample_id"] == "hard-pos"
@@ -889,7 +889,7 @@ class CurriculumRecipeTests(unittest.TestCase):
             )
             self.assertEqual(
                 selected[0]["conversations"][-1]["value"],
-                "<box><10><20><20><40></box><box><30><60><40><80></box>",
+                "<ref>cropped element</ref><box><10><20><20><40></box><box><30><60><40><80></box>",
             )
             self.assertEqual(
                 selected[1]["conversations"][-1]["value"], "<box>none</box>"
