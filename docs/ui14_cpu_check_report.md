@@ -79,6 +79,33 @@ python -m unittest tests.test_ui14_inference_workers tests.test_ui14_pipeline te
 
 未连接 A800，也未加载 GPU 模型；CPU 并发检查不代表实际显存占用测量。已有完整产物时，更新代码后执行 `prepare_ui14_sft.py --stage check`，刷新正式 YAML 和报告绑定摘要，再沿用 submit 入口。
 
+## EXIF=0 与 normalize 续跑增量验证
+
+增量基线：`9c4de2f000520e5d73f9dd85deaf7f3c9b8ea695`。46 项相关 CPU 回归通过，其中针对本次故障新增 8 项；5 个 Python 文件 AST 和正式准备入口的 bash 语法检查通过。另使用该提交的原版 normalize 函数生成构造产物，直接验证旧版本兼容性，并单独复查 finalize/check 保留续跑计数。测试数据均为本地构造数据，没有加载 GPU 模型。
+
+- EXIF Orientation=0 可转换，原文件摘要、解码 RGB 像素、尺寸、source_image_id 与 bbox 均不变；2–8 保留原有拒绝策略。
+- 旧整体 complete=false 且对齐 split 含部分成功记录时，复用其余 16 个 split，只重建 ui_alignment/train、test。来源 snapshot/normalization ID 保持一致，成功 split 的三份数据产物摘要不变，原解析差异明细保留。
+- 对复用路径禁用 Image.open、inspect_image、image_identity 和源记录重新解析，仍可成功；再次 normalize 为全部 18 split 复用。
+- 补完对齐后中断，仍能迁移旧全局报告中的其他 16 split；产物已写但未写完成标记时，下次只信任此前独立完成的 split。
+- 单个 detector input 摘要失配只重建对应 split；来源 snapshot 变化不会复用旧 normalization ID；全局页面冲突在全部复用时仍会检查并报告失败。
+- normalize 的 reused/rebuilt 计数在最终 finalize/check CPU 报告中保留。14 项注册、375 坐标投影、crop 缓存连接、CPT-9000、每 GPU 两个评测进程、EVAL_FAIL_POLICY=stop、周期评测/Excel 与正式 YAML 既有回归通过。
+
+原版 `9c4de2f` 生产器的独立兼容性检查结果（20 条构造记录，非真实 UI9 数据）：
+
+| 检查 | 实际本地结果 |
+|---|---|
+| 原版 normalize | 成功 18、EXIF=0 失败 2，整体 complete=false |
+| 新版首次续跑 | reused=16 split / 16 条；rebuilt=2 split / 4 条；成功 20、失败 0 |
+| 再次 normalize | reused=18 split / 20 条；rebuilt=0；复用路径原图读取次数=0 |
+| 来源绑定 | normalization ID 不变；旧成功 split 的标注与 detector input 摘要不变 |
+
+```bash
+python -m unittest tests.test_ui14_normalize_resume tests.test_ui14_repair \
+  tests.test_ui14_progress tests.test_ui14_pipeline
+```
+
+**真实集群 normalize/cache/finalize/submit 均未在本地执行，未产生提交任务 ID。** 用户提供的原运行统计为 130,567 条中成功 120,010、EXIF=0 失败 10,557。由该统计计算，本次目标为复用 16 split / 111,007 条，重建对齐 train 17,604 条、test 1,956 条（合计 19,560），最终 normalized=130,567、failed=0；这些是远端验收目标，不是本地实测结果。实际续跑数量由远端 `cpu_check_report.json.normalization_resume` 和进度日志给出。
+
 ## 实际数据统计的产生位置
 
 派生根目录：

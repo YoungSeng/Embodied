@@ -154,7 +154,9 @@ class PreparationProgressTests(unittest.TestCase):
             args = SimpleNamespace(ui9_data_root=root / "input", output_dir=root / "data",
                                    ui5_recipe="audited.json", ui5_test_dir=root / "old_test")
             prepare.normalize(args)
-            digests = {p: file_digest(p) for p in args.output_dir.rglob("*.json*")}
+            # Per-invocation reuse/rebuild counters belong to the CPU report;
+            # normalized data, split commits and every bound artifact remain identical.
+            digests = {p: file_digest(p) for p in args.output_dir.rglob("*.json*") if p.name != "cpu_check_report.json"}
             with progress.ProgressSession("normalize", args.output_dir, .01):
                 prepare.normalize(args)
             self.assertEqual(digests, {p: file_digest(p) for p in digests})

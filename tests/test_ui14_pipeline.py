@@ -295,6 +295,7 @@ class UI14EvaluationTests(unittest.TestCase):
             self.assertEqual(read_json(data/"progress/finalize.json")["status"],"completed")
             self.assertFalse(any("progress" in p for p in report["artifact_digests"]))
             self.assertTrue(report["ready"])
+            self.assertEqual(report["normalization_resume"]["normalized_records"],18)
             self.assertEqual(set(report["tasks"].values()),{"pass"})
             self.assertEqual(len(report["crop_coverage"]),14)
             self.assertEqual(sum(r["manual_repair_count"] for r in read_json(data/"sampling_stats.json").values()),4)
