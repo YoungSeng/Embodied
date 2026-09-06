@@ -394,6 +394,7 @@ def resolve_runtime_config(
         "GPU_COUNT": gpu_count,
         "CUDA_DEVICES": cuda_devices,
         "EVAL_GPU_DEVICES": eval_gpu_devices,
+        "EVAL_INFERENCE_WORKERS_PER_GPU": int(_env_value(env, "EVAL_INFERENCE_WORKERS_PER_GPU", 1)),
         "EVAL_ENABLE_PBD": int(_env_value(env, "EVAL_ENABLE_PBD", 1)),
         "WORKSPACE": workspace,
         "PROJECT_ROOT": project_root,
@@ -744,7 +745,8 @@ def resolve_runtime_config(
             "INSTALL_SYSTEM_RUNTIME_DEPS": 1,
         }
         if env.get("UI_TRAIN_PROFILE") == "m32-cpt9000-ui14-v1":
-            formal_exact.update(INIT_CPT_STEP=9000, EVAL_FAIL_POLICY="stop", RESOURCE_GROUP="aiai_locate", ATTN_IMPLEMENTATION="sdpa", UI_NUM_TASKS="14", LOCANY_CPT_MODE="0")
+            formal_exact.update(INIT_CPT_STEP=9000, EVAL_FAIL_POLICY="stop", EVAL_INFERENCE_WORKERS_PER_GPU=2,
+                                RESOURCE_GROUP="aiai_locate", ATTN_IMPLEMENTATION="sdpa", UI_NUM_TASKS="14", LOCANY_CPT_MODE="0")
             from ui14_common import INIT_CHECKPOINT as UI14_INIT_CHECKPOINT
             formal_exact.update(BASE_MODEL=UI14_INIT_CHECKPOINT, MODEL_PATH=UI14_INIT_CHECKPOINT, INIT_CHECKPOINT=UI14_INIT_CHECKPOINT)
         drift = {
@@ -806,6 +808,8 @@ def resolve_runtime_config(
         raise ValueError("EVAL_TILE_NMS_IOU must be in [0, 1]")
     if resolved["EVAL_DETECTOR_WORKERS_PER_GPU"] not in {1, 2}:
         raise ValueError("EVAL_DETECTOR_WORKERS_PER_GPU must be 1 or 2")
+    if resolved["EVAL_INFERENCE_WORKERS_PER_GPU"] not in {1, 2}:
+        raise ValueError("EVAL_INFERENCE_WORKERS_PER_GPU must be 1 or 2")
     if resolved["EVAL_DETECTOR_CACHE_MODE"] != "readonly":
         raise ValueError("This formal pipeline requires EVAL_DETECTOR_CACHE_MODE=readonly")
     if resolved["EVAL_REQUIRE_CACHE_SCOPE"] != "full_test":

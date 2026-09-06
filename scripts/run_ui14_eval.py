@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Full UI14 evaluation using the existing four-worker queue and UI5 scorer."""
+"""Full UI14 evaluation using a shared inference queue and the UI5 scorer."""
 from __future__ import annotations
 import os
 import subprocess
@@ -117,8 +117,10 @@ def run(args):
     destination = history_dir / "raw" / f"ui14-step-{args.step}"
     state_path = history_dir / f"ui14-step-{args.step}.json"
     started = datetime.now(timezone.utc).isoformat()
+    workers_per_gpu = getattr(args, "eval_inference_workers_per_gpu", 2)
     state = {"status": "running", "sft_step": args.step, "init_checkpoint": str(args.base_model),
-             "init_cpt_step": 9000, "identity": identity, "tasks": {}, "started": started}
+             "init_cpt_step": 9000, "identity": identity, "tasks": {}, "started": started,
+             "eval_gpu_devices": args.eval_gpu_devices, "inference_workers_per_gpu": workers_per_gpu}
     repair_metadata = {k: read_json(manifest).get(k) for k in ("repair_run_id", "normalization_id")}
     state.update(repair_metadata)
     write_json(state_path, state)
@@ -126,6 +128,7 @@ def run(args):
         "--checkpoint", str(checkpoint), "--processor-path", str(checkpoint),
         "--input-dir", str(manifest.parent), "--output-dir", str(prediction),
         "--gpu-devices", args.eval_gpu_devices, "--attn-implementation", args.attn_implementation,
+        "--workers-per-gpu", str(workers_per_gpu),
         "--inference-script", str(PROJECT_ROOT / "scripts" / "inference_ui_defect_locany.py"),
         "--eval-manifest", str(manifest), "--inference-crop-mode", "full_image",
         "--relation-gate-mode", "observe", "--enable-pbd", "--save-raw-answer",

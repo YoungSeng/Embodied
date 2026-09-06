@@ -196,18 +196,19 @@ class UI14DataTests(unittest.TestCase):
 
 
 class UI14EvaluationTests(unittest.TestCase):
-    def test_four_worker_commands_route_all_14_views_and_keep_new_figma_inputs(self):
+    def test_eight_worker_commands_route_all_14_views_and_keep_new_figma_inputs(self):
         import run_ui5_parallel_inference as parallel
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); manifest=root/"eval.json"
             specs=[{**t.to_dict(),"cache":str(root/t.task_key),"scan_name":SCAN_NAME,"skip_figma":t.task_id<5} for t in UI_TASKS]
             write_json(manifest,{"tasks":specs})
             argv=["parallel","--checkpoint",str(root/"checkpoint-1000"),"--processor-path",str(root/"base"),
-                "--input-dir",str(root),"--output-dir",str(root/"pred"),"--gpu-devices","0,1,2,3",
+                "--input-dir",str(root),"--output-dir",str(root/"pred"),"--gpu-devices","0,1,2,3","--workers-per-gpu","2",
                 "--attn-implementation","sdpa","--inference-script",str(ROOT/"scripts/inference_ui_defect_locany.py"),
                 "--eval-manifest",str(manifest),"--save-raw-answer"]
             with mock.patch.object(sys,"argv",argv): args=parallel.parse_args()
             self.assertEqual(len(args.tasks),14)
+            self.assertEqual(args.workers_per_gpu,2)
             for task in UI_TASKS:
                 command=parallel.build_command(args,task.task_key,str(task.task_id%4),root/"summary.json")
                 self.assertEqual(command[command.index("--tasks")+1],task.task_key)
@@ -243,6 +244,8 @@ class UI14EvaluationTests(unittest.TestCase):
                  mock.patch("run_ui5_eval.run_checked") as runner, \
                  mock.patch("collect_ui5_metrics.parse_markdown_report",side_effect=lambda *a: json.loads(json.dumps(ui5))):
                 evaluate.run(args)
+                inference_command=runner.call_args_list[0].args[0]
+                self.assertEqual(inference_command[inference_command.index("--workers-per-gpu")+1],"2")
                 self.assertTrue(evaluate.is_complete(output,1000,manifest,checkpoint))
                 self.assertEqual(read_json(output/"evaluation/best_checkpoints.json")["current_best"]["image"]["image_macro_f1"],.8)
                 state=read_json(output/"evaluation/ui14-step-1000.json"); state["tasks"].pop("synth_cropping")
@@ -355,6 +358,7 @@ class UI14EvaluationTests(unittest.TestCase):
             self.assertEqual(str(env["GRADIENT_ACCUMULATION_STEPS"]),"2")
             self.assertEqual(str(env["MAX_STEPS"]),"16000")
             self.assertEqual(env["EVAL_FAIL_POLICY"],"stop")
+            self.assertEqual(env["EVAL_INFERENCE_WORKERS_PER_GPU"],2)
 
 
 if __name__=="__main__": unittest.main()

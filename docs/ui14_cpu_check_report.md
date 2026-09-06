@@ -64,6 +64,21 @@ python -m unittest tests.test_ui14_progress tests.test_ui14_repair \
 bash -n shell/ui14_cpt9000_a800.sh
 ```
 
+## 每卡双推理进程增量验证
+
+基于 `c404c15440e27a87f81603cd37532f3405f99296`，正式 UI14 profile 改为 `EVAL_INFERENCE_WORKERS_PER_GPU=2`，四卡共 8 个独立推理进程槽位。65 项 CPU 回归通过，其中新增并发回归 3 项；8 个 Python 文件 AST 和两个正式 Shell 入口语法检查通过。
+
+- 使用真实 CPU 子进程和共享到达屏障验证首批 8 个进程同时运行，每个 GPU 环境标识对应 2 个进程；14 项任务全部且仅执行一次，日志和汇总独立。
+- 模拟首批 worker 失败，调度器返回失败并保留未启动任务；周期评测仍使用 `EVAL_FAIL_POLICY=stop`。
+- 参数贯穿 profile、YAML、运行配置、Shell、评测入口和调度器；UI14 正式值固定 2，旧 UI5 默认值保持 1。状态记录 worker_id/worker_slot，便于识别同卡进程。
+- 使用现有入口重新渲染正式 YAML，与上一版仅相差新增的 `EVAL_INFERENCE_WORKERS_PER_GPU: "2"`；训练四卡/16k、UI5 指标口径、best 保留及 detector 缓存并发保持原值。
+
+```bash
+python -m unittest tests.test_ui14_inference_workers tests.test_ui14_pipeline tests.test_ui5_pipeline
+```
+
+未连接 A800，也未加载 GPU 模型；CPU 并发检查不代表实际显存占用测量。已有完整产物时，更新代码后执行 `prepare_ui14_sft.py --stage check`，刷新正式 YAML 和报告绑定摘要，再沿用 submit 入口。
+
 ## 实际数据统计的产生位置
 
 派生根目录：

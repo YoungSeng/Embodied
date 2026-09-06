@@ -29,6 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-count", type=int, required=True)
     parser.add_argument("--max-num-tokens", type=int, required=True)
     parser.add_argument("--eval-gpu-devices", required=True)
+    parser.add_argument("--eval-inference-workers-per-gpu", type=int, choices=(1, 2),
+                        default=os.environ.get("EVAL_INFERENCE_WORKERS_PER_GPU", "1"))
     parser.add_argument("--attn-implementation", required=True)
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -195,6 +197,8 @@ def build_inference_command(
         str(prediction_dir),
         "--gpu-devices",
         args.eval_gpu_devices,
+        "--workers-per-gpu",
+        str(getattr(args, "eval_inference_workers_per_gpu", 1)),
         "--attn-implementation",
         args.attn_implementation,
         "--inference-script",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run five LocateAnything UI tasks on a configurable pool of physical GPUs."""
+"""Run independent LocateAnything UI tasks through a shared queue of GPU process slots."""
 
 from __future__ import annotations
 
@@ -29,6 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--gpu-devices", required=True)
+    parser.add_argument("--workers-per-gpu", type=int, choices=(1, 2), default=1,
+                        help="Independent inference processes per physical GPU; tasks share one queue")
     parser.add_argument(
         "--attn-implementation",
         choices=("sdpa", "magi", "flash_attention_2", "eager", "auto"),
@@ -372,6 +374,7 @@ def main() -> int:
         print(f"[OVERWRITE] removed {removed} stale inference artifacts before workers")
 
     gpus = parse_gpu_devices(args.gpu_devices)
+    worker_slots = [(gpu, slot) for gpu in gpus for slot in range(args.workers_per_gpu)]
     counts: dict[str, int] = {}
     for task in args.tasks:
         jsonl_path = Path(args.evaluation_tasks[task]["test"]) if args.eval_manifest else args.input_dir / TASK_JSONL[task]
@@ -404,6 +407,7 @@ def main() -> int:
     ordered = sorted(args.tasks, key=lambda task: (-estimates[task], task))
     print("===== UI5 parallel inference scheduler =====")
     print(f"physical GPUs       : {','.join(gpus)}")
+    print(f"workers per GPU     : {args.workers_per_gpu} ({len(worker_slots)} inference process slots total)")
     print(f"logical device      : cuda:0 in every subprocess")
     print(
         "inference crop     : "
@@ -489,6 +493,8 @@ def main() -> int:
                 "input_dir": str(args.input_dir),
                 "output_dir": str(args.output_dir),
                 "gpu_devices": gpus,
+                "workers_per_gpu": args.workers_per_gpu,
+                "worker_count": len(worker_slots),
                 "counts": counts,
                 "model_load_preflight": preflight_result,
                 "tasks": {},
@@ -515,7 +521,8 @@ def main() -> int:
     stop_event = threading.Event()
     results: dict[str, dict[str, Any]] = {}
 
-    def run_worker(gpu: str) -> None:
+    def run_worker(gpu: str, slot: int) -> None:
+        worker_id = f"gpu-{gpu}-worker-{slot}"
         while not stop_event.is_set():
             try:
                 _, task = work_queue.get_nowait()
@@ -525,7 +532,7 @@ def main() -> int:
             log_path = logs_dir / f"{task}.log"
             command = build_command(args, task, gpu, summary_path)
             print(
-                f"[START] task={task} physical_gpu={gpu} logical_device=cuda:0 "
+                f"[START] task={task} worker={worker_id} physical_gpu={gpu} logical_device=cuda:0 "
                 f"command={shlex.join(command)}",
                 flush=True,
             )
@@ -538,7 +545,7 @@ def main() -> int:
                 child_env["PYTHONUNBUFFERED"] = "1"
                 with log_path.open("a", encoding="utf-8") as log_handle:
                     log_handle.write(
-                        f"\n===== {datetime.now(timezone.utc).isoformat()} task={task} gpu={gpu} =====\n"
+                        f"\n===== {datetime.now(timezone.utc).isoformat()} task={task} gpu={gpu} worker={worker_id} =====\n"
                     )
                     log_handle.write(shlex.join(command) + "\n")
                     log_handle.flush()
@@ -568,6 +575,8 @@ def main() -> int:
             result = {
                 "task": task,
                 "physical_gpu": gpu,
+                "worker_id": worker_id,
+                "worker_slot": slot,
                 "logical_device": "cuda:0",
                 "command": command,
                 "return_code": return_code,
@@ -583,20 +592,20 @@ def main() -> int:
             if return_code != 0:
                 stop_event.set()
                 print(
-                    f"[FAILED] task={task} GPU={gpu} exit_code={return_code} "
+                    f"[FAILED] task={task} GPU={gpu} worker={worker_id} exit_code={return_code} "
                     f"command={shlex.join(command)} log={log_path} error={error}",
                     flush=True,
                 )
             else:
                 print(
-                    f"[DONE] task={task} GPU={gpu} elapsed={elapsed:.1f}s log={log_path}",
+                    f"[DONE] task={task} GPU={gpu} worker={worker_id} elapsed={elapsed:.1f}s log={log_path}",
                     flush=True,
                 )
             work_queue.task_done()
 
     threads = [
-        threading.Thread(target=run_worker, args=(gpu,), name=f"gpu-{gpu}", daemon=False)
-        for gpu in gpus
+        threading.Thread(target=run_worker, args=(gpu, slot), name=f"gpu-{gpu}-worker-{slot}", daemon=False)
+        for gpu, slot in worker_slots
     ]
     for thread in threads:
         thread.start()
@@ -611,6 +620,8 @@ def main() -> int:
         "input_dir": str(args.input_dir),
         "output_dir": str(args.output_dir),
         "gpu_devices": gpus,
+        "workers_per_gpu": args.workers_per_gpu,
+        "worker_count": len(worker_slots),
         "counts": counts,
         "model_load_preflight": preflight_result,
         "tasks": results,
@@ -631,6 +642,7 @@ def main() -> int:
                     "seconds_per_item": result["elapsed_seconds"]
                     / max(1, result["sample_count"]),
                     "physical_gpu": result["physical_gpu"],
+                    "workers_per_gpu": args.workers_per_gpu,
                     "updated_at": status["finished_at"],
                 }
         atomic_write_json(

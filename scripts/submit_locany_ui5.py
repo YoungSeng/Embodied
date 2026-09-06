@@ -56,6 +56,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--cuda-devices", default=None)
     parser.add_argument("--eval-gpu-devices", default=None)
+    parser.add_argument("--eval-inference-workers-per-gpu", type=int, choices=(1, 2), default=1)
     parser.add_argument("--max-num-tokens", type=int, default=None)
     parser.add_argument("--max-seq-length", type=int, default=None)
     parser.add_argument("--max-num-tokens-per-sample", type=int, default=None)
@@ -288,6 +289,7 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         "GPU_COUNT": str(args.gpus),
         "CUDA_DEVICES": cuda_devices,
         "EVAL_GPU_DEVICES": eval_gpu_devices,
+        "EVAL_INFERENCE_WORKERS_PER_GPU": str(getattr(args, "eval_inference_workers_per_gpu", 1)),
         "MAX_STEPS": str(args.max_steps),
         "SAVE_STEPS": str(args.save_steps),
         "EVAL_INTERVAL_STEPS": str(args.eval_interval_steps),
@@ -536,6 +538,7 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "GPU_COUNT",
         "CUDA_DEVICES",
         "EVAL_GPU_DEVICES",
+        "EVAL_INFERENCE_WORKERS_PER_GPU",
         "EVAL_ENABLE_PBD",
         "DATA_VERSION",
         "VERSION",
@@ -735,6 +738,7 @@ def main() -> int:
         "SAVE_STEPS",
         "ENABLE_EVAL",
         "EVAL_ENABLE_PBD",
+        "EVAL_INFERENCE_WORKERS_PER_GPU",
         "EVAL_AT_START",
         "EVAL_INTERVAL_STEPS",
         "EVAL_MAX_IMAGES_PER_TASK",
