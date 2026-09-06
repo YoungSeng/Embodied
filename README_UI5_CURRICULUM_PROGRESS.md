@@ -226,3 +226,56 @@ git pull --ff-only origin codex/ui5-crop-rollout4-curriculum-hard114 &&
 checkpoint 或非零训练/评测进度时拒绝启动，避免丢弃续训状态。课程和全部 crop PNG 原地
 复用，不重新冻结或构建；按正式规范创建新的 RUN_NAME/OUTPUT_DIR，因此 step-0 baseline
 会重新评测。旧运行目录和日志完整保留。新的 `detail-audit-restart.started` 防止重复提交。
+
+## checkpoint-200 保存时磁盘配额耗尽：明确重跑，不伪造续训状态
+
+`OSError: [Errno 122] Disk quota exceeded` 表示写入配额耗尽；此时缺少
+`continuity_state.json` / `checkpoint_complete.json` 的目录不能当作完整续训点。
+即使已有模型权重文件，也不能据此确认 optimizer、scheduler、RNG 和 sampler 完整。
+后续 NCCL 退出警告不是这次失败的根因。
+
+已经提交过的 `detail-audit-restart.started` 必须保留，它指向的是下一轮任务。
+不要删除标记再跑旧命令，也不要重新运行 freeze/build/takeover 脚本。
+下面的新入口直接使用**实际磁盘故障任务**的提交目录，适用于首个 200-step 保存失败，
+且没有完整 checkpoint、滚动 checkpoint、正式 best checkpoint 或非零评测节点的情况。
+这是用户显式选择的新运行：从原 crop 模型重新训练 0→1200，前 200 steps 会重算，
+不是从不完整 checkpoint 精确续训。若已有可用续训状态，该入口拒绝提交。
+
+先在平台确认旧任务已失败/停止，并清理足够的**账号/项目字节及 inode 配额**；不要误删
+`MODEL_PATH`、processor、课程目录或旧 `checkpoint-200`。准备好后在开发机前台运行：
+
+```bash
+WORKSPACE=/mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace
+(
+  set -Eeuo pipefail
+  cd "$WORKSPACE/code/Embodied-ui5-curriculum"
+  git pull --ff-only origin codex/ui5-crop-rollout4-curriculum-hard114
+  PYTHON_BIN="$WORKSPACE/conda_envs/LocateAnything/bin/python"
+  CUDA_VISIBLE_DEVICES="" "$PYTHON_BIN" -B -m unittest \
+    tests.test_ui5_storage_restart tests.test_ui5_detail_audit_restart
+  CUDA_VISIBLE_DEVICES="" "$PYTHON_BIN" -u scripts/restart_ui5_after_storage_failure.py \
+    --failed-submission-dir \
+    "$WORKSPACE/gui_logs/ui5_curriculum/locany-ui5-crop-rollout4-curriculum-hour021-h20x2-sdpa7268-20260905T215321Z-bfe617" \
+    --restart-from-base --confirm-job-stopped --confirm-storage-reclaimed
+)
+```
+
+此命令只在开发机做 CPU 检查并提交 H20×2 正式任务；MLX YAML 内仍为双 GPU 配置。
+添加 `--check-only` 可只检查、不提交、不创建重试锁。
+
+- 原任务的 hour021 frozen selection、课程 manifest 和全部 crop 图片原地复用，
+  不重新冻结、生成或链接 PNG。正式 launcher 仍会执行已有完整性校验。
+- 保留失败任务的所有文件；新建 RUN_NAME、OUTPUT_DIR 和绑定当前代码 SHA 的正式 YAML。
+  新任务重评 step 0，然后按原规范完成 200-step 训练/五进程评测/最佳保存/精确续训循环。
+- 检查原 crop 模型和 processor 是否存在、课程发布身份是否一致；打印磁盘空闲、
+  失败 checkpoint 大小、单次保存余量和六个节点都保存 best 时的峰值粗估。
+  对模型和日志所在目录各做 1 MiB 写入+fsync 探测，然后立即清理本次临时文件。
+- `filesystem_free_gib` 和小写入成功**不等于剩余账号配额充足**。脚本明确打印
+  `user_quota_available=UNKNOWN`，不会声称验证了平台 quota。空间估算不是保证；
+  正式 best checkpoint 可能逐节点累积，需要保留训练全程的余量。
+- 新的 `storage-restart.started` 只允许提交一次，目标保存在标记内。
+  平台失败/响应不确定时保留记录，不自动重试；确认成功才打印 `[SUBMITTED]` 和任务 ID。
+
+如果配额导致最后一段日志写不完整，仍需最新本地日志包含 `checkpoint-200` 的配额错误，
+并由 `--confirm-job-stopped` 明确确认平台任务终止。日志连错误都没保存时会安全停止，
+需保留/核对平台日志后再处理，不根据目录名猜测失败原因。

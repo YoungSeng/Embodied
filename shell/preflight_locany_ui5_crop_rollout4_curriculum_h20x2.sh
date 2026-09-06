@@ -357,6 +357,7 @@ relative_paths = (
     "scripts/build_ui5_curriculum_recipe.py",
     "scripts/prepare_ui5_curriculum_snapshot.py",
     "scripts/restart_ui5_after_detail_audit.py",
+    "scripts/restart_ui5_after_storage_failure.py",
     "scripts/ui5_curriculum_progress.py",
     "scripts/inference_ui_defect_locany.py",
     "scripts/locany_ui5_checkpoint.py",
@@ -370,6 +371,7 @@ relative_paths = (
     "tests/test_ui5_curriculum.py",
     "tests/test_ui5_detail_scale_audit.py",
     "tests/test_ui5_detail_audit_restart.py",
+    "tests/test_ui5_storage_restart.py",
     "tests/test_ui5_curriculum_artifacts.py",
     "tests/test_ui5_curriculum_diagnostics.py",
     "tests/test_ui5_curriculum_evaluation.py",
@@ -594,6 +596,7 @@ run_lightweight_tests() {
   "${PYTHON_BIN}" -B -m unittest \
     tests.test_ui5_detail_scale_audit \
     tests.test_ui5_detail_audit_restart \
+    tests.test_ui5_storage_restart \
     tests.test_ui5_curriculum \
     tests.test_ui5_curriculum_artifacts \
     tests.test_ui5_curriculum_evaluation \
