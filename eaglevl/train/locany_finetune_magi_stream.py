@@ -516,9 +516,14 @@ class LazySupervisedDatasetMTP(Dataset):
                 index_records,
                 negative_to_positive_ratio=ui_negative_to_positive_ratio,
             )
+            sampling_started = time.monotonic()
+            logger.warning("[UI sampler init] rank=%s dataset=%s phase=start draws=%s",
+                           get_rank(), self.ds_name, plan["epoch_length"])
             first_epoch = materialize_task_source_balanced_rotating_indices(
                 plan, seed=202603, epoch_index=0
             )
+            logger.warning("[UI sampler init] rank=%s dataset=%s phase=complete draws=%s elapsed=%.3fs",
+                           get_rank(), self.ds_name, len(first_epoch), time.monotonic() - sampling_started)
             required_manual = {
                 index
                 for index, record in enumerate(index_records)
@@ -749,11 +754,19 @@ class LazySupervisedDatasetMTP(Dataset):
         rng = random.Random(shuffle_seed)
         if self._source_balanced_plan is not None:
             base_seed = int(shuffle_seed) - int(epoch_index) * 999983
-            return materialize_task_source_balanced_rotating_indices(
+            sampling_started = time.monotonic()
+            logger.warning("[UI sampler epoch] rank=%s pid=%s dataset=%s epoch=%s seed=%s phase=start draws=%s",
+                           os.environ.get("RANK", "0"), os.getpid(), self.ds_name, epoch_index, base_seed,
+                           self._source_balanced_plan["epoch_length"])
+            indices = materialize_task_source_balanced_rotating_indices(
                 self._source_balanced_plan,
                 seed=base_seed,
                 epoch_index=epoch_index,
             )
+            logger.warning("[UI sampler epoch] rank=%s pid=%s dataset=%s epoch=%s phase=complete draws=%s elapsed=%.3fs",
+                           os.environ.get("RANK", "0"), os.getpid(), self.ds_name, epoch_index,
+                           len(indices), time.monotonic() - sampling_started)
+            return indices
         if self._all_records_task_buckets is not None:
             streams = {}
             for defect_type, values in self._all_records_task_buckets.items():
@@ -4106,7 +4119,15 @@ class StreamPackingMTPTrainer(Trainer):
                                f"Total samples (this run) = {self._total_samples}, "
                                f"Avg samples/step = {avg_samples_per_step:.2f}")
         
+        first_microbatch = self._ui5_enabled and not getattr(self, "_ui_first_microbatch_logged", False)
+        if first_microbatch:
+            self._ui_first_microbatch_logged = True
+            logger.warning("[UI first microbatch] rank=%s sft_step=%s phase=forward-backward-start",
+                           get_rank(), self.state.global_step)
         loss = super().training_step(model, inputs, num_items_in_batch)
+        if first_microbatch:
+            logger.warning("[UI first microbatch] rank=%s sft_step=%s phase=forward-backward-complete",
+                           get_rank(), self.state.global_step)
         if self._ui5_enabled:
             self._capture_ui5_gradient_groups(model)
         if self._ui5_enabled and torch.cuda.is_available():

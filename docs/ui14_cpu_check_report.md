@@ -294,6 +294,16 @@ python -m unittest tests.test_ui14_submit_progress tests.test_ui14_verification_
 
 本次实际仅执行本地 CPU 验证，未读取修复批次真实数据、未生成真实缓存、未测量远端检查耗时、未提交正式训练。原规范化 ID、数据/模型配置、两套资源 YAML 内容及 EVAL_FAIL_POLICY=stop 不变。当前旧进程的真实进度由用户在原开发机运行观察命令获取；不可将构造复用数量当作远端复用数量。
 
+## 2026-09-08 正式任务首批超时与采样性能修复
+
+读取用户上传的 trial 411146773 日志，确认任务已经进入 AIAI_locate 四卡 A800，训练在第一个 optimizer step 完成前因 rank 3 ALLREDUCE 等待 600 秒超时退出。数据构造耗时 3975.63 秒，其中 synth_occlusion 审核标注读入至采样初始化完成间隔约 51 分 34 秒。
+
+核对并修复 `ui_defect_data.py` 每条抽样重新排序/洗牌全部源图的重复计算：按 task/polarity 和 source_cycle 复用一次排列，只保存当前 cycle；crop 轮换、seed/epoch/worker 序列、正负比例和人工样本顺序保持。训练入口增加各 rank/worker 的索引生成、首批 forward/backward 前后日志，不更改 collective 或超时设置。
+
+**85 项 CPU 回归通过，102.847 秒。** 新增 5 项采样回归独立复现旧算法，覆盖 14 任务、多 seed/epoch、单侧来源、跨周期、恢复偏移、worker 隔离和 manual crop。构造 6,000 次抽样从 6.600 秒降至 0.300 秒，逐条相等；按日志中 170,847 条记录及正负源图规模构造，159,141 个索引生成耗时 8.394 秒，plan 构建另耗时 1.774 秒。均为本地 CPU 构造测量，不是 A800 实测。
+
+日志缺少其余 rank/数据 worker 的超时调用栈，不能断言已排除全部 NCCL 原因。未执行修复后的四卡 backward，也未由本地重新提交；保留现有数据/cache/recipe，正常入口再次 submit 即可，正式参数不变。完整证据、变更与命令见 [trial 411146773 分析](ui14_training_failure_411146773.md)。
+
 ## 实际数据统计的产生位置
 
 派生根目录：

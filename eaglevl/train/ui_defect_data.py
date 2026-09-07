@@ -426,6 +426,28 @@ def build_task_source_balanced_rotating_plan(
     }
 
 
+class _SourceCycleOrder:
+    """One source permutation per cycle, scoped to a single task/polarity draw.
+
+    The seed and namespace are identical to the original per-record algorithm.
+    Keep only the current cycle; no cross-worker cache or RNG state is shared.
+    """
+
+    def __init__(self, source_groups, seed, defect_type, polarity):
+        self.source_ids = tuple(sorted(source_groups))
+        self.seed, self.defect_type, self.polarity = seed, defect_type, polarity
+        self.cycle, self.order = None, None
+
+    def locate(self, global_position):
+        cycle, offset = divmod(global_position, len(self.source_ids))
+        if self.cycle != cycle:
+            self.order = _deterministic_permutation(
+                self.source_ids, self.seed, "source", self.defect_type, self.polarity, cycle
+            )
+            self.cycle = cycle
+        return self.order[offset], cycle
+
+
 def _rotating_source_record(
     *,
     source_groups: Mapping[str, Sequence[int]],
@@ -434,13 +456,11 @@ def _rotating_source_record(
     seed: int,
     defect_type: int,
     polarity: str,
+    source_order: Optional[_SourceCycleOrder] = None,
 ) -> int:
-    source_ids = tuple(sorted(source_groups))
-    source_cycle, source_offset = divmod(global_position, len(source_ids))
-    source_order = _deterministic_permutation(
-        source_ids, seed, "source", defect_type, polarity, source_cycle
-    )
-    source_id = source_order[source_offset]
+    if source_order is None:
+        source_order = _SourceCycleOrder(source_groups, seed, defect_type, polarity)
+    source_id, source_cycle = source_order.locate(global_position)
     values = tuple(source_groups[source_id])
 
     # Every source appears once per source cycle, so source_cycle is also this
@@ -502,6 +522,8 @@ def materialize_task_source_balanced_rotating_indices(
         slots = plan.get("slots_by_task", {}).get(defect_type, {})
         positive_slots = slots.get("positive", int(plan["positive_slots_per_task"]))
         negative_slots = slots.get("negative", int(plan["negative_slots_per_task"]))
+        positive_order = _SourceCycleOrder(polarities["positive"], seed, int(defect_type), "positive")
+        negative_order = _SourceCycleOrder(polarities["negative"], seed, int(defect_type), "negative")
         positive = [
             _rotating_source_record(
                 source_groups=polarities["positive"],
@@ -510,6 +532,7 @@ def materialize_task_source_balanced_rotating_indices(
                 seed=seed,
                 defect_type=int(defect_type),
                 polarity="positive",
+                source_order=positive_order,
             )
             for position in range(positive_slots)
         ]
@@ -521,6 +544,7 @@ def materialize_task_source_balanced_rotating_indices(
                 seed=seed,
                 defect_type=int(defect_type),
                 polarity="negative",
+                source_order=negative_order,
             )
             for position in range(negative_slots)
         ]
