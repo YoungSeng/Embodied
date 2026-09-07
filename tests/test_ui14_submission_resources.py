@@ -149,6 +149,11 @@ class SubmissionResourcesTests(unittest.TestCase):
             result = subprocess.run([bash, "--noprofile", "--norc", path.as_posix(), "submit"],
                 env={**env, "UI14_RESOURCE_GROUP": "yg"}, text=True, capture_output=True, check=True)
             self.assertIn("--resource-group yg", result.stdout)
+            result = subprocess.run([bash, "--noprofile", "--norc", path.as_posix(), "submit-status", "--watch", "--pid", "123"],
+                env=env, text=True, capture_output=True, check=True)
+            self.assertIn("scripts/ui14_submit_status.py --data-root", result.stdout)
+            self.assertIn("--watch --pid 123", result.stdout)
+            self.assertNotIn("scripts/submit_locany_ui5.py", result.stdout)
             for words in (["--resource-group"], ["--resource-group="], ["--invalid"]):
                 result = subprocess.run([bash, "--noprofile", "--norc", path.as_posix(), "submit", *words],
                     env=env, text=True, capture_output=True)

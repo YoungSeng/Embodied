@@ -682,7 +682,29 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
 
 def main() -> int:
     args = parse_args()
-    rendered, runtime = render_job(args)
+    if not args.profile:
+        return _main(args)
+    from ui14_common import DATA_ROOT
+    from ui14_progress import ProgressSession
+    from ui14_verification import preparation_lock
+    root = Path(args.ui14_data_root or DATA_ROOT)
+    print(f"[UI14 submit] PID={os.getpid()} | CPU 提交前检查；尚未调用 mlx | data={root}", flush=True)
+    # A second new coordinator fails immediately instead of sharing the status
+    # file or sending another request while the first is still checking/submitting.
+    with preparation_lock(root, filename=".ui14-submission.lock"), \
+         ProgressSession("submit", root, float(os.environ.get("UI14_PROGRESS_INTERVAL_SECONDS", "10"))):
+        result = _main(args)
+        if result:
+            # A nonzero mlx exit is not a successful submission. Do not retry an
+            # external request automatically: it may already have reached Merlin.
+            raise SystemExit(result)
+        return result
+
+
+def _main(args) -> int:
+    from ui14_progress import phase
+    with phase("生成并核对正式训练配置"):
+        rendered, runtime = render_job(args)
     if args.output_yaml is None:
         if args.profile:
             output_yaml = Path(runtime["UI14_DATA_ROOT"]) / "submissions" / f"formal_{runtime['RESOURCE_GROUP']}.yaml"
@@ -696,8 +718,10 @@ def main() -> int:
         validate_formal_yaml(rendered, runtime, config_path=args.config)
         if not args.render_only:
             from ui14_profile import validate_prepared_profile
-            validate_prepared_profile(runtime)
-        write_submission_artifacts(output_yaml, rendered, runtime, render_only=args.render_only)
+            with phase("提交前 CPU 检查（复用已有验证结果）", estimate=False):
+                validate_prepared_profile(runtime)
+        with phase("保存提交 YAML、运行配置与数据绑定"):
+            write_submission_artifacts(output_yaml, rendered, runtime, render_only=args.render_only)
     else:
         output_yaml.parent.mkdir(parents=True, exist_ok=True)
         output_yaml.write_text(rendered, encoding="utf-8")
@@ -802,14 +826,19 @@ def main() -> int:
         print("[RENDER ONLY] mlx was not invoked")
         return 0
     command = [args.mlx_bin, "job", "submitv2", "--path", str(output_yaml)]
-    print("submit_command              :", " ".join(command))
+    print("submit_command              :", " ".join(command), flush=True)
+    print("[submit] CPU 检查已完成；现在调用 mlx。等待集群响应，无法预估服务端耗时；请勿重复提交。", flush=True)
     try:
-        completed = subprocess.run(command, check=False)
+        with phase("mlx 提交请求：等待集群响应（服务端 ETA 不可估算）", estimate=False):
+            completed = subprocess.run(command, check=False)
     except FileNotFoundError as exc:
         raise SystemExit(
             f"Cannot find {args.mlx_bin!r}. Run this command on a host with mlx installed, "
             f"or use --render-only. Rendered YAML: {output_yaml}"
         ) from exc
+    print(f"[submit] mlx exited: returncode={completed.returncode}; 任务 ID 请以以上 mlx 返回为准", flush=True)
+    if completed.returncode:
+        print("[submit] mlx 未正常返回；未自动重试，请先核对集群是否已创建任务。", flush=True)
     return completed.returncode
 
 

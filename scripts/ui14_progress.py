@@ -52,6 +52,7 @@ class ProgressSession:
         self.stage, self.root, self.interval = stage, Path(root), interval
         self.started = time.monotonic()
         self.frames, self.activity, self.status = [], None, "running"
+        self.activities = []
         self.external = None
         self.lock, self.stop = threading.RLock(), threading.Event()
         self.thread = None
@@ -114,7 +115,7 @@ class ProgressSession:
             for frame in frames:
                 if frame["total"] is None and not frame["completed"]:
                     parts.append(f"{frame['label']}: {frame['status']} | 已用 {duration(frame['elapsed_seconds'])}"
-                                 " | 本阶段剩余≈估算中")
+                                 + (" | 本阶段剩余≈估算中" if frame["estimate"] else " | 总剩余时间不可估算"))
                     continue
                 total = f"/{frame['total']:,}" if frame["total"] is not None else ""
                 percent = f" ({frame['percent']:.1f}%)" if frame["percent"] is not None else ""
@@ -210,12 +211,16 @@ def file_activity(path, total, unit="bytes"):
         yield counter
         return
     with session.lock:
-        previous, session.activity = session.activity, counter
+        session.activities.append(counter)
+        session.activity = counter
     try:
         yield counter
     finally:
         with session.lock:
-            session.activity = previous
+            # Parallel hash reads can finish in a different order from entry.
+            # Never restore an already finished worker's stale file counter.
+            session.activities.remove(counter)
+            session.activity = session.activities[-1] if session.activities else None
 
 
 @contextmanager

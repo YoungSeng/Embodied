@@ -37,10 +37,12 @@ def stable_sha256(path):
     before = signature(path)
     h = hashlib.sha256()
     with Path(path).open("rb") as stream:
+        from ui14_progress import file_activity
         opened = os.fstat(stream.fileno())
         count = 0
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            h.update(block); count += len(block)
+        with file_activity(path, opened.st_size) as progress:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                h.update(block); count += len(block); progress.advance(len(block))
         finished = os.fstat(stream.fileno())
         current = Path(path).stat()
         # Compare ctime across reads of the same API. Some Windows runtimes
@@ -64,10 +66,12 @@ class Journal:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.rows, self.lock = {}, threading.RLock()
         if self.path.exists():
-            with self.path.open("rb+") as f:
+            from ui14_progress import file_activity
+            with self.path.open("rb+") as f, file_activity(self.path, self.path.stat().st_size) as progress:
                 while True:
                     offset = f.tell(); line = f.readline()
                     if not line: break
+                    progress.advance(len(line))
                     if not line.endswith(b"\n"):
                         f.truncate(offset); break
                     try:
@@ -209,14 +213,52 @@ class Verification:
                 for future in pending: future.cancel()
 
     def validate_images(self, path):
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
         from ui14_common import read_jsonl
-        for row in read_jsonl(path):
-            kind, name = row["key"].split(":", 1)
-            if signature(name) == row["stat"] and not self.full:
-                continue
-            actual = self.rgb_identity(name) if kind == "rgb_identity" else self.sha256(name)
-            if json.loads(json.dumps(actual)) != row["value"]:
-                raise RuntimeError(f"Prepared image content changed: {name}; run CPU preparation/check again")
+        from ui14_progress import phase
+        with phase("读取已验证图片清单（不打开图片）"):
+            by_path = {}
+            for row in read_jsonl(path):
+                kind, name = row["key"].split(":", 1)
+                by_path.setdefault(name, []).append((kind, row))
+        workers = int(os.environ.get("UI14_SUBMIT_CHECK_WORKERS", os.environ.get("UI14_PREPARE_WORKERS", "16")))
+        if not 1 <= workers <= 64: raise ValueError("UI14_SUBMIT_CHECK_WORKERS must be in 1..64")
+        def validate(item):
+            name, rows = item
+            state = signature(name)
+            refreshed = False
+            for kind, row in rows:
+                if state == row["stat"] and not self.full:
+                    continue
+                cached = self.journal.rows.get(row["key"], {})
+                if not self.full and cached.get("version") == self.VERSION and cached.get("stat") == state:
+                    actual = cached["value"]
+                else:
+                    actual = self.rgb_identity(name) if kind == "rgb_identity" else self.sha256(name)
+                    refreshed = True
+                if json.loads(json.dumps(actual)) != row["value"]:
+                    raise RuntimeError(f"Prepared image content changed: {name}; run CPU preparation/check again")
+            return name, refreshed
+        reused = refreshed = 0
+        iterator = iter(by_path.items())
+        with phase(f"图片属性与内容检查（{workers} workers，未变项只 stat）", len(by_path), "图片") as counter, \
+             ThreadPoolExecutor(max_workers=workers) as executor:
+            pending = set()
+            def enqueue():
+                item = next(iterator, None)
+                if item is not None: pending.add(executor.submit(validate, item))
+            for _ in range(min(len(by_path), workers * 2)): enqueue()
+            try:
+                while pending:
+                    finished, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in finished:
+                        name, changed = future.result()
+                        refreshed += int(changed); reused += int(not changed)
+                        counter.advance(detail=f"reused={reused}, refreshed={refreshed}, pending={len(by_path) - counter.completed - 1}; {name}")
+                        enqueue()
+            finally:
+                for future in pending: future.cancel()
+        return {"images": len(by_path), "reused": reused, "refreshed": refreshed, "workers": workers}
 
 
 def rgb_identity(image):
@@ -242,9 +284,10 @@ def verification_session(root, full=False):
 
 
 @contextmanager
-def preparation_lock(root):
+def preparation_lock(root, *, filename=".ui14-preparation.lock"):
     """OS releases the coordinator lock even after SIGKILL/node process exit."""
-    path = Path(root) / ".ui14-preparation.lock"
+    path = Path(root) / filename
+    busy = f"Another UI14 preparation coordinator is running (lock: {path}); keep it running and use submit-status --watch for submission progress"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as f:
         if os.name == "nt":
@@ -252,11 +295,11 @@ def preparation_lock(root):
             if f.tell() == 0: f.write(b"0"); f.flush()
             f.seek(0)
             try: msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError as exc: raise RuntimeError("Another UI14 preparation coordinator is running") from exc
+            except OSError as exc: raise RuntimeError(busy) from exc
         else:
             import fcntl
             try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc: raise RuntimeError("Another UI14 preparation coordinator is running") from exc
+            except OSError as exc: raise RuntimeError(busy) from exc
         try: yield
         finally:
             if os.name == "nt":

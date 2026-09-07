@@ -21,14 +21,21 @@ def profile_environment(*, project_root=None, data_root=None):
 
 def validate_prepared_profile(runtime):
     from ui14_verification import verification_session, preparation_lock
-    with preparation_lock(runtime["UI14_DATA_ROOT"]), verification_session(runtime["UI14_DATA_ROOT"]) as checks:
+    from ui14_progress import phase
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        with phase("获取数据检查锁并恢复已保存的验证记录"):
+            stack.enter_context(preparation_lock(runtime["UI14_DATA_ROOT"]))
+            checks = stack.enter_context(verification_session(runtime["UI14_DATA_ROOT"]))
         _validate_prepared_profile(runtime)
         evidence = Path(runtime["UI14_DATA_ROOT"]) / "verification/image_evidence.jsonl"
         if not evidence.exists(): raise RuntimeError("Missing image verification evidence; run finalize on CPU")
-        checks.validate_images(evidence)
+        summary = checks.validate_images(evidence)
+        print(f"[UI14 pre-submit check] complete: {summary}; hashes={checks.counts}", flush=True)
 
 
 def _validate_prepared_profile(runtime):
+    from ui14_progress import phase, track
     # Full checks run explicitly before rendering; launch validates the digest-bound report.
     root = Path(runtime["UI14_DATA_ROOT"])
     report = read_json(root / "cpu_check_report.json")
@@ -38,18 +45,19 @@ def _validate_prepared_profile(runtime):
         raise RuntimeError("UI14 CPU report is not bound to the repaired data batch")
     if runtime.get("INIT_CHECKPOINT") and Path(runtime["INIT_CHECKPOINT"]) != Path(report["init_checkpoint"]):
         raise RuntimeError("CPU check validated a different CPT initialization checkpoint")
-    for name, expected in report.get("artifact_digests", {}).items():
+    for name, expected in track(report.get("artifact_digests", {}).items(), "核对已准备产物摘要（复用匹配的验证记录）", unit="文件", detail=lambda item: item[0]):
         if file_digest(root / name) != expected: raise RuntimeError(f"Prepared UI14 artifact changed: {name}")
     if not report.get("artifact_digests"): raise RuntimeError("CPU check has no artifact digests")
     if "verification/image_evidence.jsonl" not in report["artifact_digests"]:
         raise RuntimeError("CPU report lacks bound image verification evidence; run finalize on CPU")
-    for path, expected in report.get("external_digests", {}).items():
+    for path, expected in track(report.get("external_digests", {}).items(), "核对来源、UI5 缓存和 CPT 配置摘要", unit="文件", detail=lambda item: item[0]):
         if file_digest(path) != expected: raise RuntimeError(f"UI14 source/cache changed since CPU check: {path}")
     from ui14_repair import validate_normalization
-    snapshot = validate_normalization(root)
-    if snapshot["normalization_id"] != report["normalization_id"]:
-        raise RuntimeError("UI14 CPU report belongs to another repair batch")
-    validate_run_data_binding(runtime, snapshot)
+    with phase("核对修复批次与 SFT 恢复绑定"):
+        snapshot = validate_normalization(root)
+        if snapshot["normalization_id"] != report["normalization_id"]:
+            raise RuntimeError("UI14 CPU report belongs to another repair batch")
+        validate_run_data_binding(runtime, snapshot)
 
 
 def validate_run_data_binding(runtime, snapshot, *, create=False):

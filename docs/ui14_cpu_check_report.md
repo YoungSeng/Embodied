@@ -271,6 +271,29 @@ python -m unittest tests.test_ui14_submission_resources tests.test_ui5_pipeline 
 
 本次仅本地 CPU 验证及参考 YAML 渲染，未读取真实集群数据，未调用真实 mlx 或提交训练。正式 submit 输出改为 `${UI14_DATA_ROOT}/submissions/formal_aiai_locate.yaml` 或 `formal_default.yaml`，旁边的 `.runtime.json`、`.binding.json` 记录资源、CPU 报告/产物摘要、repair_run_id 和 normalization_id。finalize 原产物继续作为数据验证依据，不因提交资源切换而重建。
 
+## 2026-09-07 submit 进度与已运行进程观察
+
+增量基线 `1c2903273dd498e5ec88c3f48e8a898fb8427e60`。提交入口在检查之前即输出 PID 和当前阶段；每 10 秒更新验证记录读取、产物摘要、修复绑定、图片清单与逐图检查进度，显示当前阶段 ETA。mlx 等待有心跳，服务端 ETA 标为不可估算。新协调进程使用独立提交锁，阻止并发重复运行；不会自动重试外部提交请求。
+
+图片证据按唯一路径去重，一张图的 RGB/file hash 证据共享一次 stat；默认 16 线程、有界队列。变化文件的稳定内容摘要逐项继续写入既有 verification journal；中断后复用。未变图片不解码或重算 hash。原始证据仍约束内容，不能用新计算的错误摘要绕过原报告。旧代码已完成的 stat 没有续跑游标，重新启动仍需查询属性；本次通过并发降低该开销，不声称可以永久跳过变更检查。
+
+新增只读 `submit-status --watch [--pid PID]`：同一 Linux 主机/用户可观察旧版正在运行的进程，读取 `/proc` 中的 PID 身份、打开文件的读指针及 mlx 子进程，不重新提交、重跑数据或终止原进程。旧文件字节进度受缓冲影响，ETA 只指当前文件；读取到 EOF 不算整个检查完成。新版优先显示进度 JSON；过期 PID 的日志不作为当前状态。原进程退出只报告进程退出，不据此声明任务提交成功。
+
+**106 项 CPU 回归全部通过，125.952 秒。** 覆盖本次 10 项新回归及原有数据准备、并行裁图、验证重试、进度、正式资源和推理 worker 测试。Python AST 与 Bash 语法检查通过，实际 Bash 参数转发用 echo 替身验证，未调用 mlx。
+
+```bash
+python -m unittest tests.test_ui14_submit_progress tests.test_ui14_verification_retry \
+  tests.test_ui14_submission_resources tests.test_ui14_progress tests.test_ui14_parallel_crops \
+  tests.test_ui14_pipeline tests.test_ui5_pipeline tests.test_ui14_inference_workers
+```
+
+- 构造 4 张图、每图 2 种身份：并发屏障证明至少 2 个检查 worker 同时执行，每个路径只 stat 一次，Image.open 和图片 hash 函数禁止调用仍通过。
+- 构造 3 张图仅改属性：先完成 1 张后中断，新检查复用该图内容结果并刷新另外 2 张；再跑 3 张全部复用。随后改 1 张像素，首次及再次检查均拒绝，不接受不匹配的缓存摘要。
+- 完整提交函数以 mlx 测试替身验证：CPU 检查开始前已有日志；进入 mlx 时可见独立阶段；返回非零记录 failed 且仅调用一次；并发第二入口不能覆盖状态或发起提交。
+- Linux `/proc` 使用本地构造目录验证进程筛选、读指针/字节 ETA、忽略追加 journal 的 EOF、mlx 子进程、退出和旧 PID 日志；本地 Windows 未运行真实 Linux 观察器或读取用户开发机进程。
+
+本次实际仅执行本地 CPU 验证，未读取修复批次真实数据、未生成真实缓存、未测量远端检查耗时、未提交正式训练。原规范化 ID、数据/模型配置、两套资源 YAML 内容及 EVAL_FAIL_POLICY=stop 不变。当前旧进程的真实进度由用户在原开发机运行观察命令获取；不可将构造复用数量当作远端复用数量。
+
 ## 实际数据统计的产生位置
 
 派生根目录：
