@@ -7,7 +7,7 @@ def profile_environment(*, project_root=None, data_root=None):
     root = str(data_root or DATA_ROOT)
     project = str(project_root or CLUSTER_PROJECT)
     env = read_json(PROJECT_ROOT / "configs" / "ui14_cpt9000_formal.json")["environment"]
-    env.update(PROJECT_ROOT=project, BASE_MODEL=INIT_CHECKPOINT, MODEL_PATH=INIT_CHECKPOINT,
+    env.update(PROJECT_ROOT=project, RESOURCE_GROUP="aiai_locate", BASE_MODEL=INIT_CHECKPOINT, MODEL_PATH=INIT_CHECKPOINT,
         INIT_CHECKPOINT=INIT_CHECKPOINT, UI14_DATA_ROOT=root,
         UI_TASK_REGISTRY=root + "/task_registry.json", UI_EVAL_MANIFEST=root + "/evaluation_manifest.json",
         UI14_CHECK_REPORT=root + "/cpu_check_report.json", META_PATH=root + "/training_recipe.json",

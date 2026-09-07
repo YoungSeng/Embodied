@@ -16,6 +16,7 @@ from locany_ui5_common import (
     PROJECT_ROOT,
     assert_gpu_mode_consistency,
     machine_resource_config,
+    normalize_resource_group,
     resolve_runtime_config,
 )
 
@@ -45,10 +46,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--resource-group",
-        default="default",
+        default=None,
         help=(
             "Merlin resource profile from configs/locany_ui5_machines.json; "
-            "A800 supports default and aiai_locate"
+            "A800 supports default/yg and aiai_locate. UI14 defaults to aiai_locate; UI5 to default."
         ),
     )
     parser.add_argument(
@@ -271,7 +272,8 @@ def render_template(template: str, replacements: dict[str, str]) -> str:
 
 def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
     env = dict(os.environ)
-    resource_group = str(getattr(args, "resource_group", "default"))
+    resource_group = normalize_resource_group(
+        getattr(args, "resource_group", None) or ("aiai_locate" if getattr(args, "profile", None) else "default"), args.machine)
     tc_msed_stage = str(getattr(args, "tc_msed_stage", "v4"))
     use_detection_crops = bool(getattr(args, "use_detection_crops", False))
     crop_train_mode = getattr(args, "crop_train_mode", None) or (
@@ -470,10 +472,11 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
             }
         )
     if getattr(args, "profile", None):
-        if (args.machine, args.gpus, args.resource_group) != ("a800", 4, "aiai_locate"):
-            raise ValueError("UI14 formal profile requires --machine a800 --resource-group aiai_locate --gpus 4")
+        if (args.machine, args.gpus) != ("a800", 4):
+            raise ValueError("UI14 formal profile requires --machine a800 --gpus 4")
         from ui14_profile import profile_environment
         env.update(profile_environment(project_root=args.project_root, data_root=args.ui14_data_root))
+        env["RESOURCE_GROUP"] = resource_group
     return env
 
 
@@ -681,17 +684,23 @@ def main() -> int:
     args = parse_args()
     rendered, runtime = render_job(args)
     if args.output_yaml is None:
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        output_yaml = (
-            PROJECT_ROOT
-            / "jobs"
-            / "rendered"
-            / f"locany_ui5_{args.machine}x{args.gpus}_{runtime['VERSION']}_{stamp}.yaml"
-        )
+        if args.profile:
+            output_yaml = Path(runtime["UI14_DATA_ROOT"]) / "submissions" / f"formal_{runtime['RESOURCE_GROUP']}.yaml"
+        else:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            output_yaml = PROJECT_ROOT / "jobs" / "rendered" / f"locany_ui5_{args.machine}x{args.gpus}_{runtime['VERSION']}_{stamp}.yaml"
     else:
         output_yaml = args.output_yaml.expanduser().resolve()
-    output_yaml.parent.mkdir(parents=True, exist_ok=True)
-    output_yaml.write_text(rendered, encoding="utf-8")
+    if args.profile:
+        from ui14_checks import validate_formal_yaml, write_submission_artifacts
+        validate_formal_yaml(rendered, runtime, config_path=args.config)
+        if not args.render_only:
+            from ui14_profile import validate_prepared_profile
+            validate_prepared_profile(runtime)
+        write_submission_artifacts(output_yaml, rendered, runtime, render_only=args.render_only)
+    else:
+        output_yaml.parent.mkdir(parents=True, exist_ok=True)
+        output_yaml.write_text(rendered, encoding="utf-8")
 
     print("===== LocateAnything UI5 submission =====")
     for key in (
@@ -792,9 +801,6 @@ def main() -> int:
     if args.render_only:
         print("[RENDER ONLY] mlx was not invoked")
         return 0
-    if args.profile:
-        from ui14_profile import validate_prepared_profile
-        validate_prepared_profile(runtime)
     command = [args.mlx_bin, "job", "submitv2", "--path", str(output_yaml)]
     print("submit_command              :", " ".join(command))
     try:

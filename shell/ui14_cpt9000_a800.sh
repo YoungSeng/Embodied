@@ -35,13 +35,28 @@ case "${1:-}" in
       --ui9-data-root "${UI9_DATA_ROOT}" --output-dir "${UI14_DATA_ROOT}"
     ;;
   submit)
+    shift
+    UI14_SUBMIT_RESOURCE_GROUP="${UI14_RESOURCE_GROUP:-aiai_locate}"
+    UI14_SUBMIT_OPTIONS=()
+    while (($#)); do
+      case "$1" in
+        --resource-group)
+          if (($# < 2)) || [[ "$2" == --* ]]; then printf '%s\n' '--resource-group requires aiai_locate, yg or default' >&2; exit 2; fi
+          UI14_SUBMIT_RESOURCE_GROUP="$2"; shift 2 ;;
+        --resource-group=*) UI14_SUBMIT_RESOURCE_GROUP="${1#*=}"; shift ;;
+        --render-only) UI14_SUBMIT_OPTIONS+=(--render-only); shift ;;
+        -h|--help) printf '%s\n' 'Usage: bash shell/ui14_cpt9000_a800.sh submit [--resource-group aiai_locate|yg|default] [--render-only]'; exit 0 ;;
+        *) printf 'Unknown submit option: %s\n' "$1" >&2; exit 2 ;;
+      esac
+    done
+    if [[ -z "$UI14_SUBMIT_RESOURCE_GROUP" ]]; then printf '%s\n' '--resource-group cannot be empty' >&2; exit 2; fi
     exec "${UI14_PYTHON}" scripts/submit_locany_ui5.py \
-      --profile "${UI14_PROFILE}" --machine a800 --resource-group aiai_locate --gpus 4 \
-      --ui14-data-root "${UI14_DATA_ROOT}" --output-yaml "${UI14_DATA_ROOT}/formal_job.yaml"
+      --profile "${UI14_PROFILE}" --machine a800 --resource-group "${UI14_SUBMIT_RESOURCE_GROUP}" --gpus 4 \
+      --ui14-data-root "${UI14_DATA_ROOT}" "${UI14_SUBMIT_OPTIONS[@]}"
     ;;
   check-full)
     exec "${UI14_PYTHON}" scripts/prepare_ui14_sft.py --stage check --full-verify \
       --ui9-data-root "${UI9_DATA_ROOT}" --output-dir "${UI14_DATA_ROOT}"
     ;;
-  *) printf 'Usage: bash shell/ui14_cpt9000_a800.sh {normalize|cache-prepare|cache|cache-finalize|finalize|check-full|submit}\n' >&2; exit 2 ;;
+  *) printf 'Usage: bash shell/ui14_cpt9000_a800.sh {normalize|cache-prepare|cache|cache-finalize|finalize|check-full|submit [--resource-group aiai_locate|yg|default] [--render-only]}\n' >&2; exit 2 ;;
 esac

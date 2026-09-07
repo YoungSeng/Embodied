@@ -154,6 +154,11 @@ def join_runtime_path(root: str, *parts: str) -> str:
     return str(Path(root).joinpath(*parts))
 
 
+def normalize_resource_group(value: str, machine_type: str = "a800") -> str:
+    value = str(value).strip().lower()
+    return "default" if machine_type.lower() == "a800" and value == "yg" else value
+
+
 def resolve_runtime_config(
     env: Mapping[str, str] | None = None,
     *,
@@ -390,7 +395,7 @@ def resolve_runtime_config(
     m31_family_enabled = tc_msed_stage in {"m31", "m32"}
     resolved: dict[str, Any] = {
         "MACHINE_TYPE": machine_type,
-        "RESOURCE_GROUP": str(_env_value(env, "RESOURCE_GROUP", "default")),
+        "RESOURCE_GROUP": normalize_resource_group(_env_value(env, "RESOURCE_GROUP", "default"), machine_type),
         "GPU_COUNT": gpu_count,
         "CUDA_DEVICES": cuda_devices,
         "EVAL_GPU_DEVICES": eval_gpu_devices,
@@ -746,7 +751,8 @@ def resolve_runtime_config(
         }
         if env.get("UI_TRAIN_PROFILE") == "m32-cpt9000-ui14-v1":
             formal_exact.update(INIT_CPT_STEP=9000, EVAL_FAIL_POLICY="stop", EVAL_INFERENCE_WORKERS_PER_GPU=2,
-                                RESOURCE_GROUP="aiai_locate", ATTN_IMPLEMENTATION="sdpa", UI_NUM_TASKS="14", LOCANY_CPT_MODE="0")
+                                ATTN_IMPLEMENTATION="sdpa", UI_NUM_TASKS="14", LOCANY_CPT_MODE="0")
+            machine_resource_config(machine_type, resource_group=resolved["RESOURCE_GROUP"], config_path=config_path)
             from ui14_common import INIT_CHECKPOINT as UI14_INIT_CHECKPOINT
             formal_exact.update(BASE_MODEL=UI14_INIT_CHECKPOINT, MODEL_PATH=UI14_INIT_CHECKPOINT, INIT_CHECKPOINT=UI14_INIT_CHECKPOINT)
         drift = {
@@ -925,6 +931,7 @@ def machine_resource_config(
 ) -> dict[str, Any]:
     raw = load_machine_config(config_path)
     machine_type = machine_type.lower()
+    resource_group = normalize_resource_group(resource_group, machine_type)
     if machine_type not in raw["machines"]:
         raise ValueError(f"Unknown machine type: {machine_type}")
     machine = raw["machines"][machine_type]

@@ -250,6 +250,27 @@ python -m unittest tests.test_ui14_detector_workers tests.test_ui5_eval_detector
 
 CPU 构造图片不用于声明 A800 性能。真实续跑日志将显示 `pending_shards`、各卡进程及 `reused`/`pending`；仅有 8 个待处理分片时最多启动 8 个有效 worker。少于四个分片或最后收尾阶段允许部分 GPU 空闲，未引入重切分片或跨 split 混写。
 
+## 2026-09-07 提交资源组选项
+
+以 `e9a378e30ab34476517eed59be56e09ad9875f87` 为增量基线。核对仓库已有 A800 SFT/CPT 资源配置后，UI14 submit 支持 `aiai_locate`（默认，group_id=2146，专用队列）和 `yg`/`default`（group_id=1602，默认队列）。两者 cluster_id 均为 24，挂载目录和四卡 A800 型号相同。未添加 H20 或其他机器的实验 profile。
+
+修改 `shell/ui14_cpt9000_a800.sh`、`scripts/submit_locany_ui5.py`、`scripts/locany_ui5_common.py`、`scripts/ui14_profile.py`、`scripts/ui14_checks.py`，将资源选项传递到提交、运行配置、YAML 和启动校验；新增 `tests/test_ui14_submission_resources.py`。文档补充分资源命令，参考 YG YAML 为 `jobs/rendered/locany_m32_cpt9000_ui14_a800x4_yg.yaml`。
+
+本次 **70 项 CPU 回归全部通过，37.237 秒**；5 个 Python 文件 AST、实际 Bash 参数转发、`git diff --check` 通过。原 AIAI 参考 YAML 与当前渲染文本一致，新增 YG YAML 经 YAML 解析及正式配置校验通过。
+
+```bash
+python -m unittest tests.test_ui14_submission_resources tests.test_ui5_pipeline \
+  tests.test_ui14_inference_workers tests.test_ui14_pipeline
+```
+
+- UI14 无参数默认 AIAI；旧 UI5 无 profile 仍默认 default；YG 别名恢复为 default。命令行覆盖 UI14_RESOURCE_GROUP 环境变量。
+- 两套 YAML 的 cluster/group/queue/env 均与配置一致；两套 runtime 除 RESOURCE_* 字段外完全一致，启动重新解析后资源组、9000 CPT、4 卡、16k、每卡两个评测 worker、EVAL_FAIL_POLICY=stop 等约束保持。
+- 未知资源、错误 groupIds、H20 机器、缺少参数或拼错 shell 参数会报错，不自动回退资源组。
+- 使用构造 CPU ready 报告，分别执行完整提交入口并替换 mlx 为测试替身；先校验报告，再生成独立提交 YAML/runtime/binding，然后调用既有 `mlx job submitv2`。原 formal_job.yaml、formal_runtime.json 和 CPU 报告的字节及 mtime 不变。
+- 报告校验失败不会发布提交 YAML，也不会调用 mlx；render-only 可以只渲染，但 binding 明确标注未提交。尝试以新资源 YAML 覆盖报告已绑定的文件会被拒绝。
+
+本次仅本地 CPU 验证及参考 YAML 渲染，未读取真实集群数据，未调用真实 mlx 或提交训练。正式 submit 输出改为 `${UI14_DATA_ROOT}/submissions/formal_aiai_locate.yaml` 或 `formal_default.yaml`，旁边的 `.runtime.json`、`.binding.json` 记录资源、CPU 报告/产物摘要、repair_run_id 和 normalization_id。finalize 原产物继续作为数据验证依据，不因提交资源切换而重建。
+
 ## 实际数据统计的产生位置
 
 派生根目录：
@@ -262,7 +283,7 @@ CPU 构造图片不用于声明 A800 性能。真实续跑日志将显示 `pendi
 | cache（GPU） | 仅新增七项 crop 任务的 train/test PP-OCRv5/OmniParser 检测，复用完成分片；不运行 prepare、merge、crop 或标签生成 |
 | cache-finalize（CPU） | 合并检测、横向计划、派生标签、crop PNG、ui14_label_cache_ready.json、crop_index/images.jsonl、ui14_crop_complete.json、crop_performance 报告。周期评测不运行 detector |
 | finalize（CPU） | 复用旧 UI5 审核 recipe/test cache；生成 training_recipe.json、evaluation_manifest.json、14 项连接检查、sampling_stats、完整 image_overlap、formal_job.yaml/formal_runtime.json；全部通过后 cpu_check_report.ready=true |
-| submit | 摘要校验通过后执行既有 mlx job submitv2。任务 ID 以远端 mlx 返回为准，本地未提交 |
+| submit | 按所选资源生成 submissions/formal_aiai_locate.yaml 或 formal_default.yaml 及 runtime/binding，摘要和资源检查通过后执行既有 mlx job submitv2。任务 ID 以远端 mlx 返回为准，本地未提交 |
 
 报告的 post_repair_sources（normalize 时为 tasks）含每份文件的实际记录数、正负数、格式数量、GT 字段及修复数量。parser_comparison 分开给出 legacy_parse_failure_records、legacy_consumer_failure_records、parse_result_difference_records；页面统计覆盖 UI9 跨来源的 train/test 归属。完整字段解释和分阶段命令见 [运行文档](ui14_cpt9000_a800.md)。
 
