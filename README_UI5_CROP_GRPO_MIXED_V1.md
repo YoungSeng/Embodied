@@ -71,7 +71,7 @@ bash shell/submit_ui5_crop_grpo_mixed_v1.sh --resume
 
 ### 运行时兼容修复后重提（保留已完成的 step 0）
 
-若原任务因 DeepSpeed `scale_wrt_gas` 签名检查退出，先确认平台任务已经停止，再执行：
+若原任务因 DeepSpeed `scale_wrt_gas` 签名检查或首步 AR 概率校验退出，平台任务停止后执行：
 
 ```bash
 cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Embodied-ui5-crop-grpo-mixed-v1
@@ -82,8 +82,14 @@ bash shell/submit_ui5_crop_grpo_mixed_v1.sh --resume-code-update
 该开关包含 `--resume`。仅接受运行时修复文件范围内、原提交后继的代码更新，记录原始和实际执行 SHA、
 逐文件 Git blob 清单，写入 `runtime_code_revision.json` 及 `diagnostics/code_revisions/`。
 原 `run.json`、mixed manifest、初始 reference、已保存的 optimizer/RNG/sampler 和评测身份不变。
-已完成 step 0 会核验原指标哈希并复用；这次在训练初始化前退出的任务从 optimizer step 0 开始。
+已完成 hybrid step 0 会核验原指标哈希并复用；没有完整训练 checkpoint 时从 optimizer step 0 开始。
 后续 checkpoint、运行环境诊断和 Excel 都记录实际执行的代码 SHA。
+
+本次 `fp32-head-fixed-sdpa-v1` 数值修复额外允许两个原生 AR 文件的变更，但仅限没有已保存 optimizer
+更新的任务；已有 `resume/latest`、`.previous` 或 `.pending` 时首次切换数值版本会拒绝。
+修复获绑定后可正常保存、恢复所有训练状态。原数值版本的固定 TRAIN AR step 0 诊断会归档到
+`diagnostics/previous_train_ar/`，使用同一初始权重、同一固定 train 子集重算当前版本诊断，
+避免迁移表混用数值路径；这不会重跑 hybrid 正式测试 step 0。
 
 DeepSpeed 0.16/0.17 的 [NVTX 装饰器](https://github.com/deepspeedai/DeepSpeed/blob/v0.17.5/deepspeed/utils/nvtx.py)
 可能只暴露 `(*args, **kwargs)`；不能据此断定不支持
@@ -181,12 +187,27 @@ m31 的正确数、完整性或失败不参与资格条件；旧 complete8 仅�
 
 采样 temperature=0.7、top_p=1、top_k=0、repetition_penalty=1。old/current/reference 都是
 完整词表 logits / 0.7 的同一分布。old log-prob detached 后保存到 CPU，无常驻 old actor。
+三者统一在 **FP32 中执行词表投影和 log-softmax**，避免先产生 BF16 logits 再转 FP32 的舍入损失；
+模型权重、LLM 主干和视觉仍为 BF16。关闭 TF32 matmul 和 BF16 GEMM 的低精度中间归约，
+不修改权重值，不用整段复算值替换真实采样 old log-prob。
 只取真实 completion 对应的 shifted logits/log-prob，包含实际 EOS；prompt、视觉占位及补齐位置不计损失。
 达到长度预算时不伪造 EOS。生成与复算都为 eval 模式，关闭 dropout；只有 current/replay 复算开启梯度。
 
 每个 completion 微批复算全部输入，不复用跨权重更新的视觉或 prefix 图。固定权重生成阶段内，
 同一 view 的视觉特征与 prefix KV 在四条轨迹间复用。当前策略前向返回 completion log-prob，
 普通标量 CE 只用于原 SFT 回放。
+
+仅原生 GRPO AR 的 decoder 固定 SDPA 后端：H20 为 PyTorch `EFFICIENT_ATTENTION`，CPU 验证为 `MATH`。
+后端上下文位于每个 checkpointed layer 的 callable 内，覆盖生成、reference、current 和 backward
+重算；hybrid 与 SFT/MTP 的 decoder 分支保持原实现。长序列 mask 只填充底层存储以满足 CUTLASS
+行 stride 的 8 元素对齐，再切回原 shape，不添加输入 token、不改 causal/window 可见性。
+不在 H20 上强制 materialize 完整 FP32 attention 矩阵。
+
+这修复了自动后端在单 token KV decode 与整段 teacher forcing 间切换，以及 BF16 大 logits 的精度问题。
+[PyTorch 数值说明](https://docs.pytorch.org/docs/2.14/notes/numerical_accuracy.html)指出，批量与切片计算
+不保证逐 bit 相同；[SDPA 文档](https://docs.pytorch.org/docs/2.14/generated/torch.nn.functional.scaled_dot_product_attention.html)
+也说明不同 fused backend 可产生不同结果。因此仍检查剩余数值偏差，但不能用 FP32 小随机模型校准的
+绝对阈值来判断真实 BF16 路径是否错误。
 
 奖励使用正式 parser、IoU=0.1 匹配及原图集合：
 
@@ -222,7 +243,15 @@ S_iou 包括匹配器分配的低于 0.1 的 IoU。双方空时三项为 1，仅
 变长 crop 数以跨 rank MAX 对齐微批槽，空槽使用全参数零权重依赖，避免不同参数参与或不同步通信。
 显式指定最后槽为唯一 optimizer boundary，关闭 DeepSpeed 的额外 GAS 缩放；GAS=2 表示两轮 group，
 不解释为两个 crop。每步核对 engine.global_steps，每个 completion 在更新前核对采样/复算 log-prob
-（BF16 数值容差 max≤0.08、mean≤0.01），技术错误不作为模型难度或早停指标。
+及有限值/长度。更新前所有 `exp(current_logp-old_logp)` 必须位于 `[1-clip, 1+clip]`（本轮 `[0.8, 1.2]`），
+且 `mean(expm1(delta)-delta) ≤ 0.001`，其中 delta=current-old；数值误差不得提前触发 PPO clipping，
+也不能有明显的整体分布漂移。后者是采样/复算数值诊断，与固定 reference 的 KL loss 分开记录。
+原 max/mean log-prob 误差继续记录，并加入 min/max ratio、sampling_numerical_kl；未通过仍终止技术错误，
+不丢 crop、不改 old log-prob、不作为模型难度或指标早停。
+
+CPU 轨迹在反传前保存；超限时 `diagnostics/ar_mismatch/stepXXXXXX-rankR-slotS.pt` 额外保留真实 tokens、
+raw output、old/current/reference log-prob、输入 ID/位置/mask、最大误差 token 索引、group、代码和数值版本。
+这些检查与记录内嵌正式训练，不创建额外 debug 任务。
 
 ## 评测、Excel 与完整恢复
 
@@ -257,7 +286,11 @@ python -m pytest tests/test_ui5_grpo.py tests/test_ui5_grpo_native_ar.py tests/t
 真实 PNG 复用补缺、两个真实 Gloo rank 的变长 group 梯度更新、RNG/sampler 恢复、best 副本事务和完整 Excel 导出。
 Windows 单元测试只替换 POSIX best symlink 创建原语，副本/哈希/删除/幂等仍执行真实文件操作。
 
-已完成训练相关完整回归（81 项测试及 2 个子测试），以及新增提交目标后的提交/恢复回归（13 项）。
+新增 BF16 大 logits（约 20–30）及多个 `<box>` 的概率/梯度回归、autocast 下的 FP32 词表投影、
+不同外部 SDPA 默认下的 backward checkpoint 重算、7268 等非 8 倍数长度的 mask 存储对齐，
+以及观测误差量级的接受条件、真正 ratio 越界/整体漂移/NaN/Inf 拒绝条件和数值版本恢复审计。
+
+已完成本次数值修复后的训练相关完整回归（100 项测试及 2 个子测试，包含双 rank、提交/恢复和 Excel）。
 shell 语法与 Git diff 空白检查通过。Excel 测试产物完成数值回读和渲染检查。
 
 外部开发机没有内网挂载或 H20，测试不代表真实训练已执行，也不预填真实样本量、F1 或吞吐。

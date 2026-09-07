@@ -122,3 +122,111 @@ def test_no_dropout_or_detached_caches_in_recomputation():
     model.train()
     with pytest.raises(ValueError, match="dropout"):
         forward_ar(model, **inputs)
+
+
+@pytest.mark.parametrize("seed", [12, 42, 100])
+def test_bf16_large_logits_cached_full_reference_and_checkpointed_gradients(seed):
+    # Small random FP32 logits hid the H20 failure. Exercise BF16 and logits
+    # around 20-30, where a BF16 output quantization step is appreciable at T=.7.
+    model, inputs = fixture_model()
+    torch.manual_seed(seed)
+    model.to(torch.bfloat16)
+    inputs["pixel_values"] = inputs["pixel_values"].bfloat16()
+    with torch.no_grad():
+        model.language_model.lm_head.weight.mul_(100)
+    tokens = torch.randint(10, 40, (64,))
+    tokens[0] = tokens[30] = 7
+    tokens[1:6] = 9
+    tokens[-1] = 3
+    old = []
+    with torch.no_grad():
+        cached = forward_ar(model, **inputs, use_cache=True)
+        for index, token in enumerate(tokens):
+            assert cached.logits.dtype == torch.float32
+            old.append((cached.logits[0] / .7).log_softmax(-1)[token])
+            if index < len(tokens) - 1:
+                cached = forward_ar(model, input_ids=token.reshape(1, 1), use_cache=True,
+                                    past_key_values=cached.past_key_values, visual_cache=cached.visual_cache)
+    sequence = dict(inputs, input_ids=torch.cat([inputs["input_ids"], tokens[None]], 1))
+    model.language_model.model.gradient_checkpointing = True
+    with torch.no_grad():
+        reference = forward_ar(model, **sequence, completion_start=3).completion_log_probs
+    # The head must remain FP32 even if DeepSpeed/callers add autocast.
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        full = forward_ar(model, **sequence, completion_start=3)
+    torch.testing.assert_close(full.completion_log_probs, torch.stack(old), atol=2e-5, rtol=2e-6)
+    torch.testing.assert_close(full.completion_log_probs, reference, atol=2e-5, rtol=2e-6)
+    assert full.pbd_positions.tolist() == [3, 33]
+    (-full.completion_log_probs.mean()).backward()
+    for module in (model.language_model, model.mlp1, model.relation_encoder, model.relation_pbd):
+        gradients = [p.grad for p in module.parameters() if p.grad is not None]
+        assert gradients and all(torch.isfinite(g).all() for g in gradients)
+        assert sum(g.abs().sum().item() for g in gradients) > 0
+
+
+def test_sdpa_backend_is_preserved_inside_backward_checkpoint_replay(monkeypatch):
+    import torch.nn.functional as functional
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    observations = []
+    original = functional.scaled_dot_product_attention
+    def observed(*args, **kwargs):
+        mask = kwargs.get("attn_mask")
+        if mask is not None:
+            assert mask.stride(-1) == 1
+            assert all(stride % 8 == 0 for stride in mask.stride()[:-1])
+        observations.append((torch.backends.cuda.math_sdp_enabled(),
+                             torch.backends.cuda.mem_efficient_sdp_enabled(),
+                             torch.backends.cuda.flash_sdp_enabled()))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(functional, "scaled_dot_product_attention", observed)
+    model, inputs = fixture_model()
+    model.language_model.model.gradient_checkpointing = True
+    tokens = torch.tensor([[7, 10, 3]])
+    sequence = dict(inputs, input_ids=torch.cat([inputs["input_ids"], tokens], 1))
+    # No global mutation, and a different surrounding default during backward
+    # must not change the recomputed kernel selected inside each native layer.
+    defaults = (torch.backends.cuda.math_sdp_enabled(), torch.backends.cuda.flash_sdp_enabled())
+    with torch.no_grad():
+        forward_ar(model, **inputs, use_cache=True)
+    result = forward_ar(model, **sequence, completion_start=3)
+    forward_count = len(observations)
+    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+        result.completion_log_probs.sum().backward()
+        assert not torch.backends.cuda.math_sdp_enabled()
+    assert len(observations) > forward_count
+    assert all(flags == (True, False, False) for flags in observations)
+    assert defaults == (torch.backends.cuda.math_sdp_enabled(), torch.backends.cuda.flash_sdp_enabled())
+
+
+def test_fp32_vocabulary_projection_keeps_gradients_and_avoids_bf16_output_rounding():
+    from eaglevl.model.locany.ui5_ar import _vocab_logits, _log_probs
+    torch.manual_seed(31)
+    hidden = torch.randn(5, 16, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(40, 16, dtype=torch.bfloat16, requires_grad=True)
+    targets = torch.tensor([1, 7, 3, 9, 10])
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        logits = _vocab_logits(hidden, weight)
+        actual = _log_probs(hidden, weight, targets, .7)
+    precise_logits = torch.nn.functional.linear(hidden.float(), weight.float())
+    expected = (precise_logits / .7).log_softmax(-1).gather(-1, targets[:, None]).flatten()
+    assert logits.dtype == actual.dtype == torch.float32
+    assert not torch.equal(logits, logits.bfloat16().float())
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    actual_grads = torch.autograd.grad(actual.sum(), (hidden, weight))
+    expected_grads = torch.autograd.grad(expected.sum(), (hidden, weight))
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+
+@pytest.mark.parametrize("length", [1, 8, 13, 7268])
+def test_cutlass_mask_alignment_preserves_exact_attention_domain(length):
+    from eaglevl.model.locany.ui5_ar import align_ar_attention_mask
+    mask = torch.zeros(1, 1, 3, length, dtype=torch.bfloat16)
+    mask[..., -1] = torch.finfo(mask.dtype).min
+    aligned = align_ar_attention_mask(mask)
+    assert aligned.shape == mask.shape
+    assert torch.equal(aligned, mask)
+    assert aligned.stride(-1) == 1
+    assert all(stride % 8 == 0 for stride in aligned.stride()[:-1])
+    assert align_ar_attention_mask(aligned) is aligned
+    assert align_ar_attention_mask(None) is None

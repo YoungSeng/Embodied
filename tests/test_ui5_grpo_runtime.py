@@ -9,6 +9,7 @@ import torch
 from eaglevl.train.ui5_grpo_core import deepspeed_slot_backward, digest
 from eaglevl.train.ui5_grpo_runtime import (
     backward_api_info, bind_execution_code, verify_execution_code,
+    sampling_probability_report,
 )
 from scripts.build_ui5_grpo_mixed_manifest import write_json
 
@@ -115,7 +116,7 @@ def test_runtime_update_rejects_model_change_dirty_source_and_modified_run(run_r
     with pytest.raises(ValueError, match="uncommitted"):
         bind_execution_code(run, allow_update=True)
     root = Path(run["project_root"])
-    model = root / "eaglevl/model/locany/ui5_ar.py"
+    model = root / "eaglevl/model/locany/relation_modules.py"
     model.parent.mkdir(parents=True)
     model.write_text("changed_model = True\n")
     commit(root, "model change requires a new experiment")
@@ -124,3 +125,60 @@ def test_runtime_update_rejects_model_change_dirty_source_and_modified_run(run_r
     changed = dict(run, mixed_identity="different-pool")
     with pytest.raises(ValueError, match="run.json"):
         bind_execution_code(changed, allow_update=True)
+
+
+def test_precision_repair_preserves_hybrid_baseline_and_can_then_resume_updates(run_repository):
+    run, source = run_repository
+    root, output = Path(run["project_root"]), Path(run["output_dir"])
+    model = root / "eaglevl/model/locany/ui5_ar.py"
+    model.parent.mkdir(parents=True)
+    model.write_text("precision_version = 1\n")
+    newer = commit(root, "AR numerical precision before first saved update")
+    assert bind_execution_code(run, allow_update=True) == newer
+    assert json.loads((output / "runtime_code_revision.json").read_text())["ar_precision_repair"]
+    (output / "resume/latest").mkdir(parents=True)
+    assert bind_execution_code(run) == newer
+    assert verify_execution_code(run) == newer
+    # Unrelated runtime fixes remain allowed after an already audited repair.
+    source.write_text("runtime_telemetry = True\n")
+    commit(root, "telemetry")
+    bind_execution_code(run, allow_update=True)
+    model.write_text("precision_version = 2\n")
+    commit(root, "cannot switch AR numerics mid training")
+    with pytest.raises(ValueError, match="after saved optimizer"):
+        bind_execution_code(run, allow_update=True)
+
+
+def test_precision_repair_cannot_accept_old_saved_optimizer_updates(run_repository):
+    run, _ = run_repository
+    root, output = Path(run["project_root"]), Path(run["output_dir"])
+    model = root / "eaglevl/model/locany/ui5_ar.py"
+    model.parent.mkdir(parents=True)
+    model.write_text("precision_version = 1\n")
+    commit(root, "precision repair")
+    (output / "resume/.previous").mkdir(parents=True)
+    with pytest.raises(ValueError, match="after saved optimizer"):
+        bind_execution_code(run, allow_update=True)
+    assert not (output / "runtime_code_revision.json").exists()
+
+
+def test_on_policy_guard_handles_observed_bf16_scale_without_modifying_old():
+    old = torch.full((100,), -5.)
+    saved = old.clone()
+    delta = torch.full_like(old, (100 * .01397884264588356 - .12348008155822754) / 99)
+    delta[0] = .12348008155822754
+    current = (old + delta).requires_grad_()
+    report = sampling_probability_report(current, old, .2)
+    assert report["valid"]
+    assert report["max_logprob_error"] > .08 and report["mean_logprob_error"] > .01
+    assert report["max_sampling_ratio"] < 1.2 and report["sampling_numerical_kl"] < .001
+    assert report["worst_token_index"] == 0
+    assert torch.equal(old, saved) and current.grad is None
+
+
+@pytest.mark.parametrize("delta", [.3, -.3, .1, float("nan"), float("inf")])
+def test_on_policy_guard_rejects_clipping_large_average_drift_and_nonfinite(delta):
+    old = torch.full((10,), -5.)
+    assert not sampling_probability_report(old + delta, old, .2)["valid"]
+    with pytest.raises(ValueError, match="token counts"):
+        sampling_probability_report(old[:-1], old, .2)

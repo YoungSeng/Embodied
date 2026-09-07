@@ -20,7 +20,9 @@ from eaglevl.train.ui5_grpo_core import (
     lr_multiplier, remaining_budget, stable_seed, zero_parameter_touch,
 )
 from eaglevl.train.ui5_grpo_checkpoint import restore_checkpoint, save_checkpoint
-from eaglevl.train.ui5_grpo_runtime import backward_api_info, verify_execution_code
+from eaglevl.train.ui5_grpo_runtime import (
+    backward_api_info, configure_ar_numerics, sampling_probability_report, verify_execution_code,
+)
 from scripts.build_ui5_grpo_mixed_manifest import read_json, read_rows, verify_manifest, write_json
 
 
@@ -196,6 +198,7 @@ def load_native(path, *, trainable):
 def run_diagnostic(actor, processor, groups, run, config, device, step, rank, parser, scorer):
     import torch
     import torch.distributed as dist
+    from eaglevl.model.locany.ui5_ar import AR_NUMERICS_VERSION
     rows = []
     started = time.monotonic()
     # RNG, sampler and weights do not move when the fixed train diagnosis runs.
@@ -204,6 +207,7 @@ def run_diagnostic(actor, processor, groups, run, config, device, step, rank, pa
             result = collect_group(actor, processor, group, config, device, "fixed_train_diagnostic", parser, scorer)
             count = sum(r["exact_correct"] for r in result["rewards"])
             rows.append(dict(step=step, scope="fixed mixed TRAIN diagnostic; generation_mode=slow",
+                             ar_numerics=AR_NUMERICS_VERSION,
                              group_id=group["group_id"], task=group["task"],
                              source_hybrid_correct_count=group["crop_correct_count"],
                              ar_correct_count=count, invalid=sum(r["invalid"] for r in result["rewards"])))
@@ -219,7 +223,7 @@ def run_diagnostic(actor, processor, groups, run, config, device, step, rank, pa
                 row["ar_step0_correct_count"] = lookup[row["group_id"]]
                 row["transition"] = f"{lookup[row['group_id']]}/4 -> {row['ar_correct_count']}/4"
         write_json(path, dict(step=step, rows=rows, seconds=time.monotonic() - started,
-                             run_identity=run["identity"]))
+                             run_identity=run["identity"], ar_numerics=AR_NUMERICS_VERSION))
     dist.barrier()
 
 
@@ -243,6 +247,7 @@ def main():
     config = GRPOConfig(**run["grpo"]).validate()
     execution_sha = verify_execution_code(run)
     runtime_info = dict(backward_api_info(deepspeed.DeepSpeedEngine.backward),
+                        **configure_ar_numerics(),
                         deepspeed_version=deepspeed.__version__, torch_version=torch.__version__,
                         code_sha=execution_sha, run_identity=run["identity"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -306,9 +311,14 @@ def main():
         write_json(output / "diagnostics/token_contract.json", audit)
     dist.barrier()
     diagnostic = read_rows(directory / "train_diagnostic.jsonl")
-    if not (output / "diagnostics/train_ar_step000000.json").is_file():
+    from eaglevl.model.locany.ui5_ar import AR_NUMERICS_VERSION
+    diagnostic_path = output / "diagnostics/train_ar_step000000.json"
+    previous_diagnostic = read_json(diagnostic_path) if diagnostic_path.is_file() else None
+    if previous_diagnostic is None or previous_diagnostic.get("ar_numerics") != AR_NUMERICS_VERSION:
         if start:
-            raise ValueError("resume lacks fixed step-0 AR train diagnostic")
+            raise ValueError("resume lacks fixed step-0 AR train diagnostic with the current numerical path")
+        if rank == 0 and previous_diagnostic is not None:
+            write_json(output / "diagnostics/previous_train_ar" / f"{digest(previous_diagnostic)}.json", previous_diagnostic)
         run_diagnostic(actor, processor, diagnostic, run, config, device, 0, rank, parser_module, scorer)
     window = []
     for step in range(start + 1, args.until_step + 1):
@@ -340,11 +350,28 @@ def main():
         reference.cpu()
         torch.cuda.empty_cache()
         reference_seconds = time.monotonic() - reference_started
+        # Save detached evidence before any backward, including a failing step.
+        trace = []
+        for group in collected:
+            trace.append(dict(group_id=group["group"]["group_id"], rewards=group["rewards"],
+                              advantages=group["advantages"], completions=group["completions"],
+                              views=[dict(image=v["image"], crop_id=v["crop_id"],
+                                         prompt_ids=x["input_ids"], prompt_positions=x["position_ids"],
+                                         prompt_mask=x["attention_mask"])
+                                     for v, x in zip(group["group"]["views"], group["inputs"])]))
+        trace_dir = output / "trajectories" / f"step{step:06d}"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(dict(step=step, run_identity=run["identity"], code_sha=execution_sha,
+                        ar_numerics=AR_NUMERICS_VERSION, phase="before_update", groups=trace,
+                        replay=replay_ids), trace_dir / f"rank{rank}.pt")
         local_slots = [(g, inputs, c, advantage) for g in collected
                        for trajectory, advantage in zip(g["completions"], g["advantages"])
                        for inputs, c in zip(g["inputs"], trajectory)]
         slot_count = aligned_slot_count(len(local_slots) + len(replays), device)
-        metrics = dict(policy_loss=0.0, kl_loss=0.0, replay_loss=0.0, max_logprob_error=0.0)
+        metrics = dict(policy_loss=0.0, kl_loss=0.0, replay_loss=0.0, max_logprob_error=0.0,
+                       mean_logprob_error=0.0, sampling_numerical_kl=0.0,
+                       min_sampling_ratio=float("inf"), max_sampling_ratio=0.0)
+        local_tokens = sum(g["token_count"] for g in collected)
         backward_started = time.monotonic()
         for slot in range(slot_count):
             engine.set_gradient_accumulation_boundary(slot + 1 == slot_count)
@@ -353,12 +380,22 @@ def main():
                 current_inputs = completion_inputs(inputs, completion["tokens"], device)
                 current = engine(**current_inputs, temperature=config.temperature).completion_log_probs
                 old = completion["old_log_probs"].to(device)
-                error = (current.detach() - old).abs()
-                maximum_error = error.max().item()
-                metrics["max_logprob_error"] = max(metrics["max_logprob_error"], maximum_error)
+                consistency = sampling_probability_report(current, old, config.clip)
+                for name in ("max_logprob_error", "max_sampling_ratio"):
+                    metrics[name] = max(metrics[name], consistency[name])
+                metrics["min_sampling_ratio"] = min(metrics["min_sampling_ratio"], consistency["min_sampling_ratio"])
+                for name in ("mean_logprob_error", "sampling_numerical_kl"):
+                    metrics[name] += consistency[name] * current.numel() / local_tokens
                 # Verified every on-policy completion, before any optimizer update.
-                if maximum_error > 0.08 or error.mean().item() > 0.01:
-                    raise ValueError(f"AR sample/recompute log-prob mismatch: max={maximum_error}, mean={error.mean().item()}")
+                if not consistency["valid"]:
+                    evidence = output / "diagnostics/ar_mismatch" / f"step{step:06d}-rank{rank}-slot{slot}.pt"
+                    evidence.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(dict(report=consistency, run_identity=run["identity"], code_sha=execution_sha,
+                                    ar_numerics=AR_NUMERICS_VERSION, group_id=group["group"]["group_id"],
+                                    completion=completion, current_log_probs=current.detach().cpu(),
+                                    inputs={k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+                                            for k, v in current_inputs.items() if k != "pixel_values"}), evidence)
+                    raise ValueError(f"AR sample/recompute log-prob mismatch: {consistency}; evidence={evidence}")
                 policy, kl = completion_loss_sums(current, old, completion["reference_log_probs"].to(device),
                                                   advantage, config.clip)
                 denominator = group["token_count"] * config.groups_per_rank
@@ -396,24 +433,12 @@ def main():
                        peak_reserved_gb=torch.cuda.max_memory_reserved(device) / 2**30)
         summaries = [None] * config.world_size
         dist.all_gather_object(summaries, metrics)
-        # Persist true sampled token/old log-prob evidence; never retain pixels
-        # or computation graphs in the trajectory archive.
-        trace = []
-        for group in collected:
-            trace.append(dict(group_id=group["group"]["group_id"], rewards=group["rewards"],
-                              advantages=group["advantages"], completions=group["completions"],
-                              views=[dict(image=v["image"], crop_id=v["crop_id"],
-                                         prompt_ids=x["input_ids"], prompt_positions=x["position_ids"],
-                                         prompt_mask=x["attention_mask"])
-                                     for v, x in zip(group["group"]["views"], group["inputs"])]))
-        trace_dir = output / "trajectories" / f"step{step:06d}"
-        trace_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(dict(step=step, run_identity=run["identity"], groups=trace, replay=replay_ids), trace_dir / f"rank{rank}.pt")
         if rank == 0:
             totals = {name for name in metrics if name.endswith("groups") or name.endswith("trajectories")}
             totals.add("completion_tokens")
-            maxima = {name for name in metrics if name.endswith("seconds") or name.startswith("peak_") or name in {"max_logprob_error", "slots"}}
+            maxima = {name for name in metrics if name.endswith("seconds") or name.startswith(("peak_", "max_")) or name == "slots"}
             merged = {name: (sum(s[name] for s in summaries) if name in totals else
+                             min(s[name] for s in summaries) if name == "min_sampling_ratio" else
                              max(s[name] for s in summaries) if name in maxima else
                              sum(s[name] for s in summaries) / len(summaries)) for name in metrics}
             merged.update(step=step, learning_rate=config.learning_rate * lr_multiplier(step, config),
@@ -428,8 +453,9 @@ def main():
                 report["window_steps"] = len(window)
                 for key in totals:
                     report[key] = sum(row[key] for row in window)
-                for key in ("max_logprob_error", "peak_allocated_gb", "peak_reserved_gb", "slots"):
+                for key in ("max_logprob_error", "max_sampling_ratio", "peak_allocated_gb", "peak_reserved_gb", "slots"):
                     report[key] = max(row[key] for row in window)
+                report["min_sampling_ratio"] = min(row["min_sampling_ratio"] for row in window)
                 write_json(output / "metrics" / f"step{step:06d}.json", report)
                 print("[GRPO] " + json.dumps(report, sort_keys=True), flush=True)
                 window.clear()

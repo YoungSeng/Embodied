@@ -149,6 +149,9 @@ def refresh_workbook(run):
     revision = output / "runtime_code_revision.json"
     if revision.is_file():
         identity_rows.extend(flatten_identity(read_json(revision), "runtime_revision."))
+    environment = output / "diagnostics/runtime_environment.json"
+    if environment.is_file():
+        identity_rows.extend(flatten_identity(read_json(environment), "runtime_environment."))
     tables = dict(train_curve=train, ui5_overall=artifacts._overall_rows(state),
                   ui5_by_task=artifacts._by_task_rows(state), checkpoints=artifacts._checkpoint_rows(state),
                   mixed_pool=manifest["sampling"], actual_sampling=actual_sampling,

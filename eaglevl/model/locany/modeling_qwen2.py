@@ -1342,6 +1342,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
             attention_mask, (batch_size, seq_length), inputs_embeds,
             past_key_values_length, sliding_window=self.config.sliding_window)
 
+        if ui5_ar_mode:
+            from .ui5_ar import ar_decoder_forward, align_ar_attention_mask
+            attention_mask = align_ar_attention_mask(attention_mask)
+
         hidden_states = inputs_embeds
 
         # decoder layers
@@ -1353,11 +1357,15 @@ class Qwen2Model(Qwen2PreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            decoder_forward = decoder_layer.__call__
+            if ui5_ar_mode:
+                decoder_forward = partial(ar_decoder_forward, decoder_layer)
+
             if checkpoint_layers:
                 checkpoint_function = (partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
                                        if ui5_ar_mode else self._gradient_checkpointing_func)
                 layer_outputs = checkpoint_function(
-                    decoder_layer.__call__,
+                    decoder_forward,
                     hidden_states,
                     attention_mask,
                     position_ids,
@@ -1366,7 +1374,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     use_cache,
                 )
             else:
-                layer_outputs = decoder_layer(
+                layer_outputs = decoder_forward(
                     hidden_states,
                     attention_mask=attention_mask,
                     position_ids=position_ids,

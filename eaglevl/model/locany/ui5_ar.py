@@ -8,6 +8,39 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+
+AR_NUMERICS_VERSION = "fp32-head-fixed-sdpa-v1"
+
+
+def align_ar_attention_mask(mask):
+    # CUTLASS SDPA requires bias row strides aligned to 8 BF16 elements. Pad
+    # storage only, then slice back: token counts and causal/window values stay
+    # identical, including arbitrary prompt lengths and the 7268-token cap.
+    if mask is None or all(stride % 8 == 0 for stride in mask.stride()[:-1]):
+        return mask
+    length = mask.shape[-1]
+    return F.pad(mask, (0, (-length) % 8))[..., :length]
+
+
+def ar_decoder_forward(decoder_layer, hidden_states, *args, **kwargs):
+    # Auto dispatch can choose different kernels for cached q_len=1 (no mask)
+    # and a full causal sequence, and again when autograd is enabled. Keep the
+    # backend inside the checkpointed callable so backward replay uses it too.
+    # CUDA's memory-efficient SDPA supports the native additive causal mask;
+    # forcing math on long H20 sequences would materialize large attention maps.
+    backend = (SDPBackend.EFFICIENT_ATTENTION if hidden_states.is_cuda else SDPBackend.MATH)
+    with sdpa_kernel(backend):
+        return decoder_layer(hidden_states, *args, **kwargs)
+
+
+def _vocab_logits(hidden, weight):
+    # Converting AFTER a BF16 GEMM cannot recover rounded vocabulary logits.
+    # Cast inside the checkpoint so no full FP32 head/gradient is kept per chunk.
+    # Also defeat any caller's autocast; old/current/reference use this helper.
+    with torch.autocast(device_type=hidden.device.type, enabled=False):
+        return F.linear(hidden.float(), weight.float())
 
 
 @dataclass
@@ -20,7 +53,7 @@ class ARResult:
 
 
 def _log_probs(hidden, weight, targets, temperature):
-    logits = F.linear(hidden, weight).float() / temperature
+    logits = _vocab_logits(hidden, weight) / temperature
     return logits.log_softmax(-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
 
 
@@ -81,7 +114,7 @@ def forward_ar(model, *, input_ids, pixel_values=None, image_grid_hws=None,
         text_mask_token_id=model.config.text_config.text_mask_token_id, block_size=1)
     weight = model.language_model.lm_head.weight
     if completion_start is None:
-        return ARResult(logits=F.linear(fused.hidden_states[:, -1], weight),
+        return ARResult(logits=_vocab_logits(fused.hidden_states[:, -1], weight),
                         past_key_values=output.past_key_values, visual_cache=visual_cache,
                         pbd_positions=fused.active_positions)
     if not 1 <= completion_start < input_ids.shape[1] or past_key_values is not None:

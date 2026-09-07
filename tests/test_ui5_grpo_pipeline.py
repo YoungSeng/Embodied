@@ -294,6 +294,8 @@ def test_repaired_runtime_reuses_durable_step_zero_without_gpu_workers(tmp_path,
     write_json(output / "evaluation_status.json", dict(success=True, identity=digest(identity),
                metrics_sha256=file_sha(output / "ui5_metrics.json"), evaluation_seconds=4085.0))
     write_json(tmp_path / "runtime_code_revision.json", dict(execution_code_sha="repaired-code"))
+    write_json(tmp_path / "diagnostics/runtime_environment.json",
+               dict(ar_numerics="fp32-head-fixed-sdpa-v1", ar_vocab_projection="float32"))
     preserved = {p: p.read_bytes() for p in output.iterdir()}
     def no_worker(*args, **kwargs):
         raise AssertionError("completed step 0 must not rerun a GPU worker")
@@ -305,5 +307,6 @@ def test_repaired_runtime_reuses_durable_step_zero_without_gpu_workers(tmp_path,
     workbook = openpyxl.load_workbook(tmp_path / "diagnostics/ui5_grpo_training_evaluation.xlsx", read_only=True)
     try:
         assert ("runtime_revision.execution_code_sha", "repaired-code") in list(workbook["run_identity"].values)
+        assert ("runtime_environment.ar_vocab_projection", "float32") in list(workbook["run_identity"].values)
     finally:
         workbook.close()

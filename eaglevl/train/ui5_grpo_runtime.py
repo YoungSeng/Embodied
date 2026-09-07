@@ -8,8 +8,13 @@ import subprocess
 from eaglevl.train.ui5_grpo_core import digest
 
 
-# Model, decoding, reward, sampling, data and optimizer configuration changes
-# require a new run. These files are the execution/telemetry repair surface.
+# Reward, sampling, data and optimizer changes require a new run. The two
+# native AR files below also permit an audited precision repair BEFORE the
+# first saved update; the formal hybrid implementation is never in this set.
+AR_PRECISION_UPDATE_FILES = frozenset({
+    "eaglevl/model/locany/ui5_ar.py",
+    "eaglevl/model/locany/modeling_qwen2.py",
+})
 RUNTIME_UPDATE_FILES = frozenset({
     "README_UI5_CROP_GRPO_MIXED_V1.md",
     "eaglevl/train/ui5_grpo_runtime.py",
@@ -21,7 +26,47 @@ RUNTIME_UPDATE_FILES = frozenset({
     "tests/test_ui5_grpo_runtime.py",
     "tests/test_ui5_grpo_distributed.py",
     "tests/test_ui5_grpo_pipeline.py",
-})
+    "tests/test_ui5_grpo_native_ar.py",
+}) | AR_PRECISION_UPDATE_FILES
+
+
+def configure_ar_numerics():
+    import torch
+    from eaglevl.model.locany.ui5_ar import AR_NUMERICS_VERSION
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    return dict(ar_numerics=AR_NUMERICS_VERSION, ar_vocab_projection="float32",
+                ar_sdpa_cuda="efficient_attention", ar_sdpa_cpu="math",
+                float32_matmul_precision=torch.get_float32_matmul_precision(),
+                bf16_reduced_precision_reduction=False,
+                sampling_numerical_kl_limit=0.001)
+
+
+def sampling_probability_report(current, old, clip):
+    """Before the only update, numerical drift must not engage PPO clipping.
+
+    Cached and teacher-forced BF16 are not bitwise identical even with the
+    same attention backend. Measure the actual importance ratio and its
+    nonnegative k3 discrepancy instead of arbitrary absolute log-prob limits.
+    This is a numerical check, distinct from the fixed-reference KL loss.
+    The sampled old log-probs are never replaced, rounded or recentered.
+    """
+    import torch
+    if current.shape != old.shape or current.ndim != 1 or not current.numel():
+        raise ValueError("sample/recompute completion token counts differ")
+    delta = current.detach().float() - old.detach().float()
+    error = delta.abs()
+    ratio = delta.exp()
+    numerical_kl = (delta.expm1() - delta).clamp_min(0).mean().item()
+    finite = bool(torch.isfinite(current).all() and torch.isfinite(old).all()
+                  and torch.isfinite(ratio).all())
+    minimum, maximum = ratio.min().item(), ratio.max().item()
+    return dict(valid=finite and minimum >= 1 - clip and maximum <= 1 + clip
+                and numerical_kl <= 0.001,
+                max_logprob_error=error.max().item(), mean_logprob_error=error.mean().item(),
+                min_sampling_ratio=minimum, max_sampling_ratio=maximum,
+                sampling_numerical_kl=numerical_kl,
+                worst_token_index=int(error.argmax()))
 
 
 def backward_api_info(backward):
@@ -108,10 +153,16 @@ def bind_execution_code(run, *, allow_update=False):
     if not allow_update:
         raise ValueError("existing run uses another code SHA; use --resume-code-update for a runtime-only repair")
     changes = _runtime_changes(root, run["code_sha"], current)
+    previous_sha = record["execution_code_sha"] if path.is_file() else run["code_sha"]
+    precision_changes = set(_git(root, "diff", "--name-only", previous_sha, current, "--").splitlines()) & AR_PRECISION_UPDATE_FILES
+    if precision_changes and any((Path(run["output_dir"]) / "resume" / name).exists()
+                                 for name in ("latest", ".previous", ".pending")):
+        raise ValueError("AR precision repair after saved optimizer updates requires a new run")
     record = dict(schema_version=1, run_identity=run["identity"], run_code_sha=run["code_sha"],
                   execution_code_sha=current, changed_files=changes,
                   created_at=datetime.now(timezone.utc).isoformat(),
-                  reason="runtime compatibility repair; preserve fixed reference, manifest and completed evaluation")
+                  ar_precision_repair=bool(precision_changes),
+                  reason="runtime compatibility repair; preserve fixed reference, manifest and completed hybrid evaluation")
     record["identity"] = digest(record)
     write_json(Path(run["output_dir"]) / "diagnostics/code_revisions" / f"{record['identity']}.json", record)
     write_json(path, record)
