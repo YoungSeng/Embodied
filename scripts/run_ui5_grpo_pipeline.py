@@ -128,6 +128,14 @@ def main():
                        "--run-config", str(args.run_config.resolve()), "--until-step", str(target)]
             child_env = dict(os.environ, CUDA_VISIBLE_DEVICES="0,1", TOKENIZERS_PARALLELISM="false",
                              PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
+            # Embedded failure evidence for the formal job, without changing
+            # timeout, transport or launching an independent diagnostic job.
+            nccl_dir = output / "diagnostics/nccl"
+            nccl_dir.mkdir(parents=True, exist_ok=True)
+            for key, value in dict(TORCH_NCCL_TRACE_BUFFER_SIZE="8192", TORCH_NCCL_DUMP_ON_TIMEOUT="1",
+                                   TORCH_NCCL_DESYNC_DEBUG="1",
+                                   TORCH_NCCL_DEBUG_INFO_TEMP_FILE=str(nccl_dir / "trace_")).items():
+                child_env.setdefault(key, value)
             subprocess.run(command, cwd=ROOT, env=child_env, check=True)
             # subprocess completion is the GPU release barrier for both ranks.
             marker = validate_checkpoint(output / "resume/latest", run["identity"])

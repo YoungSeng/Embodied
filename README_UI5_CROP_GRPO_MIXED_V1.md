@@ -71,7 +71,8 @@ bash shell/submit_ui5_crop_grpo_mixed_v1.sh --resume
 
 ### 运行时兼容修复后重提（保留已完成的 step 0）
 
-若原任务因 DeepSpeed `scale_wrt_gas` 签名检查或首步 AR 概率校验退出，平台任务停止后执行：
+若原任务因 DeepSpeed `scale_wrt_gas` 签名检查、首步 AR 概率校验或 ZeRO-2 通信顺序异常退出，
+平台任务停止后执行：
 
 ```bash
 cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Embodied-ui5-crop-grpo-mixed-v1
@@ -253,6 +254,30 @@ CPU 轨迹在反传前保存；超限时 `diagnostics/ar_mismatch/stepXXXXXX-ran
 raw output、old/current/reference log-prob、输入 ID/位置/mask、最大误差 token 索引、group、代码和数值版本。
 这些检查与记录内嵌正式训练，不创建额外 debug 任务。
 
+### ZeRO-2 固定梯度归约顺序
+
+仅对齐槽数和全参数零依赖不能固定 autograd hook 的到达顺序。原生
+[DeepSpeed ZeRO-2](https://github.com/deepspeedai/DeepSpeed/blob/v0.17.5/deepspeed/runtime/zero/stage_1_and_2.py)
+在 hook 到达时填充 IPG bucket；两卡分别执行 AR、MTP replay 或 padding 时，bucket 的参数组合和
+collective 数量可能不同，即使两边参数总数相同。
+
+`ui5_grpo_zero2.py` 在梯度就绪与原生 reducer 之间加入固定顺序队列。两卡从相同 optimizer 参数组
+生成同一个反向参数顺序，先核对参数名、shape、dtype、分组和 bucket 配置的 SHA。
+每个槽只缓存就绪参数的引用，按该顺序交回原生 reducer；所有参数完成后才允许进入原生 reduction
+epilogue 与 optimizer step。缺失/重复梯度立即报错。ZeRO stage=2、原生分片/累积/归约缩放、
+overflow、梯度裁剪、Adam 和 scheduler 都保留，不增加 optimizer step 或 GAS 缩放。
+
+固定顺序可能延长部分 `.grad` 的驻留，但不复制梯度、不保留额外 completion 计算图；每 10 steps
+记录 `max_pending_gradient_elements` 与原有显存峰值。每卡每槽仍为一条 completion/crop 微批。
+这属于运行时通信修复，可以用 `--resume-code-update` 接续同一 run；当前 AR 数值版本与两个 step-0
+基线均不变，无需重算已完成的 hybrid 评测或当前版本的固定 TRAIN AR 诊断。
+
+正式任务内保存 `diagnostics/zero2_reduction_plan.json`、`trajectories/stepXXXXXX/rankR-schedule.json`、
+以及持续更新的 `diagnostics/progress/rankR.json`，标明 generation/reference/具体微批槽/optimizer 完成。
+启动首个 optimizer update 成功时打印 `[GRPO UPDATE]`。训练子进程默认启用 NCCL flight recorder
+（8192 events）、超时 dump 和 desync 信息，产物位于 `diagnostics/nccl/`；不延长超时、不修改网络传输，
+不另起 debug job。变量含义见 [PyTorch NCCL 文档](https://docs.pytorch.org/docs/2.14/torch_nccl_environment_variables.html)。
+
 ## 评测、Excel 与完整恢复
 
 step 0、200、400、600、800、1000、1200 全量 UI5，始终 boundary_v3 + hybrid。
@@ -278,7 +303,7 @@ BBox TN 按既有 evaluator 的可用性留空，不填虚构的 0。
 普通单元/集成测试，不创建集群 debug job：
 
 ```bash
-python -m pytest tests/test_ui5_grpo.py tests/test_ui5_grpo_native_ar.py tests/test_ui5_grpo_distributed.py tests/test_ui5_grpo_pipeline.py tests/test_ui5_grpo_manifest_integration.py tests/test_ui5_grpo_runtime.py -q
+python -m pytest tests/test_ui5_grpo.py tests/test_ui5_grpo_native_ar.py tests/test_ui5_grpo_distributed.py tests/test_ui5_grpo_zero2.py tests/test_ui5_grpo_pipeline.py tests/test_ui5_grpo_manifest_integration.py tests/test_ui5_grpo_runtime.py -q
 ```
 
 覆盖真实小型原生 Qwen2 SDPA/PBD 的 cached slow 与 teacher-forced 概率、原 slow decoder 等价性、
@@ -290,7 +315,15 @@ Windows 单元测试只替换 POSIX best symlink 创建原语，副本/哈希/�
 不同外部 SDPA 默认下的 backward checkpoint 重算、7268 等非 8 倍数长度的 mask 存储对齐，
 以及观测误差量级的接受条件、真正 ratio 越界/整体漂移/NaN/Inf 拒绝条件和数值版本恢复审计。
 
-已完成本次数值修复后的训练相关完整回归（100 项测试及 2 个子测试，包含双 rank、提交/恢复和 Excel）。
+`test_ui5_grpo_zero2.py` 直接运行 DeepSpeed 原生 ZeRO-2 的 leaf hooks、IPG buckets、梯度分片、Adam
+及 optimizer state 保存/恢复，用两个 CPU/Gloo rank 与集中计算的 group/token 归一化更新比较。
+测试主动置换两卡的合法梯度就绪通知顺序：旧实现出现 bucket 参数/顺序差异，固定顺序后保持一致；
+同时覆盖不同 crop 数、零优势组、replay、空槽、多参数组和超出 bucket 大小的参数。
+CPU 测试仅禁用可选 shared-memory JIT extension，通信执行真实 Gloo；没有 DeepSpeed 时显式 skip，
+不能把这种 skip 计作 ZeRO-2 验证通过。
+
+已完成本次通信修复后的训练相关完整回归（103 项测试及 2 个子测试，包含双 rank、提交/恢复和 Excel），
+其中原生 ZeRO-2 专项测试在 DeepSpeed 0.17.5 与 0.16.3 的两个 CPU/Gloo rank 上均通过，未跳过。
 shell 语法与 Git diff 空白检查通过。Excel 测试产物完成数值回读和渲染检查。
 
 外部开发机没有内网挂载或 H20，测试不代表真实训练已执行，也不预填真实样本量、F1 或吞吐。

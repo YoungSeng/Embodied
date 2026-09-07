@@ -20,6 +20,7 @@ from eaglevl.train.ui5_grpo_core import (
     lr_multiplier, remaining_budget, stable_seed, zero_parameter_touch,
 )
 from eaglevl.train.ui5_grpo_checkpoint import restore_checkpoint, save_checkpoint
+from eaglevl.train.ui5_grpo_zero2 import OrderedZero2Reduction
 from eaglevl.train.ui5_grpo_runtime import (
     backward_api_info, configure_ar_numerics, sampling_probability_report, verify_execution_code,
 )
@@ -306,7 +307,17 @@ def main():
         raise ValueError("invalid segment optimizer-step range")
     parser_module, scorer = formal_modules()
     output = Path(run["output_dir"])
+    reducer = OrderedZero2Reduction(engine.optimizer, actor.named_parameters())
+    reduction_plans = [None] * config.world_size
+    dist.all_gather_object(reduction_plans, reducer.plan["identity"])
+    if len(set(reduction_plans)) != 1:
+        raise ValueError(f"ranks disagree on ZeRO-2 parameter/bucket order: {reduction_plans}")
+    runtime_info.update(zero2_reduction_version=reducer.VERSION,
+                        zero2_reduction_identity=reducer.plan["identity"])
     if rank == 0:
+        write_json(output / "diagnostics/zero2_reduction_plan.json", reducer.plan)
+        write_json(output / "diagnostics/runtime_environment.json", runtime_info)
+        print("[GRPO ZERO2] " + json.dumps({k: v for k, v in reducer.plan.items() if k != "parameters"}), flush=True)
         write_json(output / "diagnostics/optimizer_groups.json", param_report)
         write_json(output / "diagnostics/token_contract.json", audit)
     dist.barrier()
@@ -321,10 +332,15 @@ def main():
             write_json(output / "diagnostics/previous_train_ar" / f"{digest(previous_diagnostic)}.json", previous_diagnostic)
         run_diagnostic(actor, processor, diagnostic, run, config, device, 0, rank, parser_module, scorer)
     window = []
+    def progress(step, phase, **details):
+        write_json(output / "diagnostics/progress" / f"rank{rank}.json",
+                   dict(step=step, rank=rank, phase=phase, code_sha=execution_sha,
+                        reduction_identity=reducer.plan["identity"], updated_at=time.time(), **details))
     for step in range(start + 1, args.until_step + 1):
         torch.cuda.reset_peak_memory_stats(device)
         started = time.monotonic()
         collected, replays, replay_ids = [], [], []
+        progress(step, "generation")
         # Two rounds, one whole group per rank/round. No weight update inside
         # either G=4 sampling phase or between the two accumulation rounds.
         for round_index in range(config.groups_per_rank):
@@ -337,6 +353,7 @@ def main():
             replays.append(data)
             replay_ids.append(replay_identity)
         generation_seconds = time.monotonic() - started
+        progress(step, "reference", generation_seconds=generation_seconds)
         reference_started = time.monotonic()
         reference.to(device)
         with torch.no_grad():
@@ -368,13 +385,19 @@ def main():
                        for trajectory, advantage in zip(g["completions"], g["advantages"])
                        for inputs, c in zip(g["inputs"], trajectory)]
         slot_count = aligned_slot_count(len(local_slots) + len(replays), device)
+        schedule = dict(step=step, rank=rank, policy_slots=len(local_slots), replay_slots=len(replays),
+                        padding_slots=slot_count - len(local_slots) - len(replays), total_slots=slot_count,
+                        reduction_identity=reducer.plan["identity"])
+        write_json(trace_dir / f"rank{rank}-schedule.json", schedule)
         metrics = dict(policy_loss=0.0, kl_loss=0.0, replay_loss=0.0, max_logprob_error=0.0,
                        mean_logprob_error=0.0, sampling_numerical_kl=0.0,
-                       min_sampling_ratio=float("inf"), max_sampling_ratio=0.0)
+                       min_sampling_ratio=float("inf"), max_sampling_ratio=0.0, max_pending_gradient_elements=0)
         local_tokens = sum(g["token_count"] for g in collected)
         backward_started = time.monotonic()
         for slot in range(slot_count):
             engine.set_gradient_accumulation_boundary(slot + 1 == slot_count)
+            kind = "policy" if slot < len(local_slots) else "replay" if slot < len(local_slots) + len(replays) else "padding"
+            progress(step, "forward_backward", slot=slot, slot_kind=kind, total_slots=slot_count)
             if slot < len(local_slots):
                 group, inputs, completion, advantage = local_slots[slot]
                 current_inputs = completion_inputs(inputs, completion["tokens"], device)
@@ -410,13 +433,19 @@ def main():
                 loss = config.replay_weight * replay_loss / config.groups_per_rank + zero_parameter_touch(actor)
             else:
                 loss = engine(pixel_values=None, ui5_zero_slot=True).loss
+            reducer.begin_slot(step, slot)
             deepspeed_slot_backward(engine, loss, final_slot=slot + 1 == slot_count)
+            reduced = reducer.end_slot()
+            metrics["max_pending_gradient_elements"] = max(metrics["max_pending_gradient_elements"], reduced["peak_pending_elements"])
             del loss
             if slot < len(local_slots):
                 del current, current_inputs, policy, kl
         torch.cuda.synchronize(device)
         if engine.global_steps != step:
             raise ValueError(f"ZeRO optimizer boundary mismatch: {engine.global_steps} != {step}")
+        progress(step, "optimizer_step_complete", total_slots=slot_count)
+        if rank == 0 and step == start + 1:
+            print(f"[GRPO UPDATE] optimizer_step={step} slots={slot_count} zero2_order_verified=true", flush=True)
         all_rewards = [r for group in collected for r in group["rewards"]]
         metrics.update({name: sum(r[name] for r in all_rewards) / len(all_rewards)
                         for name in ("reward", "F_box", "C_img", "S_iou")})
@@ -453,7 +482,7 @@ def main():
                 report["window_steps"] = len(window)
                 for key in totals:
                     report[key] = sum(row[key] for row in window)
-                for key in ("max_logprob_error", "max_sampling_ratio", "peak_allocated_gb", "peak_reserved_gb", "slots"):
+                for key in ("max_logprob_error", "max_sampling_ratio", "max_pending_gradient_elements", "peak_allocated_gb", "peak_reserved_gb", "slots"):
                     report[key] = max(row[key] for row in window)
                 report["min_sampling_ratio"] = min(row["min_sampling_ratio"] for row in window)
                 write_json(output / "metrics" / f"step{step:06d}.json", report)

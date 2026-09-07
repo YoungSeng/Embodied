@@ -20,6 +20,7 @@ RUNTIME_UPDATE_FILES = frozenset({
     "eaglevl/train/ui5_grpo_runtime.py",
     "eaglevl/train/ui5_grpo_trainer.py",
     "eaglevl/train/ui5_grpo_checkpoint.py",
+    "eaglevl/train/ui5_grpo_zero2.py",
     "scripts/submit_ui5_grpo_mixed.py",
     "scripts/run_ui5_grpo_pipeline.py",
     "scripts/ui5_grpo_artifacts.py",
@@ -27,6 +28,7 @@ RUNTIME_UPDATE_FILES = frozenset({
     "tests/test_ui5_grpo_distributed.py",
     "tests/test_ui5_grpo_pipeline.py",
     "tests/test_ui5_grpo_native_ar.py",
+    "tests/test_ui5_grpo_zero2.py",
 }) | AR_PRECISION_UPDATE_FILES
 
 
