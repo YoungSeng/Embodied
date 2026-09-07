@@ -68,6 +68,8 @@ def save_checkpoint(engine, run, step, rank_state):
     import torch.distributed as dist
     from scripts.build_ui5_grpo_mixed_manifest import write_json
     from scripts.patch_locany_checkpoint import patch_checkpoint
+    from eaglevl.train.ui5_grpo_runtime import verify_execution_code
+    execution_sha = verify_execution_code(run)
     rank = dist.get_rank()
     root = Path(run["output_dir"]) / "resume"
     pending, latest, previous = root / ".pending", root / "latest", root / ".previous"
@@ -77,17 +79,17 @@ def save_checkpoint(engine, run, step, rank_state):
             raise ValueError("unrecovered pending GRPO checkpoint")
         pending.mkdir()
     dist.barrier()
-    state = dict(rank_state, step=step, run_identity=run["identity"],
+    state = dict(rank_state, step=step, run_identity=run["identity"], execution_code_sha=execution_sha,
                  python_rng=random.getstate(), numpy_rng=np.random.get_state(),
                  torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state_all())
     torch.save(state, pending / f"rng_sampler_rank{rank}.pt")
     engine.save_checkpoint(str(pending / "deepspeed"), tag="state",
-                           client_state=dict(step=step, run_identity=run["identity"]), save_latest=True)
+                           client_state=dict(step=step, run_identity=run["identity"], execution_code_sha=execution_sha), save_latest=True)
     dist.barrier()
     if rank == 0:
         engine.module.save_pretrained(pending, safe_serialization=True)
         write_json(pending / "trainer_state.json", dict(global_step=step, training_mode="ui5_grpo",
-                                                       run_identity=run["identity"]))
+                                                       run_identity=run["identity"], execution_code_sha=execution_sha))
         patch_checkpoint(base_model=Path(run["processor_path"]), checkpoint=pending,
                          project_root=Path(run["project_root"]), force=True, validate_relation_weights=True)
         files = {}
@@ -97,6 +99,7 @@ def save_checkpoint(engine, run, step, rank_state):
                     os.fsync(stream.fileno())
                 files[path.relative_to(pending).as_posix()] = dict(bytes=path.stat().st_size, sha256=file_sha(path))
         write_json(pending / "grpo_complete.json", dict(step=step, run_identity=run["identity"],
+                   execution_code_sha=execution_sha,
                    reference_identity=run["reference"]["identity"], world_size=dist.get_world_size(),
                    files=files, files_digest=digest(files)))
         if previous.exists():

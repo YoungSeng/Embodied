@@ -16,6 +16,7 @@ for path in (ROOT, ROOT / "scripts"):
         sys.path.insert(0, str(path))
 from eaglevl.train.ui5_grpo_core import GRPOConfig, digest, file_sha
 from eaglevl.train.ui5_grpo_checkpoint import recover, validate_checkpoint
+from eaglevl.train.ui5_grpo_runtime import verify_execution_code
 from scripts.build_ui5_grpo_mixed_manifest import read_json, write_json
 from scripts import run_ui5_curriculum_evaluation as evaluation
 from scripts.ui5_grpo_artifacts import register_evaluation, refresh_workbook
@@ -95,11 +96,9 @@ def main():
     config = GRPOConfig(**run["grpo"]).validate()
     if os.environ.get("GRPO_CONFIG_JSON") and json.loads(os.environ["GRPO_CONFIG_JSON"]) != run["grpo"]:
         raise ValueError("rendered YAML GRPO settings differ from immutable run.json")
-    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    if sha != run["code_sha"]:
-        raise ValueError("formal checkout SHA differs from the submitted code")
-    if subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=no"], cwd=ROOT, text=True).strip():
-        raise ValueError("formal source was edited after submission")
+    sha = verify_execution_code(run)
+    if os.environ.get("CODE_REVISION") and os.environ["CODE_REVISION"] != sha:
+        raise ValueError("formal checkout SHA differs from the submitted YAML")
     output = Path(run["output_dir"])
     with (output / ".pipeline.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -116,8 +115,9 @@ def main():
         recorded = {row["step"] for row in state["evaluations"]}
         if recorded and max(recorded) > current:
             raise ValueError("formal evaluation advanced beyond durable resume")
-        if 0 not in recorded:
-            evaluate(run, 0, Path(run["initial_model"]))
+        # Revalidate the durable step-0 identity/metrics on resume; a matching
+        # result is registered idempotently without launching any GPU worker.
+        evaluate(run, 0, Path(run["initial_model"]))
         if current and current % config.eval_interval == 0:
             evaluate(run, current, output / "resume/latest")
         while current < config.total_steps:

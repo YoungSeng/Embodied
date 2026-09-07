@@ -21,6 +21,7 @@ for path in (ROOT, ROOT / "scripts"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 from eaglevl.train.ui5_grpo_core import GRPOConfig, digest, file_sha
+from eaglevl.train.ui5_grpo_runtime import bind_execution_code
 from scripts.build_ui5_grpo_mixed_manifest import build, read_json, write_json
 from scripts.ui5_grpo_bootstrap import PREVIOUS, recorded_source
 
@@ -76,7 +77,7 @@ def evaluation_config(env):
                 evaluator_iou_threshold=value("EVAL_IOU_THRESHOLD", 0.1, float))
 
 
-def render_job(old_job, old_env, run, run_config):
+def render_job(old_job, old_env, run, run_config, *, execution_sha=None):
     import yaml
     job = yaml.safe_load((ROOT / "jobs/ui5_crop_grpo_mixed_v1_h20x2.yaml").read_text(encoding="utf-8"))
     for key in ("resource", "imageMeta", "volumes"):
@@ -92,7 +93,7 @@ def render_job(old_job, old_env, run, run_config):
     for key in ("RESUME_FROM_CHECKPOINT", "LOCANY_STOP_AFTER_STEP", "CURRICULUM_START_STEP", "CURRICULUM_MODE",
                 "HARD_RATIOS", "ANCHOR_RATIOS", "GLOBAL_REPLAY_RATIOS", "LLM_LRS", "UI5_CURRICULUM_PROFILE"):
         env.pop(key, None)
-    env.update(PROJECT_ROOT=run["project_root"], CODE_REVISION=run["code_sha"],
+    env.update(PROJECT_ROOT=run["project_root"], CODE_REVISION=execution_sha or run["code_sha"],
                RUN_NAME=run["run_name"], OUTPUT_DIR=run["output_dir"], GRPO_RUN_CONFIG=str(run_config),
                PYTHON_BIN=run["python"], MODEL_PATH=run["initial_model"],
                GRPO_CONFIG_JSON=json.dumps(run["grpo"], sort_keys=True),
@@ -113,6 +114,9 @@ def prepare(args):
     from scripts.ui5_curriculum_v3 import model_view
     from scripts.ui5_curriculum_text_revision import read_publication
     from scripts.patch_locany_checkpoint import patch_checkpoint
+    code_update = getattr(args, "resume_code_update", False)
+    if code_update:
+        args.resume = True
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,70}", args.run_name):
         raise ValueError("RUN_NAME must be a unique safe lowercase name")
     if ROOT.resolve() != CHECKOUT.resolve():
@@ -142,8 +146,13 @@ def prepare(args):
     run_config = output / "run.json"
     if run_config.exists():
         run = read_json(run_config)
-        if run["code_sha"] != sha or run["source_submission"] != str(source_path):
-            raise ValueError("existing RUN_NAME belongs to another code/source identity")
+        if run["source_submission"] != str(source_path):
+            raise ValueError("existing RUN_NAME belongs to another source identity")
+        # Match the pipeline's process lock before publishing a runtime update.
+        import fcntl
+        with (output / ".pipeline.lock").open("a") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            bind_execution_code(run, allow_update=code_update)
         if args.submit and not args.resume and (submission / "submission-attempt.started").exists():
             raise ValueError("submission already attempted; inspect its receipt, or --resume after the prior job stops")
     else:
@@ -195,12 +204,13 @@ def prepare(args):
         from datetime import datetime, timezone
         destination = submission / ("resume-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
         destination.mkdir(exist_ok=False)
-    job = render_job(old_job, env, run, run_config)
+    job = render_job(old_job, env, run, run_config, execution_sha=sha)
     job_path = destination / "formal.yaml"
     job_path.write_text(yaml.safe_dump(job, sort_keys=False), encoding="utf-8")
     state_path = destination / "submission.json"
     state = dict(status="prepared", runtime=job["jobRunParams"]["envsList"], job_yaml=str(job_path),
-                 run_identity=run["identity"], run_config=str(run_config), resume=args.resume)
+                 run_identity=run["identity"], run_config=str(run_config), resume=args.resume,
+                 execution_code_sha=sha, run_code_sha=run["code_sha"])
     write_json(state_path, state)
     write_json(output / "delivery_paths.json", dict(code_sha=sha, yaml=str(job_path), run_config=str(run_config),
                mixed_manifest=str(output / "mixed/manifest.json"),
@@ -224,6 +234,8 @@ def main():
     parser.add_argument("--run-name", default=RUN_NAME)
     parser.add_argument("--submit", action="store_true")
     parser.add_argument("--resume", action="store_true", help="previous platform job must be stopped; preserve the existing RUN_NAME")
+    parser.add_argument("--resume-code-update", action="store_true",
+                        help="implies --resume; audit a runtime-only code repair while preserving run.json and completed step 0")
     parser.add_argument("--mlx-bin", default="mlx")
     prepare(parser.parse_args())
 

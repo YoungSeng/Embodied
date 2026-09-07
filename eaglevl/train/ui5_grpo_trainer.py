@@ -2,7 +2,6 @@
 from __future__ import annotations
 import argparse
 from collections import Counter
-import inspect
 import json
 import os
 from pathlib import Path
@@ -21,6 +20,7 @@ from eaglevl.train.ui5_grpo_core import (
     lr_multiplier, remaining_budget, stable_seed, zero_parameter_touch,
 )
 from eaglevl.train.ui5_grpo_checkpoint import restore_checkpoint, save_checkpoint
+from eaglevl.train.ui5_grpo_runtime import backward_api_info, verify_execution_code
 from scripts.build_ui5_grpo_mixed_manifest import read_json, read_rows, verify_manifest, write_json
 
 
@@ -241,14 +241,19 @@ def main():
     if payload.pop("identity") != digest(payload):
         raise ValueError("run config identity mismatch")
     config = GRPOConfig(**run["grpo"]).validate()
+    execution_sha = verify_execution_code(run)
+    runtime_info = dict(backward_api_info(deepspeed.DeepSpeedEngine.backward),
+                        deepspeed_version=deepspeed.__version__, torch_version=torch.__version__,
+                        code_sha=execution_sha, run_identity=run["identity"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     deepspeed.init_distributed(dist_backend="nccl")
     rank = dist.get_rank()
     if dist.get_world_size() != 2 or "H20" not in torch.cuda.get_device_name(device):
         raise ValueError("this formal launcher requires two H20 ranks")
-    if "scale_wrt_gas" not in inspect.signature(deepspeed.DeepSpeedEngine.backward).parameters:
-        raise RuntimeError("inherited DeepSpeed lacks the required scale_wrt_gas public API")
+    if rank == 0:
+        print("[GRPO RUNTIME] " + json.dumps(runtime_info, sort_keys=True), flush=True)
+        write_json(Path(run["output_dir"]) / "diagnostics/runtime_environment.json", runtime_info)
     torch.manual_seed(config.seed + rank)
     random.seed(config.seed + rank)
     np.random.seed(config.seed + rank)
@@ -342,6 +347,7 @@ def main():
         metrics = dict(policy_loss=0.0, kl_loss=0.0, replay_loss=0.0, max_logprob_error=0.0)
         backward_started = time.monotonic()
         for slot in range(slot_count):
+            engine.set_gradient_accumulation_boundary(slot + 1 == slot_count)
             if slot < len(local_slots):
                 group, inputs, completion, advantage = local_slots[slot]
                 current_inputs = completion_inputs(inputs, completion["tokens"], device)

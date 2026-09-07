@@ -106,12 +106,13 @@ def test_exact_inherited_v3_submission_and_h20_job_contract(tmp_path):
     assert found == successor
     run = dict(run_name="mixed-test", project_root="/independent", code_sha="bound-commit",
                output_dir="/new-output", python="/real/conda/bin/python", initial_model="/initial", grpo=GRPOConfig().to_dict())
-    rendered = render_job(job, actual, run, "/new-output/run.json")
+    rendered = render_job(job, actual, run, "/new-output/run.json", execution_sha="repaired-commit")
     for key in ("resource", "imageMeta", "volumes"):
         assert rendered["jobDefVersion"][key] == old["jobDefVersion"][key]
     runtime = rendered["jobRunParams"]["envsList"]
     assert runtime["ENV_DIR"] == env["ENV_DIR"]
-    assert runtime["CODE_REVISION"] == "bound-commit"
+    assert runtime["CODE_REVISION"] == "repaired-commit"
+    assert run["code_sha"] == "bound-commit"
     assert all(runtime[key] == "7268" for key in ("MAX_SEQ_LENGTH", "MAX_NUM_TOKENS", "MAX_NUM_TOKENS_PER_SAMPLE"))
     config = evaluation_config(actual)
     assert (config["decoder_policy"], config["generation_mode"]) == ("boundary_v3", "hybrid")
@@ -193,3 +194,59 @@ def test_best_aliases_prune_only_superseded_owned_copies_and_repeat_idempotently
     result = register_evaluation(run, 400, candidate400, metrics(3), 1.0)
     assert result["idempotent"]
     assert read_json(tmp_path / "checkpoints.json")["evaluations"][1]["checkpoint_pruned"]
+
+
+def test_repaired_runtime_reuses_durable_step_zero_without_gpu_workers(tmp_path, monkeypatch):
+    from scripts import run_ui5_grpo_pipeline as pipeline
+    from scripts import ui5_grpo_artifacts as writer
+    monkeypatch.setattr(writer, "publish_best_link", lambda alias, target: None)
+    data = tmp_path / "test"
+    data.mkdir()
+    image = data / "original.png"
+    image.write_bytes(b"unchanged test image fixture")
+    for name in evaluation.TASK_GT_FILE.values():
+        (data / name).write_text(json.dumps({"image": str(image)}) + "\n")
+    detector = data / "detector.jsonl"
+    detector.write_text("{}\n")
+    inventory = tmp_path / "evaluation_inputs.json"
+    write_json(inventory, {str(p): file_sha(p) for p in data.iterdir()})
+    initial = tmp_path / "initial_model"
+    initial.mkdir()
+    weight = initial / "model.safetensors"
+    weight.write_bytes(b"unchanged initial checkpoint fixture")
+    (initial / "config.json").write_text("{}")
+    mixed = tmp_path / "mixed"
+    write_json(mixed / "manifest.json", dict(sampling=[]))
+    config = dict(input_dir=str(data), detector_crop_manifest=str(detector),
+                  decoder_policy="boundary_v3", generation_mode="hybrid")
+    run = dict(identity="immutable-run", code_sha="original-code", project_root=str(ROOT),
+               output_dir=str(tmp_path), mixed_dir=str(mixed), initial_model=str(initial),
+               evaluation=config, reference=dict(identity="fixed-initial-reference"),
+               evaluation_inputs=dict(path=str(inventory), sha256=file_sha(inventory)))
+    output = tmp_path / "evaluation/step-000000"
+    identity = dict(run_identity=run["identity"], step=0, candidate=str(initial),
+                    candidate_weights={weight.name: file_sha(weight)},
+                    checkpoint_manifest=run["reference"]["identity"], config=config,
+                    inputs={name: file_sha(data / name) for name in evaluation.TASK_GT_FILE.values()},
+                    detector_manifest=file_sha(detector),
+                    scorer=file_sha(ROOT / "qwen3vl_merge_and_score_fixed_5tasks.py"),
+                    parser=file_sha(ROOT / "scripts/inference_ui_defect_locany.py"),
+                    matcher=file_sha(ROOT / "scripts/ui5_metric_matching.py"))
+    write_json(output / "evaluation_manifest.json", identity)
+    write_json(output / "ui5_metrics.json", metrics(1))
+    write_json(output / "evaluation_status.json", dict(success=True, identity=digest(identity),
+               metrics_sha256=file_sha(output / "ui5_metrics.json"), evaluation_seconds=4085.0))
+    write_json(tmp_path / "runtime_code_revision.json", dict(execution_code_sha="repaired-code"))
+    preserved = {p: p.read_bytes() for p in output.iterdir()}
+    def no_worker(*args, **kwargs):
+        raise AssertionError("completed step 0 must not rerun a GPU worker")
+    monkeypatch.setattr(evaluation, "launch_workers", no_worker)
+    monkeypatch.setattr(evaluation, "run_scorer", no_worker)
+    pipeline.evaluate(run, 0, initial)
+    assert pipeline.evaluate(run, 0, initial)["idempotent"]
+    assert {p: p.read_bytes() for p in output.iterdir()} == preserved
+    workbook = openpyxl.load_workbook(tmp_path / "diagnostics/ui5_grpo_training_evaluation.xlsx", read_only=True)
+    try:
+        assert ("runtime_revision.execution_code_sha", "repaired-code") in list(workbook["run_identity"].values)
+    finally:
+        workbook.close()

@@ -45,6 +45,27 @@ bash shell/submit_ui5_crop_grpo_mixed_v1.sh --resume
 `--resume` 仅在原平台任务已经停止后使用。默认提交带持久化 attempt marker 和 MLX 回执，
 重复执行不会重复提交；pipeline 另有进程锁。`--resume` 生成独立提交日志目录，训练输出和 reference 不变。
 
+### 运行时兼容修复后重提（保留已完成的 step 0）
+
+若原任务因 DeepSpeed `scale_wrt_gas` 签名检查退出，先确认平台任务已经停止，再执行：
+
+```bash
+cd /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Embodied-ui5-crop-grpo-mixed-v1
+git pull --ff-only origin codex/ui5-crop-grpo-mixed-v1
+bash shell/submit_ui5_crop_grpo_mixed_v1.sh --resume-code-update
+```
+
+该开关包含 `--resume`。仅接受运行时修复文件范围内、原提交后继的代码更新，记录原始和实际执行 SHA、
+逐文件 Git blob 清单，写入 `runtime_code_revision.json` 及 `diagnostics/code_revisions/`。
+原 `run.json`、mixed manifest、初始 reference、已保存的 optimizer/RNG/sampler 和评测身份不变。
+已完成 step 0 会核验原指标哈希并复用；这次在训练初始化前退出的任务从 optimizer step 0 开始。
+后续 checkpoint、运行环境诊断和 Excel 都记录实际执行的代码 SHA。
+
+DeepSpeed 0.16/0.17 的 [NVTX 装饰器](https://github.com/deepspeedai/DeepSpeed/blob/v0.17.5/deepspeed/utils/nvtx.py)
+可能只暴露 `(*args, **kwargs)`；不能据此断定不支持
+`scale_wrt_gas`。兼容检查接受关键字转发，实际调用仍为 `backward(loss, scale_wrt_gas=False)`，
+不乘 GAS 补偿、不重复调用 backward，也不升级继承环境。
+
 ## 产物路径
 
 最终平台 YAML 在内网读取真实记录后生成，不能从外部开发机猜填继承配置：
@@ -204,7 +225,7 @@ BBox TN 按既有 evaluator 的可用性留空，不填虚构的 0。
 普通单元/集成测试，不创建集群 debug job：
 
 ```bash
-python -m pytest tests/test_ui5_grpo.py tests/test_ui5_grpo_native_ar.py tests/test_ui5_grpo_distributed.py tests/test_ui5_grpo_pipeline.py tests/test_ui5_grpo_manifest_integration.py -q
+python -m pytest tests/test_ui5_grpo.py tests/test_ui5_grpo_native_ar.py tests/test_ui5_grpo_distributed.py tests/test_ui5_grpo_pipeline.py tests/test_ui5_grpo_manifest_integration.py tests/test_ui5_grpo_runtime.py -q
 ```
 
 覆盖真实小型原生 Qwen2 SDPA/PBD 的 cached slow 与 teacher-forced 概率、原 slow decoder 等价性、
@@ -212,7 +233,7 @@ python -m pytest tests/test_ui5_grpo.py tests/test_ui5_grpo_native_ar.py tests/t
 真实 PNG 复用补缺、两个真实 Gloo rank 的变长 group 梯度更新、RNG/sampler 恢复、best 副本事务和完整 Excel 导出。
 Windows 单元测试只替换 POSIX best symlink 创建原语，副本/哈希/删除/幂等仍执行真实文件操作。
 
-本次本地验证：上述测试加 v3、监督修正、正式评测和产物回归，共 75 项测试及 2 个子测试通过；
+本次本地验证：上述测试加 v3、监督修正、正式评测和产物回归，共 81 项测试及 2 个子测试通过；
 shell 语法与 Git diff 空白检查通过。Excel 测试产物完成数值回读和渲染检查。
 
 外部开发机没有内网挂载或 H20，测试不代表真实训练已执行，也不预填真实样本量、F1 或吞吐。

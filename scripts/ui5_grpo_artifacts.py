@@ -145,11 +145,15 @@ def refresh_workbook(run):
     actual_sampling = [dict(step=sample["step"], stratum=key, draws=count,
                             fraction=count / sample["total_draws"])
                        for sample in samples for key, count in sorted(sample["counts"].items())]
+    identity_rows = flatten_identity(run)
+    revision = output / "runtime_code_revision.json"
+    if revision.is_file():
+        identity_rows.extend(flatten_identity(read_json(revision), "runtime_revision."))
     tables = dict(train_curve=train, ui5_overall=artifacts._overall_rows(state),
                   ui5_by_task=artifacts._by_task_rows(state), checkpoints=artifacts._checkpoint_rows(state),
                   mixed_pool=manifest["sampling"], actual_sampling=actual_sampling,
                   train_ar_diagnostic=diagnostics,
-                  run_identity=flatten_identity(run),
+                  run_identity=identity_rows,
                   **detail_tables(state))
     write_workbook(output / "diagnostics/ui5_grpo_training_evaluation.xlsx", tables)
 

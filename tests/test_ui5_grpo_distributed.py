@@ -7,6 +7,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import torch
+import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
@@ -16,6 +17,7 @@ from eaglevl.train.ui5_grpo_core import (
     aligned_slot_count, centered_advantages, completion_loss_sums,
     deepspeed_slot_backward, zero_parameter_touch,
 )
+from eaglevl.train.ui5_grpo_runtime import backward_api_info
 
 
 class Policy(nn.Module):
@@ -74,13 +76,26 @@ class BoundaryEngine:
             self.global_steps += 1
 
 
-def worker(rank, rendezvous, output):
+def nvtx_style_wrapper(function):
+    # DeepSpeed 0.16/0.17 instrumentation forwards kwargs without __wrapped__.
+    def wrapped_fn(*args, **kwargs):
+        return function(*args, **kwargs)
+    return wrapped_fn
+
+
+class InstrumentedBoundaryEngine(BoundaryEngine):
+    backward = nvtx_style_wrapper(BoundaryEngine.backward)
+
+
+def worker(rank, rendezvous, output, instrumented):
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=Path(rendezvous).as_uri(),
                             rank=rank, world_size=2, timeout=timedelta(seconds=45))
     try:
         model = DistributedDataParallel(Policy())
-        engine = BoundaryEngine(model)
+        engine = (InstrumentedBoundaryEngine if instrumented else BoundaryEngine)(model)
+        api = backward_api_info(engine.backward)
+        assert api["keyword_forwarding"] is instrumented
         groups = groups_for(rank)
         slots = [(x, a, count) for rows, count in groups for x, a in rows]
         count = aligned_slot_count(len(slots) + 2, torch.device("cpu"))
@@ -101,8 +116,9 @@ def worker(rank, rendezvous, output):
         dist.destroy_process_group()
 
 
-def test_two_ranks_match_dense_equal_group_update_with_variable_crop_slots(tmp_path):
-    mp.spawn(worker, args=(str(tmp_path / "gloo.store"), str(tmp_path)), nprocs=2, join=True)
+@pytest.mark.parametrize("instrumented", [False, True], ids=["explicit-api", "nvtx-wrapped-api"])
+def test_two_ranks_match_dense_equal_group_update_with_variable_crop_slots(tmp_path, instrumented):
+    mp.spawn(worker, args=(str(tmp_path / "gloo.store"), str(tmp_path), instrumented), nprocs=2, join=True)
     states = [torch.load(tmp_path / f"rank{rank}.pt", weights_only=True) for rank in (0, 1)]
     assert states[0]["local"] != states[1]["local"]
     assert states[0]["slots"] == states[1]["slots"] == max(s["local"] for s in states)
