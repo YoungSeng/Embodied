@@ -1271,6 +1271,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         sub_sample_lengths: Optional[torch.Tensor] = None,  # For stream packing
         cache_position: Optional[torch.LongTensor] = None,
         ui5_ar_mode: bool = False,
+        ui5_ar_prompt_length: Optional[int] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1289,6 +1290,15 @@ class Qwen2Model(Qwen2PreTrainedModel):
             batch_size, seq_length, _ = inputs_embeds.shape
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+
+        if ui5_ar_prompt_length is not None:
+            if not ui5_ar_mode or use_cache or past_key_values is not None or output_attentions or output_hidden_states:
+                raise ValueError("tokenwise UI5 replay requires fresh, uncached AR completion scoring")
+            from .ui5_ar import replay_ar_hidden
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+            hidden = replay_ar_hidden(self, inputs_embeds, ui5_ar_prompt_length)
+            return BaseModelOutputWithPast(last_hidden_state=hidden) if return_dict else (hidden,)
 
         checkpoint_layers = self.gradient_checkpointing and (
             self.training or ((ui5_ar_mode or getattr(self, "ui5_eval_gradient_checkpointing", False))

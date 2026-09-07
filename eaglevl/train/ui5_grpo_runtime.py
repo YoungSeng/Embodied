@@ -34,10 +34,10 @@ RUNTIME_UPDATE_FILES = frozenset({
 
 def configure_ar_numerics():
     import torch
-    from eaglevl.model.locany.ui5_ar import AR_NUMERICS_VERSION
+    from eaglevl.model.locany.ui5_ar import AR_NUMERICS_VERSION, AR_REPLAY_VERSION
     torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-    return dict(ar_numerics=AR_NUMERICS_VERSION, ar_vocab_projection="float32",
+    return dict(ar_numerics=AR_NUMERICS_VERSION, ar_replay=AR_REPLAY_VERSION, ar_vocab_projection="float32",
                 ar_sdpa_cuda="efficient_attention", ar_sdpa_cpu="math",
                 float32_matmul_precision=torch.get_float32_matmul_precision(),
                 bf16_reduced_precision_reduction=False,
@@ -47,8 +47,8 @@ def configure_ar_numerics():
 def sampling_probability_report(current, old, clip):
     """Before the only update, numerical drift must not engage PPO clipping.
 
-    Cached and teacher-forced BF16 are not bitwise identical even with the
-    same attention backend. Measure the actual importance ratio and its
+    Sampling and replay use the same prefill/token shapes and attention
+    backend. Continue measuring the actual importance ratio and its
     nonnegative k3 discrepancy instead of arbitrary absolute log-prob limits.
     This is a numerical check, distinct from the fixed-reference KL loss.
     The sampled old log-probs are never replaced, rounded or recentered.

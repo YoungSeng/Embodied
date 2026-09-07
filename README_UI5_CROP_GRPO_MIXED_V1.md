@@ -71,7 +71,7 @@ bash shell/submit_ui5_crop_grpo_mixed_v1.sh --resume
 
 ### 运行时兼容修复后重提（保留已完成的 step 0）
 
-若原任务因 DeepSpeed `scale_wrt_gas` 签名检查、首步 AR 概率校验或 ZeRO-2 通信顺序异常退出，
+若原任务因 DeepSpeed `scale_wrt_gas` 签名检查、AR 概率校验或 ZeRO-2 通信顺序异常退出，
 平台任务停止后执行：
 
 ```bash
@@ -86,11 +86,16 @@ bash shell/submit_ui5_crop_grpo_mixed_v1.sh --resume-code-update
 已完成 hybrid step 0 会核验原指标哈希并复用；没有完整训练 checkpoint 时从 optimizer step 0 开始。
 后续 checkpoint、运行环境诊断和 Excel 都记录实际执行的代码 SHA。
 
-本次 `fp32-head-fixed-sdpa-v1` 数值修复额外允许两个原生 AR 文件的变更，但仅限没有已保存 optimizer
-更新的任务；已有 `resume/latest`、`.previous` 或 `.pending` 时首次切换数值版本会拒绝。
-修复获绑定后可正常保存、恢复所有训练状态。原数值版本的固定 TRAIN AR step 0 诊断会归档到
+两个原生 AR 文件的数值/概率复算修复仅限没有已保存 optimizer 更新的任务；
+已有 `resume/latest`、`.previous` 或 `.pending` 时首次绑定这些文件的变更会拒绝。
+修复获绑定后可正常保存、恢复所有训练状态。原生成数值版本的固定 TRAIN AR step 0 诊断会归档到
 `diagnostics/previous_train_ar/`，使用同一初始权重、同一固定 train 子集重算当前版本诊断，
 避免迁移表混用数值路径；这不会重跑 hybrid 正式测试 step 0。
+
+本次分段复算版本为 `prefill-tokenwise-layer-replay-v1`，仅改 current/reference 的计算调度；
+生成数值版本仍为 `fp32-head-fixed-sdpa-v1`，所以已完成的同版本固定 TRAIN AR step 0 也可以复用。
+第 4 步退出时尚未到默认的第 100 步保存节点；没有完整 `resume/latest` 时重新从 optimizer step 0 训练，
+不会把未保存的第 1–3 步当成可恢复 checkpoint。
 
 DeepSpeed 0.16/0.17 的 [NVTX 装饰器](https://github.com/deepspeedai/DeepSpeed/blob/v0.17.5/deepspeed/utils/nvtx.py)
 可能只暴露 `(*args, **kwargs)`；不能据此断定不支持
@@ -198,17 +203,28 @@ m31 的正确数、完整性或失败不参与资格条件；旧 complete8 仅�
 同一 view 的视觉特征与 prefix KV 在四条轨迹间复用。当前策略前向返回 completion log-prob，
 普通标量 CE 只用于原 SFT 回放。
 
+current/reference 按采样时的 **完整 prompt prefill + 每次一个答案 token** 复算，
+不再把 prompt 和整条 completion 一次送入 decoder。每层的 Q/K/V、SDPA、MLP，以及末尾 norm、
+PBD 和 FP32 词表投影都使用相同分段形状；最后一个采样 token（包括真实 EOS）作为 target 计分，
+不额外运行一个采样阶段不存在的 decoder step。采样概率仍直接来自 multinomial 的真实分布。
+
+利用因果依赖，复算按层处理该层的全部 token，调用原生 decoder，并采用按层及按 token 的
+非重入 checkpoint。每次重算重新创建局部 KV 容器，避免重复追加/读到未来 token；
+KV 张量保留梯度，末尾 token 的损失可以传回全部可见前缀与视觉/任务模块。
+不把生成阶段的 detached KV 传给训练；不同时保存所有层、所有 token 的增长 KV 历史和展开后的
+GQA attention 激活。逐 token 复算增加前向调用次数，吞吐与显存以正式任务日志实测为准。
+
 仅原生 GRPO AR 的 decoder 固定 SDPA 后端：H20 为 PyTorch `EFFICIENT_ATTENTION`，CPU 验证为 `MATH`。
 后端上下文位于每个 checkpointed layer 的 callable 内，覆盖生成、reference、current 和 backward
 重算；hybrid 与 SFT/MTP 的 decoder 分支保持原实现。长序列 mask 只填充底层存储以满足 CUTLASS
 行 stride 的 8 元素对齐，再切回原 shape，不添加输入 token、不改 causal/window 可见性。
 不在 H20 上强制 materialize 完整 FP32 attention 矩阵。
 
-这修复了自动后端在单 token KV decode 与整段 teacher forcing 间切换，以及 BF16 大 logits 的精度问题。
+仅统一输出层精度和 SDPA 后端不足以消除整段/单 token 的计算差异。
 [PyTorch 数值说明](https://docs.pytorch.org/docs/2.14/notes/numerical_accuracy.html)指出，批量与切片计算
-不保证逐 bit 相同；[SDPA 文档](https://docs.pytorch.org/docs/2.14/generated/torch.nn.functional.scaled_dot_product_attention.html)
-也说明不同 fused backend 可产生不同结果。因此仍检查剩余数值偏差，但不能用 FP32 小随机模型校准的
-绝对阈值来判断真实 BF16 路径是否错误。
+不保证逐 bit 相同。本次复算直接对齐分段形状，并保留原有 ratio 与数值 KL 检查，不放宽阈值、
+不重写 old log-prob。`runtime_environment.json`、轨迹及失配证据同时记录生成与复算版本；
+逐卡 `diagnostics/progress/rank*.json` 在每次完整更新后保留本步概率一致性摘要。
 
 奖励使用正式 parser、IoU=0.1 匹配及原图集合：
 
@@ -315,6 +331,11 @@ Windows 单元测试只替换 POSIX best symlink 创建原语，副本/哈希/�
 不同外部 SDPA 默认下的 backward checkpoint 重算、7268 等非 8 倍数长度的 mask 存储对齐，
 以及观测误差量级的接受条件、真正 ratio 越界/整体漂移/NaN/Inf 拒绝条件和数值版本恢复审计。
 
+分段复算回归逐层比较采样、前向复算、backward replay 的输入值、形状、位置和 causal/window mask；
+旧提交在该形状对照中失败，新实现通过。另与独立的逐 token、保留完整 KV 计算图的梯度 oracle 比较，
+验证末尾 token 对 prompt/视觉模块的梯度；检查外层 checkpoint 不保存所有层的 4-D KV/attention
+历史，并执行 BF16 模型连续 5 次权重更新后的真实采样概率检查。
+
 `test_ui5_grpo_zero2.py` 直接运行 DeepSpeed 原生 ZeRO-2 的 leaf hooks、IPG buckets、梯度分片、Adam
 及 optimizer state 保存/恢复，用两个 CPU/Gloo rank 与集中计算的 group/token 归一化更新比较。
 测试主动置换两卡的合法梯度就绪通知顺序：旧实现出现 bucket 参数/顺序差异，固定顺序后保持一致；
@@ -322,7 +343,11 @@ Windows 单元测试只替换 POSIX best symlink 创建原语，副本/哈希/�
 CPU 测试仅禁用可选 shared-memory JIT extension，通信执行真实 Gloo；没有 DeepSpeed 时显式 skip，
 不能把这种 skip 计作 ZeRO-2 验证通过。
 
-已完成本次通信修复后的训练相关完整回归（103 项测试及 2 个子测试，包含双 rank、提交/恢复和 Excel），
+联合测试进一步把真实小型 Qwen2/PBD 的 BF16 分段 AR 复算接到原生 ZeRO-2 上，
+两个 rank 各自完成 G=4、不同 crop 数、不同监督图及空槽，连续更新 3 次，核验 on-policy 概率和
+更新后的两卡权重一致。测试监督分支只验证 hook/通信组合，完整 UI5 SFT/MTP 保持原测试覆盖。
+
+已完成本次分段复算修复后的训练相关完整回归（110 项测试及 2 个子测试，包含双 rank、提交/恢复和 Excel），
 其中原生 ZeRO-2 专项测试在 DeepSpeed 0.17.5 与 0.16.3 的两个 CPU/Gloo rank 上均通过，未跳过。
 shell 语法与 Git diff 空白检查通过。Excel 测试产物完成数值回读和渲染检查。
 

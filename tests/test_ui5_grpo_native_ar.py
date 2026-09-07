@@ -13,10 +13,10 @@ from eaglevl.model.locany.ui5_ar import forward_ar, sample_ar
 
 
 class TinyNative(nn.Module):
-    def __init__(self):
+    def __init__(self, kv_heads=2):
         super().__init__()
         config = Qwen2Config(vocab_size=40, hidden_size=16, intermediate_size=32,
-                            num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=2,
+                            num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=kv_heads,
                             max_position_embeddings=128, attention_dropout=.4,
                             pad_token_id=0, eos_token_id=3, block_size=6, text_mask_token_id=9)
         config._attn_implementation = "sdpa"
@@ -33,9 +33,9 @@ class TinyNative(nn.Module):
         return [pixel_values], SimpleNamespace(relation_summary=relation, best_relation_token=relation), None
 
 
-def fixture_model():
+def fixture_model(kv_heads=2):
     torch.manual_seed(12)
-    model = TinyNative()
+    model = TinyNative(kv_heads=kv_heads)
     inputs = dict(input_ids=torch.tensor([[1, 4, 2]]), pixel_values=torch.randn(1, 16),
                   image_grid_hws=torch.tensor([[1, 1]]), image_flags=torch.tensor([1]),
                   relation_family=torch.tensor([0]), defect_type=torch.tensor([0]))
@@ -125,7 +125,7 @@ def test_no_dropout_or_detached_caches_in_recomputation():
 
 
 @pytest.mark.parametrize("seed", [12, 42, 100])
-def test_bf16_large_logits_cached_full_reference_and_checkpointed_gradients(seed):
+def test_bf16_large_logits_cached_replay_reference_and_checkpointed_gradients(seed):
     # Small random FP32 logits hid the H20 failure. Exercise BF16 and logits
     # around 20-30, where a BF16 output quantization step is appreciable at T=.7.
     model, inputs = fixture_model()
@@ -230,3 +230,142 @@ def test_cutlass_mask_alignment_preserves_exact_attention_domain(length):
     assert all(stride % 8 == 0 for stride in aligned.stride()[:-1])
     assert align_ar_attention_mask(aligned) is aligned
     assert align_ar_attention_mask(None) is None
+
+
+def sequential_gradient_oracle(model, inputs, tokens):
+    """Conventional token-first AR graph; deliberately no checkpoint helpers.
+
+    Keep every sampled-prefix K/V attached. This small-test oracle is too
+    memory hungry for production, but gives an independent exact derivative.
+    """
+    model.language_model.model.gradient_checkpointing = False
+    vit, relation, _ = model.extract_ui_features(**{k: v for k, v in inputs.items() if k != "input_ids"})
+    projected = model.mlp1(torch.cat(vit))
+    cache, scores = None, []
+    for index, target in enumerate(tokens):
+        ids = inputs["input_ids"] if index == 0 else tokens[index - 1].reshape(1, 1)
+        embeds = model.language_model.get_input_embeddings()(ids).clone()
+        if index == 0:
+            embeds[ids == model.image_token_index] = projected
+        start = 0 if index == 0 else inputs["input_ids"].shape[1] + index - 1
+        output = model.language_model.model(inputs_embeds=embeds, past_key_values=cache, use_cache=True,
+            position_ids=torch.arange(start, start + ids.shape[1]).unsqueeze(0), ui5_ar_mode=True, return_dict=True)
+        cache = output.past_key_values
+        pbd = model.relation_pbd(hidden_states=output.last_hidden_state, input_ids=ids,
+            sub_sample_lengths=torch.tensor([ids.numel()]), relation_summary=relation.relation_summary,
+            best_relation_token=relation.best_relation_token, box_start_token_id=7, text_mask_token_id=9, block_size=1)
+        logits = torch.nn.functional.linear(pbd.hidden_states[:, -1].float(), model.language_model.lm_head.weight.float())
+        scores.append((logits[0] / .7).log_softmax(-1)[target])
+    return torch.stack(scores)
+
+
+@pytest.mark.parametrize("sliding_window", [None, 4])
+def test_replay_matches_token_first_gradient_oracle_and_keeps_prompt_gradients(sliding_window):
+    model, inputs = fixture_model(kv_heads=1)
+    model.config.text_config.sliding_window = sliding_window
+    expected_model = deepcopy(model)
+    tokens = torch.tensor([7, 9, 4, 7, 10, 3])
+    model.language_model.model.gradient_checkpointing = True
+    sequence = dict(inputs, input_ids=torch.cat([inputs["input_ids"], tokens[None]], 1))
+    actual = forward_ar(model, **sequence, completion_start=3).completion_log_probs
+    expected = sequential_gradient_oracle(expected_model, inputs, tokens)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    # The LAST token's probability must train the prompt/visual/relation path,
+    # not only the last token. Detached inference KV would fail this comparison.
+    actual[-1].backward()
+    expected[-1].backward()
+    for (name, p), (other_name, other) in zip(model.named_parameters(), expected_model.named_parameters()):
+        assert name == other_name
+        if other.grad is None:
+            assert p.grad is None or not p.grad.count_nonzero()
+        else:
+            assert p.grad is not None, name
+            torch.testing.assert_close(p.grad, other.grad, atol=2e-6, rtol=2e-5, msg=name)
+    assert model.mlp1.weight.grad.abs().sum() > 0
+    assert model.language_model.model.embed_tokens.weight.grad[1].abs().sum() > 0
+
+
+@pytest.mark.parametrize("sliding_window", [None, 4])
+def test_bf16_sampling_replay_and_backward_keep_each_layer_shape_mask_and_position(sliding_window):
+    model, inputs = fixture_model(kv_heads=1)
+    model.to(torch.bfloat16)
+    model.config.text_config.sliding_window = sliding_window
+    inputs["pixel_values"] = inputs["pixel_values"].bfloat16()
+    tokens = torch.tensor([7, 9, 4, 7, 10, 3])
+    observed = {}
+    phase = "sample"
+    def observe(name):
+        def hook(module, args, kwargs):
+            mask = kwargs["attention_mask"]
+            position = kwargs["position_ids"]
+            key = (name, tuple(position.flatten().tolist()))
+            record = (kwargs["hidden_states"].detach().clone(), None if mask is None else mask.clone())
+            if phase == "sample":
+                assert key not in observed
+                observed[key] = record
+            else:
+                assert key in observed, f"replay introduced a different decoder shape/position: {key}"
+                expected_hidden, expected_mask = observed[key]
+                torch.testing.assert_close(record[0], expected_hidden, atol=0, rtol=0)
+                if expected_mask is None:
+                    assert mask is None
+                else:
+                    assert torch.equal(mask, expected_mask)
+        return hook
+    handles = [layer.self_attn.register_forward_pre_hook(observe(str(i)), with_kwargs=True)
+               for i, layer in enumerate(model.language_model.model.layers)]
+    try:
+        with torch.no_grad():
+            result = forward_ar(model, **inputs, use_cache=True)
+            for token in tokens[:-1]:
+                result = forward_ar(model, input_ids=token.reshape(1, 1), use_cache=True,
+                                    past_key_values=result.past_key_values, visual_cache=result.visual_cache)
+        phase = "replay"
+        model.language_model.model.gradient_checkpointing = True
+        sequence = dict(inputs, input_ids=torch.cat([inputs["input_ids"], tokens[None]], 1))
+        result = forward_ar(model, **sequence, completion_start=3)
+        result.completion_log_probs.sum().backward()
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert len(observed) == len(tokens) * len(model.language_model.model.layers)
+
+
+def test_replay_checkpoints_do_not_save_all_layers_growing_kv_histories():
+    from eaglevl.model.locany.ui5_ar import replay_ar_hidden
+    model, _ = fixture_model(kv_heads=1)
+    model.language_model.model.gradient_checkpointing = True
+    hidden = torch.randn(1, 60, 16, requires_grad=True)
+    saved_shapes = []
+    def pack(tensor):
+        saved_shapes.append(tuple(tensor.shape))
+        return tensor
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        result = replay_ar_hidden(model.language_model.model, hidden, 17)
+    # A cached token-first graph would retain 4-D attention tensors for every
+    # token in every layer. Production retains layer inputs and the final norm.
+    assert saved_shapes and all(len(shape) < 4 for shape in saved_shapes)
+    result[:, -1].square().sum().backward()
+    assert hidden.grad[:, :17].abs().sum() > 0
+
+
+def test_bf16_on_policy_probabilities_remain_valid_after_five_weight_updates():
+    from eaglevl.train.ui5_grpo_runtime import sampling_probability_report
+    model, inputs = fixture_model()
+    model.to(torch.bfloat16)
+    model.language_model.model.gradient_checkpointing = True
+    inputs["pixel_values"] = inputs["pixel_values"].bfloat16()
+    with torch.no_grad():
+        model.language_model.lm_head.weight.mul_(100)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=.001)
+    for step in range(5):
+        result = sample_ar(model, inputs, max_new_tokens=16, eos_token_id=3, seed=step + 13)
+        original_old = result["old_log_probs"].clone()
+        sequence = dict(inputs, input_ids=torch.cat([inputs["input_ids"], result["tokens"][None]], 1))
+        current = forward_ar(model, **sequence, completion_start=3).completion_log_probs
+        assert sampling_probability_report(current, result["old_log_probs"], .2)["valid"]
+        torch.testing.assert_close(current, original_old, atol=2e-5, rtol=2e-6)
+        (-current.mean()).backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        assert torch.equal(result["old_log_probs"], original_old)

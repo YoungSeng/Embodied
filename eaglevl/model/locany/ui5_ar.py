@@ -12,6 +12,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 AR_NUMERICS_VERSION = "fp32-head-fixed-sdpa-v1"
+AR_REPLAY_VERSION = "prefill-tokenwise-layer-replay-v1"
 
 
 def align_ar_attention_mask(mask):
@@ -33,6 +34,87 @@ def ar_decoder_forward(decoder_layer, hidden_states, *args, **kwargs):
     backend = (SDPBackend.EFFICIENT_ATTENTION if hidden_states.is_cuda else SDPBackend.MATH)
     with sdpa_kernel(backend):
         return decoder_layer(hidden_states, *args, **kwargs)
+
+
+def _ar_spans(length, prompt_length):
+    yield 0, prompt_length
+    for offset in range(prompt_length, length):
+        yield offset, offset + 1
+
+
+def _replay_decoder_piece(decoder_layer, hidden, mask, positions, past_key, past_value):
+    # Each checkpoint invocation owns a fresh cache. Never close over a mutable
+    # DynamicCache: backward would append a token twice or see a future prefix.
+    # The tensors remain attached to autograd, including all prompt K/V states.
+    from transformers.cache_utils import DynamicCache
+    cache = DynamicCache()
+    layer_idx = decoder_layer.self_attn.layer_idx
+    if past_key is not None:
+        cache.update(past_key, past_value, layer_idx)
+    output = ar_decoder_forward(decoder_layer, hidden, attention_mask=mask,
+                                position_ids=positions, past_key_value=cache,
+                                use_cache=True, output_attentions=False)
+    key, value = cache[layer_idx]
+    return output[0], key, value
+
+
+def _replay_decoder_layer(decoder_layer, hidden, prompt_length, sliding_window):
+    from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
+    parts, key, value = [], None, None
+    for start, end in _ar_spans(hidden.shape[1], prompt_length):
+        piece = hidden[:, start:end]
+        positions = torch.arange(start, end, device=hidden.device).unsqueeze(0)
+        mask = align_ar_attention_mask(_prepare_4d_causal_attention_mask(
+            None, (1, end - start), piece, start, sliding_window=sliding_window))
+        args = (decoder_layer, piece, mask, positions, key, value)
+        if torch.is_grad_enabled():
+            # Nested checkpointing avoids retaining attention's expanded GQA
+            # K/V and MLP intermediates for every answer token during a layer's
+            # backward replay. Only this layer's unexpanded prefix states live.
+            result, key, value = checkpoint(_replay_decoder_piece, *args, use_reentrant=False)
+        else:
+            result, key, value = _replay_decoder_piece(*args)
+        parts.append(result)
+    return torch.cat(parts, dim=1)
+
+
+def replay_ar_hidden(decoder, embeds, prompt_length):
+    """Replay the sampled prefill + q_len=1 schedule, with full prefix gradients.
+
+    Evaluate one whole decoder layer at a time. Causal dependencies make this
+    equivalent to the sampling loop's token-first ordering, while per-layer
+    checkpointing prevents retaining every layer's growing K/V history. All
+    decoder calls (Q/K/V, SDPA, MLP) keep the sampling shapes and positions.
+    """
+    if not 1 <= prompt_length <= embeds.shape[1] or embeds.shape[0] != 1:
+        raise ValueError("invalid unpadded AR replay prompt boundary")
+    hidden = embeds
+    for layer in decoder.layers:
+        args = (layer, hidden, prompt_length, decoder.config.sliding_window)
+        if torch.is_grad_enabled():
+            hidden = checkpoint(_replay_decoder_layer, *args, use_reentrant=False)
+        else:
+            hidden = _replay_decoder_layer(*args)
+    # Final normalization also uses the exact sampling shapes.
+    return torch.cat([decoder.norm(hidden[:, start:end])
+                      for start, end in _ar_spans(hidden.shape[1], prompt_length)], dim=1)
+
+
+def _pbd(model, hidden, ids, relation):
+    return model.relation_pbd(
+        hidden_states=hidden, input_ids=ids,
+        sub_sample_lengths=torch.tensor([ids.numel()], device=ids.device),
+        relation_summary=relation.relation_summary, best_relation_token=relation.best_relation_token,
+        box_start_token_id=model.config.box_start_token_id,
+        text_mask_token_id=model.config.text_config.text_mask_token_id, block_size=1)
+
+
+def _completion_piece(model, hidden, ids, summary, best, target, temperature):
+    from types import SimpleNamespace
+    fused = _pbd(model, hidden, ids, SimpleNamespace(relation_summary=summary, best_relation_token=best))
+    # One predictor / vocabulary projection, exactly as when sampling.
+    return _log_probs(fused.hidden_states[:, -1], model.language_model.lm_head.weight,
+                      target.reshape(1), temperature)
 
 
 def _vocab_logits(hidden, weight):
@@ -61,7 +143,7 @@ def forward_ar(model, *, input_ids, pixel_values=None, image_grid_hws=None,
                relation_family=None, defect_type=None, image_flags=None,
                position_ids=None, attention_mask=None, past_key_values=None,
                use_cache=False, visual_cache=None, completion_start=None,
-               temperature=0.7, logprob_chunk_size=32, **unused):
+               temperature=0.7, **unused):
     if model.training or any(module.training for module in model.modules()):
         raise ValueError("AR sampling/scoring requires eval mode (dropout disabled)")
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -101,36 +183,36 @@ def forward_ar(model, *, input_ids, pixel_values=None, image_grid_hws=None,
         position_ids = expected_positions
     elif not torch.equal(position_ids, expected_positions):
         raise ValueError("AR positions must match the actual sampled sequence")
+    if completion_start is not None:
+        if not 1 <= completion_start < input_ids.shape[1] or past_key_values is not None or use_cache:
+            raise ValueError("completion_start must mark actual completion in the full sequence")
+        # The final sampled token (including actual EOS) is a TARGET, never a
+        # predictor. Processing it would add a decoder step absent in sampling.
+        hidden = model.language_model.model(
+            inputs_embeds=embeds[:, :-1], use_cache=False, return_dict=True,
+            output_attentions=False, output_hidden_states=False,
+            ui5_ar_mode=True, ui5_ar_prompt_length=completion_start).last_hidden_state
+        pieces, active = [], []
+        for start, end in _ar_spans(hidden.shape[1], completion_start):
+            ids = input_ids[:, start:end]
+            args = (model, hidden[:, start:end], ids, relation.relation_summary,
+                    relation.best_relation_token, input_ids[0, end], temperature)
+            if torch.is_grad_enabled():
+                pieces.append(checkpoint(_completion_piece, *args, use_reentrant=False))
+            else:
+                pieces.append(_completion_piece(*args))
+            active.append((ids.reshape(-1) == model.config.box_start_token_id).nonzero().flatten() + start)
+        return ARResult(completion_log_probs=torch.cat(pieces), pbd_positions=torch.cat(active))
     output = model.language_model.model(
         inputs_embeds=embeds, position_ids=position_ids, past_key_values=past_key_values,
         use_cache=use_cache, return_dict=True, ui5_ar_mode=True)
     # Slow decode processes one token per cached step. Only <box> anchors
     # receive PBD, including if the model literally samples <text_mask> tokens.
-    fused = model.relation_pbd(
-        hidden_states=output.last_hidden_state, input_ids=input_ids,
-        sub_sample_lengths=torch.tensor([input_ids.numel()], device=input_ids.device),
-        relation_summary=relation.relation_summary, best_relation_token=relation.best_relation_token,
-        box_start_token_id=model.config.box_start_token_id,
-        text_mask_token_id=model.config.text_config.text_mask_token_id, block_size=1)
+    fused = _pbd(model, output.last_hidden_state, input_ids, relation)
     weight = model.language_model.lm_head.weight
-    if completion_start is None:
-        return ARResult(logits=_vocab_logits(fused.hidden_states[:, -1], weight),
-                        past_key_values=output.past_key_values, visual_cache=visual_cache,
-                        pbd_positions=fused.active_positions)
-    if not 1 <= completion_start < input_ids.shape[1] or past_key_values is not None:
-        raise ValueError("completion_start must mark actual completion in the full sequence")
-    hidden = fused.hidden_states[0, completion_start - 1:-1]
-    targets = input_ids[0, completion_start:]
-    pieces = []
-    for offset in range(0, targets.numel(), logprob_chunk_size):
-        h = hidden[offset:offset + logprob_chunk_size]
-        t = targets[offset:offset + logprob_chunk_size]
-        if torch.is_grad_enabled():
-            # Avoid retaining completion_length x vocab_size logits in memory.
-            pieces.append(checkpoint(_log_probs, h, weight, t, temperature, use_reentrant=False))
-        else:
-            pieces.append(_log_probs(h, weight, t, temperature))
-    return ARResult(completion_log_probs=torch.cat(pieces), pbd_positions=fused.active_positions)
+    return ARResult(logits=_vocab_logits(fused.hidden_states[:, -1], weight),
+                    past_key_values=output.past_key_values, visual_cache=visual_cache,
+                    pbd_positions=fused.active_positions)
 
 
 @torch.no_grad()

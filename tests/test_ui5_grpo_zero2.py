@@ -204,3 +204,93 @@ def test_real_zero2_different_graphs_buckets_and_dense_update(tmp_path, ordered)
     for result in results:
         for name, expected in model.state_dict().items():
             torch.testing.assert_close(result["state"][name], expected, atol=1e-6, rtol=1e-6)
+
+
+def native_ar_zero_worker(rank, rendezvous, output):
+    """Combine native nested AR checkpoints with the real ZeRO leaf hooks."""
+    from copy import deepcopy
+    from importlib import import_module
+    from tests.test_ui5_grpo_native_ar import fixture_model
+    from eaglevl.model.locany.ui5_ar import forward_ar, sample_ar
+    from eaglevl.train.ui5_grpo_runtime import sampling_probability_report
+    os.environ["DS_ACCELERATOR"] = "cpu"
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["LOCAL_SIZE"] = "2"
+    torch.set_num_threads(1)
+    import deepspeed.comm as ds_dist
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+    from deepspeed.utils.timer import SynchronizedWallClockTimer
+    import_module("deepspeed.comm.torch").build_shm_op = lambda: None
+    dist.init_process_group("gloo", init_method=Path(rendezvous).as_uri(), rank=rank, world_size=2,
+                            timeout=timedelta(seconds=90))
+    ds_dist.init_distributed(dist_backend="gloo", dist_init_required=False)
+    try:
+        model, inputs = fixture_model(kv_heads=1)
+        model.to(torch.bfloat16)
+        inputs["pixel_values"] = inputs["pixel_values"].bfloat16()
+        model.language_model.model.gradient_checkpointing = True
+        reference = deepcopy(model).requires_grad_(False)
+        initial = {name: p.detach().clone() for name, p in model.named_parameters()}
+        base = torch.optim.AdamW(model.parameters(), lr=.005)
+        options = ({"optimizer_params": {}} if "optimizer_params" in
+                   inspect.signature(DeepSpeedZeroOptimizer).parameters else {})
+        zero = DeepSpeedZeroOptimizer(base, {p: name for name, p in model.named_parameters()},
+                    SynchronizedWallClockTimer(), **options, dp_process_group=dist.group.WORLD,
+                    partition_grads=True, contiguous_gradients=True, overlap_comm=False,
+                    reduce_scatter=True, reduce_bucket_size=700, allgather_bucket_size=1024,
+                    gradient_accumulation_steps=2, gradient_accumulation_dtype=torch.float32,
+                    communication_data_type=torch.bfloat16, clip_grad=1.0)
+        reducer = OrderedZero2Reduction(zero, model.named_parameters())
+        reports = []
+        for step in range(3):
+            completions = []
+            for trajectory, advantage in enumerate((-.5, -1 / 6, 1 / 6, .5)):
+                for crop in range(rank + 1):
+                    sampled = sample_ar(model, inputs, max_new_tokens=8, eos_token_id=3,
+                                        seed=1000 * step + 100 * rank + 10 * trajectory + crop)
+                    sequence = dict(inputs, input_ids=torch.cat([inputs["input_ids"], sampled["tokens"][None]], 1))
+                    completions.append((sequence, sampled, advantage))
+            with torch.no_grad():
+                for sequence, sampled, _ in completions:
+                    sampled["reference"] = forward_ar(reference, **sequence, completion_start=3).completion_log_probs
+            tokens = sum(len(sampled["tokens"]) for _, sampled, _ in completions)
+            slots = aligned_slot_count(len(completions) + 1, torch.device("cpu"))
+            for slot in range(slots):
+                zero.is_gradient_accumulation_boundary = slot + 1 == slots
+                if slot < len(completions):
+                    sequence, sampled, advantage = completions[slot]
+                    current = forward_ar(model, **sequence, completion_start=3).completion_log_probs
+                    report = sampling_probability_report(current, sampled["old_log_probs"], .2)
+                    assert report["valid"], report
+                    reports.append(report)
+                    policy, kl = completion_loss_sums(current, sampled["old_log_probs"], sampled["reference"], advantage)
+                    loss = (policy + .02 * kl) / tokens + zero_parameter_touch(model)
+                elif slot == len(completions):
+                    # A different supervised graph, like the existing branch
+                    # regression. Full UI5 SFT/MTP data is not needed to test
+                    # whether nested AR checkpoint hooks communicate correctly.
+                    loss = .1 * model.mlp1(inputs["pixel_values"]).float().square().mean() + zero_parameter_touch(model)
+                else:
+                    loss = zero_parameter_touch(model)
+                reducer.begin_slot(step, slot)
+                zero.backward(loss)
+                zero.overlapping_partition_gradients_reduce_epilogue()
+                reducer.end_slot()
+                if zero.is_gradient_accumulation_boundary:
+                    zero.step()
+        for prefix in ("language_model.", "mlp1.", "relation_encoder."):
+            assert any(not torch.equal(p, initial[name]) for name, p in model.named_parameters() if name.startswith(prefix))
+        torch.save(dict(state=model.state_dict(), reports=reports), Path(output) / f"native-rank{rank}.pt")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(importlib.util.find_spec("deepspeed") is None, reason="requires DeepSpeed's actual ZeRO-2 implementation")
+def test_native_bf16_ar_checkpointed_gradients_with_real_two_rank_zero2(tmp_path):
+    mp.spawn(native_ar_zero_worker, args=(str(tmp_path / "native.store"), str(tmp_path)), nprocs=2, join=True)
+    results = [torch.load(tmp_path / f"native-rank{rank}.pt", weights_only=True) for rank in (0, 1)]
+    for name, tensor in results[0]["state"].items():
+        torch.testing.assert_close(tensor, results[1]["state"][name], atol=0, rtol=0)
+    assert len(results[0]["reports"]) == 3 * 4
+    assert len(results[1]["reports"]) == 3 * 8
+    assert all(report["valid"] for result in results for report in result["reports"])

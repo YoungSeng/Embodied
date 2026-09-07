@@ -322,7 +322,7 @@ def main():
         write_json(output / "diagnostics/token_contract.json", audit)
     dist.barrier()
     diagnostic = read_rows(directory / "train_diagnostic.jsonl")
-    from eaglevl.model.locany.ui5_ar import AR_NUMERICS_VERSION
+    from eaglevl.model.locany.ui5_ar import AR_NUMERICS_VERSION, AR_REPLAY_VERSION
     diagnostic_path = output / "diagnostics/train_ar_step000000.json"
     previous_diagnostic = read_json(diagnostic_path) if diagnostic_path.is_file() else None
     if previous_diagnostic is None or previous_diagnostic.get("ar_numerics") != AR_NUMERICS_VERSION:
@@ -335,7 +335,8 @@ def main():
     def progress(step, phase, **details):
         write_json(output / "diagnostics/progress" / f"rank{rank}.json",
                    dict(step=step, rank=rank, phase=phase, code_sha=execution_sha,
-                        reduction_identity=reducer.plan["identity"], updated_at=time.time(), **details))
+                        reduction_identity=reducer.plan["identity"], ar_replay=AR_REPLAY_VERSION,
+                        updated_at=time.time(), **details))
     for step in range(start + 1, args.until_step + 1):
         torch.cuda.reset_peak_memory_stats(device)
         started = time.monotonic()
@@ -379,7 +380,8 @@ def main():
         trace_dir = output / "trajectories" / f"step{step:06d}"
         trace_dir.mkdir(parents=True, exist_ok=True)
         torch.save(dict(step=step, run_identity=run["identity"], code_sha=execution_sha,
-                        ar_numerics=AR_NUMERICS_VERSION, phase="before_update", groups=trace,
+                        ar_numerics=AR_NUMERICS_VERSION, ar_replay=AR_REPLAY_VERSION,
+                        phase="before_update", groups=trace,
                         replay=replay_ids), trace_dir / f"rank{rank}.pt")
         local_slots = [(g, inputs, c, advantage) for g in collected
                        for trajectory, advantage in zip(g["completions"], g["advantages"])
@@ -414,7 +416,8 @@ def main():
                     evidence = output / "diagnostics/ar_mismatch" / f"step{step:06d}-rank{rank}-slot{slot}.pt"
                     evidence.parent.mkdir(parents=True, exist_ok=True)
                     torch.save(dict(report=consistency, run_identity=run["identity"], code_sha=execution_sha,
-                                    ar_numerics=AR_NUMERICS_VERSION, group_id=group["group"]["group_id"],
+                                    ar_numerics=AR_NUMERICS_VERSION, ar_replay=AR_REPLAY_VERSION,
+                                    group_id=group["group"]["group_id"],
                                     completion=completion, current_log_probs=current.detach().cpu(),
                                     inputs={k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
                                             for k, v in current_inputs.items() if k != "pixel_values"}), evidence)
@@ -443,7 +446,9 @@ def main():
         torch.cuda.synchronize(device)
         if engine.global_steps != step:
             raise ValueError(f"ZeRO optimizer boundary mismatch: {engine.global_steps} != {step}")
-        progress(step, "optimizer_step_complete", total_slots=slot_count)
+        progress(step, "optimizer_step_complete", total_slots=slot_count,
+                 sampling_probability={k: metrics[k] for k in (
+                     "min_sampling_ratio", "max_sampling_ratio", "max_logprob_error", "sampling_numerical_kl")})
         if rank == 0 and step == start + 1:
             print(f"[GRPO UPDATE] optimizer_step={step} slots={slot_count} zero2_order_verified=true", flush=True)
         all_rewards = [r for group in collected for r in group["rewards"]]
