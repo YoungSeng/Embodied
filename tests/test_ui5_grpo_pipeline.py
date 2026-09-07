@@ -13,7 +13,7 @@ from eaglevl.train.ui5_grpo_checkpoint import recover, restore_checkpoint, valid
 from eaglevl.train.ui5_curriculum_artifacts import normalize_scorer_metrics
 from scripts.build_ui5_grpo_mixed_manifest import read_json, write_json
 from scripts.run_ui5_grpo_pipeline import verify_evaluation_inputs
-from scripts.submit_ui5_grpo_mixed import inherited_source, evaluation_config, render_job
+from scripts.submit_ui5_grpo_mixed import inherited_source, evaluation_config, render_job, submission_target
 from scripts.ui5_grpo_artifacts import detail_tables, write_workbook, register_evaluation
 from scripts import run_ui5_curriculum_evaluation as evaluation
 
@@ -125,6 +125,63 @@ def test_exact_inherited_v3_submission_and_h20_job_contract(tmp_path):
                                           Path("/mixed/groups.jsonl"), Path("/identity"))
     assert {s.task: s.physical_gpu for s in specs} == dict(occlusion="0", cropping="0", text_overflow="1", text_ellipsis="1", content_missing="1")
     assert all("--hard-rollout" not in " ".join(s.command) and "--anchor" not in " ".join(s.command) for s in specs)
+
+
+def test_h20_cluster_switch_changes_only_group_and_queue_and_preserves_run():
+    old = yaml.safe_load((ROOT / "jobs/ui5_crop_grpo_mixed_v1_h20x2.yaml").read_text())
+    # Inherited runtime resources, including non-template CPU/memory values,
+    # must survive the scheduling override and YAML serialization.
+    arnold = old["jobDefVersion"]["resource"]["arnoldConfig"]
+    arnold["roles"][0].update(cpu=48, memory=500000)
+    arnold["groupIds"] = [1234]
+    arnold["roles"][0]["queueName"] = "actual-v3-bound-queue"
+    env = dict(ENV_DIR="/actual/conda", EVAL_INPUT_DIR="/actual/test")
+    run = dict(run_name="same-run", project_root="/independent", code_sha="fixed-run-code",
+               output_dir="/same-output", python="/actual/conda/bin/python", initial_model="/fixed-reference",
+               grpo=GRPOConfig().to_dict())
+    run["identity"] = digest(run)
+    original_job, original_run = deepcopy(old), deepcopy(run)
+    inherited = render_job(old, env, run, "/same-output/run.json")
+    selected = render_job(old, env, run, "/same-output/run.json", cluster="ies_aiai_experience")
+    selected = yaml.safe_load(yaml.safe_dump(selected))
+    expected = deepcopy(old["jobDefVersion"]["resource"])
+    expected["arnoldConfig"]["groupIds"] = [1602]
+    expected["arnoldConfig"]["roles"][0]["queueName"] = "compute-329-hl-cloudnative-ai-ies.aiai.experience-guarantee"
+    assert selected["jobDefVersion"]["resource"] == expected
+    assert inherited["jobDefVersion"]["resource"] == old["jobDefVersion"]["resource"]
+    for name in ("imageMeta", "volumes", "gitRepo"):
+        assert selected["jobDefVersion"][name] == inherited["jobDefVersion"][name]
+    assert selected["namespace"] == inherited["namespace"]
+    runtime = selected["jobRunParams"]["envsList"]
+    assert runtime["UI5_SUBMISSION_CLUSTER"] == "ies_aiai_experience"
+    assert {k: v for k, v in runtime.items() if k != "UI5_SUBMISSION_CLUSTER"} == {
+        k: v for k, v in inherited["jobRunParams"]["envsList"].items() if k != "UI5_SUBMISSION_CLUSTER"}
+    assert submission_target(selected) == dict(profile="ies_aiai_experience", cluster_id=20,
+               group_ids=[1602], queue_name="compute-329-hl-cloudnative-ai-ies.aiai.experience-guarantee")
+    assert submission_target(inherited)["group_ids"] == [1234]
+    assert old == original_job and run == original_run
+    with pytest.raises(ValueError, match="unknown H20"):
+        render_job(old, env, run, "/same-output/run.json", cluster="misspelled")
+
+
+def test_cluster_cli_accepts_resume_code_update_and_rejects_unknown_target(monkeypatch):
+    import sys
+    from scripts import submit_ui5_grpo_mixed as submitter
+    calls = []
+    monkeypatch.setattr(submitter, "prepare", lambda args: calls.append(args))
+    monkeypatch.setattr(sys, "argv", ["submit_ui5_grpo_mixed.py", "--submit", "--resume-code-update",
+                                     "--cluster", "ies_aiai_experience"])
+    submitter.main()
+    assert calls[-1].submit and calls[-1].resume_code_update
+    assert calls[-1].cluster == "ies_aiai_experience"
+    monkeypatch.setattr(sys, "argv", ["submit_ui5_grpo_mixed.py", "--submit"])
+    submitter.main()
+    assert calls[-1].cluster == "default"
+    monkeypatch.setattr(sys, "argv", ["submit_ui5_grpo_mixed.py", "--cluster", "misspelled"])
+    with pytest.raises(SystemExit) as error:
+        submitter.main()
+    assert error.value.code == 2
+    assert len(calls) == 2
 
 
 def test_evaluation_input_change_cannot_relabel_step_zero(tmp_path):

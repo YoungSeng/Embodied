@@ -28,6 +28,30 @@ bootstrap 只依赖系统 Python 标准库，随后切换到原记录的 conda�
 相同冻结截止点、YAML 与 runtime 一致。集群资源、镜像、卷、namespace、conda、processor、
 rollout bundle、评测输入和 detector cache 都从这份真实记录继承。采用 boundary_v3/hybrid 正式评测。
 
+正式提交可通过 `--cluster` 选择 H20 资源组和队列：
+
+| 参数 | 资源组 ID | 队列 |
+| --- | --- | --- |
+| `--cluster default`（省略参数时相同） | 继承原 v3，当前为 1000 | 继承原 v3，当前为 `compute-329-hl-cloudnative-ai-iesqa.llm4se-guarantee` |
+| `--cluster ies_aiai_experience` | 1602 | `compute-329-hl-cloudnative-ai-ies.aiai.experience-guarantee` |
+
+`1602` 写入 Arnold 的 `groupIds`。物理 `clusterId` 沿用原 HL 配置（20），H20×2、CPU、内存、镜像、挂载
+及训练配置继续继承。选择按每次提交生效，写入最终 YAML、该次 `submission.json` 和 `delivery_paths.json`
+的 `submission_target`，不修改已有 `run.json` 的身份，可复用同一轮的 step 0 和完整 resume。
+后续重提若继续使用新队列，也要携带 `--cluster ies_aiai_experience`。
+
+新任务选择该目标：
+
+```bash
+bash shell/submit_ui5_crop_grpo_mixed_v1.sh --cluster ies_aiai_experience
+```
+
+已有任务更新代码后，选择该目标重提：
+
+```bash
+bash shell/submit_ui5_crop_grpo_mixed_v1.sh --resume-code-update --cluster ies_aiai_experience
+```
+
 新 checkout 固定为：
 
 ```text
@@ -233,7 +257,7 @@ python -m pytest tests/test_ui5_grpo.py tests/test_ui5_grpo_native_ar.py tests/t
 真实 PNG 复用补缺、两个真实 Gloo rank 的变长 group 梯度更新、RNG/sampler 恢复、best 副本事务和完整 Excel 导出。
 Windows 单元测试只替换 POSIX best symlink 创建原语，副本/哈希/删除/幂等仍执行真实文件操作。
 
-本次本地验证：上述测试加 v3、监督修正、正式评测和产物回归，共 81 项测试及 2 个子测试通过；
+已完成训练相关完整回归（81 项测试及 2 个子测试），以及新增提交目标后的提交/恢复回归（13 项）。
 shell 语法与 Git diff 空白检查通过。Excel 测试产物完成数值回读和渲染检查。
 
 外部开发机没有内网挂载或 H20，测试不代表真实训练已执行，也不预填真实样本量、F1 或吞吐。

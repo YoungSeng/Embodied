@@ -31,6 +31,13 @@ ROLLOUT = WORKSPACE / "gui_rollouts/ui5-train-rollout8-h20x2-v6-20260904"
 RUN_NAME = "ui5-crop-grpo-mixed-v1-h20x2-20260907"
 CHECKOUT = WORKSPACE / "code/Embodied-ui5-crop-grpo-mixed-v1"
 BASELINE = "b29590f88c4b4a102c742f8410e1c6751b0859d2"
+SUBMISSION_CLUSTERS = {
+    "default": None,  # Preserve the actual bound v3 resource group and queue.
+    "ies_aiai_experience": dict(
+        group_id=1602,
+        queue_name="compute-329-hl-cloudnative-ai-ies.aiai.experience-guarantee",
+    ),
+}
 
 
 def inherited_source(previous):
@@ -77,15 +84,29 @@ def evaluation_config(env):
                 evaluator_iou_threshold=value("EVAL_IOU_THRESHOLD", 0.1, float))
 
 
-def render_job(old_job, old_env, run, run_config, *, execution_sha=None):
+def submission_target(job):
+    arnold = job["jobDefVersion"]["resource"]["arnoldConfig"]
+    return dict(profile=job["jobRunParams"]["envsList"]["UI5_SUBMISSION_CLUSTER"],
+                cluster_id=arnold["clusterId"], group_ids=list(arnold["groupIds"]),
+                queue_name=arnold["roles"][0].get("queueName", ""))
+
+
+def render_job(old_job, old_env, run, run_config, *, execution_sha=None, cluster="default"):
     import yaml
+    if cluster not in SUBMISSION_CLUSTERS:
+        raise ValueError(f"unknown H20 submission cluster: {cluster}")
     job = yaml.safe_load((ROOT / "jobs/ui5_crop_grpo_mixed_v1_h20x2.yaml").read_text(encoding="utf-8"))
     for key in ("resource", "imageMeta", "volumes"):
         job["jobDefVersion"][key] = copy.deepcopy(old_job["jobDefVersion"][key])
     job["namespace"] = old_job["namespace"]
-    roles = job["jobDefVersion"]["resource"]["arnoldConfig"]["roles"]
+    arnold = job["jobDefVersion"]["resource"]["arnoldConfig"]
+    roles = arnold["roles"]
     if len(roles) != 1 or (roles[0]["num"], roles[0]["gpu"], roles[0]["gpuv"]) != (1, 2, "NVIDIA_H20"):
         raise ValueError("recorded resource is not H20x2")
+    override = SUBMISSION_CLUSTERS[cluster]
+    if override is not None:
+        arnold["groupIds"] = [override["group_id"]]
+        roles[0]["queueName"] = override["queue_name"]
     job["caption"] = "UI5 Crop Mixed GRPO H20x2 " + run["run_name"][-8:]
     job["jobDefVersion"]["name"] = run["run_name"]
     job["jobDefVersion"]["gitRepo"] = dict(mnt=run["project_root"])
@@ -94,6 +115,7 @@ def render_job(old_job, old_env, run, run_config, *, execution_sha=None):
                 "HARD_RATIOS", "ANCHOR_RATIOS", "GLOBAL_REPLAY_RATIOS", "LLM_LRS", "UI5_CURRICULUM_PROFILE"):
         env.pop(key, None)
     env.update(PROJECT_ROOT=run["project_root"], CODE_REVISION=execution_sha or run["code_sha"],
+               UI5_SUBMISSION_CLUSTER=cluster,
                RUN_NAME=run["run_name"], OUTPUT_DIR=run["output_dir"], GRPO_RUN_CONFIG=str(run_config),
                PYTHON_BIN=run["python"], MODEL_PATH=run["initial_model"],
                GRPO_CONFIG_JSON=json.dumps(run["grpo"], sort_keys=True),
@@ -204,15 +226,18 @@ def prepare(args):
         from datetime import datetime, timezone
         destination = submission / ("resume-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
         destination.mkdir(exist_ok=False)
-    job = render_job(old_job, env, run, run_config, execution_sha=sha)
+    job = render_job(old_job, env, run, run_config, execution_sha=sha,
+                     cluster=getattr(args, "cluster", "default"))
+    target = submission_target(job)
     job_path = destination / "formal.yaml"
     job_path.write_text(yaml.safe_dump(job, sort_keys=False), encoding="utf-8")
     state_path = destination / "submission.json"
     state = dict(status="prepared", runtime=job["jobRunParams"]["envsList"], job_yaml=str(job_path),
                  run_identity=run["identity"], run_config=str(run_config), resume=args.resume,
-                 execution_code_sha=sha, run_code_sha=run["code_sha"])
+                 execution_code_sha=sha, run_code_sha=run["code_sha"], submission_target=target)
     write_json(state_path, state)
     write_json(output / "delivery_paths.json", dict(code_sha=sha, yaml=str(job_path), run_config=str(run_config),
+               submission_target=target,
                mixed_manifest=str(output / "mixed/manifest.json"),
                excel=str(output / "diagnostics/ui5_grpo_training_evaluation.xlsx"),
                latest=str(output / "resume/latest"),
@@ -232,6 +257,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--previous-submission-dir", type=Path, default=PREVIOUS)
     parser.add_argument("--run-name", default=RUN_NAME)
+    parser.add_argument("--cluster", choices=tuple(SUBMISSION_CLUSTERS), default="default",
+                        help="H20 submission target; default inherits v3, ies_aiai_experience selects group 1602 and its HL queue")
     parser.add_argument("--submit", action="store_true")
     parser.add_argument("--resume", action="store_true", help="previous platform job must be stopped; preserve the existing RUN_NAME")
     parser.add_argument("--resume-code-update", action="store_true",
