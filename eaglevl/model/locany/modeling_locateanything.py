@@ -416,7 +416,22 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             target_box_mask: Optional[torch.BoolTensor] = None,
             return_ui_defect_outputs: bool = False,
             return_dict: Optional[bool] = None,
+            ui5_ar_mode: bool = False,
+            ui5_zero_slot: bool = False,
+            completion_start: Optional[int] = None,
+            temperature: float = 0.7,
     ) -> Union[Tuple, UIDefectModelOutput]:
+        if ui5_zero_slot:
+            from eaglevl.train.ui5_grpo_core import zero_parameter_touch
+            return UIDefectModelOutput(loss=zero_parameter_touch(self))
+        if ui5_ar_mode:
+            from .ui5_ar import forward_ar
+            return forward_ar(
+                self, pixel_values=pixel_values, input_ids=input_ids,
+                attention_mask=attention_mask, position_ids=position_ids,
+                image_grid_hws=image_grid_hws, image_flags=image_flags,
+                relation_family=relation_family, defect_type=defect_type,
+                completion_start=completion_start, temperature=temperature)
         RING_ZIGZAG = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         if sub_sample_lengths is None:

@@ -1343,6 +1343,7 @@ class LazySupervisedDatasetMTP(Dataset):
     def multi_modal_get_item(
         self, messages: list, ui_targets: Optional[Dict[str, torch.Tensor]] = None,
         audit_negative: bool = False,
+        truncation: bool = True,
     ) -> Dict[str, torch.Tensor]:
         message_text = self.processor.py_apply_chat_template(messages, tokenize=False)
         image_inputs, video_inputs = self.processor.process_vision_info(messages)
@@ -1357,7 +1358,7 @@ class LazySupervisedDatasetMTP(Dataset):
         
         inputs = self.processor(
             text=message_text, images=image_inputs, videos=video_inputs,
-            return_tensors="pt", padding=False, truncation=True
+            return_tensors="pt", padding=False, truncation=truncation
         )
         input_ids = inputs["input_ids"][0]
 

@@ -794,7 +794,7 @@ def build_worker_specs(
         ]
         if args.greedy:
             command.append("--greedy")
-        if getattr(args, "evaluation_purpose", "ui5_full") == "decoder_comparison":
+        if getattr(args, "evaluation_purpose", "ui5_full") in {"decoder_comparison", "grpo_full"}:
             # Same inference/crop/scorer path; this paired held-out comparison
             # does not reevaluate the unrelated training/mining pools.
             start, stop = command.index("--hard-groups-jsonl"), command.index("--evaluation-identity-file")

@@ -1,0 +1,61 @@
+# Formal H20x2 resource contract. scripts/submit_ui5_grpo_mixed.py replaces
+# resources/image/volumes with the EXACT recorded source job and binds the
+# code SHA, conda, processor, evaluation/cache, manifest and run.json paths.
+# Submit through: bash shell/submit_ui5_crop_grpo_mixed_v1.sh
+caption: UI5 Crop Mixed GRPO H20x2
+namespace: /user/sicheng.yang
+jobDefVersion:
+  entrypointMode: FULL_SCRIPT
+  gitRepo:
+    mnt: /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Embodied-ui5-crop-grpo-mixed-v1
+  imageMeta:
+    imageSource: url
+    imageUrl: hub.byted.org/base/lab.cuda.devel:0ffcd17bfdf8d07a198e6cff167eae26
+    imageVid: d8ap37f1enlcr23291ug
+  lazyDownloadCode: true
+  name: ui5-crop-grpo-mixed-v1-h20x2-20260907
+  resource:
+    arnoldConfig:
+      clusterId: 20
+      elasticTraining: {}
+      groupIds: [1000]
+      bytenasVolumes:
+        - name: intelligent-service-arnold-hl
+          accessMode: RW
+          roles: [worker]
+          subPath: ""
+      keepMins: 1
+      preemptible: false
+      quotaPool: default
+      roles:
+        - name: worker
+          num: 1
+          cpu: 40
+          gpu: 2
+          gpuv: NVIDIA_H20
+          queueName: compute-329-hl-cloudnative-ai-iesqa.llm4se-guarantee
+          memory: 460800
+          ports: 1
+    backend: ARNOLD
+  volumes:
+    - volumeId: 18834
+      mountPath: /mnt/bn/intelligent-service-arnold-hl
+jobRunParams:
+  entrypointFullScript: |
+    set -Eeuo pipefail
+    cd "${PROJECT_ROOT}"
+    exec bash shell/run_ui5_crop_grpo_mixed_h20x2.sh
+  envsList:
+    PROJECT_ROOT: /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/code/Embodied-ui5-crop-grpo-mixed-v1
+    RUN_NAME: ui5-crop-grpo-mixed-v1-h20x2-20260907
+    GRPO_RUN_CONFIG: /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_models/Embodied-ui5-crop-grpo-mixed/ui5-crop-grpo-mixed-v1-h20x2-20260907/run.json
+    OUTPUT_DIR: /mnt/bn/intelligent-service-arnold-hl/logging/sicheng_workspace/gui_models/Embodied-ui5-crop-grpo-mixed/ui5-crop-grpo-mixed-v1-h20x2-20260907
+    TOTAL_STEPS: "1200"
+    EVAL_INTERVAL_STEPS: "200"
+    GRADIENT_ACCUMULATION_STEPS: "2"
+    MAX_SEQ_LENGTH: "7268"
+    MAX_NUM_TOKENS_PER_SAMPLE: "7268"
+    MAX_NUM_TOKENS: "7268"
+    UI5_GPU0_WORKERS: "2"
+    UI5_GPU1_WORKERS: "3"
+    ATTN_IMPLEMENTATION: sdpa

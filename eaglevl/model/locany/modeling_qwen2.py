@@ -1270,6 +1270,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         return_dict: Optional[bool] = None,
         sub_sample_lengths: Optional[torch.Tensor] = None,  # For stream packing
         cache_position: Optional[torch.LongTensor] = None,
+        ui5_ar_mode: bool = False,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1289,7 +1290,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
 
-        if self.gradient_checkpointing and self.training:
+        checkpoint_layers = self.gradient_checkpointing and (
+            self.training or ((ui5_ar_mode or getattr(self, "ui5_eval_gradient_checkpointing", False))
+                              and torch.is_grad_enabled()))
+        if checkpoint_layers:
             if use_cache:
                 logger.warning_once(
                     "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
@@ -1334,7 +1338,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
             use_cache=use_cache,
             output_attentions=output_attentions,
             device=device,
-        )
+        ) if not ui5_ar_mode else _prepare_4d_causal_attention_mask(
+            attention_mask, (batch_size, seq_length), inputs_embeds,
+            past_key_values_length, sliding_window=self.config.sliding_window)
 
         hidden_states = inputs_embeds
 
@@ -1347,8 +1353,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
+            if checkpoint_layers:
+                checkpoint_function = (partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
+                                       if ui5_ar_mode else self._gradient_checkpointing_func)
+                layer_outputs = checkpoint_function(
                     decoder_layer.__call__,
                     hidden_states,
                     attention_mask,

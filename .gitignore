@@ -1,2 +1,6 @@
 # Large runtime artifacts are never source-controlled.
 /work_dirs/
+/.grpo-venv/
+/.pytest_cache/
+/**/__pycache__/
+/validation_artifacts/
