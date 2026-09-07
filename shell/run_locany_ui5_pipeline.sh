@@ -321,6 +321,8 @@ if ! "${PIPELINE_PYTHON}" -c 'import openpyxl; assert tuple(map(int, openpyxl.__
   locany_die 30 \
     "openpyxl>=3.1 is required for diagnostics/ui5_training_evaluation.xlsx in ${ENV_DIR}"
 fi
+"${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/initialize_ui_training_diagnostics.py" \
+  --output-dir "${OUTPUT_DIR}"
 [[ -f "${PROJECT_ROOT}/shell/train_locany_ui_defect.sh" ]] || \
   locany_die 24 "Training entrypoint missing: ${PROJECT_ROOT}/shell/train_locany_ui_defect.sh"
 if [[ "${ENABLE_EVAL}" == "1" || "${PIPELINE_MODE}" == "eval" ]]; then

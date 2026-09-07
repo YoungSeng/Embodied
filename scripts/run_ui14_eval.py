@@ -93,11 +93,14 @@ def run(args):
     from patch_locany_checkpoint import patch_checkpoint
     from run_ui5_eval import build_score_command, run_checked
     from collect_ui5_metrics import (load_history, write_history, build_best_checkpoints_document,
-                                     collect_gate_metrics, ui_model_signature)
+                                     collect_gate_metrics, ui_model_signature, print_metric_summary)
     from eaglevl.train.ui5_excel_logger import UI5ExcelLogger, build_eval_rows
     manifest = Path(os.environ["UI_EVAL_MANIFEST"])
-    specs = validate_evaluation_manifest(manifest)
     output = Path(args.output_dir)
+    workbook = UI5ExcelLogger(output / "diagnostics" / "ui5_training_evaluation.xlsx", [t.task_key for t in UI_TASKS])
+    workbook.initialize()
+    print(f"[UI14 eval] step={args.step} full test: 14 tasks | Excel: {workbook.path}", flush=True)
+    specs = validate_evaluation_manifest(manifest)
     checkpoint = Path(args.checkpoint)
     from eaglevl.ui_task_registry import validate_registry
     checkpoint_config = read_json(checkpoint / "config.json")
@@ -111,7 +114,9 @@ def run(args):
         patch_checkpoint(base_model=Path(args.base_model), checkpoint=checkpoint,
                          project_root=Path(args.project_root), force=True, validate_relation_weights=True)
     identity = evaluation_identity(manifest, checkpoint)
-    if is_complete(output, args.step, manifest, checkpoint): return 0
+    if is_complete(output, args.step, manifest, checkpoint):
+        print(f"[UI14 eval] reused complete step={args.step}: 14 tasks and Excel rows verified", flush=True)
+        return 0
     history_dir = output / "evaluation"
     prediction = output / f"inference-checkpoint-{args.step}-ui14"
     destination = history_dir / "raw" / f"ui14-step-{args.step}"
@@ -179,7 +184,6 @@ def run(args):
             audit_context={"evaluation_split": "test", "cache_scope": "full_test", "eval_inference_crop_mode": "task_registry",
                            "recipe_digest": file_digest(args.recipe_path), "cache_digest": file_digest(manifest),
                            "crop_train_mode": "crop_only", "ui_sampling_mode": "task_source_balanced_rotating", "scan_name": SCAN_NAME})
-        workbook = UI5ExcelLogger(output / "diagnostics" / "ui5_training_evaluation.xlsx", [t.task_key for t in UI_TASKS])
         workbook.append_eval(args.step, excel_rows)
         for step, selection in selections.items():
             workbook.update_checkpoint_status(step, **{k: selection[k] for k in ("is_best_image", "is_best_bbox", "is_4000_milestone", "checkpoint_kept")})
@@ -187,8 +191,10 @@ def run(args):
         write_json(history_dir / "best_checkpoints.json", best)
         state.update(status="success", tasks=metrics["tasks"], finished=row["evaluation_end_time"])
         write_json(state_path, state)
-        for result in excel_rows:
-            print(f"[EVAL] step={args.step} {result['task']} {result['granularity']} P={result['precision']:.6f} R={result['recall']:.6f} F1={result['f1']:.6f}", flush=True)
+        print_metric_summary(step=args.step, metrics=metrics, retention=selections[args.step],
+                             diagnostics_xlsx=workbook.path)
+        print(f"[UI14 eval] complete step={args.step}: 14/14 tasks, {len(excel_rows)} Excel rows; "
+              "UI9 task metrics and ui9_macro/micro are saved in Excel and evaluation outputs", flush=True)
         return 0
     except Exception as exc:
         state.update(status="failed", error=str(exc))

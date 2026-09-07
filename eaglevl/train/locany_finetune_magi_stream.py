@@ -2576,6 +2576,10 @@ class StreamPackingMTPTrainer(Trainer):
                 "ui5_training_evaluation.xlsx",
             )
         )
+        if self._ui5_enabled and self.is_world_process_zero():
+            self._ui5_excel.initialize()
+            logger.warning("[UI Excel] train_100steps every 100 optimizer steps; eval_1000steps follows pipeline evaluation; path=%s",
+                           self._ui5_excel.path)
         self._ui5_global_epoch_offset = self._ui5_excel.latest_train_global_epoch()
         self._ui5_segment_start_epoch = None
         self._ui5_last_flushed_step = 0

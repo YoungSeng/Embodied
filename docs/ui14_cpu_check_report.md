@@ -304,6 +304,31 @@ python -m unittest tests.test_ui14_submit_progress tests.test_ui14_verification_
 
 日志缺少其余 rank/数据 worker 的超时调用栈，不能断言已排除全部 NCCL 原因。未执行修复后的四卡 backward，也未由本地重新提交；保留现有数据/cache/recipe，正常入口再次 submit 即可，正式参数不变。完整证据、变更与命令见 [trial 411146773 分析](ui14_training_failure_411146773.md)。
 
+## 2026-09-08 启动建表与 step 0 全量评测
+
+针对本次上传的 trial 411146773 日志：该次运行在第一个 optimizer step 完成前退出，尚未触发 100 步训练窗口；旧 UI14 profile 为 `EVAL_AT_START=0`，所以未产生初始评测。旧 Excel logger 在首次指标写入时才保存文件，诊断目录中缺少该文件与这次日志一致，不能据此判断当前远端任务的实时状态。
+
+本次增量：UI14 正式 profile 及两份参考 YAML 固定 `EVAL_AT_START=1`，CPT checkpoint-9000 导出完整 14 任务 checkpoint-0 后先做全量 test 评测，成功才进入 SFT。pipeline 启动、独立评测入口以及 rank 0 Trainer 初始化均可创建或复用两个 sheet，打印 Excel 路径；不伪造 step 0 训练记录。100 步训练窗口、每 1000 步全量 14 项评测、每 GPU 两个推理 worker、16k SFT 和 `EVAL_FAIL_POLICY=stop` 保持。控制台复用旧五类 Image/BBox 与 five_task_macro 汇总，Excel 每轮仍为完整 36 行。
+
+**本地实际执行 97 项 CPU 回归，38.590 秒，全部通过；9 个 Python 文件 AST、3 个 Shell 入口 `bash -n` 通过。** 两份跟踪的参考 YAML 与当前正式提交渲染函数逐字一致，AIAI_locate/2146 与 YG/1602 均核对 EVAL_AT_START=1、4 卡、2 workers/GPU、stop。
+
+- 真正执行 Excel 写入/重读：首次启动只写两个表头；step 0 写完整 36 行；step 100 写训练窗口；重启不改既有字节和 mtime；旧表头迁移保留历史训练和评测内容。
+- step 0 和 step 1000 评测集成：全部 14 项指标及来源/输入策略、CPT9000/SFT step 元数据保存；UI5 best 仍按原五类 macro；完整结果重跑不调用推理；删除 UI9 状态项或 Excel 单行均触发补齐，历史不重复。GPU 推理和 UI5 外部评分命令使用测试替身，UI9 评分、原图 gate 读取、Excel、history/best/state 实际执行。
+- 执行真实 Bash 的 step 0 导出和评测控制块：仅模型导出/推理/完成状态命令替换为 CPU 测试函数；验证先导出再评测再放行训练、完整评测跳过，以及推理退出码 17 在 stop 策略下直接退出、不会进入训练。
+- 提交入口复用绑定旧 EVAL_AT_START=0 的 finalize 配置快照和报告，在独立 submissions YAML 中生成新 EVAL_AT_START=1，原审计文件字节和 mtime 不变；真实 mlx 调用由测试替身代替，不需要重新生成数据/cache。
+
+复现命令（已有 Pillow、NumPy、SciPy、PyYAML、openpyxl 的 CPU Python 环境）：
+
+```bash
+python -m unittest \
+  tests.test_ui14_initial_evaluation tests.test_ui14_pipeline \
+  tests.test_ui14_submission_resources tests.test_ui14_submit_progress \
+  tests.test_ui14_inference_workers tests.test_ui5_excel_logger \
+  tests.test_ui5_pipeline tests.test_ui_sampler_cycle_cache
+```
+
+本地未访问集群实时诊断目录，未加载 3B checkpoint、未执行 GPU step 0 推理/训练，也未提交新任务。真实 Excel 位于 `${WORKSPACE}/gui_models/locany-m32-cpt9000-ui14-a800x4-repair-v2/diagnostics/ui5_training_evaluation.xlsx`，由更新后的正式任务生成；已有失败运行没有记录的训练窗口不能补造。
+
 ## 实际数据统计的产生位置
 
 派生根目录：

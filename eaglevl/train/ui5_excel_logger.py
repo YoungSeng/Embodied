@@ -534,6 +534,27 @@ class UI5ExcelLogger:
                 pass
             temporary.unlink(missing_ok=True)
 
+    def initialize(self) -> bool:
+        """Publish headers before any metrics exist; preserve all existing rows.
+
+        A current workbook is left byte-for-byte unchanged on restart. Legacy
+        headers use the same migration as ordinary metric writes.
+        """
+        if self.path.is_file():
+            openpyxl, _, _, _ = _openpyxl()
+            workbook = openpyxl.load_workbook(self.path, read_only=True)
+            try:
+                current = tuple(workbook.sheetnames) == EXPECTED_SHEETS and all(
+                    tuple(cell.value for cell in next(workbook[name].iter_rows())) == columns
+                    for name, columns in ((SHEET_TRAIN, TRAIN_COLUMNS), (SHEET_EVAL, EVAL_COLUMNS))
+                )
+            finally:
+                workbook.close()
+            if current:
+                return False
+        self._atomic_save(self._load_or_create())
+        return True
+
     @staticmethod
     def _steps(sheet) -> set[int]:
         return {

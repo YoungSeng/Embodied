@@ -218,24 +218,31 @@ class UI14EvaluationTests(unittest.TestCase):
                 self.assertEqual(command.count("--detector-crop-manifest"),int(task.view_policy=="crops"))
 
     def test_full_evaluation_resume_repairs_missing_ui9_and_keeps_best_ui5(self):
+        self._exercise_full_evaluation(1000)
+
+    def test_step_zero_evaluation_writes_all_14_tasks_and_resumes_without_fake_training(self):
+        self._exercise_full_evaluation(0)
+
+    def _exercise_full_evaluation(self, step):
         import run_ui14_eval as evaluate
+        from openpyxl import load_workbook
         from eaglevl.train.ui5_excel_logger import UI5ExcelLogger
         from locany_ui5_common import TASK_JSONL
-        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
-            root=Path(tmp); output=root/"run"; checkpoint=output/"checkpoint-1000"; specs=[]
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as console:
+            root=Path(tmp); output=root/"run"; checkpoint=output/f"checkpoint-{step}"; specs=[]
             for task in UI_TASKS:
                 test=root/(TASK_JSONL[task.task_key] if task.task_id<5 else task.task_key+".jsonl")
                 image=str(root/f"page-{task.task_id}.png")
                 write_jsonl(test,[dict(image=image,source_image=image,source_image_id=f"id-{task.task_id}",boxes_px=[[10,10,40,40]],objects={"bbox":[[10,10,40,40]]})])
                 specs.append({**task.to_dict(),"test":str(test),"split":"test","skip_figma":task.task_id<5,"cache":None,"expected_records":1})
-                write_json(output/"inference-checkpoint-1000-ui14"/task.task_key/"gate/page.json",dict(
+                write_json(output/f"inference-checkpoint-{step}-ui14"/task.task_key/"gate/page.json",dict(
                     image_path=image,prediction_status="defect",final_boxes_pixel_xyxy=[[10,10,40,40]],p_defect=.7,
                     prediction_boxes=1,would_pass=True,coarse_boxes_px=[],coordinate_space="norm1000",image_width=375,image_height=800))
             manifest=root/"evaluation_manifest.json"; write_json(manifest,{"tasks":specs})
             write_json(checkpoint/"config.json",dict(ui_num_tasks=14,ui_task_registry=specs))
             recipe=root/"recipe.json"; write_json(recipe,{})
             args=SimpleNamespace(output_dir=output,checkpoint=checkpoint,skip_patch=True,base_model=root/"cpt-9000",
-                step=1000,project_root=ROOT,eval_gpu_devices="0,1,2,3",attn_implementation="sdpa",scorer_root=ROOT,
+                step=step,project_root=ROOT,eval_gpu_devices="0,1,2,3",attn_implementation="sdpa",scorer_root=ROOT,
                 input_dir=root,recipe_path=recipe,tile_nms_iou=.5)
             metric={g:dict(precision=.8,recall=.8,f1=.8,tp=4,fp=1,fn=1,tn=0) for g in ("image","bbox")}
             ui5={"tasks":{t.task_key:metric.copy() for t in UI_TASKS[:5]},"macro":{g:dict(precision=.8,recall=.8,f1=.8) for g in ("image","bbox")}}
@@ -243,17 +250,57 @@ class UI14EvaluationTests(unittest.TestCase):
                  mock.patch.object(evaluate,"validate_evaluation_manifest",return_value=specs), \
                  mock.patch("run_ui5_eval.run_checked") as runner, \
                  mock.patch("collect_ui5_metrics.parse_markdown_report",side_effect=lambda *a: json.loads(json.dumps(ui5))):
+                if step == 0:
+                    runner.side_effect = RuntimeError("fixture inference failed")
+                    with self.assertRaisesRegex(RuntimeError, "fixture inference failed"):
+                        evaluate.run(args)
+                    self.assertFalse(evaluate.is_complete(output, step, manifest, checkpoint))
+                    self.assertEqual(read_json(output/"evaluation/ui14-step-0.json")["status"], "failed")
+                    empty = load_workbook(output/"diagnostics/ui5_training_evaluation.xlsx", read_only=True)
+                    try:
+                        self.assertEqual([s.max_row for s in empty], [1, 1])
+                    finally:
+                        empty.close()
+                    runner.side_effect = None
+                    runner.reset_mock()
                 evaluate.run(args)
                 inference_command=runner.call_args_list[0].args[0]
                 self.assertEqual(inference_command[inference_command.index("--workers-per-gpu")+1],"2")
-                self.assertTrue(evaluate.is_complete(output,1000,manifest,checkpoint))
+                self.assertTrue(evaluate.is_complete(output,step,manifest,checkpoint))
                 self.assertEqual(read_json(output/"evaluation/best_checkpoints.json")["current_best"]["image"]["image_macro_f1"],.8)
-                state=read_json(output/"evaluation/ui14-step-1000.json"); state["tasks"].pop("synth_cropping")
-                write_json(output/"evaluation/ui14-step-1000.json",state)
-                self.assertFalse(evaluate.is_complete(output,1000,manifest,checkpoint))
+                workbook_path = output/"diagnostics/ui5_training_evaluation.xlsx"
+                workbook = load_workbook(workbook_path)
+                try:
+                    self.assertEqual(workbook["train_100steps"].max_row, 1)
+                    sheet = workbook["eval_1000steps"]
+                    self.assertEqual(sheet.max_row, 37)
+                    rows = [dict(zip([c.value for c in sheet[1]], r)) for r in sheet.iter_rows(min_row=2, values_only=True)]
+                    self.assertEqual({r["step"] for r in rows}, {step})
+                    self.assertEqual({r["sft_step"] for r in rows}, {step})
+                    self.assertEqual({r["init_cpt_step"] for r in rows}, {9000})
+                    self.assertEqual({r["task"] for r in rows}, {t.diagnostic_name for t in UI_TASKS} | {"five_task_macro", "five_task_micro", "ui9_macro", "ui9_micro"})
+                    self.assertIn(f"UI5 full-test scorer metrics: SFT step {step}", console.getvalue())
+                    self.assertIn("five_task_macro Image", console.getvalue())
+                    self.assertNotIn("synth_cropping image P=", console.getvalue())
+                    saved = workbook_path.read_bytes()
+                    evaluate.run(args)
+                    self.assertEqual(runner.call_count, 2)
+                    self.assertEqual(workbook_path.read_bytes(), saved)
+                    missing_row = next(i for i, r in enumerate(rows, 2) if r["task"] == "synth_cropping")
+                    sheet.delete_rows(missing_row)
+                    workbook.save(workbook_path)
+                finally:
+                    workbook.close()
+                self.assertFalse(evaluate.is_complete(output,step,manifest,checkpoint))
                 evaluate.run(args)
-                self.assertTrue(evaluate.is_complete(output,1000,manifest,checkpoint))
-                self.assertEqual(runner.call_count,4)
+                self.assertTrue(evaluate.is_complete(output,step,manifest,checkpoint))
+                state_path = output/f"evaluation/ui14-step-{step}.json"
+                state=read_json(state_path); state["tasks"].pop("synth_cropping")
+                write_json(state_path,state)
+                self.assertFalse(evaluate.is_complete(output,step,manifest,checkpoint))
+                evaluate.run(args)
+                self.assertTrue(evaluate.is_complete(output,step,manifest,checkpoint))
+                self.assertEqual(runner.call_count,6)
                 self.assertEqual(len(read_json(output/"evaluation/evaluation_history.json")),1)
 
     def test_finalize_connects_14_streams_original_image_eval_and_bound_report(self):
@@ -366,6 +413,7 @@ class UI14EvaluationTests(unittest.TestCase):
             self.assertEqual(str(env["MAX_STEPS"]),"16000")
             self.assertEqual(env["EVAL_FAIL_POLICY"],"stop")
             self.assertEqual(env["EVAL_INFERENCE_WORKERS_PER_GPU"],2)
+            self.assertEqual(env["EVAL_AT_START"],1)
 
 
 if __name__=="__main__": unittest.main()

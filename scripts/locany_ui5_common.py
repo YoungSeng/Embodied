@@ -750,7 +750,7 @@ def resolve_runtime_config(
             "INSTALL_SYSTEM_RUNTIME_DEPS": 1,
         }
         if env.get("UI_TRAIN_PROFILE") == "m32-cpt9000-ui14-v1":
-            formal_exact.update(INIT_CPT_STEP=9000, EVAL_FAIL_POLICY="stop", EVAL_INFERENCE_WORKERS_PER_GPU=2,
+            formal_exact.update(INIT_CPT_STEP=9000, EVAL_AT_START=1, EVAL_FAIL_POLICY="stop", EVAL_INFERENCE_WORKERS_PER_GPU=2,
                                 ATTN_IMPLEMENTATION="sdpa", UI_NUM_TASKS="14", LOCANY_CPT_MODE="0")
             machine_resource_config(machine_type, resource_group=resolved["RESOURCE_GROUP"], config_path=config_path)
             from ui14_common import INIT_CHECKPOINT as UI14_INIT_CHECKPOINT

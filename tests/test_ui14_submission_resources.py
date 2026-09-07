@@ -55,6 +55,7 @@ class SubmissionResourcesTests(unittest.TestCase):
                 self.assertEqual(restored["RESOURCE_GROUP"], runtime["RESOURCE_GROUP"])
                 self.assertEqual(restored["EVAL_FAIL_POLICY"], "stop")
                 self.assertEqual(restored["EVAL_INFERENCE_WORKERS_PER_GPU"], 2)
+                self.assertEqual(restored["EVAL_AT_START"], 1)
             self.assertEqual(common.machine_resource_config("a800", resource_group="yg")["group_id"], 1602)
             self.assertEqual(common.resolve_runtime_config({**profile_environment(), "GPU_COUNT": "4"})["RESOURCE_GROUP"], "aiai_locate")
             ui5 = submit.parse_args(["--machine", "a800", "--gpus", "4"])
@@ -73,6 +74,12 @@ class SubmissionResourcesTests(unittest.TestCase):
                 parsed["jobDefVersion"]["resource"]["arnoldConfig"]["groupIds"] = [9999]
                 with self.assertRaisesRegex(ValueError, "four-card A800"):
                     checks.validate_formal_yaml(yaml.safe_dump(parsed), runtime)
+                parsed = yaml.safe_load(rendered)
+                parsed["jobRunParams"]["envsList"]["EVAL_AT_START"] = "0"
+                with self.assertRaisesRegex(ValueError, "EVAL_AT_START"):
+                    checks.validate_formal_yaml(yaml.safe_dump(parsed), runtime)
+            with self.assertRaisesRegex(ValueError, "EVAL_AT_START"):
+                common.resolve_runtime_config({**profile_environment(), "EVAL_AT_START": "0"})
             args = self.args(tmp, "yg")
             args.machine = "h20"
             with self.assertRaisesRegex(ValueError, "a800"):
@@ -82,6 +89,13 @@ class SubmissionResourcesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
             root = Path(tmp)
             canonical, canonical_runtime = checks.render_formal_yaml(root)
+            # An existing ready report may bind the old initial-eval setting.
+            # Submission must keep this audited artifact intact, render the new
+            # setting separately, and reuse the already-prepared data.
+            old_yaml = yaml.safe_load(canonical.read_text(encoding="utf-8"))
+            old_yaml["jobRunParams"]["envsList"]["EVAL_AT_START"] = "0"
+            canonical.write_text(yaml.safe_dump(old_yaml), encoding="utf-8")
+            write_json(canonical_runtime, {**read_json(canonical_runtime), "EVAL_AT_START": 0})
             report_path = root / "cpu_check_report.json"
             write_json(report_path, {"ready": True, "normalization_id": "fixture-normalized", "repair_run_id": "fixture-repair",
                 "artifact_digests": {p.name: file_digest(p) for p in (canonical, canonical_runtime)}})
@@ -104,6 +118,7 @@ class SubmissionResourcesTests(unittest.TestCase):
                 self.assertEqual(binding["cpu_check_report_sha256"], file_digest(report_path))
                 self.assertEqual(binding["normalization_id"], "fixture-normalized")
                 self.assertEqual(binding["repair_run_id"], "fixture-repair")
+                self.assertEqual(str(yaml.safe_load(output.read_text(encoding="utf-8"))["jobRunParams"]["envsList"]["EVAL_AT_START"]), "1")
                 self.assertEqual(protected, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in protected})
             rendered, runtime = submit.render_job(self.args(root, "yg"))
             with self.assertRaisesRegex(ValueError, "overwrite CPU-checked"):
