@@ -112,6 +112,33 @@ python scripts/prepare_ui_lens_eval.py --dataset-root "$RAW" --output-dir "$DATA
 cat "$DATA/conversion_summary.json"
 ```
 
+转换默认会立即输出启动信息，并每 5 秒、每完成 100 条标注、每个任务开始/完成时打印进度。
+日志包括 `stage`（当前阶段）、`task_rows`（该任务已完成/总数）、`total_rows`（全部已完成/总数和百分比）、
+`elapsed`、`speed`、`eta_validation`（预计校验剩余时间）、已解码图片数、已处理的正负记录数、
+裁剪框数和当前图片路径。开始时会先读五个标注文件确定真实总数；此时尚无 ETA，显示 `--`。
+
+网络挂载目录读取大图较慢时，后台进度线程仍会周期打印当前操作。
+如果数字不变，可以从 `current` 查看是哪张图片，并区分 `open_image`、`image_metadata`、
+`decode_image`、`validate_boxes`、`write_jsonl` 等阶段。
+ETA 按已完成标注的平均速度估算；首次解码图片通常比后续任务复用尺寸缓存更慢，因此估计值会变化。
+`eta_validation` 只估算数据校验，不包含后续写文件时间；出现 100% 后以最终 `[UI-LENS:DONE]` 为完成标志。
+
+希望更频繁输出时（以下是一整行命令）：
+
+```bash
+python -u scripts/prepare_ui_lens_eval.py --dataset-root "$RAW" --output-dir "$DATA" --bbox-boundary-policy clip --progress-interval-seconds 2 --progress-every 50
+```
+
+进度写到 stderr 并立即刷新，stdout 仍只输出最终 JSON 汇总，因此可独立保存两种输出：
+
+```bash
+python -u scripts/prepare_ui_lens_eval.py --dataset-root "$RAW" --output-dir "$DATA" --bbox-boundary-policy clip > conversion_result.json 2> conversion_progress.log
+```
+
+`--quiet` 可关闭进度。更新脚本不会改变已经运行中的旧进程；需要先停止旧进程，再更新并重新运行。
+校验阶段中断后尚未写 `DATA`，可以直接重跑；若已开始写文件并留下输出目录，使用新的 `--output-dir`，
+不要把不完整的目录用于推理。脚本会在读取图片之前检查输出目录是否已存在，避免等待很久后才发现目录冲突。
+
 转换规则：
 
 - `infos.image_path` 转为真实存在的绝对图片路径，写入 `images`。

@@ -1,7 +1,13 @@
 import importlib.util
+import contextlib
+import io
 import json
+import subprocess
+import sys
 import tempfile
+import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from PIL import Image
@@ -147,6 +153,77 @@ class PrepareUILensTest(unittest.TestCase):
         self.modify_first("image_path", "single_UIs/absent.png")
         with self.assertRaisesRegex(ValueError, "0 matches"):
             adapter.prepare(self.root)
+
+    def test_progress_reports_totals_and_writing_without_changing_summary(self):
+        baseline = adapter.prepare(self.root)
+        log = io.StringIO()
+        with contextlib.redirect_stderr(log):
+            report = adapter.prepare(self.root, self.root / "converted", show_progress=True, progress_every=1)
+        self.assertEqual(report, baseline)
+        self.assertIn("[UI-LENS:START]", log.getvalue())
+        self.assertIn("total_rows=10/10 (100.0%)", log.getvalue())
+        self.assertIn("positive=5 negative=5", log.getvalue())
+        self.assertIn("stage=write_jsonl", log.getvalue())
+        self.assertIn("[UI-LENS:DONE]", log.getvalue())
+
+    def test_heartbeat_reports_image_path_before_slow_open_completes(self):
+        observed = threading.Event()
+
+        class Capture(io.StringIO):
+            def write(self, text):
+                result = super().write(text)
+                if "[UI-LENS:PROGRESS]" in text and "stage=open_image" in text and "positive.png" in text:
+                    observed.set()
+                return result
+
+        original_open = adapter.Image.open
+
+        def slow_open(*args, **kwargs):
+            if not observed.wait(timeout=2):
+                raise AssertionError("No heartbeat while opening an image")
+            return original_open(*args, **kwargs)
+
+        with contextlib.redirect_stderr(Capture()), mock.patch.object(adapter.Image, "open", side_effect=slow_open):
+            adapter.prepare(self.root, show_progress=True, progress_interval_seconds=0.02)
+        self.assertTrue(observed.is_set())
+
+    def test_eta_uses_completed_rows_and_unknown_before_first_row(self):
+        log = io.StringIO()
+        with mock.patch.object(adapter.time, "monotonic", return_value=100):
+            progress = adapter.ConversionProgress(enabled=True, every=100)
+            with contextlib.redirect_stderr(log):
+                progress.set_total(10)
+        self.assertIn("eta_validation=--", log.getvalue())
+        log = io.StringIO()
+        with mock.patch.object(adapter.time, "monotonic", return_value=110), contextlib.redirect_stderr(log):
+            progress.update(done=2, task_done=2, task_total=10)
+            progress.emit("PROGRESS")
+        self.assertIn("speed=0.20 rows/s", log.getvalue())
+        self.assertIn("eta_validation=00:00:40", log.getvalue())
+
+    def test_failure_reports_failed_instead_of_done(self):
+        self.modify_first("image_path", "single_UIs/absent.png")
+        log = io.StringIO()
+        with contextlib.redirect_stderr(log), self.assertRaises(ValueError):
+            adapter.prepare(self.root, show_progress=True)
+        self.assertIn("[UI-LENS:FAILED]", log.getvalue())
+        self.assertNotIn("[UI-LENS:DONE]", log.getvalue())
+
+    def test_existing_output_fails_before_decoding(self):
+        output = self.root / "existing"
+        output.mkdir()
+        with mock.patch.object(adapter.Image, "open") as opened, self.assertRaisesRegex(FileExistsError, "already exists"):
+            adapter.prepare(self.root, output)
+        opened.assert_not_called()
+
+    def test_cli_keeps_json_on_stdout_and_quiet_suppresses_progress(self):
+        command = [sys.executable, str(Path(adapter.__file__)), "--dataset-root", str(self.root)]
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", check=True)
+        self.assertEqual(json.loads(result.stdout)["unique_images"], 2)
+        self.assertIn("[UI-LENS:DONE]", result.stderr)
+        quiet = subprocess.run([*command, "--quiet"], capture_output=True, text=True, encoding="utf-8", check=True)
+        self.assertEqual(json.loads(result.stdout), json.loads(quiet.stdout))
+        self.assertEqual(quiet.stderr, "")
 
 
 if __name__ == "__main__":
