@@ -365,18 +365,22 @@ python scripts/patch_locany_checkpoint.py \
   --project-root "$PROJECT" --force --validate-relation-weights
 
 python scripts/inference_ui_defect_locany.py \
-  --checkpoint "$CKPT" --processor-path "$BASE" \
-  --input-dir "$DATA" --output-dir "${OUT}-smoke" \
+  --checkpoint "${CKPT:?请先设置 CKPT}" --processor-path "${BASE:?请先设置 BASE}" \
+  --input-dir "${DATA:?请先设置 DATA}" --output-dir "${OUT:?请先设置 OUT}-smoke" \
   --cuda-visible-devices 0 --device cuda:0 \
   --attn-implementation sdpa --vision-attn-implementation flash_attention_2 \
   --generation-mode hybrid --relation-gate-mode observe --enable-pbd \
   --inference-crop-mode detector_scan \
-  --detector-crop-manifest "$CACHE/$SCAN/detector_scan_crops.jsonl" \
+  --detector-crop-manifest "${CACHE:?请先设置 CACHE}/${SCAN:?请先设置 SCAN}/detector_scan_crops.jsonl" \
   --tasks all --max-images-per-task 2 \
   --save-raw-answer --save-visualization --fail-fast
 ```
 
 检查 `${OUT}-smoke/_summary.json`，以及每类 `raw/`、`visualizations/`。
+切换终端、SSH 会话或 GPU 任务后，需在新会话重新设置这些变量，或在任务启动脚本中设置。
+如果旧命令报 `argument --output-dir/--output_dir: expected one argument`，先检查 `OUT`：
+未设置时 `"${OUT}-smoke"` 展开为 `"-smoke"`，即使有引号，argparse 也会把它当成选项。
+按步骤 1 重新设置 `PROJECT` 和 `OUT` 后重跑；上述新版命令会在变量缺失时直接提示变量名。
 确认加载成功、图片没有缺失、框的坐标正常、无推理错误。
 `raw/*.json` 的 `inference_crop.mode` 应为 `detector_scan`，
 `inference_crop.tiles` 记录实际送入模型的每个 `tile_bbox` 和该片的回答；可据此确认真的执行了切图。
@@ -388,13 +392,13 @@ python scripts/inference_ui_defect_locany.py \
 
 ```bash
 python scripts/run_ui5_parallel_inference.py \
-  --checkpoint "$CKPT" --processor-path "$BASE" \
-  --input-dir "$DATA" --output-dir "$OUT/predictions" \
+  --checkpoint "${CKPT:?请先设置 CKPT}" --processor-path "${BASE:?请先设置 BASE}" \
+  --input-dir "${DATA:?请先设置 DATA}" --output-dir "${OUT:?请先设置 OUT}/predictions" \
   --gpu-devices 0,1,2,3 --attn-implementation sdpa \
-  --inference-script "$PROJECT/scripts/inference_ui_defect_locany.py" \
+  --inference-script "${PROJECT:?请先设置 PROJECT}/scripts/inference_ui_defect_locany.py" \
   --relation-gate-mode observe --enable-pbd \
   --inference-crop-mode detector_scan \
-  --detector-crop-manifest "$CACHE/$SCAN/detector_scan_crops.jsonl" \
+  --detector-crop-manifest "${CACHE:?请先设置 CACHE}/${SCAN:?请先设置 SCAN}/detector_scan_crops.jsonl" \
   --save-raw-answer
 ```
 
