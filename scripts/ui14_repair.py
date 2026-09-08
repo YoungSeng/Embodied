@@ -90,6 +90,9 @@ def capture_repair_snapshot(source_root):
 @phase_function("校验修复批次和规范化产物")
 def validate_normalization(root):
     root = Path(root)
+    if (root / "negative_extension_manifest.json").is_file():
+        from ui14_neg11_data import validate_extension
+        return validate_extension(root)
     snapshot = read_json(root / "source_snapshot.json")
     assert_repair_idle(snapshot["source_root"])
     if digest({k: v for k, v in snapshot.items() if k != "normalization_id"}) != snapshot["normalization_id"]:

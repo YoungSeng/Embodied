@@ -48,12 +48,14 @@ def validate_formal_yaml(rendered, runtime, *, config_path=None):
         if str(envs[key]) != str(runtime[key]): raise ValueError(f"Rendered YAML environment drift: {key}")
     if not runtime["BASE_MODEL"] == runtime["MODEL_PATH"] == runtime["INIT_CHECKPOINT"] == INIT_CHECKPOINT:
         raise ValueError("CPT initialization path drift")
-    if runtime["PROJECT_ROOT"] != CLUSTER_PROJECT: raise ValueError("Formal project path drift")
+    from ui14_neg11_data import NEG_PROJECT
+    expected_project = NEG_PROJECT if runtime.get("UI_TRAIN_PROFILE") == "m32-cpt9000-ui14-neg11-v1" else CLUSTER_PROJECT
+    if runtime["PROJECT_ROOT"] != expected_project: raise ValueError("Formal project path drift")
 
 
-def render_formal_yaml(data_root, resource_group="aiai_locate"):
+def render_formal_yaml(data_root, resource_group="aiai_locate", profile="m32-cpt9000-ui14-v1"):
     from submit_locany_ui5 import parse_args, render_job
-    args = parse_args(["--profile", "m32-cpt9000-ui14-v1", "--machine", "a800",
+    args = parse_args(["--profile", profile, "--machine", "a800",
         "--resource-group", resource_group, "--gpus", "4", "--ui14-data-root", str(data_root), "--render-only"])
     rendered, runtime = render_job(args)
     validate_formal_yaml(rendered, runtime, config_path=args.config)

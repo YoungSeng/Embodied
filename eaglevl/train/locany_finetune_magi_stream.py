@@ -507,6 +507,8 @@ class LazySupervisedDatasetMTP(Dataset):
             )
 
         if self.ui_sampling_mode == "task_source_balanced_rotating":
+            from eaglevl.train.ui_defect_data import recipe_sampling_ratio
+            ui_negative_to_positive_ratio = recipe_sampling_ratio(meta, ui_negative_to_positive_ratio)
             candidate_indices = list(self.active_indices)
             index_records = [self.lazy_loader[index] for index in candidate_indices]
             if meta.get("task_id") is not None:
@@ -2021,7 +2023,7 @@ def packed_collate_fn_mtp(features: List[dict], dataset: Optional[StreamPackedDa
             if key.startswith("_sample_"):
                 result[key] = value
 
-    for key in ("relation_family", "defect_type", "target_boxes", "target_box_mask"):
+    for key in ("relation_family", "defect_type", "target_boxes", "target_box_mask", "ui_negative_kind"):
         if key in feat:
             result[key] = feat[key]
 
@@ -3908,6 +3910,12 @@ class StreamPackingMTPTrainer(Trainer):
             values["samples"] += float(mask.sum().item())
             values["positive"] += float((mask & positive).sum().item())
             values["negative"] += float((mask & ~positive).sum().item())
+            kinds = inputs.get("ui_negative_kind")
+            if torch.is_tensor(kinds):
+                kinds = kinds.detach().reshape(-1)[:count]
+                if kinds.numel() != count: raise ValueError("Negative-kind metadata lost during sample packing")
+                for code, name in ((1,"clean_source_image"),(2,"background_crop"),(3,"other_negative")):
+                    values[name] += float((mask & ~positive & (kinds == code)).sum().item())
             values["p_defect_pos_sum"] += float(
                 probabilities[mask & positive].sum().item()
             )
@@ -4059,6 +4067,7 @@ class StreamPackingMTPTrainer(Trainer):
         num_items_in_batch=None,
     ):
         cpt_task_token_ids = inputs.pop("cpt_task_token_ids", None)
+        negative_kinds = inputs.pop("ui_negative_kind", None)
         cpt_supervision_kind = inputs.pop("cpt_supervision_kind", None)
         for key in list(inputs):
             if key.startswith("_sample_"):
@@ -4091,7 +4100,10 @@ class StreamPackingMTPTrainer(Trainer):
             )
             self.train_dataset.record_cpt_ce(values)
         if self._ui5_enabled:
+            if negative_kinds is not None:
+                inputs["ui_negative_kind"] = negative_kinds
             self._capture_ui5_batch(outputs, inputs)
+            inputs.pop("ui_negative_kind", None)
         return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):
@@ -4144,7 +4156,7 @@ class StreamPackingMTPTrainer(Trainer):
     def _reduce_ui5_window(self):
         scalar_names = list(self._UI5_SCALARS)
         task_keys = (
-            "samples", "positive", "negative",
+            "samples", "positive", "negative", "clean_source_image", "background_crop", "other_negative",
             "p_defect_pos_sum", "p_defect_pos_count",
             "p_defect_neg_sum", "p_defect_neg_count",
             "tp", "fp", "fn",
@@ -4538,6 +4550,9 @@ class StreamPackingMTPTrainer(Trainer):
                 "gate_recall": recall,
                 "gate_f1": f1,
                 "gate_pr_auc": task_pr_auc.get(task),
+                "clean_source_image": int(values["clean_source_image"]),
+                "background_crop": int(values["background_crop"]),
+                "other_negative": int(values["other_negative"]),
                 "slot_gate_loss": (
                     values["slot_gate_loss_sum"] / values["slot_gate_loss_count"]
                     if values["slot_gate_loss_count"] else None

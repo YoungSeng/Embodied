@@ -1182,6 +1182,8 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
         unit="images",
     )
     reporter.update(0, detail="纯 CPU 严格无重叠水平分区；GT disabled", force=True)
+    previous_plans = {r["image_id"]: r for r in read_jsonl(scan_manifest_path)} if getattr(args,"resume",False) and scan_manifest_path.is_file() else {}
+    geometry_reused = 0
     for detected_index, detected in enumerate(merged, 1):
         manifest = unique[detected["image_id"]]
         detector_items = [
@@ -1189,29 +1191,36 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
             for source, key in (("text", "text_detections"), ("icon", "icon_detections"))
             for item in detected[key]
         ]
-        plan = generate_detector_scan_plan(
-            int(detected["width"]),
-            int(detected["height"]),
-            detector_items,
-            task=manifest["tasks"][0] if task_manifest else None,
-            max_tiles=args.scan_max_crops,
-            target_tile_height=args.scan_target_height,
-            overlap_ratio=args.scan_overlap_ratio,
-            vertical_link_ratio=args.scan_vertical_link_ratio,
-            context_ratio=args.scan_context_ratio,
-            min_context_image_ratio=args.scan_min_context_image_ratio,
-            dense_band_ratio=args.scan_dense_band_ratio,
-            detector_margin_ratio=args.scan_detector_margin_ratio,
-            seam_search_ratio=args.scan_seam_search_ratio,
-            context_pixels=args.scan_context_pixels,
-            minimum_core_height_ratio=args.scan_minimum_core_height_ratio,
-            strict_vertical_partition=args.strict_vertical_partition,
-            target_guard_ratio=args.target_guard_ratio,
-            target_guard_min_pixels=args.target_guard_min_pixels,
-            target_guard_max_pixels=args.target_guard_max_pixels,
-            seam_edge_reference=args.seam_edge_reference,
-            seam_candidates=args.seam_candidates,
-        )
+        old = previous_plans.get(detected["image_id"])
+        if (old and old.get("geometry_config_digest") == _json_digest(geometry_config)
+                and all(old.get(k)==detected.get(k) for k in ("content_id","width","height","text_detections","icon_detections"))
+                and old.get("tasks")==manifest["tasks"]):
+            plan = {k:v for k,v in old.items() if k not in ("image_path","image_paths","tasks")}
+            geometry_reused += 1
+        else:
+            plan = generate_detector_scan_plan(
+                int(detected["width"]),
+                int(detected["height"]),
+                detector_items,
+                task=manifest["tasks"][0] if task_manifest else None,
+                max_tiles=args.scan_max_crops,
+                target_tile_height=args.scan_target_height,
+                overlap_ratio=args.scan_overlap_ratio,
+                vertical_link_ratio=args.scan_vertical_link_ratio,
+                context_ratio=args.scan_context_ratio,
+                min_context_image_ratio=args.scan_min_context_image_ratio,
+                dense_band_ratio=args.scan_dense_band_ratio,
+                detector_margin_ratio=args.scan_detector_margin_ratio,
+                seam_search_ratio=args.scan_seam_search_ratio,
+                context_pixels=args.scan_context_pixels,
+                minimum_core_height_ratio=args.scan_minimum_core_height_ratio,
+                strict_vertical_partition=args.strict_vertical_partition,
+                target_guard_ratio=args.target_guard_ratio,
+                target_guard_min_pixels=args.target_guard_min_pixels,
+                target_guard_max_pixels=args.target_guard_max_pixels,
+                seam_edge_reference=args.seam_edge_reference,
+                seam_candidates=args.seam_candidates,
+            )
         row = {
             "image_id": detected["image_id"],
             "content_id": detected["content_id"],
@@ -1236,6 +1245,7 @@ def build_scan_crops(args: argparse.Namespace) -> list[dict[str, Any]]:
         )
     rows.sort(key=lambda row: row["image_id"])
 
+    print(f"[geometry] reused={geometry_reused} built={len(rows)-geometry_reused} total={len(rows)}",flush=True)
     atomic_write_jsonl(scan_manifest_path, rows)
     coordinate_comparison = _write_v4_v5_coordinate_comparison(
         args.output_dir, crop_root, rows

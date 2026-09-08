@@ -453,6 +453,19 @@ def collect_gate_metrics(
                 except (OSError, json.JSONDecodeError):
                     continue
                 if isinstance(value, dict):
+                    features = ("pbd_enabled", "coordinate_bridge_enabled", "slot_routing_enabled")
+                    raw_path = prediction_dir / task / "raw" / path.name
+                    tile_gates = value.get("tile_gates")
+                    if isinstance(tile_gates,list) and tile_gates:
+                        for feature in features:
+                            value[feature]=consistent_feature([t.get(feature) for t in tile_gates])
+                    elif raw_path.is_file() and any(value.get(k) is None for k in features):
+                        raw = json.loads(raw_path.read_text(encoding="utf-8"))
+                        tiles = raw.get("inference_crop", {}).get("tiles", [])
+                        for feature in features:
+                            if value.get(feature) is None and tiles:
+                                values = [t.get("gate", {}).get(feature) for t in tiles]
+                                value[feature] = consistent_feature(values)
                     records.append(value)
         positives: list[float] = []
         negatives: list[float] = []
@@ -664,13 +677,13 @@ def collect_gate_metrics(
                 if duplicate_slot_values else None
             ),
             "pbd_enabled": (
-                bool(records[0].get("pbd_enabled")) if records else None
+                consistent_feature([r.get("pbd_enabled") for r in records])
             ),
             "coordinate_bridge_enabled": (
-                bool(records[0].get("coordinate_bridge_enabled")) if records else None
+                consistent_feature([r.get("coordinate_bridge_enabled") for r in records])
             ),
             "slot_routing_enabled": (
-                bool(records[0].get("slot_routing_enabled")) if records else None
+                consistent_feature([r.get("slot_routing_enabled") for r in records])
             ),
         }
     return result
@@ -806,6 +819,12 @@ def write_gate_threshold_sweep(prediction_dir: Path, sweep: dict[str, Any]) -> N
     atomic_write_text(prediction_dir / "gate_threshold_sweep.txt", "\n".join(lines) + "\n")
 
 
+def consistent_feature(values):
+    # Unknown/mixed tile states are not evidence of a disabled model feature.
+    from locany_ui5_common import consistent_feature_state
+    return consistent_feature_state(values)
+
+
 def parse_markdown_report(path: Path) -> dict[str, Any]:
     """Convert the legacy all_tasks_evaluation.txt report into metric JSON."""
 
@@ -850,6 +869,13 @@ def parse_markdown_report(path: Path) -> dict[str, Any]:
         task = issue_to_task.get(name)
         if task is None:
             continue
+        for count in (("tp", "fp", "fn", "tn") if section == "image" else ("tp", "fp", "fn")):
+            text = row.get(count, "").strip()
+            metric_values[count] = int(text) if text and text not in ("-", "N/A") else None
+        if all(metric_values[k] is not None for k in ("tp","fp","fn")):
+            tp,fp,fn=(metric_values[k] for k in ("tp","fp","fn"))
+            p=tp/(tp+fp) if tp+fp else 0.; r=tp/(tp+fn) if tp+fn else 0.
+            metric_values.update(precision=p,recall=r,f1=2*p*r/(p+r) if p+r else 0.)
         result["tasks"].setdefault(task, {"issue_name": name})[section] = metric_values
     if set(result["tasks"]) != set(TASKS):
         raise ValueError(
@@ -857,6 +883,9 @@ def parse_markdown_report(path: Path) -> dict[str, Any]:
         )
     if not result["macro"]["image"] or not result["macro"]["bbox"]:
         raise ValueError("Legacy report is missing macro image/bbox rows")
+    for section in ("image", "bbox"):
+        result["macro"][section] = {k: sum(r[section][k] for r in result["tasks"].values())/len(TASKS)
+                                    for k in ("precision","recall","f1")}
     return result
 
 

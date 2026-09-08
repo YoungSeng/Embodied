@@ -3,7 +3,12 @@ from pathlib import Path
 from ui14_common import *
 
 
-def profile_environment(*, project_root=None, data_root=None):
+def profile_environment(*, project_root=None, data_root=None, profile="m32-cpt9000-ui14-v1"):
+    neg11 = profile == "m32-cpt9000-ui14-neg11-v1"
+    if neg11:
+        from ui14_neg11_data import NEG_DATA, NEG_PROJECT
+        data_root = data_root or NEG_DATA
+        project_root = project_root or NEG_PROJECT
     root = str(data_root or DATA_ROOT)
     project = str(project_root or CLUSTER_PROJECT)
     env = read_json(PROJECT_ROOT / "configs" / "ui14_cpt9000_formal.json")["environment"]
@@ -16,6 +21,10 @@ def profile_environment(*, project_root=None, data_root=None):
         EVAL_DETECTOR_CACHE=WORKSPACE + "/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v5",
         DEEPSPEED_CONFIG=project + "/deepspeed_configs/zero_stage2_two_lr_config.json",
         OUTPUT_DIR=WORKSPACE + "/gui_models/locany-m32-cpt9000-ui14-a800x4-repair-v2")
+    if neg11:
+        from ui14_neg11_data import NEG_OUTPUT
+        env.update(UI_TRAIN_PROFILE=profile, VERSION=profile, OUTPUT_DIR=NEG_OUTPUT,
+                   RUN_NAME="locany-m32-cpt9000-ui14-neg11-a800x4-v1")
     return env
 
 

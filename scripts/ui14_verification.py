@@ -196,19 +196,31 @@ class Verification:
         paths = list(dict.fromkeys(str(p) for p in paths))
         workers = max(1, int(os.environ.get("UI14_PREPARE_WORKERS", "16")))
         operation = self.rgb_identity if kind == "rgb_identity" else self.sha256
+        def check_image(path):
+            if self.get(path,kind) is not None: return False
+            operation(path)
+            return True
         iterator = iter(paths)
         with phase(f"CPU 图片验证记录（{workers} workers，未变项只 stat）", len(paths), "图片") as counter, \
              ThreadPoolExecutor(max_workers=workers) as executor:
             pending = set()
+            counter.reused=counter.built=counter.failed=0
             def enqueue():
                 path = next(iterator, None)
-                if path is not None: pending.add(executor.submit(operation, path))
+                if path is not None: pending.add(executor.submit(check_image, path))
             for _ in range(min(len(paths), workers * 2)): enqueue()
             try:
                 while pending:
                     finished, pending = wait(pending, return_when=FIRST_COMPLETED)
                     for future in finished:
-                        future.result(); counter.advance(); enqueue()
+                        try: built=future.result()
+                        except Exception:
+                            counter.failed+=1
+                            raise
+                        counter.built+=int(built);counter.reused+=int(not built)
+                        elapsed=max(.001,time.monotonic()-counter.started)
+                        counter.advance(detail=f"reused={counter.reused} built={counter.built} failed={counter.failed} new/s={counter.built/elapsed:.2f}")
+                        enqueue()
             finally:
                 for future in pending: future.cancel()
 

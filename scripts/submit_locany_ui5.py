@@ -28,7 +28,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Render and submit a LocateAnything UI5 v4 A800/H20 4/8-GPU job"
     )
-    parser.add_argument("--profile", choices=("m32-cpt9000-ui14-v1",), default=None)
+    parser.add_argument("--profile", choices=("m32-cpt9000-ui14-v1", "m32-cpt9000-ui14-neg11-v1"), default=None)
     parser.add_argument("--ui14-data-root", default=None)
     parser.add_argument("--machine", choices=("a800", "h20"), required=True)
     parser.add_argument(
@@ -475,7 +475,7 @@ def build_submission_environment(args: argparse.Namespace) -> dict[str, str]:
         if (args.machine, args.gpus) != ("a800", 4):
             raise ValueError("UI14 formal profile requires --machine a800 --gpus 4")
         from ui14_profile import profile_environment
-        env.update(profile_environment(project_root=args.project_root, data_root=args.ui14_data_root))
+        env.update(profile_environment(project_root=args.project_root, data_root=args.ui14_data_root, profile=args.profile))
         env["RESOURCE_GROUP"] = resource_group
     return env
 

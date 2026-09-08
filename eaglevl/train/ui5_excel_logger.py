@@ -82,6 +82,9 @@ TRAIN_TASK_SUFFIXES = (
     "samples",
     "positive",
     "negative",
+    "clean_source_image",
+    "background_crop",
+    "other_negative",
     "lm_loss",
     "gate_loss",
     "attention_loss",
@@ -224,6 +227,7 @@ TRAIN_COLUMNS = (
 EVAL_COLUMNS = (
     "step",
     "task_id", "task_key", "source_dataset", "source_version", "view_policy", "positive_count", "negative_count",
+    "eval_set_id", "data_digest",
     "checkpoint",
     "evaluation_split",
     "cache_scope",
@@ -685,6 +689,7 @@ class UI5ExcelLogger:
             row for row in existing if int(row.get("step", -1)) == step
         ]
         identity_columns = (
+            "eval_set_id", "data_digest",
             "git_sha",
             "git_commit",
             "config_hash",
@@ -831,7 +836,7 @@ def _build_group_eval_rows(
     def sum_present(source_rows: Sequence[Mapping[str, Any]], name: str) -> int | None:
         values = [row.get(name) for row in source_rows]
         present = [int(value) for value in values if value is not None]
-        return sum(present) if present else None
+        return sum(present) if present and len(present) == len(values) else None
 
     def metrics_from_counts(
         *,
@@ -841,6 +846,8 @@ def _build_group_eval_rows(
         tn: int | None,
         granularity: str,
     ) -> dict[str, Any]:
+        if any(v is None for v in (tp,fp,fn)):
+            return {k:None for k in ("precision","recall","f1","accuracy")}
         precision = tp / (tp + fp) if tp + fp else 0.0
         recall = tp / (tp + fn) if tp + fn else 0.0
         f1 = (
@@ -848,7 +855,9 @@ def _build_group_eval_rows(
             if precision + recall
             else 0.0
         )
-        if granularity == "image":
+        if granularity == "image" and tn is None:
+            accuracy = None
+        elif granularity == "image":
             denominator = tp + fp + fn + int(tn or 0)
             accuracy = (tp + int(tn or 0)) / denominator if denominator else 0.0
         else:
@@ -924,6 +933,7 @@ def _build_group_eval_rows(
         return result
 
     row_metadata = {
+        "eval_set_id": metadata.get("eval_set_id"), "data_digest": metadata.get("data_digest"),
         "git_commit": metadata.get("git_commit"),
         "run_name": metadata.get("run_name"),
         "tc_msed_stage": metadata.get("tc_msed_stage"),
@@ -1038,6 +1048,7 @@ def _build_group_eval_rows(
                     **context_columns,
                     "step": step,
                     "git_commit": metadata.get("git_commit"),
+                    "eval_set_id": metadata.get("eval_set_id"), "data_digest": metadata.get("data_digest"),
                     "run_name": metadata.get("run_name"),
                     "tc_msed_stage": metadata.get("tc_msed_stage"),
                     "config_hash": metadata.get("config_hash"),
@@ -1231,11 +1242,11 @@ def _build_group_eval_rows(
         }
         rows.append(macro_row)
 
-        primary_tp = int(sum_present(source_rows, "_primary_tp") or 0)
-        primary_fp = int(sum_present(source_rows, "_primary_fp") or 0)
-        primary_fn = int(sum_present(source_rows, "_primary_fn") or 0)
+        primary_tp = sum_present(source_rows, "_primary_tp")
+        primary_fp = sum_present(source_rows, "_primary_fp")
+        primary_fn = sum_present(source_rows, "_primary_fn")
         primary_tn = (
-            int(sum_present(source_rows, "_primary_tn") or 0)
+            sum_present(source_rows, "_primary_tn")
             if granularity == "image"
             else None
         )
@@ -1246,11 +1257,11 @@ def _build_group_eval_rows(
             tn=primary_tn,
             granularity=granularity,
         )
-        raw_tp = int(sum_present(source_rows, "_raw_tp") or 0)
-        raw_fp = int(sum_present(source_rows, "_raw_fp") or 0)
-        raw_fn = int(sum_present(source_rows, "_raw_fn") or 0)
+        raw_tp = sum_present(source_rows, "_raw_tp")
+        raw_fp = sum_present(source_rows, "_raw_fp")
+        raw_fn = sum_present(source_rows, "_raw_fn")
         raw_tn = (
-            int(sum_present(source_rows, "_raw_tn") or 0)
+            sum_present(source_rows, "_raw_tn")
             if granularity == "image"
             else None
         )
@@ -1270,7 +1281,7 @@ def _build_group_eval_rows(
             gated_fp = int(sum_present(source_rows, "_gated_fp") or 0)
             gated_fn = int(sum_present(source_rows, "_gated_fn") or 0)
             gated_tn = (
-                int(sum_present(source_rows, "_gated_tn") or 0)
+                sum_present(source_rows, "_gated_tn")
                 if granularity == "image"
                 else None
             )
@@ -1296,7 +1307,7 @@ def _build_group_eval_rows(
                 "fp": primary_fp,
                 "fn": primary_fn,
                 "tn": primary_tn,
-                "predicted_positive": primary_tp + primary_fp,
+                "predicted_positive": primary_tp + primary_fp if primary_tp is not None and primary_fp is not None else None,
                 "gate_positive": sum(
                     int(gate_metrics.get(task, {}).get("gate_positive", 0))
                     for task in scorer_to_diagnostic
@@ -1314,7 +1325,7 @@ def _build_group_eval_rows(
                 "raw_precision": raw_micro["precision"],
                 "raw_recall": raw_micro["recall"],
                 "raw_f1": raw_micro["f1"],
-                "raw_predicted_positive": raw_tp + raw_fp,
+                "raw_predicted_positive": raw_tp + raw_fp if raw_tp is not None and raw_fp is not None else None,
                 "selected_gate_threshold": mean([row.get("selected_gate_threshold") for row in source_rows]),
                 "gated_precision": gated_micro["precision"] if gated_micro else None,
                 "gated_recall": gated_micro["recall"] if gated_micro else None,
@@ -1326,7 +1337,7 @@ def _build_group_eval_rows(
                     1.0
                     - (int(gated_tp) + int(gated_fp))
                     / max(1, raw_tp + raw_fp)
-                    if gated_micro
+                    if gated_micro and raw_tp is not None and raw_fp is not None
                     else None
                 ),
                 "bbox_metrics_genuinely_rescored": (

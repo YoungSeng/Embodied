@@ -51,6 +51,11 @@ def _finite_gate_probability(value: Any) -> float | None:
     return numeric if math.isfinite(numeric) else None
 
 
+def consistent_feature_state(values):
+    if not values or any(type(v) is not bool for v in values): return None
+    return values[0] if all(v == values[0] for v in values) else None
+
+
 def aggregate_tiled_gate_diagnostics(
     tile_gates: list[dict[str, Any]],
     *,
@@ -74,6 +79,8 @@ def aggregate_tiled_gate_diagnostics(
     available_count = sum(bool(row.get("available")) for row in tile_gates)
     return {
         "available": available_count > 0,
+        **{key:consistent_feature_state([r.get(key) for r in tile_gates])
+           for key in ("pbd_enabled","coordinate_bridge_enabled","slot_routing_enabled")},
         "available_tile_count": available_count,
         "p_defect": max(scores) if scores else None,
         "p_defect_tile_count": len(scores),
@@ -167,9 +174,9 @@ def resolve_runtime_config(
     """Resolve final runtime values with environment variables taking precedence."""
 
     env = os.environ if env is None else env
-    if env.get("UI_TRAIN_PROFILE") == "m32-cpt9000-ui14-v1":
+    if env.get("UI_TRAIN_PROFILE") in ("m32-cpt9000-ui14-v1", "m32-cpt9000-ui14-neg11-v1"):
         from ui14_profile import profile_environment
-        env = {**profile_environment(project_root=env.get("PROJECT_ROOT"), data_root=env.get("UI14_DATA_ROOT")), **env}
+        env = {**profile_environment(project_root=env.get("PROJECT_ROOT"), data_root=env.get("UI14_DATA_ROOT"), profile=env["UI_TRAIN_PROFILE"]), **env}
     raw = load_machine_config(config_path)
     shared = raw["shared"]
 
@@ -749,7 +756,7 @@ def resolve_runtime_config(
             "UI5_UI_SAMPLING_MODE": "task_source_balanced_rotating",
             "INSTALL_SYSTEM_RUNTIME_DEPS": 1,
         }
-        if env.get("UI_TRAIN_PROFILE") == "m32-cpt9000-ui14-v1":
+        if env.get("UI_TRAIN_PROFILE") in ("m32-cpt9000-ui14-v1", "m32-cpt9000-ui14-neg11-v1"):
             formal_exact.update(INIT_CPT_STEP=9000, EVAL_AT_START=1, EVAL_FAIL_POLICY="stop", EVAL_INFERENCE_WORKERS_PER_GPU=2,
                                 ATTN_IMPLEMENTATION="sdpa", UI_NUM_TASKS="14", LOCANY_CPT_MODE="0")
             machine_resource_config(machine_type, resource_group=resolved["RESOURCE_GROUP"], config_path=config_path)

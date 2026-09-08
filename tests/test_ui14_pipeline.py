@@ -88,7 +88,8 @@ def detector_fixture(root, task, split):
         folder = p["cache"] / "detections" / stage
         write_json(folder / "stage_summary.json", {"images": 1, "workers": 1, "runtime": {"python": stage}})
         write_jsonl(folder / "shard_00000.jsonl", [{"image_id": r["image_id"]} for r in rows])
-        write_json(folder / "shard_00000.done.json", {"stage": stage, "count": 1})
+        write_json(folder / "shard_00000.done.json", {"stage": stage, "count": 1,
+            "image_id_digest": detector.digest_ids(r["image_id"] for r in rows)})
     return detector.build_scan_crops(args)
 
 
@@ -230,7 +231,7 @@ class UI14EvaluationTests(unittest.TestCase):
     def test_real_scorer_retries_preserve_step_1000_reports_and_predictions(self):
         self._exercise_full_evaluation(1000, real_scorer=True)
 
-    def _exercise_full_evaluation(self, step, real_scorer=False):
+    def _exercise_full_evaluation(self, step, real_scorer=False, eval_set_id=None, external=False):
         import run_ui14_eval as evaluate
         from openpyxl import load_workbook
         from eaglevl.train.ui5_excel_logger import UI5ExcelLogger
@@ -247,12 +248,15 @@ class UI14EvaluationTests(unittest.TestCase):
                     prediction_boxes=1,would_pass=True,coarse_boxes_px=[],coordinate_space="norm1000",image_width=375,image_height=800))
                 write_json(output/f"inference-checkpoint-{step}-ui14"/task.task_key/f"page-{task.task_id}_defect.json",
                            [{"bbox_2d": [10,10,40,40], "class_id": task.class_id}])
-            manifest=root/"evaluation_manifest.json"; write_json(manifest,{"tasks":specs})
-            write_json(checkpoint/"config.json",dict(ui_num_tasks=14,ui_task_registry=specs))
+            if eval_set_id:
+                for spec in specs[7:]: spec["parent_positive_test"]=spec["test"]
+            manifest=root/"evaluation_manifest.json"; write_json(manifest,{"tasks":specs,"eval_set_id":eval_set_id})
+            saved_specs=[{**s,"test":str(root/"old_test"/Path(s["test"]).name)} for s in specs] if external else specs
+            write_json(checkpoint/"config.json",dict(ui_num_tasks=14,ui_task_registry=saved_specs))
             recipe=root/"recipe.json"; write_json(recipe,{})
             args=SimpleNamespace(output_dir=output,checkpoint=checkpoint,skip_patch=True,base_model=root/"cpt-9000",
                 step=step,project_root=ROOT,eval_gpu_devices="0,1,2,3",attn_implementation="sdpa",scorer_root=ROOT,
-                input_dir=root,recipe_path=recipe,tile_nms_iou=.5)
+                input_dir=root,recipe_path=recipe,tile_nms_iou=.5,external_eval_set=external)
             metric={g:dict(precision=.8,recall=.8,f1=.8,tp=4,fp=1,fn=1,tn=0) for g in ("image","bbox")}
             ui5={"tasks":{t.task_key:metric.copy() for t in UI_TASKS[:5]},"macro":{g:dict(precision=.8,recall=.8,f1=.8) for g in ("image","bbox")}}
             legacy_report = output/f"evaluation/raw/ui14-step-{step}/old-report.txt"
@@ -361,6 +365,12 @@ class UI14EvaluationTests(unittest.TestCase):
                     self.assertEqual(path.stat().st_mtime_ns, mtime)
                 for path, content in first_files.items():
                     self.assertEqual(path.read_bytes(), content)
+                if eval_set_id:
+                    self.assertEqual(final_state["identity"]["eval_set_id"],eval_set_id)
+                    subset=read_json(Path(final_state["evaluation_run_dir"])/"parent_positive_metrics.json")
+                    self.assertEqual(len(subset["tasks"]),7)
+                    write_json(manifest,{"tasks":specs,"eval_set_id":"different_set"})
+                    with self.assertRaisesRegex(ValueError,"Different eval_set_id"):evaluate.run(args)
 
     def test_finalize_connects_14_streams_original_image_eval_and_bound_report(self):
         from ui5_eval_detector_cache import validate_eval_detector_cache as real_validate

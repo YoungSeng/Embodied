@@ -75,7 +75,8 @@ def score_ui9(spec, prediction_dir, destination):
 
 def evaluation_identity(manifest, checkpoint):
     from collect_ui5_metrics import ui_model_signature
-    return {"manifest_digest": file_digest(manifest), "model_signature": ui_model_signature(Path(checkpoint)),
+    return {"manifest_digest": file_digest(manifest), "eval_set_id": read_json(manifest).get("eval_set_id"),
+            "model_signature": ui_model_signature(Path(checkpoint)),
             "git_commit": os.environ.get("GIT_COMMIT", ""), "config_hash": os.environ.get("UI5_CONFIG_HASH", "")}
 
 
@@ -91,6 +92,17 @@ def is_complete(output_dir, step, manifest, checkpoint):
 
 
 def run(args):
+    # The composite dataset already has CPU image/hash evidence. Periodic
+    # evaluation must not reread every source image merely to count cache IDs.
+    from ui14_verification import current_checks, verification_session
+    root = Path(os.environ["UI_EVAL_MANIFEST"]).parent
+    if (root/"negative_extension_manifest.json").is_file() and current_checks() is None:
+        with verification_session(root):
+            return _run(args)
+    return _run(args)
+
+
+def _run(args):
     from patch_locany_checkpoint import patch_checkpoint
     from run_ui5_eval import build_score_command, run_checked
     from collect_ui5_metrics import (load_history, write_history, build_best_checkpoints_document,
@@ -108,13 +120,21 @@ def run(args):
     validate_registry(checkpoint_config.get("ui_task_registry"), checkpoint_config.get("ui_num_tasks"))
     if checkpoint_config.get("ui_num_tasks") != 14: raise ValueError("UI14 evaluation requires a 14-task checkpoint")
     for saved, current in zip(checkpoint_config["ui_task_registry"], specs):
-        for field in ("task_id", "task_key", "source_dataset", "source_version", "train", "test", "view_policy",
-                      "repair_run_id", "normalization_id", "train_source_sha256", "test_source_sha256", "bbox_config"):
+        fields = ("task_id", "task_key", "source_dataset", "source_version", "train", "test", "view_policy",
+                  "repair_run_id", "normalization_id", "train_source_sha256", "test_source_sha256", "bbox_config")
+        if getattr(args, "external_eval_set", False):
+            if not args.skip_patch: raise ValueError("External evaluation must not patch the read-only checkpoint")
+            fields = ("task_id", "task_key", "relation_family", "view_policy")
+        for field in fields:
             if saved.get(field) != current.get(field): raise ValueError(f"Checkpoint/evaluation registry drift: {current['task_key']}.{field}")
     if not args.skip_patch:
         patch_checkpoint(base_model=Path(args.base_model), checkpoint=checkpoint,
                          project_root=Path(args.project_root), force=True, validate_relation_weights=True)
     identity = evaluation_identity(manifest, checkpoint)
+    history_file = output / "evaluation/evaluation_history.json"
+    for previous in load_history(history_file):
+        if previous.get("eval_set_id") != identity.get("eval_set_id"):
+            raise ValueError("Different eval_set_id must use a separate output directory")
     if is_complete(output, args.step, manifest, checkpoint):
         print(f"[UI14 eval] reused complete step={args.step}: 14 tasks and Excel rows verified", flush=True)
         return 0
@@ -174,11 +194,25 @@ def run(args):
         for spec in specs:
             metrics["tasks"][spec["task_key"]].update(source_dataset=spec["source_dataset"],
                 source_version=spec["source_version"], view_policy=spec["view_policy"], task_id=spec["task_id"])
+        for spec in specs[:5]:
+            item=metrics["tasks"][spec["task_key"]]; counts=item["image"]
+            if all(counts.get(k) is not None for k in ("tp","fp","fn","tn")):
+                item.update(positive_count=counts["tp"]+counts["fn"],negative_count=counts["tn"]+counts["fp"])
+        if identity.get("eval_set_id"):
+            subset={"eval_set_id":identity["eval_set_id"],"subset":"parent_positive_images", "tasks":{}}
+            for spec in specs[7:]:
+                if spec.get("parent_positive_test"):
+                    subset_path=destination/"parent_positive_inputs"/f"{spec['task_key']}.jsonl"
+                    write_jsonl(subset_path,[r for r in read_jsonl(spec["parent_positive_test"]) if r["boxes_px"]])
+                    value,_=score_ui9({**spec,"test":str(subset_path)},prediction,destination/"parent_positive_subset")
+                    subset["tasks"][spec["task_key"]]=value
+            write_json(destination/"parent_positive_metrics.json",subset)
         if set(metrics["tasks"]) != {t.task_key for t in UI_TASKS}: raise RuntimeError("Incomplete UI14 metrics")
         write_json(destination / "ui14_metrics.json", metrics)
         write_json(prediction / "_gate_metrics.json", gate_metrics)
         rows = [r for r in load_history(history_dir / "evaluation_history.json") if int(r.get("step", -1)) != args.step]
         row = {"step": args.step, "sft_step": args.step, "checkpoint": str(checkpoint), **repair_metadata,
+               "eval_set_id":identity.get("eval_set_id"),"data_digest":identity["manifest_digest"],
                "evaluation_status": "success", "evaluation_run_dir": str(destination),
                "relation_gate_mode": "observe", "evaluation_split": "test",
                "cache_scope": "full_test", "git_commit": identity["git_commit"], "config_hash": identity["config_hash"],

@@ -25,6 +25,7 @@ class Counter:
         self.label, self.total, self.unit = label, total, unit
         self.estimate = estimate
         self.completed, self.detail, self.status = 0, "", "running"
+        self.reused = self.built = self.failed = self.gap = None
         self.started = time.monotonic()
 
     def advance(self, amount=1, detail=None):
@@ -42,7 +43,9 @@ class Counter:
         return {"label": self.label, "completed": self.completed, "total": self.total, "unit": self.unit,
                 "percent": min(100, self.completed * 100 / self.total) if self.total else None,
                 "elapsed_seconds": elapsed, "rate_per_second": rate, "eta_seconds": eta,
-                "status": self.status, "detail": self.detail, "estimate": self.estimate}
+                "status": self.status, "detail": self.detail, "estimate": self.estimate,
+                "reused":self.reused,"built":self.built,"failed":self.failed,"gap":self.gap,
+                "new_rate_per_second": self.built/elapsed if self.built is not None and elapsed else None}
 
 
 class ProgressSession:
@@ -54,6 +57,7 @@ class ProgressSession:
         self.frames, self.activity, self.status = [], None, "running"
         self.activities = []
         self.external = None
+        self.delegated = False
         self.lock, self.stop = threading.RLock(), threading.Event()
         self.thread = None
 
@@ -103,9 +107,12 @@ class ProgressSession:
 
     def emit(self):
         with self.lock:
+            if self.delegated:
+                return  # Child stage owns the live progress.json until it exits.
             now = time.monotonic()
             frames = [frame.snapshot(now) for frame in self.frames]
             payload = {"stage": self.stage, "status": self.status, "pid": os.getpid(),
+                       "output_path": str(self.root),
                        "updated_at": datetime.now(timezone.utc).isoformat(),
                        "elapsed_seconds": now - self.started, "phases": frames,
                        "activity": self.activity.snapshot(now) if self.activity else None,
@@ -125,6 +132,10 @@ class ProgressSession:
                              f" | 已用 {duration(frame['elapsed_seconds'])} | {frame['rate_per_second']:.2f} {frame['unit']}/s"
                              f" | {eta_text}"
                              + (f" | {frame['detail']}" if frame["detail"] else ""))
+                if frame["built"] is not None or frame["reused"] is not None:
+                    parts[-1] += (f" | reused={frame['reused']} built={frame['built']}"
+                                  f" failed={frame['failed']} gap={frame['gap']}"
+                                  f" new/s={frame['new_rate_per_second'] or 0:.2f}")
             if self.activity:
                 activity = payload["activity"]
                 amounts = (f"{activity['completed']/1048576:.1f}/{activity['total']/1048576:.1f} MiB"
@@ -141,6 +152,8 @@ class ProgressSession:
                              f" | 本阶段剩余≈{duration(detector.get('eta_seconds'))}"
                              f" | 状态更新于 {duration(detector['update_age_seconds'])} 前")
             line = "\n  ".join(parts)
+            if os.environ.get("UI14_NEG11") == "1":
+                line += f"\n  output={self.root}"
             # Progress is optional observability: a log failure must not change labels,
             # consume iterator items, or hide the original preparation exception.
             try:
@@ -152,6 +165,11 @@ class ProgressSession:
                 temp = path.with_name(path.name + f".tmp-{os.getpid()}")
                 temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
                 os.replace(temp, path)
+                if os.environ.get("UI14_NEG11") == "1":
+                    latest=self.root/"progress.json"
+                    tmp=latest.with_name(latest.name+f".tmp-{os.getpid()}")
+                    tmp.write_text(json.dumps(payload,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+                    os.replace(tmp,latest)
             except (OSError, UnicodeError):
                 pass
 

@@ -77,6 +77,19 @@ def is_positive_ui_defect(record: dict) -> bool:
     return bool(BOX_PATTERN.search(_conversation_text(record, "gpt")))
 
 
+def negative_kind(record):
+    if is_positive_ui_defect(record): return "positive"
+    if record.get("clean_source_image"): return "clean_source_image"
+    if record.get("_ui5_record_kind") == "crop" or record.get("crop_id", "full") != "full": return "background_crop"
+    return "other_negative"
+
+
+def recipe_sampling_ratio(meta, default=2.0):
+    ratio = float(meta.get("negative_to_positive_ratio", default))
+    if not math.isfinite(ratio) or ratio <= 0: raise ValueError("Recipe negative_to_positive_ratio must be finite and positive")
+    return ratio
+
+
 def extract_ui_defect_targets(record: dict, max_boxes: int = 8) -> Dict[str, torch.Tensor]:
     import torch
     task = identify_ui_defect_task(record)
@@ -104,6 +117,7 @@ def extract_ui_defect_targets(record: dict, max_boxes: int = 8) -> Dict[str, tor
         "defect_type": torch.tensor([defect_type], dtype=torch.long),
         "target_boxes": boxes.unsqueeze(0),
         "target_box_mask": box_mask.unsqueeze(0),
+        "ui_negative_kind": torch.tensor([{"positive":0,"clean_source_image":1,"background_crop":2,"other_negative":3}[negative_kind(record)]], dtype=torch.long),
     }
 
 

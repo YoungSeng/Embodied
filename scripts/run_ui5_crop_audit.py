@@ -1075,18 +1075,24 @@ def run_detector_worker(args: argparse.Namespace) -> None:
             if args.resume and completed_shard_valid(shard, output_path, done_path, stage):
                 print(f"[{stage}] resume skip {shard.name}", flush=True)
                 continue
-            if detector is None:
-                detector = create_detector()
             rows = read_jsonl(shard)
-            outputs = []
+            reused = {}
+            seed_path = paths.output / "detections/reuse" / stage / (shard.stem + ".json")
+            if seed_path.is_file():
+                from ui14_neg11_cache import load_detector_reuse
+                reused = load_detector_reuse(paths.output, stage, shard, config)
+            pending_rows = [row for row in rows if row["image_id"] not in reused]
+            if detector is None and pending_rows:
+                detector = create_detector()
+            outputs = list(reused.values())
             write_worker_progress(
                 status="running",
                 current_shard=shard.name,
-                current_completed=0,
+                current_completed=len(reused),
                 current_total=len(rows),
             )
             for image_index, (row, image) in enumerate(
-                _loaded_images(rows, args.image_loader_threads), 1
+                _loaded_images(pending_rows, args.image_loader_threads), 1
             ):
                 try:
                     started = time.perf_counter()
@@ -1118,16 +1124,18 @@ def run_detector_worker(args: argparse.Namespace) -> None:
                     processed_this_run += 1
                     if (
                         image_index % args.progress_every_images == 0
-                        or image_index == len(rows)
+                        or image_index == len(pending_rows)
                     ):
                         write_worker_progress(
                             status="running",
                             current_shard=shard.name,
-                            current_completed=image_index,
+                            current_completed=image_index+len(reused),
                             current_total=len(rows),
                         )
                 finally:
                     image.close()
+            by_id = {row["image_id"]:row for row in outputs}
+            outputs = [by_id[row["image_id"]] for row in rows]
             atomic_write_jsonl(output_path, outputs)
             atomic_write_json(
                 done_path,
@@ -1480,7 +1488,7 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
         # A fully completed stage must not import or initialize its model again.
         # This also lets merge/crop reuse immutable detections after GPU envs are released.
         summary_path = paths.stage_dir(stage) / "stage_summary.json"
-        if not summary_path.is_file():
+        if not summary_path.is_file() or json.loads(summary_path.read_text(encoding="utf-8")).get("images") != len(unique):
             # The parent can be killed after the last worker commits its shard
             # but before writing this summary. Recover metadata without a GPU.
             atomic_write_json(summary_path, {
@@ -1524,6 +1532,11 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
         raise ValueError(f"requested GPUs are unavailable: {missing_gpus}; available={sorted(available)}")
     runtime: dict[str, Any] = {"python": detection_python(args, stage)}
     config = detector_config(args)
+    seed_count = 0
+    for shard in pending_shards:
+        if (paths.output / "detections/reuse" / stage / (shard.stem + ".json")).is_file():
+            from ui14_neg11_cache import load_detector_reuse
+            seed_count += len(load_detector_reuse(paths.output, stage, shard, config))
     if stage == "text":
         runtime.update(
             preflight_text_runtime(
@@ -1554,13 +1567,13 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
         total=len(unique),
         output_dir=args.output_dir,
         interval_seconds=args.progress_interval_seconds,
-        initial_completed=baseline_completed,
+        initial_completed=baseline_completed+seed_count,
     )
     reporter.update(
-        baseline_completed,
+        baseline_completed+seed_count,
         detail=(f"启动 {len(assignments)} 个常驻 GPU worker (每卡上限 {args.workers_per_gpu}); "
                 f"各卡进程={active_workers_per_gpu}, pending_shards={len(pending_shards)}; "
-                f"reused={baseline_completed}, pending={len(unique) - baseline_completed}"),
+                f"reused={baseline_completed+seed_count}, pending={len(unique) - baseline_completed - seed_count}"),
         force=True,
     )
     # Worker indices change when concurrency changes. Progress from a previous
@@ -1628,13 +1641,16 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
         raise ValueError(f"{stage} completed workers left missing, duplicate or unexpected images")
     total_inference_ms = sum(float(row.get("inference_ms", 0.0)) for row in stage_rows)
     wall_seconds = time.perf_counter() - wall_started
-    new_images = len(stage_rows) - baseline_completed
+    pending_ids = {r["image_id"] for shard in pending_shards for r in read_jsonl(shard)}
+    seeded_images = sum(bool(r.get("reused_from_cache")) and r["image_id"] in pending_ids for r in stage_rows)
+    new_images = len(stage_rows) - baseline_completed - seeded_images
     atomic_write_json(
         paths.stage_dir(stage) / "stage_summary.json",
         {
             "stage": stage,
             "images": len(stage_rows),
-            "reused_images": baseline_completed,
+            "reused_images": baseline_completed + seeded_images,
+            "cross_task_seed_images": seeded_images,
             "new_images": new_images,
             "workers": len(assignments),
             "workers_per_gpu": args.workers_per_gpu,
@@ -1654,7 +1670,7 @@ def run_detection_stage(args: argparse.Namespace, stage: str) -> None:
     reporter.update(
         len(stage_rows),
         status="completed",
-        detail=f"{len(assignments)} 个 worker 已退出；reused={baseline_completed}, built={new_images}, pending=0",
+        detail=f"{len(assignments)} 个 worker 已退出；reused={baseline_completed+seeded_images}, built={new_images}, pending=0",
         force=True,
     )
 
