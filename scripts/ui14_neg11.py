@@ -15,7 +15,7 @@ from ui14_neg11_data import (NEG_DATA, NEG_OUTPUT, OLD_OUTPUT, assert_isolated, 
 from ui14_progress import ProgressSession
 from ui14_verification import preparation_lock, verification_session
 
-STAGES=("inventory","normalize","cache-prepare","cache","cache-finalize","finalize","check","submit","status","eval-existing","audit-errors")
+STAGES=("inventory","audit-raw","normalize","cache-prepare","cache","cache-finalize","finalize","check","submit","status","eval-existing","audit-errors")
 
 
 def audit_errors(prediction, destination):
@@ -147,6 +147,9 @@ def run(args):
                     pred=Path(args.old_output)/"inference-checkpoint-1000-ui14"
                     if pred.is_dir(): audit_errors(pred,root/"parent_parse_error_audit.json")
                 elif args.stage=="normalize": result=normalize(args)
+                elif args.stage=="audit-raw":
+                    from ui14_neg11_raw_audit import audit_raw
+                    result=audit_raw(args)
                 elif args.stage in ("cache-prepare","cache","cache-finalize"):
                     from ui14_neg11_cache import import_parent_cache, cache_status
                     if args.stage=="cache-prepare": import_parent_cache(root,parent)

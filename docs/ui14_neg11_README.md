@@ -55,6 +55,21 @@ bash shell/ui14_neg11_a800.sh inventory
 
 HTML 每任务最多 10 对正常/异常图，GT 默认隐藏；通过能访问挂载盘的本机文件浏览器打开。它引用原图，不复制大图。池候选没有配对异常图时仅显示正常图和证据。
 
+如果 RawImgURL 的来源语义尚不能确认，先运行独立 CPU 审计：
+
+```bash
+bash shell/ui14_neg11_a800.sh audit-raw
+```
+
+它复用现有图片身份日志；属性未变时只 stat，不重新解码图片。不需要 normalize 成功，不申请 GPU，不修改 inventory、selection、页面映射或旧文件。输出在新数据目录的 `raw_reference_audit/`：
+
+- `summary.json`：每 task/split 的 raw 引用条数、独立 raw 图片数、与对应异常图/LocalImgURL 相同的数量、已选中数量、已观察到的 raw 跨 split 冲突、路径分布。
+- `pairs.jsonl`：按内容去重的 raw 与异常图配对及原记录 ID。
+- `source_metadata_examples.jsonl`、`samples.html`：每任务最多 10 个固定样例，显示 Raw（待确认）、对应 ScreenShot、对应 LocalImgURL（若有），异常图 GT 默认隐藏。
+- `missing_references.jsonl`：无法定位的 raw 引用。
+
+上述数量是审计观察，不代表正常负样本配额。`unselected_raw_without_observed_conflict` 只是待审查数量，不是 clean 标签；raw 跨 split 统计范围是七个合成任务的引用，最终 inventory 仍检查全部 14 项。视觉样例也不能证明整个来源都正常：需要生成代码或可追溯的当前任务 clean 证据。尚未确认时继续保留 normalize 的缺口检查。
+
 ### ② CPU normalize
 
 ```bash
