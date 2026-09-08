@@ -98,6 +98,18 @@ def convert_boxes(raw, width: int, height: int) -> list[list[float]]:
     return result
 
 
+def normalize_image_size(raw) -> list[int]:
+    """Accept UI-Lens [W, H] and the observed singleton-wrapped [[W, H]]."""
+    size = raw
+    if isinstance(size, list) and len(size) == 1 and isinstance(size[0], list):
+        size = size[0]
+    if not isinstance(size, list) or len(size) != 2 or any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in size
+    ):
+        raise ValueError(f"infos.image_size must be [W,H] or [[W,H]] with positive integers, got {raw!r}")
+    return list(size)
+
+
 def prepare(root: Path, output: Path | None = None) -> dict:
     root = root.expanduser().resolve(strict=True)
     source = annotation_dir(root)
@@ -120,7 +132,7 @@ def prepare(root: Path, output: Path | None = None) -> dict:
                             raise ValueError("Nontrivial EXIF orientation; reconcile image and annotation coordinates first")
                         opened.load()
                 width, height = image_sizes[image]
-                if info.get("image_size") != [width, height]:
+                if normalize_image_size(info.get("image_size")) != [width, height]:
                     raise ValueError(f"infos.image_size {info.get('image_size')!r} != actual size {[width, height]}")
                 target = info.get("target_problem")
                 allowed = {norm(v) for v in [task, source_name, *ALIASES[task]]}

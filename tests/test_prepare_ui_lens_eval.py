@@ -75,6 +75,23 @@ class PrepareUILensTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unrecognized target_problem"):
             adapter.prepare(self.root)
 
+    def test_singleton_wrapped_image_size(self):
+        self.modify_first("image_size", [[100, 200]])
+        output = self.root / "converted"
+        report = adapter.prepare(self.root, output)
+        self.assertEqual(report["tasks"]["occlusion"]["rows"], 2)
+        row = json.loads((output / "test_ui_occlusion_wcnt_no_figma.jsonl").read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(row["extra_info"]["original_infos"]["image_size"], [[100, 200]])
+        self.assertEqual(row["answer"]["bbox"], [[10, 20, 40, 60]])
+
+    def test_wrapped_image_size_still_checks_actual_dimensions(self):
+        self.modify_first("image_size", [[200, 100]])
+        with self.assertRaisesRegex(ValueError, "actual size"):
+            adapter.prepare(self.root)
+        for invalid in ([[100, 200], [100, 200]], [True, 200], None, [[100]], [[[100, 200]]]):
+            with self.subTest(size=invalid), self.assertRaises(ValueError):
+                adapter.normalize_image_size(invalid)
+
     def test_rejects_duplicate_images_within_task(self):
         path = self.root / "label_for_single_UIs_cn" / "container_overlap.jsonl"
         rows = [json.loads(line) for line in path.read_text().splitlines()]

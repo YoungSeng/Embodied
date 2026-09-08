@@ -17,7 +17,8 @@
 
 ## 1. 进入服务器环境，设置目录
 
-在已分配 GPU 的 Linux 节点执行；本地 Windows 工作区无法检查这个 `/mnt/bn` checkpoint。
+步骤 1–3 和下面的 3.5（下载、转换、统计、GT 可视化）在能访问这些路径的 CPU 开发机执行即可。
+只有步骤 4 的模型推理和步骤 5 的全量推理需要已分配的 GPU；步骤 6 的 F1 评分只用 CPU。
 
 ```bash
 conda activate /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything
@@ -117,7 +118,8 @@ cat "$DATA/conversion_summary.json"
 - `infos.box_list` 的 `[x,y,w,h]` 转成 `[x,y,x+w,y+h]`，保持原图像素坐标，不乘除 1000。
 - `answer.bbox` 保存框，`answer.types` 保存对应任务的中文标签。
 - 各任务只使用其源文件已有的样本。明确的空框列表 `[]` 保留为负样本；不把未标注图片补成负样本。
-- 逐张核对 `image_size` 和实际尺寸，拒绝越界框、未知任务、缺失标注、任务内重复图和同名冲突。
+- `image_size` 支持 `[W,H]` 和真实标注中出现的 `[[W,H]]`，去掉单层包装后核对实际尺寸。
+  原始字段保留在元信息中；尺寸不一致、越界框、未知任务、缺失标注、任务内重复图和同名冲突仍会报错。
 - `target_problem` 和源文件确定任务，原始 `label_list` 保留在元信息中。
 
 例如源框 `[10,20,30,40]` 变为：
@@ -137,7 +139,64 @@ cat "$DATA/conversion_summary.json"
 如果某类源数据没有负样本，保留这一事实并在报告说明 image F1 的测试范围，不能凭空补负样本。
 也不要强制使用旧 UI5 的 1555 张计数；使用本次转换统计。
 
+## 3.5. 打印全量统计，并可视化转换后的 GT 框（仅 CPU）
+
+在转换成功后执行。已经生成 `DATA` 的用户无需重新转换，直接运行这个检查脚本：
+
+```bash
+python scripts/inspect_ui_lens_eval.py \
+  --input-dir "$DATA" \
+  --output-dir "$DATA/inspection" \
+  --samples-per-task 20 --seed 42
+```
+
+终端会打印每类的样本数、正样本数、负样本数、正样本比例、GT 框数、单图最大框数、
+坐标转换不一致数，以及五类合计和去重图片数。这些数字基于**全部五个 JSONL**，不是抽样数量。
+`TOTAL(image-task)` 是“图片 × 任务”的记录数；去重图片数按解析后的图片路径计算。
+同一图片可以在 cropping 是正样本、在 occlusion 是负样本，不能将五类记录数当成独立图片数。
+
+输出内容：
+
+```text
+UI_lens_ui5_eval_v1/inspection/
+├── index.html                 # 离线可打开的图集，可筛任务和正负样本
+├── dataset_stats.json         # 全量统计与抽样参数
+├── dataset_stats.csv          # 每任务及合计统计表
+├── samples.json               # 预览图片对应的路径、JSONL 行号、原始/转换后坐标
+├── cropping/*.png
+├── occlusion/*.png
+└── ...                        # 其他三类
+```
+
+将整个 `inspection` 目录复制到本机后打开 `index.html`，或直接查看各任务 PNG。
+图中左侧为原图，右侧绿色框**直接取自转换后保存的 `answer.bbox`**，不重新转换后再画。
+每个框显示编号，HTML 中展开“查看原始与转换后的坐标”即可核对
+原始 `[x,y,w,h]` 与转换后 `[x1,y1,x2,y2]`。点击预览图可查看原分辨率 PNG。
+负样本显示 `NEGATIVE | boxes=0`，保留未画框的原图。
+
+默认每类最多 20 张，尽量各选 10 张正负样本；某一类样本不足时用另一类补足。
+发现坐标转换不一致的记录时优先展示，并在统计里计数；报告仍会生成，命令返回非零退出码，
+需先查看并解决问题再做推理。检查输出目录必须是新的，重复运行时换成 `inspection-v2` 等目录名。
+
+只打印全量统计，不生成图片或文件：
+
+```bash
+python scripts/inspect_ui_lens_eval.py --input-dir "$DATA" --stats-only
+```
+
+查看全部标注图片时将 `--samples-per-task` 改为 `0`，并换一个新的输出目录。
+全量可视化会生成更多 PNG，通常先抽查即可。
+
+如果转换时遇到 `infos.image_size [[1206, 2622]] != actual size [1206, 2622]`，
+先 `git pull --ff-only` 获取支持嵌套尺寸的修复，再重跑步骤 3。
+这个尺寸错误发生在写输出前，所以通常还没有 `conversion_summary.json`；此时不要先运行 `cat` 或检查脚本。
+
 ## 4. 准备 checkpoint，先推理少量图片
+
+此时才需要 GPU。建议先申请一张交互式 GPU，执行下面的每类两张图片检查；
+通过后再选择在已有 GPU 配额内直接运行步骤 5，或提交正式 GPU 评测任务。
+正式任务的启动命令使用步骤 5 的推理入口，不需要重新训练，也不要用训练提交入口来代替评测。
+若平台给交互式会话的时限较短，全量推理建议提交正式任务。
 
 参考分支的常规评测也会做 checkpoint patch，补齐自定义模型代码、配置和 processor 文件，
 并验证 Relation/PBD 权重。使用同一个训练分支执行：
