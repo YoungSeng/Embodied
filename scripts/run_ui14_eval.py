@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from uuid import uuid4
 from pathlib import Path
 from datetime import datetime, timezone
 from ui14_common import *
@@ -119,7 +120,11 @@ def run(args):
         return 0
     history_dir = output / "evaluation"
     prediction = output / f"inference-checkpoint-{args.step}-ui14"
-    destination = history_dir / "raw" / f"ui14-step-{args.step}"
+    # The external UI5 scorer creates its run directory with exist_ok=False.
+    # Keep every scoring attempt separate, including retries after partial
+    # scoring/Excel writes. Prediction paths remain stable for image reuse.
+    score_run_name = f"ui14-step-{args.step}-{uuid4().hex}"
+    destination = history_dir / "raw" / score_run_name
     state_path = history_dir / f"ui14-step-{args.step}.json"
     started = datetime.now(timezone.utc).isoformat()
     workers_per_gpu = getattr(args, "eval_inference_workers_per_gpu", 2)
@@ -127,7 +132,7 @@ def run(args):
     state = {"status": "running", "sft_step": args.step, "init_checkpoint": str(args.base_model),
              "init_cpt_step": 9000, "identity": identity, "tasks": {}, "started": started,
              "eval_gpu_devices": args.eval_gpu_devices, "inference_workers_per_gpu": workers_per_gpu,
-             "exclusive_gpu_tasks": exclusive_gpu_tasks}
+             "exclusive_gpu_tasks": exclusive_gpu_tasks, "evaluation_run_dir": str(destination)}
     repair_metadata = {k: read_json(manifest).get(k) for k in ("repair_run_id", "normalization_id")}
     state.update(repair_metadata)
     write_json(state_path, state)
@@ -146,8 +151,10 @@ def run(args):
         run_checked(command, cwd=Path(args.project_root), stage="ui14_parallel_inference")
         # UI5 goes through its unmodified scorer entrypoint and frozen test files.
         args.input_dir = Path(specs[0]["test"]).parent
+        print(f"[UI14 eval] scoring attempt: {destination} | existing reports preserved; "
+              f"prediction cache: {prediction}", flush=True)
         score_command = build_score_command(args, prediction_dir=prediction,
-            raw_evaluation_root=history_dir / "raw", run_name=f"ui14-step-{args.step}")
+            raw_evaluation_root=destination.parent, run_name=score_run_name)
         run_checked(score_command, cwd=Path(args.project_root), stage="ui5_score")
         candidates = list(destination.rglob("metrics_summary.json"))
         # The legacy all-task report's filename is fixed by that scorer.
@@ -172,7 +179,8 @@ def run(args):
         write_json(prediction / "_gate_metrics.json", gate_metrics)
         rows = [r for r in load_history(history_dir / "evaluation_history.json") if int(r.get("step", -1)) != args.step]
         row = {"step": args.step, "sft_step": args.step, "checkpoint": str(checkpoint), **repair_metadata,
-               "evaluation_status": "success", "relation_gate_mode": "observe", "evaluation_split": "test",
+               "evaluation_status": "success", "evaluation_run_dir": str(destination),
+               "relation_gate_mode": "observe", "evaluation_split": "test",
                "cache_scope": "full_test", "git_commit": identity["git_commit"], "config_hash": identity["config_hash"],
                "ui_model_signature": ui_model_signature(checkpoint), "init_checkpoint": str(args.base_model), "init_cpt_step": 9000,
                "tasks": metrics["tasks"], "image_macro_f1": metrics["macro"]["image"]["f1"],

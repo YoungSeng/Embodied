@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -223,7 +224,13 @@ class UI14EvaluationTests(unittest.TestCase):
     def test_step_zero_evaluation_writes_all_14_tasks_and_resumes_without_fake_training(self):
         self._exercise_full_evaluation(0)
 
-    def _exercise_full_evaluation(self, step):
+    def test_real_scorer_retries_preserve_step_zero_reports_and_predictions(self):
+        self._exercise_full_evaluation(0, real_scorer=True)
+
+    def test_real_scorer_retries_preserve_step_1000_reports_and_predictions(self):
+        self._exercise_full_evaluation(1000, real_scorer=True)
+
+    def _exercise_full_evaluation(self, step, real_scorer=False):
         import run_ui14_eval as evaluate
         from openpyxl import load_workbook
         from eaglevl.train.ui5_excel_logger import UI5ExcelLogger
@@ -238,6 +245,8 @@ class UI14EvaluationTests(unittest.TestCase):
                 write_json(output/f"inference-checkpoint-{step}-ui14"/task.task_key/"gate/page.json",dict(
                     image_path=image,prediction_status="defect",final_boxes_pixel_xyxy=[[10,10,40,40]],p_defect=.7,
                     prediction_boxes=1,would_pass=True,coarse_boxes_px=[],coordinate_space="norm1000",image_width=375,image_height=800))
+                write_json(output/f"inference-checkpoint-{step}-ui14"/task.task_key/f"page-{task.task_id}_defect.json",
+                           [{"bbox_2d": [10,10,40,40], "class_id": task.class_id}])
             manifest=root/"evaluation_manifest.json"; write_json(manifest,{"tasks":specs})
             write_json(checkpoint/"config.json",dict(ui_num_tasks=14,ui_task_registry=specs))
             recipe=root/"recipe.json"; write_json(recipe,{})
@@ -246,10 +255,26 @@ class UI14EvaluationTests(unittest.TestCase):
                 input_dir=root,recipe_path=recipe,tile_nms_iou=.5)
             metric={g:dict(precision=.8,recall=.8,f1=.8,tp=4,fp=1,fn=1,tn=0) for g in ("image","bbox")}
             ui5={"tasks":{t.task_key:metric.copy() for t in UI_TASKS[:5]},"macro":{g:dict(precision=.8,recall=.8,f1=.8) for g in ("image","bbox")}}
+            legacy_report = output/f"evaluation/raw/ui14-step-{step}/old-report.txt"
+            legacy_report.parent.mkdir(parents=True)
+            legacy_report.write_text("Preserve the previous scoring attempt.", encoding="utf-8")
+            prediction = output/f"inference-checkpoint-{step}-ui14"
+            protected = [legacy_report, checkpoint/"config.json", *prediction.rglob("*.json")]
+            snapshots = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in protected}
+
+            def execute_score(command, *, cwd, stage):
+                if stage == "ui14_parallel_inference":
+                    return  # Fixtures already contain predictions; no GPU/model calls.
+                self.assertEqual(stage, "ui5_score")
+                result = subprocess.run(command, cwd=cwd, capture_output=True, text=True,
+                                        encoding="utf-8", errors="replace", timeout=60)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
             with mock.patch.dict("os.environ",{"UI_EVAL_MANIFEST":str(manifest),"INIT_CPT_STEP":"9000"}), \
                  mock.patch.object(evaluate,"validate_evaluation_manifest",return_value=specs), \
                  mock.patch("run_ui5_eval.run_checked") as runner, \
-                 mock.patch("collect_ui5_metrics.parse_markdown_report",side_effect=lambda *a: json.loads(json.dumps(ui5))):
+                 (contextlib.nullcontext() if real_scorer else
+                  mock.patch("collect_ui5_metrics.parse_markdown_report",side_effect=lambda *a: json.loads(json.dumps(ui5)))):
                 if step == 0:
                     runner.side_effect = RuntimeError("fixture inference failed")
                     with self.assertRaisesRegex(RuntimeError, "fixture inference failed"):
@@ -263,12 +288,17 @@ class UI14EvaluationTests(unittest.TestCase):
                         empty.close()
                     runner.side_effect = None
                     runner.reset_mock()
+                runner.side_effect = execute_score if real_scorer else None
                 evaluate.run(args)
                 inference_command=runner.call_args_list[0].args[0]
                 self.assertEqual(inference_command[inference_command.index("--workers-per-gpu")+1],"2")
                 self.assertEqual(inference_command[inference_command.index("--exclusive-gpu-tasks")+1], "synth_loneword")
                 self.assertTrue(evaluate.is_complete(output,step,manifest,checkpoint))
-                self.assertEqual(read_json(output/"evaluation/best_checkpoints.json")["current_best"]["image"]["image_macro_f1"],.8)
+                self.assertEqual(read_json(output/"evaluation/best_checkpoints.json")["current_best"]["image"]["image_macro_f1"],1. if real_scorer else .8)
+                first_state = read_json(output/f"evaluation/ui14-step-{step}.json")
+                first_attempt = Path(first_state["evaluation_run_dir"])
+                self.assertTrue((first_attempt/"ui14_metrics.json").is_file())
+                first_files = {p: p.read_bytes() for p in first_attempt.rglob("*") if p.is_file()}
                 workbook_path = output/"diagnostics/ui5_training_evaluation.xlsx"
                 workbook = load_workbook(workbook_path)
                 try:
@@ -303,6 +333,34 @@ class UI14EvaluationTests(unittest.TestCase):
                 self.assertTrue(evaluate.is_complete(output,step,manifest,checkpoint))
                 self.assertEqual(runner.call_count,6)
                 self.assertEqual(len(read_json(output/"evaluation/evaluation_history.json")),1)
+                if real_scorer:
+                    saved_workbook = workbook_path.read_bytes()
+                    saved_history = (output/"evaluation/evaluation_history.json").read_bytes()
+                    state = read_json(state_path); state["tasks"].pop("synth_loneword")
+                    write_json(state_path, state)
+                    with mock.patch.object(evaluate, "score_ui9", side_effect=RuntimeError("UI9 scoring interrupted")):
+                        with self.assertRaisesRegex(RuntimeError, "UI9 scoring interrupted"):
+                            evaluate.run(args)
+                    failed_state = read_json(state_path)
+                    self.assertEqual(failed_state["status"], "failed")
+                    self.assertFalse(evaluate.is_complete(output, step, manifest, checkpoint))
+                    self.assertTrue((Path(failed_state["evaluation_run_dir"])/"all_tasks_evaluation.txt").is_file())
+                    self.assertEqual(workbook_path.read_bytes(), saved_workbook)
+                    self.assertEqual((output/"evaluation/evaluation_history.json").read_bytes(), saved_history)
+                    evaluate.run(args)
+                    self.assertTrue(evaluate.is_complete(output, step, manifest, checkpoint))
+                    self.assertEqual(runner.call_count, 10)
+                commands = [c.args[0] for c in runner.call_args_list if c.kwargs["stage"] == "ui5_score"]
+                attempts = [c[c.index("--run_name")+1] for c in commands]
+                self.assertEqual(len(attempts), len(set(attempts)))
+                final_state = read_json(state_path)
+                self.assertEqual(read_json(output/"evaluation/evaluation_history.json")[0]["evaluation_run_dir"],
+                                 final_state["evaluation_run_dir"])
+                for path, (content, mtime) in snapshots.items():
+                    self.assertEqual(path.read_bytes(), content)
+                    self.assertEqual(path.stat().st_mtime_ns, mtime)
+                for path, content in first_files.items():
+                    self.assertEqual(path.read_bytes(), content)
 
     def test_finalize_connects_14_streams_original_image_eval_and_bound_report(self):
         from ui5_eval_detector_cache import validate_eval_detector_cache as real_validate
