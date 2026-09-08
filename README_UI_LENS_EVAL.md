@@ -455,3 +455,108 @@ python qwen3vl_merge_and_score_fixed_5tasks.py \
 
 本结果是沿用当前工程评分器的 UI-Lens 单界面评测，不能自动等同于 UI-Lens 论文官方指标。
 如果后续将其作为独立外部测试集，应检查这些图片是否出现在本次 CPT/SFT 的来源中。
+
+## 7. 提取抖音子集，单独评分和重跑
+
+按 [UI-Lens 官方字段说明](https://huggingface.co/datasets/wuhuohua/UI_lens#data-organization)，
+应用名来自 `infos.app_name`。转换器将它保存在 `extra_info.original_infos.app_name`。
+子集脚本只按这个字段精确匹配默认别名 `douyin`、`抖音`（忽略大小写、首尾空白，支持单元素列表）；
+不根据文件名、截图文字或 GT 是否为正样本猜测应用。
+
+### 7.1. CPU 提取与检查
+
+保留 `DATA` 指向原先的全量转换目录，另用 `SUB` 保存子集：
+
+```bash
+cd "${PROJECT:?请先设置 PROJECT}"
+git pull --ff-only
+
+export DATA=/mnt/bn/intelligent-service-yg/dataset/UI_lens_ui5_eval_clip_v1
+export SUB=/mnt/bn/intelligent-service-yg/dataset/UI_lens_douyin_ui5_eval_clip_v1
+
+python scripts/subset_ui_lens_eval.py --input-dir "$DATA" --list-apps
+
+python scripts/subset_ui_lens_eval.py \
+  --input-dir "$DATA" --output-dir "$SUB"
+
+cat "$SUB/subset_summary.json"
+
+python scripts/inspect_ui_lens_eval.py \
+  --input-dir "$SUB" --output-dir "$SUB/inspection" --samples-per-task 20
+```
+
+输出五个同名 UI5 评测 JSONL、`subset_summary.json`、`selection_manifest.jsonl` 和子集裁剪审计。
+统计包括每任务筛选前/后样本数、正负数量、bbox 数、边界裁剪数、全部应用名分布及按路径去重图片数。
+`selection_manifest.jsonl` 记录每条入选记录的来源文件和行号。
+图片仍引用原来的绝对路径；完整 JSONL 记录原样保留，不改 bbox、ID 或原始元信息，不复制图片。
+不要把全量 `conversion_summary.json` 复制过来当作子集统计。
+
+如果应用名采用其他拼法，查看 `--list-apps` 的输出后显式指定，例如
+`--app-name douyin --app-name 抖音`。重复参数表示取并集；精确匹配不会自动把 `douyin_lite` 或 TikTok 纳入。
+缺失/非法应用元信息会使提取失败，避免静默生成不完整子集；未匹配任何记录时也不会写空输出。
+输出目录必须是新的。某任务没有抖音记录时保留空文件，并在 `empty_tasks` 中标出；
+此时不要把包含空任务的“五类平均”当作五类都有评测样本的结果。
+
+### 7.2. 先复用现有预测算抖音分数（CPU，无需重推）
+
+`OUT` 仍指向原来的全量运行目录。评分器按子集 GT 的图片路径/文件名关联现有预测：
+
+```bash
+python qwen3vl_merge_and_score_fixed_5tasks.py \
+  --all_tasks --input_mode yolo_dir \
+  --gt_dir "${SUB:?请先设置 SUB}" --pred_root "${OUT:?请先设置全量 OUT}/predictions" \
+  --output_root "$OUT/evaluation" --run_name douyin_iou010 \
+  --yolo_bbox_format xyxy --iou_thresh 0.1
+```
+
+这一步回答“现有模型在抖音上的表现是否比整体好”，没有更改模型和推理设置。
+检查 `missing_files`、`parse_errors`、`invalid_pred`，并核对每任务 `total_samples` 等于子集 `rows`。
+
+### 7.3. 复用全量切图缓存，单卡重新推理抖音子集
+
+适用于已经完成步骤 3.6 的全量 detector_scan 缓存。`CACHE`、`SCAN` 仍指向那个全量缓存，
+先按步骤 3.6 的验证命令检查它，`--input-dir` 仍传原全量 `DATA`，图数使用全量 `N_UNIQUE`。
+缓存的坐标按图片路径索引，子集保持这些路径，因此可直接复用，预测时只处理子集 JSONL 中的记录。
+
+使用**单卡推理入口**，为重跑结果另设 `DOUYIN_OUT`：
+
+```bash
+export DOUYIN_OUT="${PROJECT:?请先设置 PROJECT}/work_dirs/ui-lens-douyin-checkpoint9000-detectorscan-clip-v1"
+
+python scripts/inference_ui_defect_locany.py \
+  --checkpoint "${CKPT:?请先设置 CKPT}" --processor-path "${BASE:?请先设置 BASE}" \
+  --input-dir "${SUB:?请先设置 SUB}" --output-dir "$DOUYIN_OUT/predictions" \
+  --cuda-visible-devices 0 --device cuda:0 \
+  --attn-implementation sdpa --vision-attn-implementation flash_attention_2 \
+  --generation-mode hybrid --relation-gate-mode observe --enable-pbd \
+  --inference-crop-mode detector_scan \
+  --detector-crop-manifest "${CACHE:?请先设置 CACHE}/${SCAN:?请先设置 SCAN}/detector_scan_crops.jsonl" \
+  --tasks all --max-images-per-task 0 \
+  --save-raw-answer --save-visualization --fail-fast
+
+python qwen3vl_merge_and_score_fixed_5tasks.py \
+  --all_tasks --input_mode yolo_dir \
+  --gt_dir "$SUB" --pred_root "$DOUYIN_OUT/predictions" \
+  --output_root "$DOUYIN_OUT/evaluation" --run_name iou010 \
+  --yolo_bbox_format xyxy --iou_thresh 0.1
+```
+
+上述命令沿用本指南的 Gate/PBD 等设置。若原运行设置不同，应先从原 `_run_manifest.json` 核对并对齐。
+`run_ui5_parallel_inference.py` 会要求缓存绑定的五个 JSONL 路径与推理输入一致，
+因此不能直接给这个多卡入口同时传子集输入和全量 ready cache；多卡重跑需要按步骤 3.6 为 `SUB`
+单独建 `external_test` 缓存。这里单卡复用已有切片坐标不修改全量缓存，仍然不使用 GT 选 crop。
+
+同一 checkpoint、参数、图片和切片坐标下，重跑结果应与原预测的抖音部分接近。
+筛选应用能帮助分析应用间的差异，不会自动提高同一张图的检测能力。
+
+### 7.4. 如何分析高 precision、低 recall
+
+先核对全量推理是否完成、评分路径是否正确、缺失/非法预测是否为零。
+之后从正样本但无预测框的记录中检查 `raw/` 原始回答和 `inference_crop.tiles`：
+模型回答无缺陷、输出无法解析，以及切片缺少判定所需上下文，是不同的问题。
+同时核对实际 checkpoint、crop mode、Gate mode、PBD 和切片数量；`observe` 不执行 hard gate 过滤，
+不能在未检查运行参数时把低召回归因于 gate 阈值。
+
+Image recall 只看有无缺陷框，不看 IoU；严重的 image 漏检不能仅由 bbox 坐标偏移解释。
+如果输出完整、解析正常、输入配置正确，再通过漏检图、原始回答和每 App 指标判断
+是否存在应用分布差异、缺陷语义差异或切图上下文不足。汇总表本身不能确认是哪一种原因。
