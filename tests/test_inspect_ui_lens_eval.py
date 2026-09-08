@@ -94,6 +94,51 @@ class InspectUILensTest(unittest.TestCase):
         self.assertEqual(summary["total_image_task_records"]["samples"], 10)
         self.assertEqual(before, sorted(self.root.rglob("*")))
 
+    def add_clipped_sample(self):
+        path = self.data / "test_ui_occlusion_wcnt_no_figma.jsonl"
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        rows[0]["answer"]["bbox"] = [[90, 20, 100, 60]]
+        rows[0]["extra_info"]["original_infos"]["box_list"] = [[90, 20, 30, 40]]
+        rows[0]["extra_info"]["bbox_conversion"] = {
+            "boundary_policy": "clip", "clipped_boxes": [{
+                "box_index": 0, "original_xywh": [90, 20, 30, 40],
+                "original_xyxy": [90, 20, 120, 60], "clipped_xyxy": [90, 20, 100, 60],
+                "max_clip_pixels": 20, "removed_area_ratio": 1 - 10 / 30,
+            }],
+        }
+        self.write_rows("occlusion", rows)
+        return rows
+
+    def test_declared_clipping_is_audited_counted_and_drawn_at_visible_edge(self):
+        self.add_clipped_sample()
+        output = self.root / "inspection"
+        stats = self.inspect(output, samples_per_task=1)
+        task = stats["tasks"]["occlusion"]
+        self.assertEqual((task["conversion_mismatches"], task["clipped_images"], task["clipped_boxes"]), (0, 1, 1))
+        self.assertEqual((task["positive"], task["negative"]), (1, 1))
+        self.assertEqual(task["max_clip_pixels"], 20)
+        self.assertIn("clip_box", self.stdout.getvalue())
+        with Image.open(output / "occlusion" / "000001_positive.png") as pair:
+            self.assertEqual(pair.getpixel((280 + 16 + 99, 40 + 64)), (224, 128, 22))
+        gallery = (output / "index.html").read_text(encoding="utf-8")
+        self.assertIn('data-clipped="yes"', gallery)
+        self.assertIn("裁剪边缘最多 20 px", gallery)
+
+    def test_silent_clipping_and_incorrect_audit_are_mismatches(self):
+        rows = self.add_clipped_sample()
+        rows[0]["extra_info"]["bbox_conversion"]["clipped_boxes"] = []
+        self.write_rows("occlusion", rows)
+        self.assertEqual(self.inspect()["tasks"]["occlusion"]["conversion_mismatches"], 1)
+        del rows[0]["extra_info"]["bbox_conversion"]
+        self.write_rows("occlusion", rows)
+        self.assertEqual(self.inspect()["tasks"]["occlusion"]["conversion_mismatches"], 1)
+
+    def test_clipped_samples_are_prioritized_after_mismatches(self):
+        records = [{"line": i, "positive": True, "conversion_ok": True, "clipped_boxes": []} for i in range(30)]
+        records[20]["clipped_boxes"] = [{"box_index": 0}]
+        records[25]["conversion_ok"] = False
+        self.assertEqual([r["line"] for r in inspector.select_samples(records, 2, 42)], [20, 25])
+
 
 if __name__ == "__main__":
     unittest.main()

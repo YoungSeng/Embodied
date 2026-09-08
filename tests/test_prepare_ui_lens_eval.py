@@ -61,6 +61,50 @@ class PrepareUILensTest(unittest.TestCase):
             adapter.prepare(self.root, output)
         self.assertFalse(output.exists())
 
+    def test_reported_nine_pixel_overflow(self):
+        raw = [[2778, 4140, 849, 348]]
+        self.assertEqual(adapter.convert_boxes(raw, 3618, 7866, "clip"), [[2778, 4140, 3618, 4488]])
+        self.assertEqual(raw, [[2778, 4140, 849, 348]])
+        with self.assertRaisesRegex(ValueError, "no automatic clipping"):
+            adapter.convert_boxes(raw, 3618, 7866)
+
+    def test_clipping_preserves_labels_and_records_each_correction(self):
+        self.modify_first("box_list", [[90, 20, 30, 40]])
+        output = self.root / "converted"
+        report = adapter.prepare(self.root, output, bbox_boundary_policy="clip")
+        self.assertEqual(report["bbox_boundary_policy"], "clip")
+        self.assertEqual(report["clipped_image_task_records"], 1)
+        self.assertEqual(report["clipped_boxes"], 1)
+        stats = report["tasks"]["occlusion"]
+        self.assertEqual((stats["positive"], stats["negative"], stats["boxes"]), (1, 1, 1))
+        self.assertEqual((stats["clipped_images"], stats["clipped_boxes"], stats["max_clip_pixels"]), (1, 1, 20))
+        self.assertAlmostEqual(stats["max_removed_area_ratio"], 2 / 3)
+        rows = [json.loads(line) for line in (output / "test_ui_occlusion_wcnt_no_figma.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(rows[0]["answer"]["bbox"], [[90, 20, 100, 60]])
+        self.assertEqual(rows[0]["extra_info"]["original_infos"]["box_list"], [[90, 20, 30, 40]])
+        self.assertEqual(rows[1]["answer"], {"bbox": [], "types": []})
+        corrections = rows[0]["extra_info"]["bbox_conversion"]["clipped_boxes"]
+        self.assertEqual(corrections[0]["original_xyxy"], [90, 20, 120, 60])
+        self.assertEqual(corrections[0]["clipped_xyxy"], [90, 20, 100, 60])
+        audit = [json.loads(line) for line in (output / "bbox_clipping_audit.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(audit), 1)
+        self.assertEqual(audit[0]["source_line"], 1)
+        self.assertEqual(audit[0]["clipped_boxes"], corrections)
+
+    def test_clipping_all_edges_preserves_fractional_coordinates(self):
+        self.assertEqual(adapter.convert_boxes([[-2.5, -3, 105, 205]], 100, 200, "clip"), [[0, 0, 100, 200]])
+        self.assertEqual(adapter.convert_boxes([[99.5, 190.25, 1, 12]], 100, 200, "clip"), [[99.5, 190.25, 100, 200]])
+
+    def test_clipping_does_not_drop_invalid_or_fully_external_boxes(self):
+        for raw in ([[100, 20, 3, 4]], [[-5, 20, 5, 4]], [[5, 210, 3, 4]], [[5, 20, 0, 4]], [[5, 20, -3, 4]]):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                adapter.convert_boxes(raw, 100, 200, "clip")
+        self.modify_first("box_list", [[100, 20, 3, 4]])
+        output = self.root / "converted"
+        with self.assertRaisesRegex(ValueError, "refusing to drop"):
+            adapter.prepare(self.root, output, bbox_boundary_policy="clip")
+        self.assertFalse(output.exists())
+
     def test_missing_annotations_are_not_negatives(self):
         self.modify_first("box_list", None)
         with self.assertRaisesRegex(ValueError, "explicit"):

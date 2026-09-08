@@ -27,8 +27,8 @@ export PROJECT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eag
 export CKPT="$PROJECT/work_dirs/locany-ui5-m32-cpt3000-croponly-sourcebalanced-a800x4-v1/checkpoint-9000"
 export BASE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/hf_home/hub/models--nvidia--LocateAnything-3B/snapshots/c32291ca5e996f5a7a485845b4f57a233936bba0
 export RAW=/mnt/bn/intelligent-service-yg/dataset/UI_lens
-export DATA=/mnt/bn/intelligent-service-yg/dataset/UI_lens_ui5_eval_v1
-export OUT="$PROJECT/work_dirs/ui-lens-checkpoint9000-fullimage-v1"
+export DATA=/mnt/bn/intelligent-service-yg/dataset/UI_lens_ui5_eval_clip_v1
+export OUT="$PROJECT/work_dirs/ui-lens-checkpoint9000-fullimage-clip-v1"
 
 cd "$PROJECT"
 export PYTHONPATH="$PROJECT${PYTHONPATH:+:$PYTHONPATH}"
@@ -105,10 +105,10 @@ PY
 
 ```bash
 # 只校验、输出统计，不写文件。
-python scripts/prepare_ui_lens_eval.py --dataset-root "$RAW"
+python scripts/prepare_ui_lens_eval.py --dataset-root "$RAW" --bbox-boundary-policy clip
 
 # 校验通过后写入新的 DATA 目录。
-python scripts/prepare_ui_lens_eval.py --dataset-root "$RAW" --output-dir "$DATA"
+python scripts/prepare_ui_lens_eval.py --dataset-root "$RAW" --output-dir "$DATA" --bbox-boundary-policy clip
 cat "$DATA/conversion_summary.json"
 ```
 
@@ -116,10 +116,12 @@ cat "$DATA/conversion_summary.json"
 
 - `infos.image_path` 转为真实存在的绝对图片路径，写入 `images`。
 - `infos.box_list` 的 `[x,y,w,h]` 转成 `[x,y,x+w,y+h]`，保持原图像素坐标，不乘除 1000。
+  本指南显式选用 `--bbox-boundary-policy clip`：有部分落在图内的越界框取与图像的交集。
+  不丢弃框、不改变样本正负标签，原始标注和裁剪记录一起保留。
 - `answer.bbox` 保存框，`answer.types` 保存对应任务的中文标签。
 - 各任务只使用其源文件已有的样本。明确的空框列表 `[]` 保留为负样本；不把未标注图片补成负样本。
 - `image_size` 支持 `[W,H]` 和真实标注中出现的 `[[W,H]]`，去掉单层包装后核对实际尺寸。
-  原始字段保留在元信息中；尺寸不一致、越界框、未知任务、缺失标注、任务内重复图和同名冲突仍会报错。
+  原始字段保留在元信息中；尺寸不一致、零/负面积框、完全位于图外的框、未知任务、缺失标注、任务内重复图和同名冲突仍会报错。
 - `target_problem` 和源文件确定任务，原始 `label_list` 保留在元信息中。
 
 例如源框 `[10,20,30,40]` 变为：
@@ -139,6 +141,17 @@ cat "$DATA/conversion_summary.json"
 如果某类源数据没有负样本，保留这一事实并在报告说明 image F1 的测试范围，不能凭空补负样本。
 也不要强制使用旧 UI5 的 1555 张计数；使用本次转换统计。
 
+真实标注中已遇到：图像 `3618 × 7866`，框 `[2778,4140,849,348]`。
+其原始 xyxy 为 `[2778,4140,3627,4488]`，右边缘超出 9 像素；
+`clip` 模式保存为 `[2778,4140,3618,4488]`。
+默认不传参数时仍是 `--bbox-boundary-policy error`，严格拒绝越界，便于保留原来的检查行为。
+
+`conversion_summary.json` 会记录 `bbox_boundary_policy`、各任务 `clipped_images`、`clipped_boxes`、
+`max_clip_pixels` 和 `max_removed_area_ratio`；顶层 `clipped_image_task_records` 与 `clipped_boxes`
+汇总受影响的记录数和框数。`bbox_clipping_audit.jsonl` 记录每条受影响记录的来源行号、原始框、裁剪后框、
+最大边缘裁剪像素数和移除面积比例。每条转换后的样本也在 `extra_info.bbox_conversion` 中保存这些信息。
+原始数据文件始终不变。正式报告中应说明 GT 使用了边界裁剪策略；修改该策略时使用新的 `DATA` 和 `OUT`。
+
 ## 3.5. 打印全量统计，并可视化转换后的 GT 框（仅 CPU）
 
 在转换成功后执行。已经生成 `DATA` 的用户无需重新转换，直接运行这个检查脚本：
@@ -151,14 +164,15 @@ python scripts/inspect_ui_lens_eval.py \
 ```
 
 终端会打印每类的样本数、正样本数、负样本数、正样本比例、GT 框数、单图最大框数、
-坐标转换不一致数，以及五类合计和去重图片数。这些数字基于**全部五个 JSONL**，不是抽样数量。
+发生边界裁剪的图片记录数和框数、坐标转换不一致数，以及五类合计和去重图片数。
+这些数字基于**全部五个 JSONL**，不是抽样数量。
 `TOTAL(image-task)` 是“图片 × 任务”的记录数；去重图片数按解析后的图片路径计算。
 同一图片可以在 cropping 是正样本、在 occlusion 是负样本，不能将五类记录数当成独立图片数。
 
 输出内容：
 
 ```text
-UI_lens_ui5_eval_v1/inspection/
+UI_lens_ui5_eval_clip_v1/inspection/
 ├── index.html                 # 离线可打开的图集，可筛任务和正负样本
 ├── dataset_stats.json         # 全量统计与抽样参数
 ├── dataset_stats.csv          # 每任务及合计统计表
@@ -169,13 +183,17 @@ UI_lens_ui5_eval_v1/inspection/
 ```
 
 将整个 `inspection` 目录复制到本机后打开 `index.html`，或直接查看各任务 PNG。
-图中左侧为原图，右侧绿色框**直接取自转换后保存的 `answer.bbox`**，不重新转换后再画。
+图中左侧为原图，右侧框**直接取自转换后保存的 `answer.bbox`**，不重新转换后再画。
+绿色为未裁剪框，橙色为经过边界裁剪的框；图集可以筛选“有裁剪”，坐标表会展示每个框的裁剪量。
 每个框显示编号，HTML 中展开“查看原始与转换后的坐标”即可核对
 原始 `[x,y,w,h]` 与转换后 `[x1,y1,x2,y2]`。点击预览图可查看原分辨率 PNG。
 负样本显示 `NEGATIVE | boxes=0`，保留未画框的原图。
 
 默认每类最多 20 张，尽量各选 10 张正负样本；某一类样本不足时用另一类补足。
-发现坐标转换不一致的记录时优先展示，并在统计里计数；报告仍会生成，命令返回非零退出码，
+发现坐标转换不一致的记录时最先展示，再优先展示发生边界裁剪的记录，剩余名额才做正负抽样。
+因此当异常/裁剪样本较多时，预览中的正负数量不一定均衡。检查会独立核对 `error` 或 `clip` 策略、
+原始 xywh、实际保存的 xyxy 和裁剪记录，合法且有记录的 clip 不计为转换错误。
+真正的转换不一致会在统计里计数；报告仍会生成，命令返回非零退出码，
 需先查看并解决问题再做推理。检查输出目录必须是新的，重复运行时换成 `inspection-v2` 等目录名。
 
 只打印全量统计，不生成图片或文件：
@@ -190,6 +208,7 @@ python scripts/inspect_ui_lens_eval.py --input-dir "$DATA" --stats-only
 如果转换时遇到 `infos.image_size [[1206, 2622]] != actual size [1206, 2622]`，
 先 `git pull --ff-only` 获取支持嵌套尺寸的修复，再重跑步骤 3。
 这个尺寸错误发生在写输出前，所以通常还没有 `conversion_summary.json`；此时不要先运行 `cat` 或检查脚本。
+如果遇到越界框错误，更新代码后使用上述 `--bbox-boundary-policy clip` 命令，并查看裁剪统计和橙色框。
 
 ## 4. 准备 checkpoint，先推理少量图片
 

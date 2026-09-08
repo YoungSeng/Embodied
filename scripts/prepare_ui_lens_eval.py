@@ -82,7 +82,9 @@ def resolve_image(root: Path, raw: str) -> Path:
     return found[0]
 
 
-def convert_boxes(raw, width: int, height: int) -> list[list[float]]:
+def convert_boxes(raw, width: int, height: int, boundary_policy: str = "error") -> list[list[float]]:
+    if boundary_policy not in ("error", "clip"):
+        raise ValueError(f"Unknown bbox boundary policy: {boundary_policy!r}")
     if not isinstance(raw, list):
         raise ValueError("infos.box_list must be a list (explicit [] for a negative)")
     result = []
@@ -92,9 +94,18 @@ def convert_boxes(raw, width: int, height: int) -> list[list[float]]:
         if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in box):
             raise ValueError(f"Box coordinates must be finite numbers: {box!r}")
         x, y, w, h = box
-        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > width or y + h > height:
-            raise ValueError(f"xywh box {box!r} is invalid for image size {(width, height)}; no automatic clipping")
-        result.append([x, y, x + w, y + h])
+        if w <= 0 or h <= 0 or not all(math.isfinite(v) for v in (x + w, y + h)):
+            raise ValueError(f"xywh box must have positive size and finite corners: {box!r}")
+        corners = [x, y, x + w, y + h]
+        bounded = [max(0, min(width, corners[0])), max(0, min(height, corners[1])),
+                   max(0, min(width, corners[2])), max(0, min(height, corners[3]))]
+        if boundary_policy == "error" and corners != bounded:
+            raise ValueError(f"xywh box {box!r} is invalid for image size {(width, height)}; "
+                             "no automatic clipping (use --bbox-boundary-policy clip to record and clip intersecting boxes)")
+        if bounded[2] <= bounded[0] or bounded[3] <= bounded[1]:
+            raise ValueError(f"xywh box {box!r} has no positive-area intersection with image size {(width, height)}; "
+                             "refusing to drop a GT box or turn a positive into a negative")
+        result.append(bounded if boundary_policy == "clip" else corners)
     return result
 
 
@@ -110,17 +121,22 @@ def normalize_image_size(raw) -> list[int]:
     return list(size)
 
 
-def prepare(root: Path, output: Path | None = None) -> dict:
+def prepare(root: Path, output: Path | None = None, bbox_boundary_policy: str = "error") -> dict:
+    if bbox_boundary_policy not in ("error", "clip"):
+        raise ValueError(f"Unknown bbox boundary policy: {bbox_boundary_policy!r}")
     root = root.expanduser().resolve(strict=True)
     source = annotation_dir(root)
-    report = {"source": str(root), "coordinate_format": "pixel_xyxy", "tasks": {}}
+    report = {"source": str(root), "coordinate_format": "pixel_xyxy",
+              "bbox_boundary_policy": bbox_boundary_policy, "tasks": {}}
     all_records = {}
+    clipping_audit = []
     image_sizes = {}
     for source_name, (task, issue) in TASKS.items():
         path = source / f"{source_name}.jsonl"
         records, seen_paths, seen_stems = [], set(), {}
         target_values, label_values = Counter(), Counter()
         positive, box_count = 0, 0
+        clipped_images, clipped_boxes, max_clip_pixels, max_removed_area_ratio = 0, 0, 0, 0.0
         for line, row in read_rows(path):
             try:
                 info = row["infos"]
@@ -139,7 +155,18 @@ def prepare(root: Path, output: Path | None = None) -> dict:
                 if not isinstance(target, str) or norm(target) not in allowed:
                     raise ValueError(f"Unrecognized target_problem {target!r} for {task}; inspect its meaning before adding an alias")
                 labels = info.get("label_list")
-                boxes = convert_boxes(info.get("box_list"), width, height)
+                boxes = convert_boxes(info.get("box_list"), width, height, bbox_boundary_policy)
+                corrections = []
+                for box_index, (raw_box, converted) in enumerate(zip(info["box_list"], boxes)):
+                    x, y, w, h = raw_box
+                    original_xyxy = [x, y, x + w, y + h]
+                    if original_xyxy != converted:
+                        corrections.append({
+                            "box_index": box_index, "original_xywh": raw_box,
+                            "original_xyxy": original_xyxy, "clipped_xyxy": converted,
+                            "max_clip_pixels": max(abs(a - b) for a, b in zip(original_xyxy, converted)),
+                            "removed_area_ratio": 1 - ((converted[2] - converted[0]) / w) * ((converted[3] - converted[1]) / h),
+                        })
                 if not isinstance(labels, list) or len(labels) != len(boxes):
                     raise ValueError("label_list and box_list must be parallel lists; inspect any negative sentinels explicitly")
                 # The task category is declared by target_problem and its source
@@ -156,13 +183,22 @@ def prepare(root: Path, output: Path | None = None) -> dict:
                 seen_stems[image.stem] = image
                 positive += bool(boxes)
                 box_count += len(boxes)
+                if corrections:
+                    clipped_images += 1
+                    clipped_boxes += len(corrections)
+                    max_clip_pixels = max(max_clip_pixels, *(c["max_clip_pixels"] for c in corrections))
+                    max_removed_area_ratio = max(max_removed_area_ratio, *(c["removed_area_ratio"] for c in corrections))
+                    clipping_audit.append({"task": task, "image": str(image), "source_file": str(path),
+                                           "source_line": line, "image_size": [width, height], "clipped_boxes": corrections})
                 records.append({
                     "id": row.get("id", f"{task}:{line}"),
                     "images": [str(image)],
                     "answer": {"bbox": boxes, "types": [issue] * len(boxes)},
                     "extra_info": {"dataset": "UI_lens", "task": task,
                                    "source_file": str(path), "source_line": line,
-                                   "original_infos": info},
+                                   "original_infos": info,
+                                   "bbox_conversion": {"boundary_policy": bbox_boundary_policy,
+                                                       "clipped_boxes": corrections}},
                 })
             except (KeyError, ValueError, TypeError, OSError) as exc:
                 raise ValueError(f"{path}:{line}: {exc}") from exc
@@ -171,11 +207,15 @@ def prepare(root: Path, output: Path | None = None) -> dict:
         report["tasks"][task] = {
             "rows": len(records), "positive": positive,
             "negative": len(records) - positive, "boxes": box_count,
+            "clipped_images": clipped_images, "clipped_boxes": clipped_boxes,
+            "max_clip_pixels": max_clip_pixels, "max_removed_area_ratio": max_removed_area_ratio,
             "target_problem_values": dict(target_values), "label_values": dict(label_values),
             "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
         all_records[task] = records
     report["unique_images"] = len(image_sizes)
+    report["clipped_image_task_records"] = len(clipping_audit)
+    report["clipped_boxes"] = sum(t["clipped_boxes"] for t in report["tasks"].values())
     if output is not None:
         output = output.expanduser().absolute()
         # Validate all five files before writing, and use a new output directory.
@@ -186,6 +226,9 @@ def prepare(root: Path, output: Path | None = None) -> dict:
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         (output / "conversion_summary.json").write_text(
             json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        with (output / "bbox_clipping_audit.jsonl").open("w", encoding="utf-8") as handle:
+            for record in clipping_audit:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     return report
 
 
@@ -193,8 +236,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, help="Omit to validate and report without writing")
+    parser.add_argument("--bbox-boundary-policy", choices=("error", "clip"), default="error",
+                        help="error: reject out-of-bounds boxes; clip: intersect with the image and retain a clipping audit")
     args = parser.parse_args()
-    print(json.dumps(prepare(args.dataset_root, args.output_dir), ensure_ascii=False, indent=2))
+    print(json.dumps(prepare(args.dataset_root, args.output_dir, args.bbox_boundary_policy), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

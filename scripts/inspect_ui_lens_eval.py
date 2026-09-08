@@ -71,15 +71,39 @@ def read_converted(input_dir: Path):
                         ) for box in source_boxes
                     ):
                         raise ValueError("Missing or invalid original xywh boxes")
+                    if any(w <= 0 or h <= 0 or not all(math.isfinite(v) for v in (x + w, y + h))
+                           for x, y, w, h in source_boxes):
+                        raise ValueError("Original xywh boxes must have positive size and finite corners")
                     # Independent check against the saved raw coordinates, not
                     # the converter's convert_boxes helper.
                     expected = [[x, y, x + w, y + h] for x, y, w, h in source_boxes]
+                    metadata = row["extra_info"].get("bbox_conversion", {})
+                    if not isinstance(metadata, dict):
+                        raise ValueError("bbox_conversion must be an object")
+                    policy = metadata.get("boundary_policy", "error")
+                    if policy not in ("error", "clip"):
+                        raise ValueError(f"Unknown bbox boundary policy: {policy!r}")
+                    corrections = []
+                    if policy == "clip":
+                        for box_index, (raw_box, corners) in enumerate(zip(source_boxes, expected)):
+                            bounded = [max(0, min(width, corners[0])), max(0, min(height, corners[1])),
+                                       max(0, min(width, corners[2])), max(0, min(height, corners[3]))]
+                            if bounded != corners:
+                                corrections.append({
+                                    "box_index": box_index, "original_xywh": raw_box,
+                                    "original_xyxy": corners, "clipped_xyxy": bounded,
+                                    "max_clip_pixels": max(abs(a - b) for a, b in zip(corners, bounded)),
+                                    "removed_area_ratio": 1 - ((bounded[2] - bounded[0]) / raw_box[2]) * ((bounded[3] - bounded[1]) / raw_box[3]),
+                                })
+                            expected[box_index] = bounded
                     conversion_ok = boxes == expected and normalize_image_size(original["image_size"]) == [width, height]
+                    conversion_ok = conversion_ok and metadata.get("clipped_boxes", []) == corrections
                     records.append({
                         "task": task, "id": row.get("id"), "line": line_number,
                         "jsonl": str(path), "image": str(image_path), "image_size": [width, height],
                         "positive": bool(boxes), "boxes_xyxy": boxes,
                         "source_boxes_xywh": source_boxes, "conversion_ok": conversion_ok,
+                        "bbox_boundary_policy": policy, "clipped_boxes": corrections,
                     })
                 except (KeyError, ValueError, TypeError, OSError) as exc:
                     raise ValueError(f"{path}:{line_number}: {exc}") from exc
@@ -97,10 +121,15 @@ def summarize(records_by_task):
         return {"samples": n, "positive": positive, "negative": n - positive,
                 "positive_ratio": positive / n if n else 0.0, "boxes": boxes,
                 "max_boxes_per_image": max((len(r["boxes_xyxy"]) for r in records), default=0),
+                "clipped_images": sum(bool(r["clipped_boxes"]) for r in records),
+                "clipped_boxes": sum(len(r["clipped_boxes"]) for r in records),
+                "max_clip_pixels": max((c["max_clip_pixels"] for r in records for c in r["clipped_boxes"]), default=0),
+                "max_removed_area_ratio": max((c["removed_area_ratio"] for r in records for c in r["clipped_boxes"]), default=0.0),
                 "conversion_mismatches": sum(not r["conversion_ok"] for r in records)}
 
     all_records = [r for records in records_by_task.values() for r in records]
     return {"counting_unit": "image-task annotation record; unique images counted by resolved path",
+            "bbox_boundary_policies": sorted({r["bbox_boundary_policy"] for r in all_records}),
             "unique_image_paths": len({r["image"] for r in all_records}),
             "tasks": {task: counts(records) for task, records in records_by_task.items()},
             "total_image_task_records": counts(all_records)}
@@ -108,22 +137,28 @@ def summarize(records_by_task):
 
 def print_summary(summary):
     print("\n全量标注统计（不是可视化抽样统计）")
-    print(f"{'task':<19} {'samples':>8} {'positive':>9} {'negative':>9} {'pos_%':>8} {'boxes':>8} {'max_box':>8} {'mismatch':>9}")
+    print(f"{'task':<19} {'samples':>8} {'positive':>9} {'negative':>9} {'pos_%':>8} {'boxes':>8} {'max_box':>8} {'clip_img':>9} {'clip_box':>9} {'mismatch':>9}")
     for task, value in [*summary["tasks"].items(), ("TOTAL(image-task)", summary["total_image_task_records"])]:
         print(f"{task:<19} {value['samples']:>8} {value['positive']:>9} {value['negative']:>9} "
               f"{100 * value['positive_ratio']:>7.2f}% {value['boxes']:>8} "
-              f"{value['max_boxes_per_image']:>8} {value['conversion_mismatches']:>9}")
+              f"{value['max_boxes_per_image']:>8} {value['clipped_images']:>9} {value['clipped_boxes']:>9} {value['conversion_mismatches']:>9}")
     print(f"去重图片数（按路径）: {summary['unique_image_paths']}")
     print("positive/negative = 该任务有框/无框；同一图片可在多个任务中计数。")
-    print("mismatch = 原始 xywh → 已保存 xyxy 或图片尺寸校验不一致的记录数。")
+    print("clip_img/clip_box = 发生边界裁剪的图片任务记录数/框数；裁剪保留每个 GT 框。")
+    print("mismatch = 已保存框、尺寸或裁剪记录不符合声明的转换策略；合法 clip 不计为错误。")
+    total = summary["total_image_task_records"]
+    print(f"边界策略: {', '.join(summary['bbox_boundary_policies'])}; 最大边缘裁剪: {total['max_clip_pixels']} px; "
+          f"单框最大面积移除比例: {total['max_removed_area_ratio']:.2%}")
 
 
 def select_samples(records, limit, seed):
     if limit == 0 or limit >= len(records):
         return list(records)
     rng = random.Random(seed)
-    # Show any coordinate mismatch first; balance the remaining inspection slots.
+    # Show mismatches, then boundary clips, before balancing remaining slots.
     selected = [r for r in records if not r["conversion_ok"]][:limit]
+    chosen = {r["line"] for r in selected}
+    selected.extend([r for r in records if r.get("clipped_boxes") and r["line"] not in chosen][:limit - len(selected)])
     chosen = {r["line"] for r in selected}
     pools = [[r for r in records if r["positive"] == positive and r["line"] not in chosen]
              for positive in (True, False)]
@@ -153,10 +188,15 @@ def render_pair(record, output_path):
     draw = ImageDraw.Draw(overlay)
     stroke = max(2, round(min(width, height) / 350))
     box_font = load_font(max(12, min(24, width // 40)))
+    clipped_indices = {c["box_index"] for c in record.get("clipped_boxes", [])}
     for number, box in enumerate(record["boxes_xyxy"], 1):
-        draw.rectangle(box, outline="#00b86b", width=stroke)
+        # Pixel xyxy edges may equal W/H; draw their visible border at W-1/H-1.
+        display_box = [min(box[0], width - 1), min(box[1], height - 1),
+                       min(box[2], width - 1), min(box[3], height - 1)]
+        clipped = number - 1 in clipped_indices
+        draw.rectangle(display_box, outline="#e08016" if clipped else "#00b86b", width=stroke)
         x, y = box[:2]
-        draw.text((x + stroke + 1, y + stroke + 1), f"#{number}", fill="#ffffff",
+        draw.text((x + stroke + 1, y + stroke + 1), f"#{number}" + (" clipped" if clipped else ""), fill="#ffffff",
                   font=box_font, stroke_width=1, stroke_fill="#00351e")
     header, gap = 64, 16
     panel_width = max(width, 280)
@@ -170,6 +210,8 @@ def render_pair(record, output_path):
     heading.text((panel_width + gap + 10, 8), "Converted GT (pixel xyxy)", fill="#172334", font=font)
     status = "POSITIVE" if record["positive"] else "NEGATIVE"
     check = "OK" if record["conversion_ok"] else "MISMATCH"
+    if clipped_indices:
+        check += f" | CLIPPED={len(clipped_indices)}"
     heading.text((panel_width + gap + 10, 34), f"{status} | boxes={len(record['boxes_xyxy'])} | {check}",
                  fill="#116b45" if record["conversion_ok"] else "#bc2434", font=load_font(14))
     pair.save(output_path)
@@ -180,21 +222,27 @@ def build_gallery(summary, manifest):
     stats_rows = []
     for task, value in [*summary["tasks"].items(), ("合计（图片 × 任务）", summary["total_image_task_records"])]:
         cells = [task, value["samples"], value["positive"], value["negative"],
-                 f"{value['positive_ratio']:.1%}", value["boxes"], value["conversion_mismatches"]]
+                 f"{value['positive_ratio']:.1%}", value["boxes"], value["clipped_images"],
+                 value["clipped_boxes"], value["conversion_mismatches"]]
         stats_rows.append("<tr>" + "".join(f"<td>{esc(cell)}</td>" for cell in cells) + "</tr>")
     cards = []
     for sample in manifest:
         polarity = "positive" if sample["positive"] else "negative"
         label = "正样本" if sample["positive"] else "负样本"
-        check = "坐标转换一致" if sample["conversion_ok"] else "坐标转换不一致，请检查"
+        check = "符合声明的转换策略" if sample["conversion_ok"] else "转换或裁剪记录不一致，请检查"
+        check += f" · 策略 {sample['bbox_boundary_policy']} · 边界裁剪 {len(sample['clipped_boxes'])} 个框"
+        corrections = {c["box_index"]: c for c in sample["clipped_boxes"]}
         coordinates = []
         for i in range(max(len(sample["source_boxes_xywh"]), len(sample["boxes_xyxy"]))):
             raw = sample["source_boxes_xywh"][i] if i < len(sample["source_boxes_xywh"]) else "缺失"
             converted = sample["boxes_xyxy"][i] if i < len(sample["boxes_xyxy"]) else "缺失"
-            coordinates.append(f"<tr><td>#{i + 1}</td><td>{esc(raw)}</td><td>{esc(converted)}</td></tr>")
-        coordinate_table = ("<table><tr><th>框</th><th>原始 xywh</th><th>转换后 xyxy</th></tr>"
+            correction = corrections.get(i)
+            change = (f"裁剪边缘最多 {correction['max_clip_pixels']} px；移除面积 {correction['removed_area_ratio']:.2%}"
+                      if correction else "无")
+            coordinates.append(f"<tr><td>#{i + 1}</td><td>{esc(raw)}</td><td>{esc(converted)}</td><td>{esc(change)}</td></tr>")
+        coordinate_table = ("<table><tr><th>框</th><th>原始 xywh</th><th>转换后 xyxy</th><th>边界裁剪</th></tr>"
                             + "".join(coordinates) + "</table>") if coordinates else "<p>该任务没有 GT 框，保留为负样本。</p>"
-        cards.append(f'''<article data-task="{esc(sample['task'])}" data-polarity="{polarity}">
+        cards.append(f'''<article data-task="{esc(sample['task'])}" data-polarity="{polarity}" data-clipped="{'yes' if corrections else 'no'}">
 <h2>{esc(sample['task'])} · {label} · {len(sample['boxes_xyxy'])} 个框</h2>
 <p class="{'ok' if sample['conversion_ok'] else 'error'}">{check}</p>
 <a href="{esc(sample['preview'])}" target="_blank" rel="noopener"><img loading="lazy" src="{esc(sample['preview'])}" alt="原图与转换后的 GT 框对照"></a>
@@ -209,15 +257,16 @@ th,td{text-align:left;border-bottom:1px solid #e2e7ee;padding:9px}select{padding
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,580px),1fr));gap:20px}article{background:white;padding:18px;border-radius:12px;border:1px solid #e2e7ee}
 article[hidden]{display:none}img{width:100%;height:auto;display:block}.path{overflow-wrap:anywhere;color:#536277;font-size:12px}.ok{color:#116b45}.error{color:#bc2434;font-weight:700}
 details{overflow:auto}summary{cursor:pointer}header{margin-bottom:22px}.table-scroll{overflow:auto}</style><header>
-<h1>UI-Lens · 转换后 GT 检查</h1><p>左侧原图，右侧直接绘制已保存 JSONL 中的像素 xyxy 框。点击图片查看完整分辨率。</p>
+<h1>UI-Lens · 转换后 GT 检查</h1><p>左侧原图，右侧直接绘制已保存 JSONL 中的像素 xyxy 框。绿色为未裁剪框，橙色为边界裁剪框。点击图片查看完整分辨率。</p>
 <p class="muted">统计覆盖全部标注；下方图片为抽样检查。正负标签仅针对当前任务，不代表整张图所有缺陷类别。</p>
 ''' + f'<p>去重图片数（按路径）：<b>{summary["unique_image_paths"]}</b> · 可视化记录：<b>{len(manifest)}</b></p>' + '''
-<div class="table-scroll"><table><tr><th>任务</th><th>样本数</th><th>正样本</th><th>负样本</th><th>正样本比例</th><th>框数</th><th>转换不一致</th></tr>
+<div class="table-scroll"><table><tr><th>任务</th><th>样本数</th><th>正样本</th><th>负样本</th><th>正样本比例</th><th>框数</th><th>裁剪图片</th><th>裁剪框数</th><th>转换不一致</th></tr>
 ''' + "".join(stats_rows) + '</table></div><label>任务<select id="task"><option value="">全部</option>' + options + '''</select></label>
 <label>正负样本<select id="polarity"><option value="">全部</option><option value="positive">正样本</option><option value="negative">负样本</option></select></label>
+<label>边界裁剪<select id="clipping"><option value="">全部</option><option value="yes">有裁剪</option><option value="no">无裁剪</option></select></label>
 </header><main class="grid">''' + "".join(cards) + '''</main><script>
-function filter(){const task=document.getElementById('task').value, polarity=document.getElementById('polarity').value;
-document.querySelectorAll('article').forEach(card=>{card.hidden=!!((task&&card.dataset.task!==task)||(polarity&&card.dataset.polarity!==polarity));});}
+function filter(){const task=document.getElementById('task').value, polarity=document.getElementById('polarity').value, clipping=document.getElementById('clipping').value;
+document.querySelectorAll('article').forEach(card=>{card.hidden=!!((task&&card.dataset.task!==task)||(polarity&&card.dataset.polarity!==polarity)||(clipping&&card.dataset.clipped!==clipping));});}
 document.querySelectorAll('select').forEach(select=>select.addEventListener('change',filter));</script></html>'''
 
 
