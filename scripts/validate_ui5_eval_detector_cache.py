@@ -13,10 +13,11 @@ from ui5_eval_detector_cache import validate_eval_detector_cache
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-dir", type=Path, required=True)
+    parser.add_argument("--input-dir", type=Path, default=None)
     parser.add_argument("--scan-name", required=True)
     parser.add_argument("--expected-unique-images", type=int, default=0)
     parser.add_argument(
-        "--cache-scope", choices=("preview", "validation", "full_test"), default=None
+        "--cache-scope", choices=("preview", "validation", "full_test", "external_test"), default=None
     )
     parser.add_argument("--require-strict-nonoverlap", action="store_true")
     parser.add_argument("--require-raw-detector-edge-alignment", action="store_true")
@@ -35,6 +36,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_unique_images=args.expected_unique_images,
         require_ready=args.require_ready,
         required_cache_scope=args.cache_scope,
+        input_dir=args.input_dir,
         require_strict_nonoverlap=args.require_strict_nonoverlap,
         require_raw_detector_edge_alignment=args.require_raw_detector_edge_alignment,
         require_detector_unique_containment=args.require_detector_unique_containment,

@@ -95,7 +95,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--scan-name", default="horizontal_scan_v5_raw_detector_edge_aligned"
     )
     parser.add_argument(
-        "--cache-scope", choices=("auto", "preview", "validation", "full_test"), default="auto"
+        "--cache-scope",
+        choices=("auto", "preview", "validation", "full_test", "external_test"),
+        default="auto",
+        help="external_test uses the complete external dataset, allowing unequal task populations.",
     )
     parser.add_argument(
         "--expected-full-test-unique-images",
@@ -106,7 +109,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--expected-unique-images",
         type=int,
         default=None,
-        help="Explicit expected count for validation/full-test caches.",
+        help="Expected content-unique images; external_test infers this from the complete manifest if omitted.",
     )
     parser.add_argument("--scan-max-crops", type=int, default=10)
     parser.add_argument("--scan-target-height", type=int, default=960)
@@ -856,14 +859,15 @@ def _resolve_cache_scope(
     requested = str(getattr(args, "cache_scope", "auto"))
     cache_scope = inferred if requested == "auto" else requested
     if cache_scope != inferred and not (
-        cache_scope == "validation" and inferred == "full_test"
+        cache_scope in {"validation", "external_test"} and inferred == "full_test"
     ):
         raise RuntimeError(
             f"cache scope contradicts prepared manifest: requested={cache_scope}, "
             f"max_images_per_task={max_images_per_task}"
         )
     explicit_expected = getattr(args, "expected_unique_images", None)
-    expected = unique_count if cache_scope == "preview" else int(
+    infer_external_count = cache_scope == "external_test" and explicit_expected is None
+    expected = unique_count if cache_scope == "preview" or infer_external_count else int(
         explicit_expected
         if explicit_expected is not None
         else getattr(
@@ -872,7 +876,7 @@ def _resolve_cache_scope(
             DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES,
         )
     )
-    if unique_count != expected:
+    if expected <= 0 or unique_count != expected:
         raise RuntimeError(
             f"{cache_scope} cache unique image count mismatch: {unique_count} != {expected}"
         )

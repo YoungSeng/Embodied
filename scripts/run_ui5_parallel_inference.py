@@ -111,7 +111,8 @@ def validated_full_test_expected_images_per_task(
     """Return the fail-closed per-task count bound by an adjacent full-test marker.
 
     Preview/legacy detector manifests remain usable without a per-task count contract.
-    A full-test marker, however, is revalidated here before any inference worker starts.
+    Full-test and external-test markers are revalidated before any worker starts.
+    External tasks can have unequal populations, so they do not supply a common count.
     """
 
     scan_root = detector_crop_manifest.parent
@@ -122,17 +123,18 @@ def validated_full_test_expected_images_per_task(
         recorded = json.loads(ready_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"invalid detector cache ready marker: {ready_path}") from exc
-    if str(recorded.get("cache_scope", "")) != "full_test":
+    cache_scope = str(recorded.get("cache_scope", ""))
+    if cache_scope not in {"full_test", "external_test"}:
         return None
     try:
         expected = int(recorded.get("expected_unique_images", 0))
     except (TypeError, ValueError) as exc:
         raise RuntimeError(
-            f"full_test detector cache marker has invalid expected_unique_images: {ready_path}"
+            f"{cache_scope} detector cache marker has invalid expected_unique_images: {ready_path}"
         ) from exc
     if expected <= 0:
         raise RuntimeError(
-            f"full_test detector cache marker requires positive expected_unique_images: {ready_path}"
+            f"{cache_scope} detector cache marker requires positive expected_unique_images: {ready_path}"
         )
     scan_name = str(recorded.get("scan_name", ""))
     if scan_name != scan_root.name:
@@ -146,7 +148,7 @@ def validated_full_test_expected_images_per_task(
         expected_unique_images=expected,
         require_ready=True,
         input_dir=input_dir,
-        required_cache_scope="full_test",
+        required_cache_scope=cache_scope,
         require_strict_nonoverlap=True,
         require_raw_detector_edge_alignment=True,
         require_detector_unique_containment=True,
@@ -160,7 +162,7 @@ def validated_full_test_expected_images_per_task(
             "validated detector cache marker is bound to a different scan manifest: "
             f"{recorded_manifest} != {detector_crop_manifest}"
         )
-    return expected
+    return expected if cache_scope == "full_test" else None
 
 
 def load_runtime_profile(path: Path | None) -> dict[str, Any]:

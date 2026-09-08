@@ -12,13 +12,20 @@
 - [参考分支评分器](https://github.com/YoungSeng/Embodied/blob/codex/m32-cpt-sft-croponly-v1/qwen3vl_merge_and_score_fixed_5tasks.py)。
 
 本次先跑五个单界面任务。序列界面的文本不一致需要多图/历史信息输入，不能混入这次 UI5 结果。
-下面使用整图推理得到第一版结果。`croponly` 的训练输入方式并不阻止整图推理，
-但整图结果和 detector-scan 的结果代表不同推理设置，比较时应写清楚。
+下面使用本分支已有的 `detector_scan` 切图推理流程。
+旧版指南使用 `full_image`，会将五类任务都送全图，未对齐这次需要的 crop 评测设置；
+已执行的数据转换和 GT 检查仍可复用，从步骤 3.6 补建 UI-Lens 自己的切图缓存。
+已产生的 full-image 预测使用原目录保留，切图推理使用新的 `OUT`。
+
+`croponly` 描述训练输入方式，推理时仍需显式指定切图模式，不会因 checkpoint 目录名自动切图。
+当前 `detector_scan` 实现中，`occlusion`、`cropping`、`text_overflow`、`text_ellipsis` 使用检测器切图；
+`content_missing` 使用一个全图视野。无法安全切分的图片也可能只有一个全图 crop，具体数量由统计和预览确认。
 
 ## 1. 进入服务器环境，设置目录
 
 步骤 1–3 和下面的 3.5（下载、转换、统计、GT 可视化）在能访问这些路径的 CPU 开发机执行即可。
-只有步骤 4 的模型推理和步骤 5 的全量推理需要已分配的 GPU；步骤 6 的 F1 评分只用 CPU。
+步骤 3.6 的 OCR/icon 检测、步骤 4 的模型试跑和步骤 5 的全量推理需要已分配的 GPU；
+切图几何计算、缓存检查、预览和步骤 6 的 F1 评分只用 CPU。
 
 ```bash
 conda activate /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything
@@ -28,7 +35,7 @@ export CKPT="$PROJECT/work_dirs/locany-ui5-m32-cpt3000-croponly-sourcebalanced-a
 export BASE=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/hf_home/hub/models--nvidia--LocateAnything-3B/snapshots/c32291ca5e996f5a7a485845b4f57a233936bba0
 export RAW=/mnt/bn/intelligent-service-yg/dataset/UI_lens
 export DATA=/mnt/bn/intelligent-service-yg/dataset/UI_lens_ui5_eval_clip_v1
-export OUT="$PROJECT/work_dirs/ui-lens-checkpoint9000-fullimage-clip-v1"
+export OUT="$PROJECT/work_dirs/ui-lens-checkpoint9000-detectorscan-clip-v1"
 
 cd "$PROJECT"
 export PYTHONPATH="$PROJECT${PYTHONPATH:+:$PYTHONPATH}"
@@ -237,9 +244,114 @@ python scripts/inspect_ui_lens_eval.py --input-dir "$DATA" --stats-only
 这个尺寸错误发生在写输出前，所以通常还没有 `conversion_summary.json`；此时不要先运行 `cat` 或检查脚本。
 如果遇到越界框错误，更新代码后使用上述 `--bbox-boundary-policy clip` 命令，并查看裁剪统计和橙色框。
 
+## 3.6. 生成 UI-Lens 检测器切图缓存，并检查实际 crops
+
+`inspect_ui_lens_eval.py` 画的是原图上的 GT 框，**不生成模型输入 crops**。
+`--bbox-boundary-policy clip` 只修正越界 GT 坐标，也不是切图。
+下面先用 PP-OCRv5 / icon detector 检测图像内容，再沿安全边界生成全宽水平切片；不读取 GT 缺陷框来选区域。
+缓存主要保存每张图的切片坐标；推理入口读取原图并调用 `image.crop(...)`，逐片送入模型。
+不必将五个评测 JSONL 改成 crop 样本，也不必提前保存全量 crop PNG。
+
+**现在需要 GPU。** 一张卡即可顺序执行检测和模型试跑；有四张卡时可使用 `0,1,2,3`。
+短流程调试可以申请交互式 GPU，全量检测或推理用正式 GPU 任务更适合有时限的平台。
+申请和正式提交是运行资源的两种方式，代码仍使用下面的评测命令，不需要重新训练。
+
+在 GPU 环境中重新设置步骤 1 的变量并激活原 LocateAnything 环境，然后执行：
+
+```bash
+cd "$PROJECT"
+git pull --ff-only
+
+export CACHE=/mnt/bn/intelligent-service-yg/dataset/UI_lens_detector_cache_v1
+export SCAN=horizontal_scan_v5_raw_detector_edge_aligned
+export PARSER_ROOT="$(dirname "$PROJECT")/ui-region-parser"
+export TEXT_PYTHON=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/UI5PaddleOCR/bin/python
+export ICON_PYTHON="$(command -v python)"
+export ICON_MODEL="$PARSER_ROOT/weights/icon_detect_v3/model.pt"
+export GPUS=0
+
+test -d "$PARSER_ROOT"
+test -x "$TEXT_PYTHON"
+test -f "$ICON_MODEL"
+nvidia-smi
+```
+
+上面的 parser 和 OCR 环境路径按工程目录惯例填写，需在服务器确认。
+如果不存在，替换为原任务实际使用的 `EVAL_PARSER_ROOT`、`EVAL_TEXT_PYTHON`、`EVAL_ICON_MODEL`；
+原检测缓存的 `detections/text/stage_summary.json` 中 `runtime.python` 也记录了 OCR Python 路径。
+`ICON_PYTHON` 应为原 LocateAnything/icon 环境，必须与 PaddleOCR 环境分开。
+如果原任务指定了本地 PP-OCRv5 模型目录，给下方命令加上 `--text-model-dir /实际模型目录`；
+省略时沿用 PP-OCRv5 的缓存/自动下载方式。应复用原任务的检测器权重和环境。
+
+确认上述路径检查通过后生成缓存：
+
+```bash
+"$ICON_PYTHON" -u scripts/prepare_ui5_eval_detector_crops.py \
+  --stage all --input-dir "$DATA" --output-dir "$CACHE" \
+  --parser-root "$PARSER_ROOT" \
+  --text-python "$TEXT_PYTHON" --icon-python "$ICON_PYTHON" \
+  --icon-model "$ICON_MODEL" \
+  --gpus "$GPUS" --workers-per-gpu 1 \
+  --cache-scope external_test --max-images-per-task 0 \
+  --scan-name "$SCAN" --scan-max-crops 10 --scan-target-height 960 \
+  --visualization-samples 60 --save-preview-crops \
+  --progress-interval-seconds 5 --resume
+```
+
+依次执行 `prepare → text → icon → merge → crop`，终端有分阶段进度和 ETA。
+`external_test` 根据完整图片清单计算内容去重图数，保留五类各自的样本范围；不套用 UI5 的 1555 张约束。
+它仍绑定五个源 JSONL、检测结果和切图几何的摘要，推理前会重新验证。
+中断后用完全相同的参数和目录重跑可以续建；数据、检测器或切图参数变化时使用新缓存目录。
+
+生成成功后检查缓存和统计（CPU）：
+
+```bash
+export N_UNIQUE="$(python -c 'import json, os; from pathlib import Path; print(json.loads((Path(os.environ["CACHE"])/"manifest/selection_config.json").read_text())["unique_images"])')"
+
+python scripts/validate_ui5_eval_detector_cache.py \
+  --cache-dir "$CACHE" --scan-name "$SCAN" --input-dir "$DATA" \
+  --cache-scope external_test --expected-unique-images "$N_UNIQUE" \
+  --require-ready --require-strict-nonoverlap \
+  --require-raw-detector-edge-alignment --require-detector-unique-containment
+
+python - <<'PY'
+import json, os
+from pathlib import Path
+s = json.loads((Path(os.environ["CACHE"]) / os.environ["SCAN"] / "summary.json").read_text())
+print("scope:", s["cache_scope"], "content-unique images:", s["unique_images"])
+for task, stats in s["by_task"].items():
+    print(task, "mode=", stats["effective_mode"], "images=", stats["images"],
+          "crops_mean=", round(stats["tile_count_mean"], 2),
+          "crops_max=", stats["tile_count_max"],
+          "one_full_image=", stats["single_full_image_count"],
+          "crop_count_distribution=", stats["tile_count_distribution"])
+print("geometry_gate:", s["geometry_gate"])
+PY
+```
+
+要求校验返回 `valid: true`，`geometry_gate.passes` 为 `true`。
+这里的图片数按图片文件内容去重，可能小于 GT 检查中按路径统计的数目；实际评测仍保留各任务原有记录。
+
+切图可视化位于：
+
+```text
+$CACHE/$SCAN/
+├── detector_scan_crops.jsonl     # 全量切片坐标；推理实际读取此文件
+├── summary.json                 # 每类有效模式、crop 数量、覆盖/切边检查
+├── statistics.csv               # 逐图几何统计
+├── gallery/index.html           # 检测器框、切片边界的抽样图集
+├── preview_crops/*.png          # 抽样保存的实际切片图像
+└── eval_detector_cache_ready.json
+```
+
+将整个 `$CACHE/$SCAN` 目录复制到本机后打开 `gallery/index.html`，再查看 `preview_crops`。
+这个图集展示任务无关的切片方案；`content_missing` 的实际输入仍以全图为准，见 `by_task` 统计。
+安全边界不足时允许减少 crop 数，不保证每张图片都切成 10 份，也不保证切片高度恒为 960。
+先确认切片覆盖整图、没有重复区域且检测到的文本/图标框没有被切开，再继续试跑。
+
 ## 4. 准备 checkpoint，先推理少量图片
 
-此时才需要 GPU。建议先申请一张交互式 GPU，执行下面的每类两张图片检查；
+检查切图后，使用已分配的 GPU 执行下面的每类两张图片检查；
 通过后再选择在已有 GPU 配额内直接运行步骤 5，或提交正式 GPU 评测任务。
 正式任务的启动命令使用步骤 5 的推理入口，不需要重新训练，也不要用训练提交入口来代替评测。
 若平台给交互式会话的时限较短，全量推理建议提交正式任务。
@@ -258,13 +370,17 @@ python scripts/inference_ui_defect_locany.py \
   --cuda-visible-devices 0 --device cuda:0 \
   --attn-implementation sdpa --vision-attn-implementation flash_attention_2 \
   --generation-mode hybrid --relation-gate-mode observe --enable-pbd \
-  --inference-crop-mode full_image \
+  --inference-crop-mode detector_scan \
+  --detector-crop-manifest "$CACHE/$SCAN/detector_scan_crops.jsonl" \
   --tasks all --max-images-per-task 2 \
   --save-raw-answer --save-visualization --fail-fast
 ```
 
 检查 `${OUT}-smoke/_summary.json`，以及每类 `raw/`、`visualizations/`。
 确认加载成功、图片没有缺失、框的坐标正常、无推理错误。
+`raw/*.json` 的 `inference_crop.mode` 应为 `detector_scan`，
+`inference_crop.tiles` 记录实际送入模型的每个 `tile_bbox` 和该片的回答；可据此确认真的执行了切图。
+`content_missing` 应只有一个 `[0,0,W,H]` 的 tile，其他任务的 tile 数由缓存决定。
 这只验证流程，不能用 smoke 预测对全量 GT 算正式 F1。
 若缺少 FlashAttention 2，应先核对是否激活了原训练环境；上述多卡入口固定使用这个视觉后端。
 
@@ -277,13 +393,17 @@ python scripts/run_ui5_parallel_inference.py \
   --gpu-devices 0,1,2,3 --attn-implementation sdpa \
   --inference-script "$PROJECT/scripts/inference_ui_defect_locany.py" \
   --relation-gate-mode observe --enable-pbd \
-  --inference-crop-mode full_image --save-raw-answer
+  --inference-crop-mode detector_scan \
+  --detector-crop-manifest "$CACHE/$SCAN/detector_scan_crops.jsonl" \
+  --save-raw-answer
 ```
 
 五类任务分配到四张卡独立推理；只有一张卡时将 `--gpu-devices` 改为 `0`。
 进程中断后用相同参数重跑，入口支持按图片续推。
 数据、checkpoint 或推理方式变化时使用新 `OUT`，防止复用旧结果。
 本方案不传 `--expected-images-per-task 1555`，不使用旧 UI5 的 detector cache。
+各 crop 的预测框会自动映射回原图并合并，输出仍是一张原图、一个任务对应一个预测文件。
+不要用 crop 数量作为 image F1 的样本数，也不要修改原图 GT 来匹配 crop 局部坐标。
 
 ## 6. 复用原评分器计算 image F1 / bbox F1
 
@@ -323,16 +443,11 @@ python qwen3vl_merge_and_score_fixed_5tasks.py \
 
 评分输出目录必须是新的；重新评分时换一个 `--run_name`。
 
-## 后续对齐 crop-only 训练的推理方式
+## 记录评测设置
 
-如果需要与训练期间的 detector-scan 评测严格对照，应先读取原运行保存的 evaluation 元数据，
-确认 crop mode、Gate mode、PBD 和切图参数，再为 UI-Lens 生成独立的 OCR/icon detector cache。
-参考分支已有 `scripts/prepare_ui5_eval_detector_crops.py`，但还需要实际 parser/model 路径，
-并按 UI-Lens 的真实图数验证缓存。不能套用原 UI5 的缓存和 1555 张约束。
-推理 crops 必须只由图像/detector 决定，不能用 UI-Lens GT 框选 crop；最终预测应回映射到原图后评分。
-
-不依赖 OCR/icon 的另一个已有选项是 `--inference-crop-mode lossless_tiling`，
-但它与 detector-scan 是不同方法。改变推理方式时使用单独的输出目录并单独报告。
+本指南使用 `detector_scan`、Gate `observe`、PBD 开启及上述切图参数。
+如需与训练期间的某次评测严格对照，先核对原运行保存的 evaluation 元数据中的同名设置，
+同时确认 OCR/icon 的权重和参数一致。改变设置时使用独立缓存/预测目录，并在报告中记录。
 
 本结果是沿用当前工程评分器的 UI-Lens 单界面评测，不能自动等同于 UI-Lens 论文官方指标。
 如果后续将其作为独立外部测试集，应检查这些图片是否出现在本次 CPT/SFT 的来源中。
