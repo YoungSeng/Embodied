@@ -329,6 +329,32 @@ python -m unittest \
 
 本地未访问集群实时诊断目录，未加载 3B checkpoint、未执行 GPU step 0 推理/训练，也未提交新任务。真实 Excel 位于 `${WORKSPACE}/gui_models/locany-m32-cpt9000-ui14-a800x4-repair-v2/diagnostics/ui5_training_evaluation.xlsx`，由更新后的正式任务生成；已有失败运行没有记录的训练窗口不能补造。
 
+## 2026-09-08 checkpoint-1000 评测 OOM：每卡一个进程
+
+用户上传日志确认：训练已完成第一个 1000-step 分段，`TRAIN_EXIT_CODE=0`、`TRAIN_STATUS=SUCCESS`；随后 checkpoint resume 校验 `valid=true`、errors/warnings 为空，四 rank 的 optimizer、RNG、dataloader 状态均存在。此次故障发生在评测 synth_loneword 第 65/767 张，位置是语言模型 `modeling_qwen2.py:1500` 的 `logits.float()`；需要分配 3.71 GiB，仅余 2.02 GiB，同卡两个进程分别占 23.28 和 14.26 GiB。worker 物理 GPU=3，报错中的 GPU 0 是该进程隔离后的逻辑卡。
+
+正式 UI14 profile、运行配置固定检查、两套参考 YAML 及 UI14 评测默认值统一从 2 workers/GPU 改为 1；四卡共 4 个槽位仍处理完整 14 项。视觉 FlashAttention 2、语言模型 SDPA、训练 12800/7268 token 预算、16k SFT、100 步训练窗口、step 0/每 1000 步评测和 EVAL_FAIL_POLICY=stop 均保持。没有改模型、processor、数据/crop、生成参数或预测完成标记。
+
+**本次本地实际执行 99 项 CPU 回归，45.105 秒，全部通过；8 个 Python 文件 AST 通过。** AIAI_locate/2146 与 YG/1602 两份参考 YAML 均与当前正式渲染器逐字一致，4 卡 × 1 eval worker，12800/7268 和 stop 已核对。
+
+- CPU 子进程和同步屏障验证四张逻辑卡各 1 个进程，14 个任务各处理一次；通用调度器旧的 2 workers/GPU 能力仍有回归覆盖，但当前正式 UI14 profile 拒绝覆盖为 2。
+- 实际抽取推理脚本的纯 CPU 参数/manifest/待处理清单函数执行：构造两个完成结果（包括已完成的非法输出）、一张仅保存 OOM error sidecar 的图片；并发 2→1 和 GPU 分配变化不改变预测身份，两个结果及 raw/gate 字节和 mtime 保留，只有 OOM 图待重试；补齐后全部复用。更换 checkpoint 或几何清单摘要仍拒绝混用。此测试不导入模型/CUDA，也不解码图片。
+- UI14 step 0/1000 完整评测、缺 UI9 补齐、36 行 Excel、旧五类 best、失败停止、分段 checkpoint 恢复、提交/启动正式参数和旧准备报告复用相关回归通过。提交用旧 2-worker 配置快照建立审计绑定，新实际 YAML 单独渲染为 1-worker，旧 CPU 报告和配置快照不变。
+
+复现命令（具备项目 CPU 测试依赖）：
+
+```bash
+python -m unittest \
+  tests.test_ui14_inference_resume tests.test_ui14_inference_workers \
+  tests.test_ui14_initial_evaluation tests.test_ui14_pipeline \
+  tests.test_ui14_submission_resources tests.test_ui14_submit_progress \
+  tests.test_ui5_excel_logger tests.test_ui5_pipeline tests.test_ui_sampler_cycle_cache
+```
+
+远端恢复：等当前失败评测任务退出后，在同一目录 `git pull --ff-only origin codex/m32-cpt9000-ui14-v1 && bash shell/ui14_cpt9000_a800.sh submit`。保留当前输出目录和 checkpoint-1000，不执行之前从头重跑使用的归档命令，不重做数据/缓存/finalize。审计代码/config 身份变化可能使历史轮次重新检查/汇总；同一预测身份下已经落盘的逐图结果不会因并发减少而重推。先补齐本轮评测，再恢复到 1000 后继续训练。
+
+本地仅检查上传日志并执行 CPU 回归，未连接集群、未实际重试失败图片、未测量单进程峰值、未提交新任务。减少同卡进程消除了本次观察到的双模型竞争，但不能据 CPU 测试声称已验证所有图片均无 OOM。
+
 ## 实际数据统计的产生位置
 
 派生根目录：

@@ -122,7 +122,7 @@ def run(args):
     destination = history_dir / "raw" / f"ui14-step-{args.step}"
     state_path = history_dir / f"ui14-step-{args.step}.json"
     started = datetime.now(timezone.utc).isoformat()
-    workers_per_gpu = getattr(args, "eval_inference_workers_per_gpu", 2)
+    workers_per_gpu = getattr(args, "eval_inference_workers_per_gpu", 1)
     state = {"status": "running", "sft_step": args.step, "init_checkpoint": str(args.base_model),
              "init_cpt_step": 9000, "identity": identity, "tasks": {}, "started": started,
              "eval_gpu_devices": args.eval_gpu_devices, "inference_workers_per_gpu": workers_per_gpu}

@@ -54,7 +54,7 @@ class SubmissionResourcesTests(unittest.TestCase):
                 restored = common.resolve_runtime_config(env)
                 self.assertEqual(restored["RESOURCE_GROUP"], runtime["RESOURCE_GROUP"])
                 self.assertEqual(restored["EVAL_FAIL_POLICY"], "stop")
-                self.assertEqual(restored["EVAL_INFERENCE_WORKERS_PER_GPU"], 2)
+                self.assertEqual(restored["EVAL_INFERENCE_WORKERS_PER_GPU"], 1)
                 self.assertEqual(restored["EVAL_AT_START"], 1)
             self.assertEqual(common.machine_resource_config("a800", resource_group="yg")["group_id"], 1602)
             self.assertEqual(common.resolve_runtime_config({**profile_environment(), "GPU_COUNT": "4"})["RESOURCE_GROUP"], "aiai_locate")
@@ -94,8 +94,9 @@ class SubmissionResourcesTests(unittest.TestCase):
             # setting separately, and reuse the already-prepared data.
             old_yaml = yaml.safe_load(canonical.read_text(encoding="utf-8"))
             old_yaml["jobRunParams"]["envsList"]["EVAL_AT_START"] = "0"
+            old_yaml["jobRunParams"]["envsList"]["EVAL_INFERENCE_WORKERS_PER_GPU"] = "2"
             canonical.write_text(yaml.safe_dump(old_yaml), encoding="utf-8")
-            write_json(canonical_runtime, {**read_json(canonical_runtime), "EVAL_AT_START": 0})
+            write_json(canonical_runtime, {**read_json(canonical_runtime), "EVAL_AT_START": 0, "EVAL_INFERENCE_WORKERS_PER_GPU": 2})
             report_path = root / "cpu_check_report.json"
             write_json(report_path, {"ready": True, "normalization_id": "fixture-normalized", "repair_run_id": "fixture-repair",
                 "artifact_digests": {p.name: file_digest(p) for p in (canonical, canonical_runtime)}})
@@ -119,6 +120,7 @@ class SubmissionResourcesTests(unittest.TestCase):
                 self.assertEqual(binding["normalization_id"], "fixture-normalized")
                 self.assertEqual(binding["repair_run_id"], "fixture-repair")
                 self.assertEqual(str(yaml.safe_load(output.read_text(encoding="utf-8"))["jobRunParams"]["envsList"]["EVAL_AT_START"]), "1")
+                self.assertEqual(str(yaml.safe_load(output.read_text(encoding="utf-8"))["jobRunParams"]["envsList"]["EVAL_INFERENCE_WORKERS_PER_GPU"]), "1")
                 self.assertEqual(protected, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in protected})
             rendered, runtime = submit.render_job(self.args(root, "yg"))
             with self.assertRaisesRegex(ValueError, "overwrite CPU-checked"):
