@@ -265,7 +265,8 @@ class UI14EvaluationTests(unittest.TestCase):
                     runner.reset_mock()
                 evaluate.run(args)
                 inference_command=runner.call_args_list[0].args[0]
-                self.assertEqual(inference_command[inference_command.index("--workers-per-gpu")+1],"1")
+                self.assertEqual(inference_command[inference_command.index("--workers-per-gpu")+1],"2")
+                self.assertEqual(inference_command[inference_command.index("--exclusive-gpu-tasks")+1], "synth_loneword")
                 self.assertTrue(evaluate.is_complete(output,step,manifest,checkpoint))
                 self.assertEqual(read_json(output/"evaluation/best_checkpoints.json")["current_best"]["image"]["image_macro_f1"],.8)
                 workbook_path = output/"diagnostics/ui5_training_evaluation.xlsx"
@@ -412,7 +413,7 @@ class UI14EvaluationTests(unittest.TestCase):
             self.assertEqual(str(env["GRADIENT_ACCUMULATION_STEPS"]),"2")
             self.assertEqual(str(env["MAX_STEPS"]),"16000")
             self.assertEqual(env["EVAL_FAIL_POLICY"],"stop")
-            self.assertEqual(env["EVAL_INFERENCE_WORKERS_PER_GPU"],1)
+            self.assertEqual(env["EVAL_INFERENCE_WORKERS_PER_GPU"],2)
             self.assertEqual(env["EVAL_AT_START"],1)
 
 

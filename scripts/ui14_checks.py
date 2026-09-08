@@ -32,7 +32,7 @@ def validate_formal_yaml(rendered, runtime, *, config_path=None):
                 "INIT_CPT_STEP": 9000, "MAX_SEQ_LENGTH": 7268, "MAX_NUM_TOKENS_PER_SAMPLE": 7268,
                 "MAX_NUM_TOKENS": 12800, "RESOURCE_GROUP_ID": selected["group_id"], "SEED": 42,
                 "EVAL_FAIL_POLICY": "stop", "EVAL_INTERVAL_STEPS": 1000, "SAVE_STEPS": 4000,
-                "EVAL_INFERENCE_WORKERS_PER_GPU": 1, "EVAL_AT_START": 1}
+                "EVAL_INFERENCE_WORKERS_PER_GPU": 2, "EVAL_AT_START": 1}
     for key, expected in required.items():
         if str(runtime[key]) != str(expected): raise ValueError(f"Formal runtime drift: {key}")
     resource = parsed["jobDefVersion"]["resource"]["arnoldConfig"]

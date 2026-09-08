@@ -102,7 +102,7 @@ INIT_CPT_STEP=9000
 UI_EVAL_MANIFEST=/fixture/evaluation_manifest.json
 EVAL_AT_START=1
 EVAL_FAIL_POLICY=stop
-EVAL_INFERENCE_WORKERS_PER_GPU=1
+EVAL_INFERENCE_WORKERS_PER_GPU=2
 EVAL_GPU_DEVICES=0,1,2,3
 current_step=0
 fake_python() {
@@ -129,7 +129,7 @@ fake_python() {
                     if complete:
                         self.assertIn("--init-cpt-step 9000", result.stdout)
                         self.assertIn("--step 0", result.stdout)
-                        self.assertIn("--eval-inference-workers-per-gpu 1", result.stdout)
+                        self.assertIn("--eval-inference-workers-per-gpu 2", result.stdout)
                         self.assertLess(result.stdout.index("EXPORTED"), result.stdout.index("EVALUATED"))
                         if not inference_exit:
                             self.assertLess(result.stdout.index("EVALUATED"), result.stdout.index("TRAINING_ALLOWED"))

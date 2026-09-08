@@ -124,7 +124,93 @@ class InferenceWorkersTests(unittest.TestCase):
             self.assertEqual(len(status["missing_tasks"]), 6)
             self.assertTrue(all(r["return_code"] == 17 for r in status["tasks"].values()))
 
-    def test_profile_and_yaml_bind_one_inference_worker_only(self):
+    def test_loneword_exclusivity_keeps_other_gpus_parallel_then_restores_both_slots(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(tmp)
+            argv = fixture(root) + ["--exclusive-gpu-tasks", "synth_loneword"]
+            barrier = threading.Barrier(7, timeout=10)
+            refilled = threading.Event()
+            guard = threading.Lock()
+            active = {gpu: set() for gpu in "0123"}
+            arrivals = []
+            first_wave = []
+            exclusive_gpu = None
+            refilled_tasks = []
+
+            def child(command, **kwargs):
+                nonlocal exclusive_gpu
+                task = command[command.index("--tasks") + 1]
+                gpu = kwargs["env"]["CUDA_VISIBLE_DEVICES"]
+                with guard:
+                    active[gpu].add(task)
+                    arrivals.append((task, gpu))
+                    wave_one = len(arrivals) <= 7
+                    if task == "synth_loneword":
+                        exclusive_gpu = gpu
+                    if "synth_loneword" in active[gpu]:
+                        self.assertEqual(active[gpu], {"synth_loneword"})
+                    self.assertLessEqual(len(active[gpu]), 2)
+                    if len(arrivals) == 7:
+                        first_wave.extend(arrivals)
+                    if not wave_one and gpu == exclusive_gpu:
+                        refilled_tasks.append(task)
+                        if len(active[gpu]) == 2:
+                            refilled.set()
+                if wave_one:
+                    barrier.wait()
+                if task != "synth_loneword":
+                    # Keep all other cards busy while the exclusive task exits.
+                    # Both slots of its card must then accept ordinary tasks.
+                    self.assertTrue(refilled.wait(10), "exclusive GPU failed to resume two slots")
+                path = root / "pred" / task / "sample.json"
+                write_json(path, {"task": task, "gpu": gpu})
+                with guard:
+                    active[gpu].remove(task)
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(parallel.subprocess, "run", side_effect=child) as run:
+                self.assertEqual(parallel.main(), 0)
+            status = read_json(root / "pred/parallel_inference_status.json")
+            self.assertEqual(run.call_count, 14)
+            self.assertTrue(status["success"])
+            self.assertEqual(status["exclusive_gpu_tasks"], ["synth_loneword"])
+            self.assertEqual(Counter(gpu for _, gpu in first_wave), {gpu: 1 if gpu == exclusive_gpu else 2 for gpu in "0123"})
+            self.assertGreaterEqual(len(refilled_tasks), 2)
+            for task, result in status["tasks"].items():
+                self.assertEqual(result["exclusive_gpu"], task == "synth_loneword")
+                self.assertEqual(result["gpu_slots_reserved"], 2 if task == "synth_loneword" else 1)
+
+    def test_failed_exclusive_task_wakes_blocked_sibling_without_claiming_more(self):
+        queue = parallel.GpuTaskQueue(["synth_loneword", "cropping"], ["synth_loneword"])
+        self.assertEqual(queue.claim("0", 0), "synth_loneword")
+        entered = threading.Event()
+        result = []
+
+        def sibling():
+            entered.set()
+            result.append(queue.claim("0", 1))
+
+        thread = threading.Thread(target=sibling, daemon=True)
+        thread.start()
+        self.assertTrue(entered.wait(2))
+        queue.finish("0", 0, failed=True)
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [None])
+        self.assertEqual(queue.pending, ["cropping"])
+
+    def test_launch_error_releases_exclusive_gpu_and_returns_failure(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            root = Path(tmp)
+            argv = fixture(root) + ["--exclusive-gpu-tasks", "synth_loneword"]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(parallel.subprocess, "run", side_effect=OSError("fixture launch failure")):
+                self.assertEqual(parallel.main(), 1)
+            status = read_json(root / "pred/parallel_inference_status.json")
+            self.assertFalse(status["success"])
+            self.assertEqual(status["tasks"]["synth_loneword"]["return_code"], 91)
+            self.assertIn("fixture launch failure", status["tasks"]["synth_loneword"]["error"])
+
+    def test_profile_and_yaml_bind_two_inference_workers(self):
         from ui14_checks import render_formal_yaml
         from ui14_profile import profile_environment
         import yaml
@@ -132,15 +218,15 @@ class InferenceWorkersTests(unittest.TestCase):
             path, runtime_path = render_formal_yaml(Path(tmp))
             runtime = read_json(runtime_path)
             document = yaml.safe_load(path.read_text(encoding="utf-8"))
-            self.assertEqual(runtime["EVAL_INFERENCE_WORKERS_PER_GPU"], 1)
-            self.assertEqual(str(document["jobRunParams"]["envsList"]["EVAL_INFERENCE_WORKERS_PER_GPU"]), "1")
+            self.assertEqual(runtime["EVAL_INFERENCE_WORKERS_PER_GPU"], 2)
+            self.assertEqual(str(document["jobRunParams"]["envsList"]["EVAL_INFERENCE_WORKERS_PER_GPU"]), "2")
             self.assertEqual(runtime["GPU_COUNT"], 4)
             self.assertEqual(runtime["PER_DEVICE_TRAIN_BATCH_SIZE"], 1)
             self.assertEqual(runtime["EVAL_DETECTOR_WORKERS_PER_GPU"], 1)
             self.assertEqual(runtime["EVAL_FAIL_POLICY"], "stop")
             env = {**profile_environment(), "GPU_COUNT": "4", "RESOURCE_GROUP": "aiai_locate"}
             with self.assertRaisesRegex(ValueError, "EVAL_INFERENCE_WORKERS_PER_GPU"):
-                common.resolve_runtime_config({**env, "EVAL_INFERENCE_WORKERS_PER_GPU": "2"})
+                common.resolve_runtime_config({**env, "EVAL_INFERENCE_WORKERS_PER_GPU": "1"})
         self.assertEqual(common.resolve_runtime_config({"MACHINE_TYPE": "a800", "GPU_COUNT": "4"})["EVAL_INFERENCE_WORKERS_PER_GPU"], 1)
         for value in ("0", "3"):
             with self.assertRaisesRegex(ValueError, "EVAL_INFERENCE_WORKERS_PER_GPU"):

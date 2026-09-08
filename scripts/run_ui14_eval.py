@@ -122,10 +122,12 @@ def run(args):
     destination = history_dir / "raw" / f"ui14-step-{args.step}"
     state_path = history_dir / f"ui14-step-{args.step}.json"
     started = datetime.now(timezone.utc).isoformat()
-    workers_per_gpu = getattr(args, "eval_inference_workers_per_gpu", 1)
+    workers_per_gpu = getattr(args, "eval_inference_workers_per_gpu", 2)
+    exclusive_gpu_tasks = ["synth_loneword"]
     state = {"status": "running", "sft_step": args.step, "init_checkpoint": str(args.base_model),
              "init_cpt_step": 9000, "identity": identity, "tasks": {}, "started": started,
-             "eval_gpu_devices": args.eval_gpu_devices, "inference_workers_per_gpu": workers_per_gpu}
+             "eval_gpu_devices": args.eval_gpu_devices, "inference_workers_per_gpu": workers_per_gpu,
+             "exclusive_gpu_tasks": exclusive_gpu_tasks}
     repair_metadata = {k: read_json(manifest).get(k) for k in ("repair_run_id", "normalization_id")}
     state.update(repair_metadata)
     write_json(state_path, state)
@@ -134,6 +136,7 @@ def run(args):
         "--input-dir", str(manifest.parent), "--output-dir", str(prediction),
         "--gpu-devices", args.eval_gpu_devices, "--attn-implementation", args.attn_implementation,
         "--workers-per-gpu", str(workers_per_gpu),
+        "--exclusive-gpu-tasks", *exclusive_gpu_tasks,
         "--inference-script", str(PROJECT_ROOT / "scripts" / "inference_ui_defect_locany.py"),
         "--eval-manifest", str(manifest), "--inference-crop-mode", "full_image",
         "--relation-gate-mode", "observe", "--enable-pbd", "--save-raw-answer",

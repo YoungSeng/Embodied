@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import queue
 import shlex
 import subprocess
 import sys
@@ -31,6 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-devices", required=True)
     parser.add_argument("--workers-per-gpu", type=int, choices=(1, 2), default=1,
                         help="Independent inference processes per physical GPU; tasks share one queue")
+    parser.add_argument("--exclusive-gpu-tasks", nargs="*", choices=[t.task_key for t in UI_TASKS], default=[],
+                        help="Tasks that occupy a whole GPU until their subprocess exits; other GPUs remain parallel")
     parser.add_argument(
         "--attn-implementation",
         choices=("sdpa", "magi", "flash_attention_2", "eager", "auto"),
@@ -99,6 +100,38 @@ def parse_args() -> argparse.Namespace:
     args.evaluation_tasks = {r["task_key"]: r for r in read_json(args.eval_manifest)["tasks"]} if args.eval_manifest else {}
     args.tasks = args.tasks or list(args.evaluation_tasks or TASKS)
     return args
+
+
+class GpuTaskQueue:
+    """Atomically claim tasks and reserve a physical GPU for exclusive work."""
+
+    def __init__(self, ordered_tasks, exclusive_tasks=()):
+        self.pending = list(ordered_tasks)
+        self.exclusive = set(exclusive_tasks)
+        self.active: dict[str, dict[int, str]] = {}
+        self.stopped = False
+        self.condition = threading.Condition()
+
+    def claim(self, gpu: str, slot: int) -> str | None:
+        with self.condition:
+            while self.pending and not self.stopped:
+                active = self.active.setdefault(gpu, {})
+                if not any(task in self.exclusive for task in active.values()):
+                    for index, task in enumerate(self.pending):
+                        if task in self.exclusive and active:
+                            continue
+                        self.pending.pop(index)
+                        active[slot] = task
+                        return task
+                self.condition.wait()
+            return None
+
+    def finish(self, gpu: str, slot: int, *, failed: bool = False) -> None:
+        with self.condition:
+            self.active[gpu].pop(slot)
+            if failed:
+                self.stopped = True
+            self.condition.notify_all()
 
 
 def count_jsonl_records(path: Path) -> int:
@@ -404,10 +437,14 @@ def main() -> int:
         else:
             estimates[task] = float(count)
 
-    ordered = sorted(args.tasks, key=lambda task: (-estimates[task], task))
+    exclusive_tasks = set(args.exclusive_gpu_tasks) & set(args.tasks)
+    # Start exclusive work on an empty card first, leaving all other cards free
+    # to fill both slots. It must not wait for a stream of ordinary work to end.
+    ordered = sorted(args.tasks, key=lambda task: (task not in exclusive_tasks, -estimates[task], task))
     print("===== UI5 parallel inference scheduler =====")
     print(f"physical GPUs       : {','.join(gpus)}")
     print(f"workers per GPU     : {args.workers_per_gpu} ({len(worker_slots)} inference process slots total)")
+    print(f"exclusive GPU tasks : {','.join(sorted(exclusive_tasks)) or '<none>'} (other GPUs retain all slots)")
     print(f"logical device      : cuda:0 in every subprocess")
     print(
         "inference crop     : "
@@ -422,9 +459,7 @@ def main() -> int:
             f"estimated={estimates[task]:.2f} ({source})"
         )
 
-    work_queue: queue.PriorityQueue[tuple[float, str]] = queue.PriorityQueue()
-    for task in ordered:
-        work_queue.put((-estimates[task], task))
+    work_queue = GpuTaskQueue(ordered, exclusive_tasks)
 
     summaries_dir = args.output_dir / "_worker_summaries"
     logs_dir = args.output_dir / "_worker_logs"
@@ -495,6 +530,7 @@ def main() -> int:
                 "gpu_devices": gpus,
                 "workers_per_gpu": args.workers_per_gpu,
                 "worker_count": len(worker_slots),
+                "exclusive_gpu_tasks": sorted(exclusive_tasks),
                 "counts": counts,
                 "model_load_preflight": preflight_result,
                 "tasks": {},
@@ -518,90 +554,107 @@ def main() -> int:
         )
 
     lock = threading.Lock()
-    stop_event = threading.Event()
     results: dict[str, dict[str, Any]] = {}
 
-    def run_worker(gpu: str, slot: int) -> None:
+    def run_task(gpu: str, slot: int, task: str) -> int:
         worker_id = f"gpu-{gpu}-worker-{slot}"
-        while not stop_event.is_set():
-            try:
-                _, task = work_queue.get_nowait()
-            except queue.Empty:
-                return
-            summary_path = summaries_dir / f"{task}.json"
-            log_path = logs_dir / f"{task}.log"
-            command = build_command(args, task, gpu, summary_path)
+        summary_path = summaries_dir / f"{task}.json"
+        log_path = logs_dir / f"{task}.log"
+        command = build_command(args, task, gpu, summary_path)
+        print(
+            f"[START] task={task} worker={worker_id} physical_gpu={gpu} logical_device=cuda:0 "
+            f"exclusive_gpu={task in exclusive_tasks} slots_reserved={args.workers_per_gpu if task in exclusive_tasks else 1} "
+            f"command={shlex.join(command)}",
+            flush=True,
+        )
+        started = time.time()
+        return_code = 0
+        error = ""
+        if not args.dry_run:
+            child_env = dict(os.environ)
+            child_env["CUDA_VISIBLE_DEVICES"] = gpu
+            child_env["PYTHONUNBUFFERED"] = "1"
+            with log_path.open("a", encoding="utf-8") as log_handle:
+                log_handle.write(
+                    f"\n===== {datetime.now(timezone.utc).isoformat()} task={task} gpu={gpu} worker={worker_id} =====\n"
+                )
+                log_handle.write(shlex.join(command) + "\n")
+                log_handle.flush()
+                process = subprocess.run(
+                    command,
+                    env=child_env,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+            return_code = process.returncode
+            task_dir = args.output_dir / task
+            prediction_files = list(task_dir.glob("*.json")) if task_dir.is_dir() else []
+            if return_code != 0:
+                error = f"inference subprocess exited with code {return_code}"
+            if return_code == 0 and not prediction_files:
+                return_code = 90
+                error = f"no prediction JSON files found under {task_dir}"
+        elapsed = time.time() - started
+        log_tail = ""
+        if return_code != 0:
+            log_tail = print_failure_log(
+                f"task={task} GPU={gpu}",
+                log_path,
+                args.failure_log_lines,
+            )
+        result = {
+            "task": task,
+            "physical_gpu": gpu,
+            "worker_id": worker_id,
+            "worker_slot": slot,
+            "exclusive_gpu": task in exclusive_tasks,
+            "gpu_slots_reserved": args.workers_per_gpu if task in exclusive_tasks else 1,
+            "logical_device": "cuda:0",
+            "command": command,
+            "return_code": return_code,
+            "elapsed_seconds": round(elapsed, 6),
+            "sample_count": counts[task],
+            "log_path": str(log_path),
+            "summary_path": str(summary_path),
+            "error": error,
+            "log_tail": log_tail,
+        }
+        with lock:
+            results[task] = result
+        if return_code != 0:
             print(
-                f"[START] task={task} worker={worker_id} physical_gpu={gpu} logical_device=cuda:0 "
-                f"command={shlex.join(command)}",
+                f"[FAILED] task={task} GPU={gpu} worker={worker_id} exit_code={return_code} "
+                f"command={shlex.join(command)} log={log_path} error={error}",
                 flush=True,
             )
-            started = time.time()
-            return_code = 0
-            error = ""
-            if not args.dry_run:
-                child_env = dict(os.environ)
-                child_env["CUDA_VISIBLE_DEVICES"] = gpu
-                child_env["PYTHONUNBUFFERED"] = "1"
-                with log_path.open("a", encoding="utf-8") as log_handle:
-                    log_handle.write(
-                        f"\n===== {datetime.now(timezone.utc).isoformat()} task={task} gpu={gpu} worker={worker_id} =====\n"
-                    )
-                    log_handle.write(shlex.join(command) + "\n")
-                    log_handle.flush()
-                    process = subprocess.run(
-                        command,
-                        env=child_env,
-                        stdout=log_handle,
-                        stderr=subprocess.STDOUT,
-                        check=False,
-                    )
-                return_code = process.returncode
-                task_dir = args.output_dir / task
-                prediction_files = list(task_dir.glob("*.json")) if task_dir.is_dir() else []
-                if return_code != 0:
-                    error = f"inference subprocess exited with code {return_code}"
-                if return_code == 0 and not prediction_files:
-                    return_code = 90
-                    error = f"no prediction JSON files found under {task_dir}"
-            elapsed = time.time() - started
-            log_tail = ""
-            if return_code != 0:
-                log_tail = print_failure_log(
-                    f"task={task} GPU={gpu}",
-                    log_path,
-                    args.failure_log_lines,
-                )
-            result = {
-                "task": task,
-                "physical_gpu": gpu,
-                "worker_id": worker_id,
-                "worker_slot": slot,
-                "logical_device": "cuda:0",
-                "command": command,
-                "return_code": return_code,
-                "elapsed_seconds": round(elapsed, 6),
-                "sample_count": counts[task],
-                "log_path": str(log_path),
-                "summary_path": str(summary_path),
-                "error": error,
-                "log_tail": log_tail,
-            }
-            with lock:
-                results[task] = result
-            if return_code != 0:
-                stop_event.set()
-                print(
-                    f"[FAILED] task={task} GPU={gpu} worker={worker_id} exit_code={return_code} "
-                    f"command={shlex.join(command)} log={log_path} error={error}",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"[DONE] task={task} GPU={gpu} worker={worker_id} elapsed={elapsed:.1f}s log={log_path}",
-                    flush=True,
-                )
-            work_queue.task_done()
+        else:
+            print(
+                f"[DONE] task={task} GPU={gpu} worker={worker_id} elapsed={elapsed:.1f}s log={log_path}",
+                flush=True,
+            )
+        return return_code
+
+    def run_worker(gpu: str, slot: int) -> None:
+        while True:
+            task = work_queue.claim(gpu, slot)
+            if task is None:
+                return
+            failed = True
+            try:
+                failed = run_task(gpu, slot, task) != 0
+            except Exception as exc:
+                with lock:
+                    results[task] = {
+                        "task": task, "physical_gpu": gpu, "worker_id": f"gpu-{gpu}-worker-{slot}",
+                        "worker_slot": slot, "return_code": 91, "error": f"{type(exc).__name__}: {exc}",
+                        "exclusive_gpu": task in exclusive_tasks,
+                        "gpu_slots_reserved": args.workers_per_gpu if task in exclusive_tasks else 1,
+                    }
+                print(f"[FAILED] task={task} GPU={gpu} worker={slot} scheduler error: {exc}", file=sys.stderr, flush=True)
+            finally:
+                # Wake blocked sibling slots on success, failure and launch errors.
+                work_queue.finish(gpu, slot, failed=failed)
 
     threads = [
         threading.Thread(target=run_worker, args=(gpu, slot), name=f"gpu-{gpu}-worker-{slot}", daemon=False)
@@ -622,6 +675,7 @@ def main() -> int:
         "gpu_devices": gpus,
         "workers_per_gpu": args.workers_per_gpu,
         "worker_count": len(worker_slots),
+        "exclusive_gpu_tasks": sorted(exclusive_tasks),
         "counts": counts,
         "model_load_preflight": preflight_result,
         "tasks": results,
@@ -643,6 +697,7 @@ def main() -> int:
                     / max(1, result["sample_count"]),
                     "physical_gpu": result["physical_gpu"],
                     "workers_per_gpu": args.workers_per_gpu,
+                    "exclusive_gpu": result["exclusive_gpu"],
                     "updated_at": status["finished_at"],
                 }
         atomic_write_json(
