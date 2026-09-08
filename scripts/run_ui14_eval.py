@@ -61,6 +61,8 @@ def score_ui9(spec, prediction_dir, destination):
     result = build_metrics_summary(evaluate_merged_file(str(merged_path), key, 0.1, include_figma=True))
     result.update(positive_count=positives, negative_count=negatives, source_dataset=spec["source_dataset"],
                   source_version=spec["source_version"], task_id=spec["task_id"], view_policy=spec["view_policy"])
+    if "negative_quota_policy" in spec:
+        result.update(negative_quota_policy=spec["negative_quota_policy"], evaluation_balance="observed_counts")
     gate_summary = {"samples": len(merged), "positive_count": positives, "negative_count": negatives,
                     "p_defect_pos": sum(scores[True])/len(scores[True]) if scores[True] else None,
                     "p_defect_neg": sum(scores[False])/len(scores[False]) if scores[False] else None,

@@ -14,6 +14,34 @@ from eaglevl.train.ui5_excel_logger import build_eval_rows
 
 
 class Neg11EvaluationTests(unittest.TestCase):
+    def test_real_scoring_preserves_unbalanced_and_zero_negative_counts(self):
+        from run_ui14_eval import score_ui9
+        with tempfile.TemporaryDirectory() as tmp,contextlib.redirect_stdout(io.StringIO()):
+            root=Path(tmp);task=UI_TASKS[11];test=root/"test.jsonl"
+            rows=[]
+            for i in range(3):
+                path=str(root/f"image-{i}.png")
+                rows.append({"source_image":path,"source_image_id":str(i),"boxes_px":[[1,2,10,20]]})
+                write_json(root/"pred"/task.task_key/"gate"/f"{i}.json",{
+                    "image_path":path,"prediction_status":"ok","final_boxes_pixel_xyxy":[[1,2,10,20]]})
+            spec={**task.to_dict(),"test":str(test),"negative_quota_policy":"available"}
+            spec.setdefault("source_version","fixture")
+            write_jsonl(test,rows)
+            metric,_=score_ui9(spec,root/"pred",root/"score-zero")
+            self.assertEqual((metric["positive_count"],metric["negative_count"]),(3,0))
+            self.assertEqual(metric["negative_quota_policy"],"available")
+            self.assertEqual(metric["image"]["tn"],0)
+            self.assertNotIn("tn",metric["bbox"])
+            normal=str(root/"normal.png")
+            rows.append({"source_image":normal,"source_image_id":"normal","boxes_px":[]})
+            write_jsonl(test,rows)
+            write_json(root/"pred"/task.task_key/"gate/normal.json",{
+                "image_path":normal,"prediction_status":"ok","final_boxes_pixel_xyxy":[]})
+            metric,_=score_ui9(spec,root/"pred",root/"score-mixed")
+            self.assertEqual((metric["positive_count"],metric["negative_count"]),(3,1))
+            self.assertEqual(metric["image"]["tn"],1)
+            self.assertEqual(metric["image"]["f1"],1.)
+
     def test_periodic_composite_eval_opens_cached_verification_session(self):
         import run_ui14_eval as evaluation
         from ui14_verification import current_checks

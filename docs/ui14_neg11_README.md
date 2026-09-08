@@ -1,6 +1,27 @@
-# UI14：七个合成任务补充 1:1 正常原图
+# UI14：补充实际可用的正常原图，七个合成任务按 1:1 采样
 
 基于 `e06add6b0b3c05b3f66384cf93331a0c94c076e8`，分支 `codex/m32-cpt9000-ui14-neg11-v1`。旧训练继续运行。所有命令从新 checkout 执行；入口拒绝新输出与旧数据、旧代码、原始 UI9 或旧模型输出目录重叠。
+
+2026-09-09 按用户选择改为较快的 `available` 策略：保留全部旧正例和冻结 split，使用实际有证据、去重且无 split 冲突的正常图，最多补至独立原图 1:1，缺口只统计。七项训练采样仍为 1:1（有正负两侧时）；单侧标签使用实际样本。test 不重采样、不补重复行，记录实际正负数，允许 negative_count=0。历史 `neg11` 分支、profile 和输出目录名称沿用，不代表 test 必定 1:1。
+
+已有失败 inventory 的最快恢复方式：**不必重跑 inventory/audit-raw**，直接执行下列 CPU 命令。normalize 校验原摘要、选样清单、页面映射及图片验证记录后，复用旧 selection，将未冻结 inventory 的策略改为 available；候选图片扫描为 0。旧 inventory 留存于 `inventory_history/<原 inventory_id>.json`。首次选中图或属性发生变化的图片仍执行必要内容检查。
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui14-neg11
+export UI9_DATA_ROOT=/mnt/bn/intelligent-service-yg/dataset/gui/ui9_datasets_v1
+export UI14_PARENT_DATA_ROOT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_data/ui14_cpt9000_repair_v2
+export UI14_DATA_ROOT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_data/ui14_cpt9000_neg11_v1
+export UI14_NEGATIVE_QUOTA_POLICY=available
+
+bash shell/ui14_neg11_a800.sh normalize &&
+UI14_PREPARE_WORKERS=16 bash shell/ui14_neg11_a800.sh cache-prepare
+```
+
+随后按下文④申请独立四卡做 cache，结束即释放预处理 GPU，回 CPU 做 cache-finalize/finalize/check/submit。旧训练继续运行。没有确认 raw 正常语义，也没有将文件名配对自动升级为 clean 证据。按用户已提供 inventory，现成合格 selection 为 12,323 张 task/split 独立正常图，其中 test 1,199；cropping/loneword 原图负例仍为 0，训练中的背景正常裁片保留。实际新 run 数量以当前清单校验结果为准。
+
+需要保留旧的严格门槛时，inventory/normalize 可显式传 `--negative-quota-policy strict`。**已经冻结的扩展数据不因 CLI 默认值改变而换策略或 eval_set_id**；旧无策略字段的冻结版本仍解释为 strict。
+
+本轮验证结果见 [实际可用负例 CPU 增量报告](ui14_available_negatives_cpu_report.md)。下文历史入口和资源分离方式继续使用。
 
 ## 独立 checkout 与默认路径
 
@@ -41,7 +62,9 @@ bash shell/ui14_neg11_a800.sh inventory
 
 读取旧规范化快照、原 train/test、source_metadata、复制 SQLite/JSON 清单及各来源 `sample_imgs/_folders/`。输出 `inventory_summary.json` 配额表、`negative_candidates.jsonl`、`negative_rejections.jsonl`、`negative_selection.proposed.jsonl`、`negative_page_assignments.json`、`negative_split_overlap.json`、`normal_pairs.html`。
 
-成功标志：`stage_summaries/inventory.json.status=complete`。配额表的 `gap=0` 才能进入 normalize；inventory 即使有缺口也保存完整盘点结果。目标由旧规范化数据的独立 RGB 内容身份计算，用户给出的 9,600 张正例 test 只作参考核对。
+成功标志：`stage_summaries/inventory.json.status=complete`。默认 available 下 `gap` 是距独立原图 1:1 的统计缺口，`gap_blocks_normalize=false`；strict 下仍需 gap=0。目标由旧规范化数据的独立 RGB 内容身份计算，用户给出的 9,600 张正例 test 只作参考核对。
+
+inventory 同时输出 `local_candidate_discovery/candidates.jsonl` 和 `summary.json`，记录未引用 local 文件与同任务页面的配对线索。该发现过程不解码图片、不新增标签；文件夹名称或文件名匹配不会绕过证据检查。无需为了本次最快恢复额外运行 inventory。
 
 配对 `LocalImgURL` 采用导出器的正常图语义；`RawImgURL` 还需明确的合成前底图或当前任务 clean 证据。路径命中、其他任务负标签、无标注、名为 raw 的目录均不构成 clean 证据。缺口不会通过复制行填满。
 
@@ -129,12 +152,14 @@ bash shell/ui14_neg11_a800.sh check
 直接组装已完成标签和缓存，不重新解码/裁图。输出：
 
 - `training_recipe.json`、`task_registry.json`、`evaluation_manifest.json`：14 项。
-- `negative_image_counts.json`：每 task/split 独立原图正负 1:1、派生 crop 正负数。
-- `sampling_stats.json`：共享 sampler 的真实抽样模拟，含 clean_source_image/background_crop 数量。
+- `negative_image_counts.json`：每 task/split 独立原图实际正负数、实际比例、独立 1:1 缺口、派生 crop 正负数。
+- `sampling_stats.json`：共享 sampler 的真实抽样模拟，含 clean_source_image/background_crop 数量、实际抽样比例及两侧标签是否均存在。
 - `cpu_check_report.json`：父/子身份、路径、标签、坐标、分片绑定、重叠及检查结果；成功为 ready=true。
 - `formal_job.yaml`、`formal_runtime.json`：新目录四卡正式配置。
 
 仅七个 synth recipe 声明 `negative_to_positive_ratio=1.0`，已接到真实训练 sampler；全局 `UI_NEGATIVE_TO_POSITIVE_RATIO=2` 和其余七项旧 recipe 不变。任务均衡、源图均衡、crop 轮换不变；正常裁片继续作为 background_crop，完整正常图作为 clean_source_image。
+
+finalize/check 不要求 available 数据集的独立图数相等，但仍逐项核对冻结配额中的实际正例数和已选负例数：丢失任何已选图片、删除旧正例、篡改 test 正负计数仍会失败。策略、缺口和实际数量写入快照、扩展清单、recipe、评测清单及 CPU 报告，数据版本身份随之绑定。
 
 需要独立全量 CPU 内容复核时：
 

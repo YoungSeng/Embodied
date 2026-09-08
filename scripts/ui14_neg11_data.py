@@ -1,6 +1,6 @@
 """Read-only parent snapshot plus independently bound task-specific clean images.
 
-No detector or model is imported here. Missing evidence or quota fails closed.
+No detector or model is imported here. Missing evidence never creates a label.
 """
 from __future__ import annotations
 from collections import Counter, defaultdict
@@ -15,6 +15,7 @@ from ui14_common import *
 from ui14_verification import current_checks, signature
 from ui14_progress import phase, track
 from ui9_source_parser import Resolver, image_slots, page_key
+from ui14_negative_quota import quota_policy, inventory_policy_fields, reuse_inventory_policy
 
 PARENT_COMMIT = "e06add6b0b3c05b3f66384cf93331a0c94c076e8"
 NEG_DATA = WORKSPACE + "/gui_data/ui14_cpt9000_neg11_v1"
@@ -179,6 +180,7 @@ def inventory(args):
         return previous
     checks = current_checks(); resolver = ReferenceResolver(source)
     frozen = defaultdict(set); candidates = []; rejected = []; targets = {}; old_rows = []
+    declared_local_paths = set()
     old_ui5_rows = []
     for task, split, rows in source_rows(parent):
         old_rows.extend(rows)
@@ -235,6 +237,7 @@ def inventory(args):
                     # All references inherit their original positive's split,
                     # including unevidenced raw references; they cannot leak later.
                     frozen["reference:"+str(path)].add(split)
+                    if role=="normal": declared_local_paths.add((task.task_key,str(path)))
                     if not evidence:
                         rejected.append({"task_key":task.task_key,"split":split,"reference":str(path),
                                          "reason":"raw reference lacks explicit pre-synthesis/task-clean evidence"}); continue
@@ -247,6 +250,8 @@ def inventory(args):
                         "source_split":raw.get("split"), "source_jsonl":str(source_path),
                         "raw_parent_paths":sorted(set(raw_parents)),
                         "selection_priority":0 if role=="normal" else 1, "original_reference":value})
+    from ui14_local_candidates import discover_local_candidates
+    discover_local_candidates(root,resolver,SYNTH,old_rows,declared_local_paths)
     # A pool needs task-specific clean evidence; neither another task's negative
     # label nor a raw folder name establishes this. Support explicit local pools.
     pools = sorted({p for task in SYNTH for pattern in ("normal_pool*.jsonl","negative_pool*.jsonl")
@@ -353,6 +358,7 @@ def inventory(args):
         "gap":sum(t["gap"] for t in targets.values()),
         "existing_conflicting_groups":sum(len(s)>1 for s in memberships.values()),
         "new_cross_split_groups":0,"selection_basis":"source evidence, frozen page/content, seed=42; no model outputs"}
+    payload.update(inventory_policy_fields(targets, getattr(args,"negative_quota_policy","available")))
     payload["inventory_id"]=digest(payload)
     save_if_changed(root/"inventory_summary.json",payload)
     from prepare_ui14_sft import image_overlaps
@@ -369,7 +375,7 @@ def inventory(args):
     save_if_changed(root/"negative_split_overlap.json",overlap)
     for key,t in targets.items():
         print(f"[inventory] {key}: positive={t['positive_images']} candidates={t['candidate_images']} "
-              f"selected={t['selected_images']} gap={t['gap']}",flush=True)
+              f"selected={t['selected_images']} gap={t['gap']} policy={payload['negative_quota_policy']}",flush=True)
     gallery(root,selected)
     return payload
 
@@ -406,7 +412,11 @@ def normalize(args):
         raise ValueError("Inventory page assignments changed")
     parent_now=parent_binding(parent)
     if parent_now["parent_normalization_id"]!=inv["parent_normalization_id"]: raise ValueError("Parent version changed")
-    if inv["gap"]: raise ValueError(f"Independent negative quota not met: gap={inv['gap']}; inspect inventory and evidence pools")
+    marker=root/"negative_extension_manifest.json"
+    requested_policy=getattr(args,"negative_quota_policy","available")
+    effective_policy=quota_policy(inv) if marker.exists() else requested_policy
+    if effective_policy=="strict" and inv["gap"]:
+        raise ValueError(f"Independent negative quota not met: gap={inv['gap']}; inspect inventory and evidence pools")
     for path,h in inv["files"].items():
         if file_digest(path)!=h: raise ValueError(f"Inventory input changed: {path}")
     proposed=root/"negative_selection.proposed.jsonl"
@@ -416,11 +426,16 @@ def normalize(args):
     for row in selected:
         if image_identity(row["source_image"])!=(row["source_image_id"],row["width"],row["height"]):
             raise ValueError("Selected normal image changed; rerun inventory before selection is frozen")
-    marker=root/"negative_extension_manifest.json"
+    # Only a policy transition of an unfrozen selection is permitted. Source,
+    # page-map, selection and actual normal-image evidence were checked above.
+    inv=reuse_inventory_policy(root,inv,requested_policy)
     body={"schema_version":1,"kind":"ui14_negative_extension",**parent_now,"seed":SEED,
           "inventory_id":inv["inventory_id"],"selection_sha256":inv["proposed_selection_sha256"],
           "page_assignments_sha256":inv["page_assignments_sha256"],"targets":inv["targets"],
           "selection_file":str(root/"negative_selection.jsonl")}
+    if "negative_quota_policy" in inv:
+        body.update(inventory_policy_fields(inv["targets"],quota_policy(inv)),
+                    one_to_one_shortfall=inv["gap"])
     # Pool exports are extension inputs, not fictitious entries in the old
     # repair's after counts. Preserve their original inventory digests, too.
     body["pool_files"]={p:h for p,h in inv["files"].items() if p not in parent_now["files"]}
@@ -441,6 +456,8 @@ def normalize(args):
     parent_snap=read_json(parent/"source_snapshot.json")
     snapshot={**parent_snap,"kind":"ui14_negative_extension","parent_normalization_id":parent_snap["normalization_id"],
               "parent_snapshot_sha256":file_digest(parent/"source_snapshot.json"),"extension_id":body["extension_id"]}
+    if "negative_quota_policy" in body:
+        snapshot["negative_quota_policy"]=quota_policy(body)
     snapshot.pop("normalization_id"); snapshot["normalization_id"]=digest(snapshot)
     save_if_changed(root/"source_snapshot.json",snapshot)
     registry_doc=read_json(parent/"task_registry.json")
@@ -484,6 +501,7 @@ def normalize(args):
     report={"ready":False,"normalization_complete":True,"normalization_id":snapshot["normalization_id"],
         "repair_run_id":body["repair_run_id"],"extension_id":body["extension_id"],"parent_version":body["parent_normalization_id"],
         "normalization_resume":stats,"cpu_only":True,"gpu_loaded":False}
+    report.update(inventory_policy_fields(inv["targets"],quota_policy(inv)), one_to_one_shortfall=inv["gap"])
     # The unchanged, complete path returned above preserves finalize. Rebuilt
     # artifacts require a new final check, even when their labels are identical.
     write_json(root/"cpu_check_report.json",report)
@@ -502,6 +520,7 @@ def validate_extension(root):
     if snap["extension_id"]!=ext["extension_id"]: raise ValueError("Wrong extension snapshot")
     if snap["parent_normalization_id"]!=ext["parent_normalization_id"]:
         raise ValueError("Wrong parent normalization")
+    if quota_policy(snap)!=quota_policy(ext): raise ValueError("Wrong negative quota policy")
     required={str(paths_for(root,t.task_key,s)[k].relative_to(root))
               for t in UI9_TASKS for s in ("train","test")
               for k in ("normalized","detector_input","detector_inputs")}

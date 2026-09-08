@@ -79,18 +79,21 @@ class Neg11Tests(unittest.TestCase):
         return SimpleNamespace(data_root=self.root/name,parent_root=self.parent,source_root=self.source,
                                init_checkpoint=self.init,ui5_cache=self.ui5cache,full_verify=False)
 
-    def normalize_new(self,args):
+    def normalize_new(self,args,missing_negatives=0):
         data.seed_evidence(args.data_root,args.parent_root)
         with verification_session(args.data_root):
             report=data.inventory(args)
-            self.assertEqual(report["gap"],0)
-            self.assertEqual(report["selected_count"],14)
+            self.assertEqual(report["gap"],missing_negatives)
+            self.assertEqual(report["selected_count"],14-missing_negatives)
             data.normalize(args)
 
     def test_full_composite_cpu_path_and_incremental_cache(self):
         args=self.options("new");root=args.data_root
         with contextlib.redirect_stdout(io.StringIO()):
-            self.normalize_new(args)
+            evidence=data.eligible_evidence
+            with mock.patch.object(data,"eligible_evidence",side_effect=lambda raw,role,task:
+                                   None if task=="synth_radius" else evidence(raw,role,task)):
+                self.normalize_new(args,missing_negatives=2)
             with verification_session(root):
                 summary=import_parent_cache(root,self.parent)
                 self.assertGreater(summary["parent_pngs_referenced"],0)
@@ -103,7 +106,7 @@ class Neg11Tests(unittest.TestCase):
                         opts=detector.parse_args(["--stage","prepare","--input-dir",str(p["detector_input"].parent),
                             "--task-input-manifest",str(p["detector_inputs"]),"--data-split",split,"--output-dir",str(p["cache"]),
                             "--parser-root",str(root),"--cache-scope","full_test" if split=="test" else "full_train",
-                            "--expected-unique-images",str(2 if task.task_id>=7 else 1),"--resume","--no-skip-figma","--visualization-samples","1"])
+                            "--expected-unique-images",str(2 if task.task_id>=7 and task.task_key!="synth_radius" else 1),"--resume","--no-skip-figma","--visualization-samples","1"])
                         config=read_json(p["cache"]/"detections/detector_config.json")
                         with mock.patch.object(detector,"detector_config",return_value=config):
                             unique=detector.prepare_manifest(opts,image_info_loader=journal.load,allow_selection_refresh=True)
@@ -130,7 +133,7 @@ class Neg11Tests(unittest.TestCase):
                         write_jsonl(p["cache"]/"detections/merged/detections.jsonl",merged)
                         with mock.patch.object(detector,"generate_detector_scan_plan",wraps=detector.generate_detector_scan_plan) as plan:
                             detector.build_scan_crops(opts)
-                            self.assertEqual(plan.call_count,1 if task.task_id>=7 else 0)
+                            self.assertEqual(plan.call_count,1 if task.task_id>=7 and task.task_key!="synth_radius" else 0)
                         from ui14_crop_materialization import materialize_split
                         normalized=list(read_jsonl(p["normalized"]))
                         derived=materialize_split(root,task,split,normalized)
@@ -147,14 +150,22 @@ class Neg11Tests(unittest.TestCase):
                 recipe=read_json(root/"training_recipe.json")
                 for task in UI_TASKS:
                     self.assertEqual(recipe_sampling_ratio(recipe[task.task_key]),1. if task.task_id>=7 else 2.)
-                for r in read_json(root/"negative_image_counts.json").values():
-                    self.assertEqual((r["positive_images"],r["negative_images"]),(1,1))
+                for key,r in read_json(root/"negative_image_counts.json").items():
+                    self.assertEqual((r["positive_images"],r["negative_images"]),(1,0) if key.startswith("synth_radius/") else (1,1))
+                report=read_json(root/"cpu_check_report.json")
+                self.assertTrue(report["ready"])
+                self.assertEqual(report["negative_quota_policy"],"available")
+                self.assertEqual(report["one_to_one_shortfall"],2)
+                spec=read_json(root/"evaluation_manifest.json")["tasks"][9]
+                self.assertEqual((spec["positive_count"],spec["negative_count"]),(1,0))
                 before={p:p.read_bytes() for p in (root/"training_recipe.json",root/"task_registry.json",root/"evaluation_manifest.json")}
                 with mock.patch.object(Image,"open",side_effect=AssertionError("repeat normalize image read")):
                     data.normalize(args)
                 self.assertEqual(before,{p:p.read_bytes() for p in before})
                 stats=read_json(root/"sampling_stats.json")
-                for task in data.SYNTH:self.assertEqual(stats[task.task_key]["sampled_positive"],stats[task.task_key]["sampled_negative"])
+                for task in data.SYNTH:
+                    if stats[task.task_key]["both_labels_available"]:
+                        self.assertEqual(stats[task.task_key]["sampled_positive"],stats[task.task_key]["sampled_negative"])
         for p,(content,mtime) in self.parent_bytes.items():
             self.assertEqual(p.read_bytes(),content);self.assertEqual(p.stat().st_mtime_ns,mtime)
 
@@ -181,6 +192,7 @@ class Neg11Tests(unittest.TestCase):
 
     def test_cross_split_content_alias_is_rejected_and_deficit_blocks_normalize(self):
         args=self.options("conflict");data.seed_evidence(args.data_root,args.parent_root)
+        args.negative_quota_policy="strict"
         original=data.ReferenceResolver.resolve
         def alias(resolver,value,task):
             if task=="synth_radius" and "normal-train" in str(value):
@@ -205,6 +217,56 @@ class Neg11Tests(unittest.TestCase):
             with mock.patch.object(Image,"open",side_effect=AssertionError("inventory reread image")):
                 second=data.inventory(args)
             self.assertEqual(first,second)
+
+    def test_failed_legacy_inventory_reuses_selection_without_image_scan(self):
+        args=self.options("legacy-gap");args.negative_quota_policy="strict"
+        data.seed_evidence(args.data_root,args.parent_root)
+        original=data.eligible_evidence
+        with contextlib.redirect_stdout(io.StringIO()),verification_session(args.data_root):
+            with mock.patch.object(data,"eligible_evidence",side_effect=lambda raw,role,task:
+                                   None if task=="synth_radius" else original(raw,role,task)):
+                inv=data.inventory(args)
+            for key in ("negative_quota_policy","gap_blocks_normalize","sampling_negative_to_positive_ratio",
+                        "evaluation_balance","zero_negative_splits","inventory_id"):
+                inv.pop(key,None)
+            inv["inventory_id"]=digest(inv)
+            write_json(args.data_root/"inventory_summary.json",inv)
+            protected=[args.data_root/name for name in ("negative_selection.proposed.jsonl","negative_page_assignments.json")]
+            before={p:(p.read_bytes(),p.stat().st_mtime_ns) for p in protected}
+            args.negative_quota_policy="available"
+            with mock.patch.object(Image,"open",side_effect=AssertionError("migration reread image")),\
+                 mock.patch.object(data,"inventory",side_effect=AssertionError("migration rescanned inventory")):
+                data.normalize(args)
+                snap=data.validate_extension(args.data_root)
+                self.assertEqual(snap["negative_quota_policy"],"available")
+                migrated=read_json(args.data_root/"inventory_summary.json")
+                self.assertEqual(migrated["gap"],2)
+                self.assertFalse(migrated["gap_blocks_normalize"])
+                self.assertEqual(migrated["parent_inventory_id"],inv["inventory_id"])
+                self.assertEqual(read_json(args.data_root/"inventory_history"/(inv["inventory_id"]+".json")),inv)
+                # An explicit different CLI default cannot mutate a frozen set.
+                args.negative_quota_policy="strict"
+                data.normalize(args)
+                self.assertEqual(data.validate_extension(args.data_root),snap)
+            self.assertEqual(before,{p:(p.read_bytes(),p.stat().st_mtime_ns) for p in protected})
+
+    def test_completed_legacy_strict_snapshot_survives_new_default(self):
+        args=self.options("legacy-complete");args.negative_quota_policy="strict"
+        data.seed_evidence(args.data_root,args.parent_root)
+        with contextlib.redirect_stdout(io.StringIO()),verification_session(args.data_root):
+            inv=data.inventory(args)
+            for key in ("negative_quota_policy","gap_blocks_normalize","sampling_negative_to_positive_ratio",
+                        "evaluation_balance","zero_negative_splits","inventory_id"):
+                inv.pop(key,None)
+            inv["inventory_id"]=digest(inv)
+            write_json(args.data_root/"inventory_summary.json",inv)
+            data.normalize(args)
+            snap=data.validate_extension(args.data_root)
+            self.assertNotIn("negative_quota_policy",snap)
+            args.negative_quota_policy="available"
+            with mock.patch.object(Image,"open",side_effect=AssertionError("legacy resume image read")):
+                data.normalize(args)
+                self.assertEqual(data.validate_extension(args.data_root),snap)
 
     def test_isolation_rejects_parent_or_training_output_writes(self):
         with self.assertRaises(ValueError):data.assert_isolated(self.parent,self.parent,self.source)

@@ -3,6 +3,7 @@ from collections import Counter
 from pathlib import Path
 from ui14_common import *
 from ui14_neg11_data import SYNTH, save_if_changed, validate_extension
+from ui14_negative_quota import quota_policy, extension_quota, image_quota_counts
 from ui14_annotations import training_record, answer, crop_boxes
 from ui14_verification import current_checks
 from ui14_progress import track
@@ -19,6 +20,7 @@ def image_counts(rows):
 def finalize(args):
     root,parent=Path(args.data_root),Path(args.parent_root)
     snapshot=validate_extension(root)
+    extension=extension_quota(root,snapshot)
     parent_recipe=read_json(parent/"training_recipe.json")
     parent_eval=read_json(parent/"evaluation_manifest.json")
     registry=read_json(root/"task_registry.json")
@@ -42,9 +44,7 @@ def finalize(args):
             else:
                 derived=[training_record(r,task,r["source_image"],r["boxes_px"],r["width"],r["height"]) for r in rows]
                 save_if_changed(p["derived"],derived,True)
-            counts=image_counts(rows)
-            if counts["positive_images"]!=counts["negative_images"]:
-                raise ValueError(f"Independent image quota not 1:1: {task.task_key}/{split}: {counts}")
+            counts=image_quota_counts(extension,f"{task.task_key}/{split}",image_counts(rows))
             counts.update(derived_records=len(derived),derived_positive=sum(is_positive_ui_defect(r) for r in derived),
                           derived_negative=sum(not is_positive_ui_defect(r) for r in derived),
                           negative_kinds=dict(Counter(negative_kind(r) for r in derived)))
@@ -52,7 +52,8 @@ def finalize(args):
             if split=="train":
                 train=derived
                 recipes[task.task_key]={**parent_recipe[task.task_key],"annotation":str(p["derived"]),"length":len(derived),
-                    "negative_to_positive_ratio":1.0,"negative_pool_balance":"source_image","extension_id":snapshot["extension_id"]}
+                    "negative_to_positive_ratio":1.0,"negative_pool_balance":"source_image","extension_id":snapshot["extension_id"],
+                    "negative_quota_policy":quota_policy(snapshot),"source_image_counts":counts}
             else:
                 by_image={}
                 for row in rows:
@@ -69,6 +70,8 @@ def finalize(args):
                 evaluation.append({**spec,"split":"test","cache":str(p["cache"]) if task.view_policy=="crops" else None,
                     "skip_figma":False,"scan_name":SCAN_NAME,"expected_records":len(by_image),
                     "positive_count":counts["positive_images"],"negative_count":counts["negative_images"],
+                    "negative_quota_policy":quota_policy(snapshot),"evaluation_balance":"observed_counts",
+                    "source_image_counts":counts,
                     "data_sha256":file_digest(test),"parent_positive_test":parent_eval["tasks"][task.task_id]["test"]})
         registry["tasks"][task.task_id]=spec
     # The exact ratio used by the real dataset loader also drives this simulation.
@@ -85,6 +88,9 @@ def finalize(args):
             "sampled_negative":sum(not is_positive_ui_defect(train[i]) for i in draws),
             "sampled_negative_kinds":dict(Counter(negative_kind(train[i]) for i in draws)),
             "image_counts":originals.get(f"{task.task_key}/train")}
+        stat=statistics[task.task_key]
+        stat.update(actual_sampled_negative_to_positive_ratio=stat["sampled_negative"]/stat["sampled_positive"] if stat["sampled_positive"] else None,
+                    both_labels_available=bool(stat["derived_positive"] and stat["derived_negative"]))
     eval_id=digest({"normalization_id":snapshot["normalization_id"],
                     "test_files":{r["task_key"]:file_digest(r["test"]) for r in evaluation},
                     "scoring":"UI5 no_figma; UI9 all; IoU=.1; illegal outputs penalized"})
@@ -93,7 +99,8 @@ def finalize(args):
     save_if_changed(root/"task_registry.json",registry)
     save_if_changed(root/"evaluation_manifest.json",{"schema_version":3,"tasks":evaluation,"eval_set_id":eval_id,
         "repair_run_id":snapshot["repair_run_id"],"normalization_id":snapshot["normalization_id"],
-        "parent_normalization_id":snapshot["parent_normalization_id"],"extension_id":snapshot["extension_id"]})
+        "parent_normalization_id":snapshot["parent_normalization_id"],"extension_id":snapshot["extension_id"],
+        "negative_quota_policy":quota_policy(snapshot),"evaluation_balance":"observed_counts"})
     save_if_changed(root/"sampling_stats.json",statistics)
     save_if_changed(root/"negative_image_counts.json",originals)
     return check(args)
@@ -101,10 +108,12 @@ def finalize(args):
 
 def check(args):
     root,parent=Path(args.data_root),Path(args.parent_root)
-    snap=validate_extension(root); checks=current_checks()
+    snap=validate_extension(root); checks=current_checks(); extension=extension_quota(root,snap)
     write_json(root/"cpu_check_report.json",{"ready":False,"normalization_complete":True,
         "normalization_id":snap["normalization_id"],"stage":"neg11_final_cpu_check"})
     recipe=read_json(root/"training_recipe.json"); evaluation=read_json(root/"evaluation_manifest.json")
+    if quota_policy(evaluation)!=quota_policy(snap): raise ValueError("Evaluation quota policy changed")
+    reported_counts=read_json(root/"negative_image_counts.json")
     registry=read_json(root/"task_registry.json")
     from eaglevl.ui_task_registry import validate_registry
     validate_registry(registry["tasks"],14); validate_registry(evaluation["tasks"],14)
@@ -121,6 +130,8 @@ def check(args):
             for name in (entry["annotation"],spec["test"]): external[name]=file_digest(name)
         else:
             if recipe_sampling_ratio(entry)!=1.0: raise ValueError("Synthetic sampler ratio must be 1")
+            if quota_policy(entry)!=quota_policy(snap) or quota_policy(spec)!=quota_policy(snap):
+                raise ValueError("Recipe/task evaluation quota policy changed")
             for split in ("train","test"):
                 p=paths_for(root,task.task_key,split); rows=list(read_jsonl(p["normalized"]))
                 old=list(read_jsonl(paths_for(parent,task.task_key,split)["normalized"]))
@@ -128,8 +139,12 @@ def check(args):
                 for current,previous in zip(rows,old):
                     if any(current.get(k)!=v for k,v in previous.items() if k!="normalization_id"):
                         raise ValueError("Frozen parent annotation was modified")
-                counts=image_counts(rows)
-                if counts["positive_images"]!=counts["negative_images"]: raise ValueError("Original image quota must be 1:1")
+                counts=image_quota_counts(extension,f"{task.task_key}/{split}",image_counts(rows))
+                saved=reported_counts[f"{task.task_key}/{split}"]
+                if any(saved[k]!=counts[k] for k in ("positive_images","negative_images","total_images")):
+                    raise ValueError("Reported source image counts changed")
+                if split=="test" and (spec["positive_count"],spec["negative_count"])!=(counts["positive_images"],counts["negative_images"]):
+                    raise ValueError("Evaluation manifest positive/negative counts changed")
                 by_record={r["source_record_id"]:r for r in rows}
                 checks.prefetch_images(r["source_image"] for r in rows)
                 for r in rows:
@@ -181,7 +196,10 @@ def check(args):
         "parent_normalization_id":snap["parent_normalization_id"],"eval_set_id":evaluation["eval_set_id"],
         "init_checkpoint":str(args.init_checkpoint),"init_cpt_step":9000,"sft_start_step":0,"initialization":initialization,
         "artifact_digests":bindings,"external_digests":external,"verification":checks.counts,
-        "negative_counts":read_json(root/"negative_image_counts.json"),"errors":[]}
+        "negative_counts":reported_counts,"errors":[]}
+    report.update(negative_quota_policy=quota_policy(snap),evaluation_balance="observed_counts",
+                  one_to_one_shortfall=sum(max(0,c["positive_images"]-c["negative_images"]) for c in reported_counts.values()),
+                  zero_negative_splits=[k for k,c in report["negative_counts"].items() if c["negative_images"]==0])
     report["split_overlap"]=read_json(root/"negative_split_overlap.json")
     write_json(root/"cpu_check_report.json",report)
     return report

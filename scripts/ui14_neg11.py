@@ -14,6 +14,7 @@ from ui14_neg11_data import (NEG_DATA, NEG_OUTPUT, OLD_OUTPUT, assert_isolated, 
                             inventory, normalize, validate_extension)
 from ui14_progress import ProgressSession
 from ui14_verification import preparation_lock, verification_session
+from ui14_negative_quota import POLICIES
 
 STAGES=("inventory","audit-raw","normalize","cache-prepare","cache","cache-finalize","finalize","check","submit","status","eval-existing","audit-errors")
 
@@ -200,6 +201,9 @@ def parse_args(argv=None):
     p.add_argument("--resource-group",default=os.environ.get("UI14_RESOURCE_GROUP","aiai_locate"))
     p.add_argument("--render-only",action="store_true")
     p.add_argument("--full-verify",action="store_true")
+    p.add_argument("--negative-quota-policy", choices=POLICIES,
+        default=os.environ.get("UI14_NEGATIVE_QUOTA_POLICY", "available"),
+        help="available: keep evidenced negatives up to the target and report gaps; strict: require image 1:1")
     p.add_argument("--progress-interval-seconds",type=float,default=float(os.environ.get("UI14_PROGRESS_INTERVAL_SECONDS","10")))
     return p.parse_args(argv)
 
