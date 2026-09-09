@@ -24,7 +24,7 @@ def validate_evaluation_manifest(path):
             kwargs = {}
             if spec["task_id"] >= 5:
                 paths = paths_for(Path(path).parent, spec["task_key"], "test")
-                kwargs["expected_task_files"] = {spec["task_key"]: paths["detector_input"]}
+                kwargs["expected_task_files"] = {spec["task_key"]: Path(spec.get("detector_input", paths["detector_input"]))}
                 count = len({file_digest(r["source_image"]) for r in read_jsonl(paths["normalized"])})
             else:
                 count = 1555
@@ -77,7 +77,9 @@ def score_ui9(spec, prediction_dir, destination):
 
 def evaluation_identity(manifest, checkpoint):
     from collect_ui5_metrics import ui_model_signature
+    from eaglevl.ui_answer_grammar import decode_contract
     return {"manifest_digest": file_digest(manifest), "eval_set_id": read_json(manifest).get("eval_set_id"),
+            "decoder_contract": decode_contract(os.environ.get("UI_EVAL_ANSWER_GRAMMAR", "legacy")),
             "model_signature": ui_model_signature(Path(checkpoint)),
             "git_commit": os.environ.get("GIT_COMMIT", ""), "config_hash": os.environ.get("UI5_CONFIG_HASH", "")}
 

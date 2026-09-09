@@ -4,6 +4,10 @@ from ui14_common import *
 
 
 def profile_environment(*, project_root=None, data_root=None, profile="m32-cpt9000-ui14-v1"):
+    from ui14_alignment_common import PROFILE, PROJECT, DATA, OUTPUT
+    alignment = profile == PROFILE
+    if alignment:
+        data_root, project_root = data_root or DATA, project_root or PROJECT
     neg11 = profile == "m32-cpt9000-ui14-neg11-v1"
     if neg11:
         from ui14_neg11_data import NEG_DATA, NEG_PROJECT
@@ -25,6 +29,10 @@ def profile_environment(*, project_root=None, data_root=None, profile="m32-cpt90
         from ui14_neg11_data import NEG_OUTPUT
         env.update(UI_TRAIN_PROFILE=profile, VERSION=profile, OUTPUT_DIR=NEG_OUTPUT,
                    RUN_NAME="locany-m32-cpt9000-ui14-neg11-a800x4-v1")
+    if alignment:
+        env.update(UI_TRAIN_PROFILE=profile, VERSION=profile, OUTPUT_DIR=OUTPUT,
+                   RUN_NAME="locany-m32-cpt9000-ui14-alignment-context-a800x4-v1",
+                   UI_EVAL_ANSWER_GRAMMAR="ui14_answer_v1")
     return env
 
 

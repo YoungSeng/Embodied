@@ -54,6 +54,11 @@ def audit_errors(prediction, destination):
 
 def summarize_parent(args):
     """Only completed old step-1000 predictions; never its live workbook/state."""
+    if getattr(args, "steps", None) or getattr(args, "task", None):
+        from ui14_alignment_audit import audit_runs
+        return audit_runs(args.old_output, args.audit_manifest or Path(args.parent_root)/"evaluation_manifest.json",
+                          args.task or ["ui_alignment"], args.steps or [2000, 4000],
+                          Path(args.data_root)/"alignment_audit")
     from uuid import uuid4
     from run_ui5_eval import build_score_command
     from run_ui14_eval import score_ui9
@@ -193,7 +198,10 @@ def parse_args(argv=None):
     p.add_argument("--parent-root",default=os.environ.get("UI14_PARENT_DATA_ROOT",DATA_ROOT))
     p.add_argument("--source-root",default=os.environ.get("UI9_DATA_ROOT",UI9_DATA_ROOT))
     p.add_argument("--output-dir",default=NEG_OUTPUT)
-    p.add_argument("--old-output",default=OLD_OUTPUT)
+    p.add_argument("--old-output", "--old-run", dest="old_output", default=OLD_OUTPUT)
+    p.add_argument("--task", nargs="+", choices=[t.task_key for t in UI_TASKS])
+    p.add_argument("--steps", nargs="+", type=int)
+    p.add_argument("--audit-manifest")
     p.add_argument("--init-checkpoint",default=INIT_CHECKPOINT)
     p.add_argument("--ui5-cache",default=WORKSPACE+"/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v5")
     p.add_argument("--workers",type=int,default=int(os.environ.get("UI14_PREPARE_WORKERS","16")))

@@ -29,6 +29,7 @@ from .configuration_qwen2 import Qwen2Config
 
 from .generate_utils import (
     constrain_ui5_bbox_logits,
+    constrain_ui_answer_ar_logits,
     sample_tokens,
     handle_pattern,
     get_token_ids_from_config,
@@ -644,6 +645,18 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
 
 
         use_mtp = generation_mode in ('fast', 'hybrid')
+        # Full-answer grammar is an explicit inference policy. Model/task/loss
+        # configuration and the existing joint MTP box resolver stay unchanged.
+        from eaglevl.ui_answer_grammar import answer_state, VERSION as UI_ANSWER_VERSION
+        answer_grammar = generate_kwargs.pop('ui_answer_grammar', 'legacy')
+        if answer_grammar not in ('legacy', UI_ANSWER_VERSION):
+            raise ValueError(f"Unknown UI answer grammar: {answer_grammar}")
+        label_ids = generate_kwargs.pop('ui_ref_label_ids', None)
+        structured_answer = answer_grammar == UI_ANSWER_VERSION
+        grammar_force_ar = False
+        if structured_answer:
+            answer_state([], self.token_ids, label_ids, int(getattr(self.config, 'relation_num_slots', 8)))
+            use_mtp = False  # The initial ref/none decision is autoregressive.
         # Slow/teacher-style AR decoding does not need the MTP window cropping
         # below.  Starting with a Cache object prevents the language model from
         # converting its result to a legacy tuple, whose representation changed
@@ -667,7 +680,7 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         text_config = self.config.text_config
         pbd_block_size = int(text_config.block_size)
         text_mask_token_id = int(text_config.text_mask_token_id)
-        if use_mtp and int(n_future_tokens) != pbd_block_size:
+        if (use_mtp or structured_answer and generation_mode != 'slow') and int(n_future_tokens) != pbd_block_size:
             raise ValueError(
                 "Generation n_future_tokens must match the configured MTP "
                 f"block_size: n_future_tokens={n_future_tokens}, "
@@ -699,6 +712,13 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             start_idx = _generation_cache_seq_length(past_key_values)
             position_ids = full_position_ids[:, start_idx : generated_with_mask.size(1)].clone()
             position_ids[0, -n_future_tokens:] -= 1
+
+            if structured_answer:
+                # AR prefixes use modern Cache objects too. Avoid the vendored
+                # prepare method's removed seen_tokens/get_max_length APIs.
+                return {"input_ids": generated_with_mask[:, start_idx:],
+                        "past_key_values": past_key_values, "attention_mask": None,
+                        "inputs_embeds": None, "use_cache": True, "position_ids": position_ids}
 
             prepare_inputs = self.language_model.prepare_inputs_for_generation(
                 generated_with_mask,
@@ -737,6 +757,12 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             """Sample tokens using MTP (Multi-Token Prediction) mode."""
             next_token_logits = outputs.logits[:, -n_future_tokens:, :]
             raw_frame_type = None
+            if structured_answer:
+                raw_frame_type = resolve_ui5_mtp_frame(next_token_logits[0], self.token_ids)
+                if raw_frame_type != 'legal_box':
+                    # No speculative tokens are committed. Resume AR from the
+                    # exact same prefix rather than emit a broken or none frame.
+                    return 'grammar_ar', generated.new_empty((0,)), raw_frame_type
             if bool(getattr(self.config, "relation_constrained_bbox_decoding", False)):
                 raw_frame_type = resolve_ui5_mtp_frame(
                     next_token_logits[0], self.token_ids
@@ -760,13 +786,29 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             out_type = out_pattern['type']
             out_token = torch.tensor(out_pattern['tokens'], dtype=x0.dtype, device=x0.device)
 
+            if structured_answer:
+                # MTP predicts [box, x1, y1, x2, y2, /box] at the duplicated
+                # box anchor. AR already emitted that anchor into the answer.
+                if out_token.numel() <= 1 or int(out_token[0]) != int(self.token_ids['box_start_token_id']):
+                    return 'grammar_ar', generated.new_empty((0,)), raw_frame_type
+                out_token = out_token[1:]
+                try:
+                    answer_state(torch.cat((generated[:, seq_len:].reshape(-1), out_token)).tolist(),
+                                 self.token_ids, label_ids, int(getattr(self.config, 'relation_num_slots', 8)))
+                except ValueError:
+                    return 'grammar_ar', generated.new_empty((0,)), raw_frame_type
+
             return out_type, out_token, raw_frame_type
 
 
         def _sample_token_in_ar(generated, outputs):
             """Sample a single token using AR (Auto-Regressive) mode."""
             next_token_logits = outputs.logits[:, -1:, :]
-            if bool(getattr(self.config, "relation_constrained_bbox_decoding", False)):
+            if structured_answer:
+                next_token_logits = constrain_ui_answer_ar_logits(
+                    next_token_logits, generated[:, seq_len:].reshape(-1), self.token_ids,
+                    label_ids, int(getattr(self.config, 'relation_num_slots', 8)))
+            elif bool(getattr(self.config, "relation_constrained_bbox_decoding", False)):
                 next_token_logits = constrain_ui5_bbox_logits(
                     next_token_logits,
                     generated[:, seq_len:].reshape(-1),
@@ -781,6 +823,10 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             out_token = x0[0]
             out_type = 'continue_ar'
             token_val = out_token[0].item()
+
+            if structured_answer:
+                return ('im_end' if token_val == int(self.token_ids['im_end_token_id'])
+                        else 'grammar_token'), out_token
 
             box_end_token_id = self.token_ids['box_end_token_id']
             coord_start_token_id = self.token_ids['coord_start_token_id']
@@ -806,6 +852,17 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
 
         # Generate loop
         while generated.size(1) < total_gen_length:
+            if structured_answer:
+                state = answer_state(generated[:, seq_len:].reshape(-1).tolist(), self.token_ids,
+                                     label_ids, int(getattr(self.config, 'relation_num_slots', 8)))
+                use_mtp = generation_mode != 'slow' and state['can_mtp'] and not grammar_force_ar
+                if use_mtp:
+                    # Speculative slot/PBD state is committed only with tokens.
+                    grammar_saved_relation_state = (
+                        slot_usage_state.clone() if slot_usage_state is not None else None,
+                        len(selected_slot_history), len(pre_mask_selected_slot_history),
+                        pbd_delta_sum, pbd_active_positions, box_anchor_hidden, coordinate_logits,
+                        pending_ar_coordinate_box, pending_ar_coordinate_offset)
             iter_round += 1
 
             # Step 1: Prepare inputs
@@ -1027,7 +1084,10 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 raise RuntimeError(
                     "language model returned no KV cache although use_cache=True"
                 )
-            if use_mtp:
+            if use_mtp and structured_answer and hasattr(outputs.past_key_values, 'crop'):
+                outputs.past_key_values.crop(generated.shape[1])
+                past_key_values = outputs.past_key_values
+            elif use_mtp:
                 # MTP appends speculative mask positions; discard them before
                 # the next round.  This path deliberately retains the legacy
                 # representation used by the original MTP implementation.
@@ -1055,7 +1115,28 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
                 raw_frame_type = None
 
             if verbose:
-                sampling_history.append(('ar' if 'ar' in out_type else 'mtp', tokenizer.decode(out_token, skip_special_tokens=False)))
+                sampled_mode = ('mtp' if use_mtp else 'ar') if structured_answer else ('ar' if 'ar' in out_type else 'mtp')
+                sampling_history.append((sampled_mode, tokenizer.decode(out_token, skip_special_tokens=False)))
+
+            if structured_answer and out_type == 'grammar_ar':
+                # No token was accepted. Recompute the last prefix position in
+                # AR; otherwise its KV entry would be duplicated on fallback.
+                keep = generated.shape[1] - 1
+                if hasattr(past_key_values, 'crop'):
+                    past_key_values.crop(keep)
+                else:
+                    past_key_values = tuple((k[:, :, :keep, :], v[:, :, :keep, :]) for k, v in past_key_values)
+                (slot_usage_state, selected_count, pre_mask_count, pbd_delta_sum,
+                 pbd_active_positions, box_anchor_hidden, coordinate_logits,
+                 pending_ar_coordinate_box, pending_ar_coordinate_offset) = grammar_saved_relation_state
+                del selected_slot_history[selected_count:]
+                del pre_mask_selected_slot_history[pre_mask_count:]
+                grammar_force_ar = True
+                switch_to_ar_count += 1
+                ambiguous_mtp_to_ar_count += int(raw_frame_type == 'ambiguous')
+                continue
+            if structured_answer:
+                grammar_force_ar = False
 
             generated = torch.cat([generated, out_token.unsqueeze(0)], dim=1)
 
@@ -1081,6 +1162,9 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
 
         # Decode and return
         generated_ids = generated[:, seq_len:]
+        if structured_answer and not answer_state(generated_ids.reshape(-1).tolist(), self.token_ids,
+                label_ids, int(getattr(self.config, 'relation_num_slots', 8)))['complete']:
+            raise RuntimeError("UI answer token budget exhausted inside an unfinished ref/box; output remains a failure")
         response = tokenizer.batch_decode(generated_ids, skip_special_tokens=False)
 
         if relation_output is not None:

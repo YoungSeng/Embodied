@@ -50,6 +50,10 @@ def validate_formal_yaml(rendered, runtime, *, config_path=None):
         raise ValueError("CPT initialization path drift")
     from ui14_neg11_data import NEG_PROJECT
     expected_project = NEG_PROJECT if runtime.get("UI_TRAIN_PROFILE") == "m32-cpt9000-ui14-neg11-v1" else CLUSTER_PROJECT
+    from ui14_alignment_common import PROFILE, PROJECT
+    if runtime.get("UI_TRAIN_PROFILE") == PROFILE:
+        expected_project = PROJECT
+        if runtime.get("UI_EVAL_ANSWER_GRAMMAR") != "ui14_answer_v1": raise ValueError("Alignment answer grammar drift")
     if runtime["PROJECT_ROOT"] != expected_project: raise ValueError("Formal project path drift")
 
 

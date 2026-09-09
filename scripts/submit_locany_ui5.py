@@ -28,7 +28,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Render and submit a LocateAnything UI5 v4 A800/H20 4/8-GPU job"
     )
-    parser.add_argument("--profile", choices=("m32-cpt9000-ui14-v1", "m32-cpt9000-ui14-neg11-v1"), default=None)
+    parser.add_argument("--profile", choices=("m32-cpt9000-ui14-v1", "m32-cpt9000-ui14-neg11-v1", "m32-cpt9000-ui14-alignment-context-v1"), default=None)
     parser.add_argument("--ui14-data-root", default=None)
     parser.add_argument("--machine", choices=("a800", "h20"), required=True)
     parser.add_argument(
@@ -627,7 +627,7 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "PIPELINE_MODE",
     )
     if getattr(args, "profile", None):
-        env_keys = (*env_keys, "UI_TRAIN_PROFILE", "UI14_DATA_ROOT", "UI_TASK_REGISTRY", "UI_EVAL_MANIFEST", "UI14_CHECK_REPORT", "UI_NUM_TASKS", "META_PATH", "OUTPUT_DIR", "LOGGING_STEPS", "SAMPLE_LOG_INTERVAL", "LOCANY_CPT_MODE")
+        env_keys = (*env_keys, "UI_TRAIN_PROFILE", "UI14_DATA_ROOT", "UI_TASK_REGISTRY", "UI_EVAL_MANIFEST", "UI14_CHECK_REPORT", "UI_EVAL_ANSWER_GRAMMAR", "UI_NUM_TASKS", "META_PATH", "OUTPUT_DIR", "LOGGING_STEPS", "SAMPLE_LOG_INTERVAL", "LOCANY_CPT_MODE")
     if args.scorer_root:
         env_keys = (*env_keys, "SCORER_ROOT")
     if args.training_data_source_dir:

@@ -1109,8 +1109,8 @@ def get_gt_payload(sample: dict[str, Any]) -> Any:
     )
 
 
-def evaluate_merged_file(
-    merged_path: str,
+def evaluate_samples(
+    samples,
     target_issue: str,
     iou_thresh: float,
     include_figma: bool,
@@ -1129,77 +1129,77 @@ def evaluate_merged_file(
         "invalid_pred": 0,
     }
 
-    with open(merged_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
+    for sample in samples:
+        if not include_figma and is_figma_sample(sample):
+            continue
 
-            sample = json.loads(line)
+        gt_payload = get_gt_payload(sample)
+        gt_bboxes = extract_bboxes_for_issue(gt_payload, target_issue)
+        gt_count = len(gt_bboxes)
+        metrics["total_samples"] += 1
 
-            if not include_figma and is_figma_sample(sample):
-                continue
+        pred_ans = sample.get("pred_ans")
+        pred_ans_valid = isinstance(pred_ans, dict)
 
-            gt_payload = get_gt_payload(sample)
-            gt_bboxes = extract_bboxes_for_issue(gt_payload, target_issue)
-            gt_count = len(gt_bboxes)
-            metrics["total_samples"] += 1
-
-            pred_ans = sample.get("pred_ans")
-            pred_ans_valid = isinstance(pred_ans, dict)
-
-            # 保持原评测逻辑：非法/缺失输出不能视为合法空预测。
-            if not pred_ans_valid:
-                metrics["invalid_pred"] += 1
-                if gt_count > 0:
-                    metrics["img_fn"] += 1
-                    metrics["fn"] += gt_count
-                else:
-                    metrics["img_fp"] += 1
-                    metrics["fp"] += 1
-                continue
-
-            pred_bboxes = extract_bboxes_for_issue(pred_ans, target_issue)
-            pred_count = len(pred_bboxes)
-
-            if gt_count == pred_count:
-                metrics["count_match"] += 1
-
-            if gt_count > 0 and pred_count > 0:
-                metrics["img_tp"] += 1
-            elif gt_count > 0 and pred_count == 0:
+        # 保持原评测逻辑：非法/缺失输出不能视为合法空预测。
+        if not pred_ans_valid:
+            metrics["invalid_pred"] += 1
+            if gt_count > 0:
                 metrics["img_fn"] += 1
-            elif gt_count == 0 and pred_count > 0:
-                metrics["img_fp"] += 1
-            else:
-                metrics["img_tn"] += 1
-
-            if gt_count == 0:
-                metrics["fp"] += pred_count
-                continue
-
-            if pred_count == 0:
                 metrics["fn"] += gt_count
-                continue
+            else:
+                metrics["img_fp"] += 1
+                metrics["fp"] += 1
+            continue
 
-            iou_matrix = np.zeros((gt_count, pred_count), dtype=np.float64)
-            for gt_index, gt_box in enumerate(gt_bboxes):
-                for pred_index, pred_box in enumerate(pred_bboxes):
-                    iou_matrix[gt_index, pred_index] = calculate_iou(
-                        gt_box, pred_box
-                    )
+        pred_bboxes = extract_bboxes_for_issue(pred_ans, target_issue)
+        pred_count = len(pred_bboxes)
 
-            row_indices, col_indices = linear_sum_assignment(-iou_matrix)
-            matched_tp = sum(
-                1
-                for row_index, col_index in zip(row_indices, col_indices)
-                if iou_matrix[row_index, col_index] >= iou_thresh
-            )
+        if gt_count == pred_count:
+            metrics["count_match"] += 1
 
-            metrics["tp"] += matched_tp
-            metrics["fp"] += pred_count - matched_tp
-            metrics["fn"] += gt_count - matched_tp
+        if gt_count > 0 and pred_count > 0:
+            metrics["img_tp"] += 1
+        elif gt_count > 0 and pred_count == 0:
+            metrics["img_fn"] += 1
+        elif gt_count == 0 and pred_count > 0:
+            metrics["img_fp"] += 1
+        else:
+            metrics["img_tn"] += 1
+
+        if gt_count == 0:
+            metrics["fp"] += pred_count
+            continue
+
+        if pred_count == 0:
+            metrics["fn"] += gt_count
+            continue
+
+        iou_matrix = np.zeros((gt_count, pred_count), dtype=np.float64)
+        for gt_index, gt_box in enumerate(gt_bboxes):
+            for pred_index, pred_box in enumerate(pred_bboxes):
+                iou_matrix[gt_index, pred_index] = calculate_iou(
+                    gt_box, pred_box
+                )
+
+        row_indices, col_indices = linear_sum_assignment(-iou_matrix)
+        matched_tp = sum(
+            1
+            for row_index, col_index in zip(row_indices, col_indices)
+            if iou_matrix[row_index, col_index] >= iou_thresh
+        )
+
+        metrics["tp"] += matched_tp
+        metrics["fp"] += pred_count - matched_tp
+        metrics["fn"] += gt_count - matched_tp
 
     return metrics
+
+
+def evaluate_merged_file(merged_path: str, target_issue: str, iou_thresh: float, include_figma: bool):
+    with open(merged_path, "r", encoding="utf-8") as handle:
+        return evaluate_samples((json.loads(line) for line in handle if line.strip()),
+                                target_issue, iou_thresh, include_figma)
 
 
 def safe_prf(tp: int, fp: int, fn: int) -> tuple[float, float, float]:

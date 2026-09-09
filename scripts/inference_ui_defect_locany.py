@@ -308,6 +308,8 @@ def parse_args() -> argparse.Namespace:
         default="flash_attention_2",
         help="MoonViT attention 后端；A800/H20 默认均使用普通 FlashAttention 2",
     )
+    parser.add_argument("--ui-answer-grammar", choices=("legacy", "ui14_answer_v1"),
+                        default=os.environ.get("UI_EVAL_ANSWER_GRAMMAR", "legacy"))
     parser.add_argument(
         "--generation-mode",
         "--generation_mode",
@@ -1350,11 +1352,17 @@ class LocateAnythingInferencer:
         }
 
         active_task = getattr(self, "active_task", None)
+        grammar = getattr(self.args, "ui_answer_grammar", "legacy")
+        if grammar != "legacy" and active_task is None:
+            raise ValueError("Structured UI decoding requires an explicit task route")
         if active_task is not None:
             route = get_task(active_task)
             if route.task_id >= int(getattr(self.model.config, "ui_num_tasks", 5)):
                 raise ValueError("Requested task is absent from checkpoint registry")
             generate_kwargs.update(defect_type=route.task_id, relation_family=route.family_id)
+            if grammar != "legacy":
+                generate_kwargs.update(ui_answer_grammar=grammar,
+                    ui_ref_label_ids=self.tokenizer.encode(route.prompt_label, add_special_tokens=False))
         eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
         if eos_token_id is not None:
             generate_kwargs["eos_token_id"] = eos_token_id
@@ -1591,6 +1599,8 @@ def seconds_to_text(seconds: float) -> str:
 
 
 def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
+    from eaglevl.ui_answer_grammar import decode_contract
+    args.ui_decoder_contract = decode_contract(getattr(args, "ui_answer_grammar", "legacy"))
     return {
         "schema_version": 1,
         "backend": "LocateAnything",
@@ -1600,6 +1610,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "tasks": [asdict(task) | {"prompt": task.prompt} for task in TASK_CONFIGS],
         "evaluation_manifest_digest": hashlib.sha256(Path(args.eval_manifest).read_bytes()).hexdigest() if getattr(args, "eval_manifest", None) else None,
         "generation": {
+            "decoder_contract": args.ui_decoder_contract,
             "mode": args.generation_mode,
             "max_new_tokens": args.max_new_tokens,
             "n_future_tokens": args.n_future_tokens,
@@ -1752,6 +1763,7 @@ def build_raw_record(
         "checkpoint": args.checkpoint,
         "processor_path": args.processor_path or args.checkpoint,
         "generation": {
+            "decoder_contract": getattr(args, "ui_decoder_contract", None),
             "mode": args.generation_mode,
             "max_new_tokens": args.max_new_tokens,
             "n_future_tokens": args.n_future_tokens,

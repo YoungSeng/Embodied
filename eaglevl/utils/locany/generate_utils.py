@@ -10,6 +10,18 @@ import torch
 import torch.nn.functional as F
 import torch.distributions as dists
 from typing import Dict, Optional
+from eaglevl.ui_answer_grammar import answer_state
+
+
+def constrain_ui_answer_ar_logits(logits, generated_tokens, token_ids, label_ids, max_boxes=8):
+    """Mask from the same complete-answer prefix used by MTP and termination."""
+    state = answer_state(generated_tokens.reshape(-1).tolist(), token_ids, label_ids, max_boxes)
+    if logits.shape[0:2] != (1, 1) or not state["allowed"]:
+        raise ValueError("UI answer AR requires one unfinished batch-size-one prefix")
+    output = torch.full_like(logits, torch.finfo(logits.dtype).min)
+    allowed = list(state["allowed"])
+    output[:, :, allowed] = logits[:, :, allowed]
+    return output
 
 
 def get_token_ids_from_config(config) -> Dict[str, int]:
