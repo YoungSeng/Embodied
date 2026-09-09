@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 
 def _bootstrap_cuda_visible_devices() -> None:
@@ -71,6 +72,35 @@ def _bootstrap_cuda_visible_devices() -> None:
 _bootstrap_cuda_visible_devices()
 
 
+def _bootstrap_project_imports() -> None:
+    """Resolve this checkout before dependencies can cache another eaglevl.
+
+    Direct script execution puts scripts/, not the repository root, on
+    sys.path. An older editable installation may otherwise win the first
+    eaglevl import; adding the root later cannot replace that cached package.
+    """
+    root = Path(__file__).resolve().parents[1]
+    expected_package = root / "eaglevl" / "__init__.py"
+    registry = root / "eaglevl" / "ui_task_registry.py"
+    for path in (expected_package, registry):
+        if not path.is_file():
+            raise RuntimeError(f"Incomplete inference checkout: missing {path}; update this checkout before retrying")
+    sys.path.insert(0, str(root))
+    import eaglevl
+
+    origin = getattr(eaglevl, "__file__", None)
+    if origin is None or Path(origin).resolve() != expected_package:
+        raise RuntimeError(
+            f"eaglevl was already imported from {origin}; expected {expected_package}. "
+            "Start a fresh inference process without preloading another checkout."
+        )
+    print(f"[inference imports] checkout={root} eaglevl={origin}", flush=True)
+
+
+# Must precede torch/transformers as well as direct eaglevl imports.
+_bootstrap_project_imports()
+
+
 import hashlib
 import json
 import random
@@ -109,7 +139,6 @@ def _coarse_boxes_norm1000_and_px(value, width: int, height: int):
     return normalized, pixels
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from types import MethodType
 from typing import Any, Sequence
 

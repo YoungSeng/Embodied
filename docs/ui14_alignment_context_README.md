@@ -101,6 +101,30 @@ queue=`compute-3302-yg-cloudnative-ai-aiai.locate-guarantee`，
 状态可用 `bash shell/ui14_alignment_context_a800.sh status`。
 每阶段保留 `progress.json` 和 `stage_summaries/<stage>.json`，默认每 10 秒打印进度。
 
+## worker 导入 eaglevl.ui_task_registry 失败后的接续
+
+若 worker 在模型加载前报 `ModuleNotFoundError: No module named 'eaglevl.ui_task_registry'`，
+更新本分支。推理脚本现在先加入自身 checkout 根路径，再导入 eaglevl 和模型依赖，
+避免 conda 环境里另一个 editable checkout 抢先被导入；日志打印 `[inference imports]`
+及实际包路径。若本 checkout 的文件确实缺失或旧包已被启动钩子提前加载，会在模型加载前
+报告具体路径，不会静默切换到另一版本。无需重装 torch/CUDA 或修改评测并发数。
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui14-alignment-context
+git pull --ff-only &&
+bash shell/ui14_alignment_context_a800.sh eval-prepare --task ui_alignment --steps 2000 4000
+
+# 上一步成功后，在独立评测 GPU 上运行
+bash shell/ui14_alignment_context_a800.sh eval-existing \
+  --task ui_alignment --steps 2000 4000 --gpu-devices 0
+```
+
+本次推理文件摘要改变，eval-prepare 刷新比较身份与目录；已完成且来源/属性匹配的
+checkpoint 快照文件仍然复用。原 raw 审计、冻结数据和 detector 缓存无需重做。
+这次导入失败的 worker 尚未开始模型推理，原失败目录保留。若之前使用自定义
+`--old-run`/`--old-manifest`，eval-prepare 继续传入相同参数。
+本次 CPU 验证见 [导入修复报告](ui14_alignment_import_cpu_report.md)。
+
 ## 成功标志和产物
 
 | 阶段 | 成功标志/输出（相对新数据目录） |
