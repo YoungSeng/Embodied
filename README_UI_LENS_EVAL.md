@@ -560,3 +560,96 @@ python qwen3vl_merge_and_score_fixed_5tasks.py \
 Image recall 只看有无缺陷框，不看 IoU；严重的 image 漏检不能仅由 bbox 坐标偏移解释。
 如果输出完整、解析正常、输入配置正确，再通过漏检图、原始回答和每 App 指标判断
 是否存在应用分布差异、缺陷语义差异或切图上下文不足。汇总表本身不能确认是哪一种原因。
+
+## 8. 检查完全重复和视觉近重复截图（CPU）
+
+`scripts/audit_ui_lens_duplicates.py` 独立检查截图目录，使用 Pillow 和 numpy，不加载模型、
+不下载视觉编码器、不需要 GPU，也不修改/删除图片。原训练环境已经声明这两项依赖。
+
+脚本分三层检查：
+
+1. 文件 SHA256：文件字节完全相同。
+2. 像素 SHA256：EXIF 方向校正后，尺寸和完整 RGBA 像素完全相同，能识别 PNG 元信息/编码不同的副本。
+3. 64-bit pHash：32×32 灰度图 DCT 的低频特征；默认汉明距离 ≤ 8，且宽高比相对差 ≤ 3%。
+   另外输出 dHash 距离和 32×32 RGB 平均绝对差，辅助识别整体布局相似的误报，不把它们作为额外过滤条件。
+
+这里的阈值是审核起点，尚未用 UI-Lens 人工标定。“同一页面的不同缺陷变体”也可能非常相似，
+所以近重复只作为候选。连通组可能通过 A↔B、B↔C 串起来，不意味着 A、C 也满足阈值。
+
+### 8.1. 生成报告
+
+在数据所在开发机执行：
+
+```bash
+export PROJECT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-m32-cpt-sft-croponly-v1
+cd "$PROJECT"
+git pull --ff-only
+
+export RAW=/mnt/bn/intelligent-service-yg/dataset/UI_lens
+export DATA=/mnt/bn/intelligent-service-yg/dataset/UI_lens_ui5_eval_clip_v1
+export REPORT=/mnt/bn/intelligent-service-yg/dataset/UI_lens_duplicate_audit_v1
+
+python -u scripts/audit_ui_lens_duplicates.py \
+  --dataset-root "$RAW" \
+  --eval-dir "$DATA" \
+  --output-dir "$REPORT" \
+  --phash-threshold 8 --aspect-tolerance 0.03 \
+  --max-preview-pairs 60 --max-preview-groups 20 \
+  --progress-interval-seconds 5
+
+cat "$REPORT/report.md"
+```
+
+`--dataset-root` 扫描 `single_UIs_cn` 下所有支持格式的截图，包含未出现在五类评测 JSONL 中的图片，
+不扫描 `Seq_UIs_cn`。要检查其他目录，可改用 `--image-dir /实际截图目录`，它会递归扫描子目录。
+`--eval-dir` 是可选的：只用于给已关联图片补充应用名称、任务正负标签，并标出相似图片之间的正负标签差异；
+不改变图片选择范围、不参与哈希匹配。只检查原始截图时直接去掉这一个参数即可。
+使用抖音子集作为 `--eval-dir` 也不会将扫描范围缩小为抖音，只会改变可关联到的标注范围。
+
+阶段日志包括 `fingerprint`、`compare`、`render` 的已完成数量、速度和预计剩余时间，读取大图时也有后台心跳。
+每张截图只作为一张图统计，不会因为同一图出现在五类任务中而重复计数。
+所有成功解码的图片做两两比较，计算量随图片数平方增长；本次几千张单界面截图适合先用 CPU 检查。
+输出目录必须是新的，重复检查时使用 `..._v2` 等新目录。
+
+### 8.2. 报告怎么看
+
+```text
+UI_lens_duplicate_audit_v1/
+├── index.html           # 可离线打开：摘要、精确重复组、近重复对、并排图和放大差异图
+├── report.md            # 中文结论、计数、阈值敏感性表和解释
+├── summary.json         # 机器可读统计
+├── images.jsonl         # 每图 ID/原路径/尺寸/SHA256/pHash/dHash/可选应用和任务标签
+├── exact_groups.json    # 文件相同、像素相同的完整分组（成员为 images.jsonl 中的 ID）
+├── near_groups.json     # 完全重复与近重复边构成的完整连通组
+├── pairs.csv            # 候选对的路径、距离、差异量、共同任务的正负标签分歧
+├── errors.json          # 无法读取的图片及原因
+├── status.json          # 完成状态；完成后为 complete 或 complete_with_errors
+└── assets/              # 抽样缩略图和差异图
+```
+
+将整个报告目录复制到本机，打开 `index.html`；HTML 图片不依赖服务器绝对路径。
+近重复预览按较小的 pHash/dHash 距离优先，不是随机抽样。精确重复组最多预览 20 组，每组最多展示 6 张；
+完整成员保存在 JSON 中。差异图是缩略图对齐后的像素差放大 4 倍，包含缩放/JPEG误差，不是缺陷检测结果。
+
+关键统计：
+
+- `identical_file_extra_copies`、`identical_pixel_extra_copies`：每组除第一张外的副本数。
+  像素相同计数包含文件相同，二者不能相加。源文件完全保留。
+- `near_candidate_pairs_excluding_exact`：排除像素完全相同后的近似候选**对数**，不是重复图片张数。
+- `images_in_exact_or_near_groups`：落入精确/近似连通组的图片数；不能直接当作“可删除图片数”。
+- `near_candidate_counts_by_threshold_excluding_exact`：距离 0/2/4/6/8/10/12 的候选数，使用相同宽高比限制。
+  pHash 距离为 0 也不等于像素完全一致。
+- `candidate_pairs_with_task_label_disagreement`：精确/候选对中，共同已标注任务的正负状态不同的对数。
+  两图有框但 bbox 不同不会被此项统计捕获；仍需看原图和 GT。未标注任务也不会被当成负样本。
+
+`pairs.csv` 默认最多保存 100000 对，按图片路径对的顺序截取；可通过 `--max-pairs` 调整。
+`csv_pairs_omitted` 明确记录未保存的对数。即使 CSV 或预览达到上限，完整分组、汇总计数和阈值曲线也不截断。
+读取失败的图片不进入距离比较；`errors.json` 会记录它们，报告生成后 CLI 返回退出码 2。
+
+### 8.3. 根据报告决定后续分析
+
+先看像素完全一致的组，再查看近重复对中的局部差异。高相似截图可能因时间、滚动位置、弹窗、
+遮挡、裁切、文字省略等而产生不同标注；保留这些差异对分析低召回也有价值。
+大面积空白、相同导航栏可能造成感知哈希误报，明显滚动或裁剪也可能造成漏报。
+如果候选太多，可把 `--phash-threshold` 改为 4 并使用新的报告目录。
+若人工审核证明跨滚动位置的同页变体被大量漏掉，再考虑增加视觉特征检索；本版报告不声称完成语义级去重。
