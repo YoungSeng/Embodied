@@ -34,9 +34,23 @@ def validate_initial_export(runtime, snapshot, checkpoint):
                 raise ValueError("CPT initialization differs")
         if Path(exported["checkpoint"]).resolve() != checkpoint.resolve():
             raise ValueError("export destination differs")
-        if (config.get("ui_relation_initialization_seed") != 42
-                or config.get("ui_relation_initialization_reason") != "checkpoint-0-export"):
-            raise ValueError("missing deterministic export provenance")
+        # The exporter sets the short reason before loading, then the actual
+        # initializer overwrites it and serializes the final reason in BOTH
+        # config and the export's initialization report. Check saved provenance,
+        # not only the temporary pre-load value.
+        seed = config.get("ui_relation_initialization_seed")
+        reason = config.get("ui_relation_initialization_reason")
+        final_reason = "all-ui-relation-keys-missing-checkpoint-0-export"
+        if seed != 42 or reason not in ("checkpoint-0-export", final_reason):
+            raise ValueError(f"invalid deterministic export provenance: seed={seed!r}, reason={reason!r}")
+        initialization = exported.get("initialization")
+        if reason == final_reason and initialization is None:
+            raise ValueError("missing final export initialization report")
+        for name, report in (("export initialization", initialization),
+                             ("config initialization stats", config.get("ui_relation_initialization_stats"))):
+            if report is not None and (not isinstance(report, dict)
+                    or report.get("seed") != seed or report.get("reason") != reason):
+                raise ValueError(f"{name} contradicts config seed/reason")
         current = load_registry(runtime["UI_TASK_REGISTRY"])
         saved = validate_registry(config.get("ui_task_registry"), config.get("ui_num_tasks"))
         if config.get("ui_num_tasks") != 14 or saved != current:

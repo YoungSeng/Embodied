@@ -4,6 +4,13 @@
 用户提供的正式日志已完成 step 0 的 14 项评测和 36 行 Excel，在 0→1000 训练前的数据绑定
 校验失败。本地只执行代码修改及 CPU 回归，没有连接 A800、读取该 run 文件或重新提交集群任务。
 
+`21079cc` 首版恢复校验还有一个兼容错误：只认可导出器载入前临时设置的
+`checkpoint-0-export`。真实 `initialize_or_validate_ui_relation` 随后会调用模型初始化，
+将 config 中的 reason 改成 `all-ui-relation-keys-missing-checkpoint-0-export`，并把相同
+seed/reason 保存到 config 初始化统计和 `ui5_checkpoint0_manifest.json.initialization`。
+本次更正校验，接受真实最终值并交叉检查报告；没有修改原 checkpoint 或导出/初始化实现。
+上一轮手写成功夹具没有覆盖 reason 被覆盖这一行为，本轮改用生产代码元数据调用链生成夹具。
+
 ## 根因与修改
 
 - `scripts/ui14_profile.py`：保持非零 SFT 断点错批保护，兼容完整、来源与任务表匹配且无
@@ -18,10 +25,16 @@
 
 ## 已实际执行
 
-19 项 CPU 测试全部通过（10.225 秒）；另通过 4 个 Python 文件 AST 检查、2 个 Bash 入口语法检查。
+本轮 22 项 CPU 测试全部通过（9.800 秒），另通过两个变更 Python 文件 AST 检查及实际 Git
+变更兼容检查。Bash 入口本轮未改；此前两个入口语法检查通过。
 
 - 首次运行先发布绑定，重复启动不改写绑定；错批被拒绝。
 - 旧无绑定 checkpoint-0 只读核对后可恢复；核对不读取权重内容或修改 config。
+- 成功夹具执行生产导出器、加载状态分支、模型初始化元数据赋值和 manifest 序列化的 CPU
+  语句，确认最终 reason 覆盖临时值，并核对两份初始化报告一致。模型/张量加载与参数统计
+  使用替代对象，没有初始化真实模型、执行 tensor 初始化或使用 GPU。
+- 实际最终 reason 和旧短 reason 都能恢复；错误/缺失的最终初始化报告、报告 seed/reason
+  与 config 冲突、训练初始化 reason 均被拒绝。CPT 路径、任务表、训练状态等检查照旧。
 - 错误 CPT/seed/任务表、缺导出完成标记、混入训练状态均被拒绝。
 - 即使 checkpoint-0 完整，存在无绑定 checkpoint-1000 仍被拒绝；原断点完整性检查继续通过。
 - 相同数据/配置下，启动代码更新后可两次复用原 14 项/36 行结果；模型、评测 JSON、Excel

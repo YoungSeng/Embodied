@@ -33,6 +33,11 @@ UI14_PREPARE_WORKERS=16 bash shell/ui14_neg11_a800.sh cache-prepare
 新代码在初始评测前完成绑定，也能核对并接纳此次遗留的完整 CPT9000 导出。
 不删除 checkpoint-0、评测结果、Excel 或数据产物；无需重跑数据准备。
 
+若 `21079cc` 提交前校验又报 `missing deterministic export provenance`，也用下面同一条
+更新/提交命令。后续修复已认可模型初始化最终写入的
+`all-ui-relation-keys-missing-checkpoint-0-export`，并与导出初始化报告交叉核对。
+保留 checkpoint 的原始 config 和 manifest，不手工改 reason；这样已完成评测仍可校验复用。
+
 在新 checkout 更新代码，再提交到同一 neg11 输出目录：
 
 ```bash

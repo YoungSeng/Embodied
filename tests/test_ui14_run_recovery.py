@@ -1,4 +1,5 @@
 """Reproduce evaluation-success/startup-failure without GPU or source images."""
+import ast
 import contextlib
 from datetime import datetime, timezone
 import io
@@ -7,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -17,6 +19,67 @@ from ui14_profile import validate_run_data_binding
 from ui14_run_recovery import completed_evaluation, startup_only_changes, PIPELINE_BINDING_BLOCK
 from run_ui14_eval import evaluation_identity
 from eaglevl.train.ui5_excel_logger import UI5ExcelLogger, build_eval_rows
+
+
+def export_metadata_from_actual_code(config, checkpoint, base):
+    """Execute export -> loading policy -> initializer metadata -> manifest.
+
+    Extract these CPU statements from production sources. Only tensor/model
+    loading and parameter statistics are substituted; do not hand-write the
+    initialization seed/reason in the successful checkpoint fixtures.
+    """
+    namespace = {"Any": object, "logger": mock.Mock()}
+    setup = ast.parse((ROOT / "eaglevl/model/locany/ui_relation_setup.py").read_text(encoding="utf-8"))
+    functions = [n for n in setup.body if isinstance(n, ast.FunctionDef)
+                 and n.name in ("ui_relation_loading_state", "initialize_or_validate_ui_relation")]
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(ROOT / "eaglevl/model/locany/ui_relation_setup.py"), "exec"), namespace)
+    model_path = ROOT / "eaglevl/model/locany/modeling_locateanything.py"
+    model_tree = ast.parse(model_path.read_text(encoding="utf-8"))
+    initializer = next(n for n in ast.walk(model_tree) if isinstance(n, ast.FunctionDef)
+                       and n.name == "initialize_ui_relation_modules")
+    start = next(i for i, n in enumerate(initializer.body) if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Attribute) and t.attr == "ui_relation_initialization_seed" for t in n.targets))
+    initializer.body = initializer.body[start:]
+    initializer.decorator_list = []
+    exec(compile(ast.Module(body=[initializer], type_ignores=[]), str(model_path), "exec"), namespace)
+
+    class CPUModel:
+        initialize_ui_relation_modules = namespace["initialize_ui_relation_modules"]
+
+        def __init__(self, model_config):
+            self.config = model_config
+
+        def named_parameters(self):
+            return [("relation_pyramid.fixture", None), ("relation_pbd.fixture", None)]
+
+        def validate_ui_relation_parameters(self):
+            return {"parameters": 2, "values": 2, "checksum": .1}
+
+        @classmethod
+        def from_pretrained(cls, base_path, *, config, **kwargs):
+            model = cls(config)
+            return model, {"missing_keys": [name for name, _ in model.named_parameters()]}
+
+    import json
+    namespace.update(config=SimpleNamespace(**config), args=SimpleNamespace(seed=42, init_cpt_step=9000),
+                     base=Path(base), output=checkpoint,
+                     torch=SimpleNamespace(bfloat16="unused CPU fixture"),
+                     LocateAnythingForConditionalGeneration=CPUModel, std=.02,
+                     json=json, num_new_tokens=0, expanded_tied_aliases=[],
+                     complete_marker=checkpoint / "ui5_checkpoint0_manifest.json")
+    exporter = ROOT / "scripts/export_ui5_checkpoint0.py"
+    main = next(n for n in ast.parse(exporter.read_text(encoding="utf-8")).body
+                if isinstance(n, ast.FunctionDef) and n.name == "main")
+    start = next(i for i, n in enumerate(main.body) if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Attribute) and t.attr == "ui_relation_initialization_seed" for t in n.targets))
+    end = next(i for i, n in enumerate(main.body) if isinstance(n, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == "init_report" for t in n.targets))
+    publish = next(n for n in main.body if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+                   and isinstance(n.value.func, ast.Attribute) and isinstance(n.value.func.value, ast.Name)
+                   and n.value.func.value.id == "complete_marker" and n.value.func.attr == "write_text")
+    checkpoint.mkdir(parents=True, exist_ok=True)
+    exec(compile(ast.Module(body=main.body[start:end + 1] + [publish], type_ignores=[]), str(exporter), "exec"), namespace)
+    return vars(namespace["model"].config)
 
 
 class StartupRecoveryTests(unittest.TestCase):
@@ -36,14 +99,10 @@ class StartupRecoveryTests(unittest.TestCase):
         self.marker = self.output / "ui14_training_data.json"
 
     def export(self):
-        config = {"ui_task_registry": self.registry, "ui_num_tasks": 14,
-                  "init_checkpoint": self.runtime["INIT_CHECKPOINT"], "init_cpt_step": 9000,
-                  "ui_relation_initialization_seed": 42,
-                  "ui_relation_initialization_reason": "checkpoint-0-export"}
+        config = export_metadata_from_actual_code(
+            {"ui_task_registry": self.registry, "ui_num_tasks": 14},
+            self.checkpoint, self.runtime["INIT_CHECKPOINT"])
         write_json(self.checkpoint / "config.json", config)
-        write_json(self.checkpoint / "ui5_checkpoint0_manifest.json", {
-            "init_checkpoint": self.runtime["INIT_CHECKPOINT"], "init_cpt_step": 9000,
-            "checkpoint": str(self.checkpoint)})
         # Real validator checks existence/shard completeness, never loads weights.
         (self.checkpoint / "pytorch_model.bin").write_bytes(b"CPU fixture, no model load")
 
@@ -133,6 +192,51 @@ class StartupRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no repair data binding"):
             validate_run_data_binding(self.runtime, self.snapshot, create=True)
         self.assertFalse(self.marker.exists())
+
+    def test_actual_initializer_overwrites_reason_and_reports_match(self):
+        self.export()
+        config = read_json(self.checkpoint / "config.json")
+        report = read_json(self.checkpoint / "ui5_checkpoint0_manifest.json")["initialization"]
+        self.assertEqual(config["ui_relation_initialization_reason"],
+                         "all-ui-relation-keys-missing-checkpoint-0-export")
+        self.assertEqual(report, config["ui_relation_initialization_stats"])
+        self.assertEqual(report["seed"], 42)
+        validate_run_data_binding(self.runtime, self.snapshot)
+        self.assertFalse(self.marker.exists())
+
+    def test_report_conflicts_and_training_initialization_reason_are_rejected(self):
+        self.export()
+        config_path = self.checkpoint / "config.json"
+        export_path = self.checkpoint / "ui5_checkpoint0_manifest.json"
+        config, exported = read_json(config_path), read_json(export_path)
+        for report in (None, {}, "not a report", {**exported["initialization"], "seed": 43},
+                       {**exported["initialization"], "reason": "checkpoint-0-export"}):
+            with self.subTest(report=report):
+                write_json(export_path, {**exported, "initialization": report})
+                with self.assertRaisesRegex(RuntimeError, "initialization"):
+                    validate_run_data_binding(self.runtime, self.snapshot, create=True)
+                self.assertFalse(self.marker.exists())
+        write_json(export_path, exported)
+        for field, value in (("ui_relation_initialization_reason", "all-ui-relation-keys-missing-from-base-checkpoint"),
+                             ("ui_relation_initialization_stats", {**config["ui_relation_initialization_stats"], "seed": 43})):
+            write_json(config_path, {**config, field: value})
+            with self.assertRaises(RuntimeError):
+                validate_run_data_binding(self.runtime, self.snapshot, create=True)
+            self.assertFalse(self.marker.exists())
+
+    def test_legacy_short_reason_remains_supported_without_rewriting_checkpoint(self):
+        self.export()
+        config_path = self.checkpoint / "config.json"
+        export_path = self.checkpoint / "ui5_checkpoint0_manifest.json"
+        config, exported = read_json(config_path), read_json(export_path)
+        config["ui_relation_initialization_reason"] = "checkpoint-0-export"
+        config.pop("ui_relation_initialization_stats")
+        exported.pop("initialization")
+        write_json(config_path, config)
+        write_json(export_path, exported)
+        before = {p: p.read_bytes() for p in (config_path, export_path)}
+        validate_run_data_binding(self.runtime, self.snapshot, create=True)
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
 
     def test_completed_fourteen_tasks_survive_startup_fix_without_excel_or_weights_write(self):
         self.evaluation()
