@@ -653,3 +653,90 @@ UI_lens_duplicate_audit_v1/
 大面积空白、相同导航栏可能造成感知哈希误报，明显滚动或裁剪也可能造成漏报。
 如果候选太多，可把 `--phash-threshold` 改为 4 并使用新的报告目录。
 若人工审核证明跨滚动位置的同页变体被大量漏掉，再考虑增加视觉特征检索；本版报告不声称完成语义级去重。
+
+## 9. 按五个任务统计重复、质量候选和标注分歧（CPU）
+
+全局截图重复数不能直接分摊到五个任务：同一内容可能被不同任务分别使用。
+`scripts/audit_ui_lens_task_quality.py` 读取上一步的 `images.jsonl` 和当前五个评测 JSONL，
+在**每个任务自己的样本范围内**重新计算精确/近似关系，将跨任务内容复用单独统计。
+不会使用全局连通组给任务强行分组，也不依赖可能截断的全局 `pairs.csv`。
+
+### 9.1. 运行
+
+```bash
+export PROJECT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-m32-cpt-sft-croponly-v1
+cd "$PROJECT"
+git pull --ff-only
+
+export DATA=/mnt/bn/intelligent-service-yg/dataset/UI_lens_ui5_eval_clip_v1
+export AUDIT=/mnt/bn/intelligent-service-yg/dataset/UI_lens_duplicate_audit_v1
+export TASK_REPORT=/mnt/bn/intelligent-service-yg/dataset/UI_lens_task_quality_audit_v1
+
+python -u scripts/audit_ui_lens_task_quality.py \
+  --audit-dir "$AUDIT" \
+  --eval-dir "$DATA" \
+  --output-dir "$TASK_REPORT" \
+  --min-short-side 256 \
+  --blank-std 5 \
+  --low-detail-variance 20 \
+  --max-previews-per-task 12 \
+  --progress-interval-seconds 5
+
+cat "$TASK_REPORT/report.md"
+```
+
+不需要 GPU，不重跑全局 pHash 两两比较。质量检测仍需读取任务涉及的每张唯一图片一次并计算图像统计，
+同时核对文件 SHA256 是否与旧报告相符；同一图片出现在多个任务时复用检查结果。
+日志包括图像质量/缓存检查、每任务距离比较和报告渲染的进度与 ETA。
+默认沿用旧报告中的 pHash 阈值和宽高比限制；可用 `--phash-threshold`、`--aspect-tolerance` 显式覆盖。
+
+`--eval-dir` 决定本次统计人口：传全量目录得到全量五类统计；传抖音子集目录得到抖音的五类统计。
+旧 `--audit-dir` 仍可使用全量哈希报告。输出目录必须是新的。
+
+### 9.2. 输出的三个分类表
+
+`report.md` 和终端会打印：
+
+1. **每任务内部重复**：总样本/正负样本、精确重复组、涉及图片、额外副本、近重复对、近重复涉及图片、
+   精确/近似图片并集、尚未完成重复判断的样本数。
+2. **每任务图像质量候选**：读取失败、低分辨率、近纯色/空白、低细节/疑似模糊、候选并集及其中正负数量。
+3. **标注复查与跨任务复用**：同像素同任务的正负冲突组、bbox 不同组、近重复正负不同对、GT 框格式/边界异常、
+   先前已审计的 GT clip 样本、与其他任务共享相同内容的图片数。
+
+```text
+UI_lens_task_quality_audit_v1/
+├── report.md             # 上述三个中文分类表及口径
+├── task_summary.csv      # 每个任务一行，完整统计字段
+├── summary.json          # 参数、源 JSONL 摘要、分类统计、缓存不匹配原因
+├── index.html            # 按任务展示的审核图集，橙色框为该任务原图 GT
+├── task_samples.jsonl    # 每条图像×任务记录的重复、质量和标注状态
+├── image_quality.jsonl   # 每张唯一图片的尺寸、灰度标准差、Laplacian 方差与标记
+├── groups.json           # 每任务精确重复组及任务内部近似连通组，成员为图片路径
+├── near_pairs.csv        # 每任务实际满足近似阈值的图片对
+├── status.json
+└── assets/               # 可离线查看的带 GT 缩略图
+```
+
+复制整个目录后打开 `index.html`。每任务默认最多 12 个预览条目，每条最多 3 张图片；
+按冲突、质量、重复等类型轮流抽取，避免某种大量候选占满全部预览。完整数量不受预览上限影响。
+`near_pairs.csv` 默认每任务最多 100000 对，支持 `--max-pairs-per-task` 调整；
+`near_csv_pairs_omitted` 报告未保存的对数，所有组和汇总仍按完整比较结果计算。
+
+### 9.3. 计数和质量判定口径
+
+- 一个任务内 n 张像素相同的图，计 1 组、n 张涉及图片、n−1 张额外副本。不指定该保留哪张。
+- 精确重复涉及图片、近重复涉及图片、质量候选之间可以重叠；看并集列，不要简单相加。
+  五任务数量相加是“图片×任务”记录数，不能当作独立截图数。
+- 跨任务共享内容单独报告，不自动当作任务内部重复或标签错误。
+- 同像素、同任务的正负冲突优先复查；bbox 对比按像素坐标集合进行，不受框列表顺序影响。
+  坐标存在细微差异也会被标出，仍需人工判断。正负冲突组可能同时计入 bbox 不同组。
+- 近似图正负标签不同可能是合法缺陷变体，不自动算标注错误。
+- `clipped_gt_rows` 仅表示转换时已审计的边界裁剪，与 `invalid_bbox_rows` 分开，不自动计入图像质量候选。
+- **低分辨率**：原图短边 < 256px；**近纯色/空白**：等比例缩至长边最多 1024px（不放大）后的灰度标准差 < 5；
+  其余图片若四邻域 Laplacian 方差 < 20，则标 **低细节/疑似模糊**。阈值均可用上述参数调整。
+  这些规则未在 UI-Lens 人工标定，空白/模糊也可能正是缺陷，特别是内容未展示正样本。
+  质量候选不是“可直接删除的坏样本”，应查看原图和 GT。
+
+旧哈希中缺失的图片、发生变化的图片或无法读取的图片不使用旧哈希判断重复，
+计入 `duplicate_unassessed_rows`，并在 `cache_issues` 中列出原因。报告仍生成，但 CLI 返回退出码 2；
+解决文件问题或更新全局哈希报告后，使用新的输出目录复查。
