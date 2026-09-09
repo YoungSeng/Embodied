@@ -740,3 +740,37 @@ UI_lens_task_quality_audit_v1/
 旧哈希中缺失的图片、发生变化的图片或无法读取的图片不使用旧哈希判断重复，
 计入 `duplicate_unassessed_rows`，并在 `cache_issues` 中列出原因。报告仍生成，但 CLI 返回退出码 2；
 解决文件问题或更新全局哈希报告后，使用新的输出目录复查。
+
+## 10. 导出 788、819 的论文用 GT 框 PDF
+
+在存有原始截图和转换后 JSONL 的服务器执行（CPU 即可）：
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-m32-cpt-sft-croponly-v1
+git pull --ff-only
+python -m pip install reportlab
+python scripts/export_ui_lens_bbox_pdf.py
+```
+
+默认从 `/mnt/bn/intelligent-service-yg/dataset/UI_lens_ui5_eval_clip_v1` 的五个任务 JSONL 中查找
+`788.png`、`819.png`，打印每个匹配记录的英文任务、中文任务、正负标签和框数，然后选择正样本标注。
+同一图片有多个正样本任务时会列出候选并停止，请用 `--task` 和 `--image-names` 明确选择。
+源图片通过 JSONL 的 `images` 路径读取，使用转换后的 `answer.bbox` 原图像素 xyxy 坐标。
+
+默认生成：
+
+```text
+/mnt/bn/intelligent-service-yg/dataset/UI_lens_paper_figures/
+├── 788_bbox.pdf
+├── 819_bbox.pdf
+├── 788_bbox_preview.png
+├── 819_bbox_preview.png
+└── export_manifest.json
+```
+
+每个 PDF 一页，原图全幅、无标题和额外页边距，红色透明内部矢量框；截图保留原始像素并无损嵌入。
+默认线宽 1.5pt，`--line-width` 可调。`--dpi 144` 只决定 PDF 页面物理尺寸，不会降低截图分辨率。
+触及页边缘的框将线条中心向内移动半个线宽以防被页面裁断，清单仍保留原始 GT 坐标。
+预览 PNG 用于快速检查；清单保存任务、框坐标、原图 SHA256、标注文件和行号、输出绝对路径。
+原图不修改，已有输出不覆盖；再次导出请指定新的 `--output-dir`。
+如果转换结果在其他目录，使用 `--eval-dir /实际转换目录`。
