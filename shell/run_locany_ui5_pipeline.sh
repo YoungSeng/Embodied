@@ -513,7 +513,7 @@ has_successful_evaluation() {
   local step="$1"
   local checkpoint="${OUTPUT_DIR}/checkpoint-${step}"
   if [[ -n "${UI_EVAL_MANIFEST:-}" ]]; then
-    "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/run_ui14_eval.py" --output-dir "${OUTPUT_DIR}" \
+    "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/ui14_run_recovery.py" --output-dir "${OUTPUT_DIR}" \
       --step "${step}" --manifest "${UI_EVAL_MANIFEST}" --checkpoint "${checkpoint}"
     return $?
   fi
@@ -607,6 +607,13 @@ if [[ ! -f "${META_PATH}" ]]; then
   fi
   echo "========================================" >&2
   locany_die 26 "Training metadata missing: ${META_PATH}"
+fi
+
+# Publish the UI14 data binding before checkpoint-0 export/evaluation. This is
+# intentionally after the eval-only branch: external evaluation is read-only.
+if [[ -n "${UI_TASK_REGISTRY:-}" ]]; then
+  echo "[PIPELINE] validating and binding UI14 data before initial evaluation/training"
+  "${PIPELINE_PYTHON}" "${PROJECT_ROOT}/scripts/validate_ui14_ready.py"
 fi
 
 if [[ "${ENABLE_EVAL}" == "0" ]]; then

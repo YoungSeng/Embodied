@@ -81,7 +81,15 @@ def validate_run_data_binding(runtime, snapshot, *, create=False):
         if read_json(marker) != expected:
             raise RuntimeError("SFT output directory belongs to another repair batch; use a fresh output directory")
     else:
-        if output.exists() and any(output.glob("checkpoint-*")):
-            raise RuntimeError("Existing SFT checkpoints have no repair data binding; refusing to resume them")
+        checkpoints = list(output.glob("checkpoint-*")) if output.exists() else []
+        if checkpoints:
+            # The initial evaluation exports a model, not an SFT resume point.
+            # Older pipelines did this before publishing the run/data binding.
+            if len(checkpoints) != 1 or checkpoints[0].name != "checkpoint-0":
+                raise RuntimeError("Existing SFT checkpoints have no repair data binding; refusing to resume them")
+            from ui14_run_recovery import validate_initial_export
+            validate_initial_export(runtime, snapshot, checkpoints[0])
+            print("[UI14 binding] verified legacy checkpoint-0: CPT9000 model-only export; SFT step=0", flush=True)
         if create:
             write_json(marker, expected)
+            print(f"[UI14 binding] {'recovered' if checkpoints else 'created'}: {marker}", flush=True)

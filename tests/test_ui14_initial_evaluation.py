@@ -92,6 +92,7 @@ class InitialEvaluationOrderingTests(unittest.TestCase):
         # substituted. Completion-set correctness is covered by the UI14 runner.
         functions = source[source.index("run_evaluation() {"):source.index('if [[ "${PIPELINE_MODE}" == "eval" ]]; then')]
         initial = source[source.index('CHECKPOINT_ZERO="'):source.index("while (( current_step < MAX_STEPS )); do")]
+        binding = source[source.index("# Publish the UI14 data binding"):source.index('if [[ "${ENABLE_EVAL}" == "0" ]]; then')]
         stubs = r'''
 set -e
 PIPELINE_PYTHON=fake_python
@@ -100,6 +101,7 @@ OUTPUT_DIR=/fixture/output
 BASE_MODEL=/fixture/checkpoint-9000
 INIT_CPT_STEP=9000
 UI_EVAL_MANIFEST=/fixture/evaluation_manifest.json
+UI_TASK_REGISTRY=/fixture/task_registry.json
 EVAL_AT_START=1
 EVAL_FAIL_POLICY=stop
 EVAL_INFERENCE_WORKERS_PER_GPU=2
@@ -109,7 +111,10 @@ fake_python() {
   case "$1" in
     */export_ui5_checkpoint0.py)
       echo "EXPORTED $*" ;;
-    */run_ui14_eval.py)
+    */validate_ui14_ready.py)
+      echo "BOUND"
+      return "${VALIDATION_EXIT}" ;;
+    */ui14_run_recovery.py)
       return "${COMPLETE_STATUS}" ;;
     */run_ui5_eval.py)
       echo "EVALUATED $*"
@@ -120,16 +125,23 @@ fake_python() {
 '''
         with tempfile.TemporaryDirectory() as tmp:
             script = Path(tmp) / "initial-eval.sh"
-            script.write_text(stubs + functions + initial + '\necho "TRAINING_ALLOWED"\n', encoding="utf-8", newline="\n")
-            for complete, inference_exit in ((1, 0), (0, 0), (1, 17)):
-                with self.subTest(complete=complete, inference_exit=inference_exit):
-                    env = {**os.environ, "COMPLETE_STATUS": str(complete), "INFERENCE_EXIT": str(inference_exit)}
+            script.write_text(stubs + functions + binding + initial + '\necho "TRAINING_ALLOWED"\n', encoding="utf-8", newline="\n")
+            for complete, inference_exit, validation_exit in ((1, 0, 0), (0, 0, 0), (1, 17, 0), (1, 0, 18)):
+                with self.subTest(complete=complete, inference_exit=inference_exit, validation_exit=validation_exit):
+                    env = {**os.environ, "COMPLETE_STATUS": str(complete), "INFERENCE_EXIT": str(inference_exit), "VALIDATION_EXIT": str(validation_exit)}
                     result = subprocess.run([bash, "--noprofile", "--norc", script.as_posix()], env=env, text=True, capture_output=True)
+                    if validation_exit:
+                        self.assertEqual(result.returncode, validation_exit)
+                        for text in ("EXPORTED", "EVALUATED", "TRAINING_ALLOWED"):
+                            self.assertNotIn(text, result.stdout)
+                        continue
                     self.assertEqual(result.returncode, inference_exit)
+                    self.assertIn("BOUND", result.stdout)
                     if complete:
                         self.assertIn("--init-cpt-step 9000", result.stdout)
                         self.assertIn("--step 0", result.stdout)
                         self.assertIn("--eval-inference-workers-per-gpu 2", result.stdout)
+                        self.assertLess(result.stdout.index("BOUND"), result.stdout.index("EXPORTED"))
                         self.assertLess(result.stdout.index("EXPORTED"), result.stdout.index("EVALUATED"))
                         if not inference_exit:
                             self.assertLess(result.stdout.index("EVALUATED"), result.stdout.index("TRAINING_ALLOWED"))

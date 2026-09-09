@@ -25,6 +25,39 @@ UI14_PREPARE_WORKERS=16 bash shell/ui14_neg11_a800.sh cache-prepare
 
 ## 独立 checkout 与默认路径
 
+### step 0 评测成功、首段训练因缺少数据绑定失败时恢复
+
+若日志已经显示 `complete step=0: 14/14 tasks, 36 Excel rows`，随后报
+`Existing SFT checkpoints have no repair data binding`，这是旧启动顺序问题：
+评测先导出 model-only `checkpoint-0`，数据绑定原本到训练入口才写。
+新代码在初始评测前完成绑定，也能核对并接纳此次遗留的完整 CPT9000 导出。
+不删除 checkpoint-0、评测结果、Excel 或数据产物；无需重跑数据准备。
+
+在新 checkout 更新代码，再提交到同一 neg11 输出目录：
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui14-neg11
+git pull --ff-only origin codex/m32-cpt9000-ui14-neg11-v1 &&
+bash shell/ui14_neg11_a800.sh submit
+```
+
+只在失败任务已退出后重新提交一次。旧对照实验继续运行。启动时先显示
+`[UI14 binding] recovered: .../ui14_training_data.json`。若原来的评测完整、数据和
+运行配置一致，且这次更新仅涉及启动修复，随后显示
+`[UI14 eval] reused complete step=0: 14/14 tasks, 36 Excel rows; startup-only fix verified; inference skipped`，
+然后进入 `current=0, stop_after=1000, total_max=16000`。
+训练仍从 CPT9000 初始化新的 optimizer/scheduler；checkpoint-0 不作为 optimizer resume 点。
+
+复用还要求 checkpoint-0 导出来源、seed=42、14 项任务表与当前批次匹配，且模型文件自评测
+开始后未变化。旧结果没有逐权重内容摘要，因此这里只接受文件大小/修改时间/变更时间证据
+支持的原地导出；重新复制、修改过的模型不自动复用。代码比较要求 Git 中保留原评测提交，
+不对真实推理/评分代码变更放行。另写 `evaluation/ui14-step-0-startup-reuse.json` 留存复用依据，
+原 evaluation JSON、history、Excel 和 checkpoint 保持原样。
+
+缺项评测照常补跑；数据错批、无绑定非零 SFT 断点仍阻止启动。
+`EVAL_FAIL_POLICY=stop`、每卡两个槽位和 synth_loneword 独占调度保持原配置。
+本次 CPU 验证与执行边界见 [启动恢复检查报告](ui14_startup_recovery_cpu_report.md)。
+
 在开发机执行以下命令，只创建新目录，不在旧 checkout 内操作 Git：
 
 ```bash
