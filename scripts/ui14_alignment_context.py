@@ -15,23 +15,37 @@ STAGES = ("audit-errors", "prepare", "check", "eval-prepare", "eval-existing", "
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
+    data_root, parent_root = alignment_default_roots()
     p.add_argument("stage", choices=STAGES)
-    p.add_argument("--data-root", default=os.environ.get("UI14_DATA_ROOT", DATA))
-    p.add_argument("--parent-root", default=os.environ.get("UI14_PARENT_DATA_ROOT", NEG_DATA))
+    p.add_argument("--data-root", default=data_root)
+    p.add_argument("--parent-root", default=parent_root)
     p.set_defaults(output_dir=OUTPUT)
     p.add_argument("--old-run", default=OLD_OUTPUT)
     p.add_argument("--old-manifest", default=OLD_MANIFEST)
     p.add_argument("--task", nargs="+", default=["ui_alignment"])
     p.add_argument("--steps", nargs="+", type=int, default=[2000, 4000])
     p.add_argument("--examples", type=int, default=5)
+    p.add_argument("--reuse-audit-root", type=Path,
+                   help="Read-only import of completed historical_audit results; source files are never moved or edited")
     p.add_argument("--gpu-devices", default="0", help="Independent evaluation allocation only; formal training remains 4 A800")
     p.add_argument("--resource-group", default="aiai_locate")
     return p.parse_args(argv)
 
 
 def run(args):
-    root = independent_output(args.data_root, args.parent_root, args.old_run, NEG_OUTPUT, args.output_dir)
+    print(f"[alignment paths] stage={args.stage}\ndata_root={args.data_root}\n"
+          f"parent_root={args.parent_root}\nold_run={args.old_run}\n"
+          f"old_manifest={args.old_manifest}\noutput_dir={args.output_dir}", flush=True)
+    for name, selected in (("UI14_DATA_ROOT", args.data_root), ("UI14_PARENT_DATA_ROOT", args.parent_root)):
+        inherited = os.environ.get(name)
+        if inherited and Path(inherited).resolve() != Path(selected).resolve():
+            print(f"[alignment paths] ignored inherited {name}={inherited}; "
+                  "use UI14_ALIGNMENT_* or explicit --data-root/--parent-root", flush=True)
+    root = alignment_destination(args.data_root, args.parent_root, args.old_run, args.output_dir)
     independent_output(args.output_dir, args.parent_root, args.old_run, NEG_OUTPUT)
+    if args.stage == "prepare": require_neg11_parent(args.parent_root)
+    if args.reuse_audit_root and args.stage != "audit-errors":
+        raise ValueError("--reuse-audit-root is only valid for audit-errors")
     if args.stage == "status":
         result = {stage: read_json(root / "stage_summaries" / f"{stage}.json")
                   if (root / "stage_summaries" / f"{stage}.json").is_file() else {"status": "not_run"} for stage in STAGES}
@@ -42,6 +56,11 @@ def run(args):
             if args.stage in ("audit-errors", "prepare", "eval-prepare"):
                 with verification_session(root):
                     if args.stage == "audit-errors":
+                        if args.reuse_audit_root:
+                            from ui14_alignment_audit_reuse import import_completed_audits
+                            imported = import_completed_audits(args.reuse_audit_root, root / "historical_audit",
+                                                               args.task, args.steps)
+                            write_json(root / "historical_audit/import_summary.json", imported)
                         from ui14_alignment_audit import audit_runs
                         result = audit_runs(args.old_run, args.old_manifest, args.task, args.steps,
                                             root / "historical_audit", examples=args.examples)

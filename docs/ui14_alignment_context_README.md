@@ -28,6 +28,10 @@ cd Embodied-ui14-alignment-context
 ```
 
 入口默认使用 `/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/conda_envs/LocateAnything/bin/python`。
+本入口使用专属 `UI14_ALIGNMENT_DATA_ROOT` 和 `UI14_ALIGNMENT_PARENT_DATA_ROOT`；
+旧实验残留的 `UI14_DATA_ROOT`、`UI14_PARENT_DATA_ROOT` 不会决定本次读写目录。
+每次启动会打印最终路径；显式 `--data-root`/`--parent-root` 优先于专属环境变量。
+旧 neg11/repair 数据目录在任何日志、锁或验证记录写入前即被保护。
 下面三个命令全部在 CPU 节点运行；前一个成功后再运行下一个：
 
 ```bash
@@ -42,6 +46,31 @@ bash shell/ui14_alignment_context_a800.sh prepare &&
 bash shell/ui14_alignment_context_a800.sh eval-prepare \
   --task ui_alignment --steps 2000 4000
 ```
+
+### 旧环境变量导致串目录后的接续
+
+若 533f36b 的审计曾落在旧 neg11 目录，且 prepare 因父目录缺少
+`negative_extension_manifest.json` 失败，更新代码后使用以下命令。
+已完成的审计只读复制到新目录，再核对原输入及代码身份；匹配时日志显示 reused，
+不重新评分、不推理。旧目录中的数据和审计文件不移动、不覆盖、不删除。
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui14-alignment-context
+git pull --ff-only
+
+export UI14_ALIGNMENT_DATA_ROOT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_data/ui14_alignment_context_v1
+export UI14_ALIGNMENT_PARENT_DATA_ROOT=/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_data/ui14_cpt9000_neg11_v1
+
+bash shell/ui14_alignment_context_a800.sh audit-errors \
+  --task ui_alignment --steps 2000 4000 \
+  --reuse-audit-root /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/gui_data/ui14_cpt9000_neg11_v1/historical_audit &&
+bash shell/ui14_alignment_context_a800.sh prepare &&
+bash shell/ui14_alignment_context_a800.sh eval-prepare
+```
+
+`historical_audit/import_summary.json` 记录 imported/reused/skipped 数量。
+缺失或校验不通过的审计不会冒充完成，原 audit-errors 会补做需要的 CPU 审计。
+导入不改变原审计身份算法，也不改变生成、评分、数据选择、训练参数或正式 YAML。
 
 如果旧 run/对应 test 不在默认路径，给 `audit-errors` 和 `eval-prepare` **同时**加上
 `--old-run /实际旧run --old-manifest /对应旧数据/evaluation_manifest.json`。

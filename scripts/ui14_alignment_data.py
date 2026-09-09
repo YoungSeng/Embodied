@@ -3,7 +3,8 @@ from pathlib import Path
 import os
 import shutil
 from ui14_common import read_json, read_jsonl, write_json, file_digest, paths_for, UI_TASKS
-from ui14_alignment_common import PROFILE, NEG_OUTPUT, OLD_OUTPUT, independent_output
+from ui14_alignment_common import (PROFILE, NEG_OUTPUT, OLD_OUTPUT, independent_output,
+                                  alignment_destination, require_neg11_parent)
 from ui14_progress import track
 
 
@@ -45,8 +46,8 @@ def copy_verified(source, target, expected):
 
 
 def prepare_frozen_data(parent, root, output):
-    parent = Path(parent).resolve(strict=True)
-    root = independent_output(root, parent, NEG_OUTPUT, OLD_OUTPUT, output)
+    parent = require_neg11_parent(parent)
+    root = alignment_destination(root, parent, output=output)
     independent_output(output, root, parent, NEG_OUTPUT, OLD_OUTPUT)
     source_report_path = parent / "cpu_check_report.json"
     source_report = read_json(source_report_path)
