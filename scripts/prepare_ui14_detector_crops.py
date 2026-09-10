@@ -12,6 +12,16 @@ from ui14_cache_prepare import ImageInfoJournal, publish_prepared, validate_prep
 from ui14_verification import verification_session, preparation_lock
 
 
+def selected_crop_jobs(registry, selected=None):
+    from eaglevl.ui_task_registry import task_from_spec
+    jobs = [(task_from_spec(spec), split) for spec in registry[5:]
+            if spec["view_policy"] == "crops" and (not selected or spec["task_key"] in selected)
+            for split in ("train", "test")]
+    if selected and {t.task_key for t, _ in jobs} != set(selected):
+        raise ValueError("Requested cache tasks must be registered with view_policy=crops")
+    return jobs
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=("prepare", "detect", "crops", "all"), default="detect",
@@ -20,6 +30,9 @@ def main():
     parser.add_argument("--detector-workers-per-gpu", type=int, choices=range(1, 6),
                         default=int(os.environ.get("UI14_DETECTOR_WORKERS_PER_GPU", "4")))
     parser.add_argument("--data-root", default=DATA_ROOT)
+    parser.add_argument("--tasks", nargs="+", choices=[t.task_key for t in UI9_TASKS], default=None)
+    parser.add_argument("--local-task-inputs", action="store_true",
+                        help="CPU prepare binds a local input list when normalized data was frozen from a parent")
     parser.add_argument("--parser-root", default=WORKSPACE + "/code/Eagle_LocateUI5_v4/ui-region-parser")
     parser.add_argument("--ui5-cache", default=WORKSPACE + "/code/Eagle_LocateUI5_v4/Embodied-ui5-det-crop/work_dirs/ui5_eval_detector_cache_horizontal_v5")
     parser.add_argument("--text-python", default=None)
@@ -56,16 +69,23 @@ def _run(args):
     stage_summary = Path(args.ui5_cache) / "detections" / "text" / "stage_summary.json"
     runtime = read_json(stage_summary).get("runtime", {}) if stage_summary.is_file() else {}
     text_python = args.text_python or runtime.get("python") or WORKSPACE + "/conda_envs/UI5PaddleOCR/bin/python"
-    jobs = [(get_task(spec["task_id"]), split) for spec in registry[5:]
-            if get_task(spec["task_id"]).view_policy == "crops" for split in ("train", "test")]
+    jobs = selected_crop_jobs(registry, getattr(args, "tasks", None))
     stage = getattr(args, "stage", "detect")
     detector_workers = getattr(args, "detector_workers_per_gpu", int(os.environ.get("UI14_DETECTOR_WORKERS_PER_GPU", "4")))
     if detector_workers not in range(1, 6): raise ValueError("UI14_DETECTOR_WORKERS_PER_GPU must be in 1..5")
 
     def options(paths, split, step, count=1):
         workers = detector_workers if step in ("text", "icon") else 1
+        task_inputs = paths["detector_inputs"]
+        if getattr(args, "local_task_inputs", False):
+            task_inputs = paths["cache"] / "task_input_manifest.json"
+            expected = {paths["detector_input"].parent.name: str(paths["detector_input"])}
+            if stage in ("prepare", "all"):
+                if not task_inputs.is_file() or read_json(task_inputs) != expected: write_json(task_inputs, expected)
+            elif not task_inputs.is_file() or read_json(task_inputs) != expected:
+                raise ValueError("Run CPU cache-prepare before GPU detection; local task inputs are missing/stale")
         command = ["--stage", step, "--input-dir", str(paths["detector_input"].parent),
-                "--task-input-manifest", str(paths["detector_inputs"]), "--data-split", split,
+                "--task-input-manifest", str(task_inputs), "--data-split", split,
                 "--output-dir", str(paths["cache"]), "--parser-root", args.parser_root,
                 "--gpus", args.gpus, "--workers-per-gpu", str(workers), "--scan-name", SCAN_NAME,
                 "--cache-scope", "full_test" if split == "test" else "full_train",
@@ -92,7 +112,7 @@ def _run(args):
                for task, split, paths in plans}
     if stage in ("prepare", "all"):
         journal = ImageInfoJournal(root / "cache_preparation/image_info.jsonl", getattr(args, "prepare_workers", 16))
-        for task, split, paths in track(plans, "CPU 准备七个 crop 任务 × train/test", unit="任务/split", estimate=False):
+        for task, split, paths in track(plans, f"CPU 准备 {len(jobs)//2} 个 crop 任务 × train/test", unit="任务/split", estimate=False):
             with phase(f"{task.task_key}/{split} CPU 图片扫描与分片"):
                 expected_config = configs[task.task_key, split]
                 # Reject incompatible legacy detector settings before touching its manifests.
@@ -138,7 +158,7 @@ def _run(args):
         geometry_ready = set()
         # Finish GPU work for every split before starting any CPU geometry.
         for step in phases:
-            for task, split, paths in track(plans, f"{step}: 七个 crop 任务 × train/test", unit="任务/split", estimate=False):
+            for task, split, paths in track(plans, f"{step}: {len(jobs)//2} 个 crop 任务 × train/test", unit="任务/split", estimate=False):
                 key = (task.task_key, split)
                 if step == "merge" and (paths["cache"] / SCAN_NAME / "eval_detector_cache_ready.json").exists():
                     from prepare_ui14_sft import validate_task_cache

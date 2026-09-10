@@ -14,6 +14,7 @@ from typing import Any, Mapping
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "locany_ui5_machines.json"
+UI14_EXCLUSIVE_GPU_TASKS = ("synth_loneword", "change_line_illegal_v3")
 TASKS = (
     "occlusion",
     "cropping",
@@ -174,7 +175,7 @@ def resolve_runtime_config(
     """Resolve final runtime values with environment variables taking precedence."""
 
     env = os.environ if env is None else env
-    if env.get("UI_TRAIN_PROFILE") in ("m32-cpt9000-ui14-v1", "m32-cpt9000-ui14-neg11-v1", "m32-cpt9000-ui14-alignment-context-v1"):
+    if env.get("UI_TRAIN_PROFILE") in ("m32-cpt9000-ui14-v1", "m32-cpt9000-ui14-neg11-v1", "m32-cpt9000-ui14-alignment-context-v1", "m32-cpt9000-ui14-neg11-alignment-crops-v1"):
         from ui14_profile import profile_environment
         env = {**profile_environment(project_root=env.get("PROJECT_ROOT"), data_root=env.get("UI14_DATA_ROOT"), profile=env["UI_TRAIN_PROFILE"]), **env}
     raw = load_machine_config(config_path)
@@ -407,6 +408,7 @@ def resolve_runtime_config(
         "CUDA_DEVICES": cuda_devices,
         "EVAL_GPU_DEVICES": eval_gpu_devices,
         "EVAL_INFERENCE_WORKERS_PER_GPU": int(_env_value(env, "EVAL_INFERENCE_WORKERS_PER_GPU", 1)),
+        "EVAL_EXCLUSIVE_GPU_TASKS": str(_env_value(env, "EVAL_EXCLUSIVE_GPU_TASKS", " ".join(UI14_EXCLUSIVE_GPU_TASKS))),
         "EVAL_ENABLE_PBD": int(_env_value(env, "EVAL_ENABLE_PBD", 1)),
         "WORKSPACE": workspace,
         "PROJECT_ROOT": project_root,
@@ -757,7 +759,7 @@ def resolve_runtime_config(
             "UI5_UI_SAMPLING_MODE": "task_source_balanced_rotating",
             "INSTALL_SYSTEM_RUNTIME_DEPS": 1,
         }
-        if env.get("UI_TRAIN_PROFILE") in ("m32-cpt9000-ui14-v1", "m32-cpt9000-ui14-neg11-v1", "m32-cpt9000-ui14-alignment-context-v1"):
+        if env.get("UI_TRAIN_PROFILE") in ("m32-cpt9000-ui14-v1", "m32-cpt9000-ui14-neg11-v1", "m32-cpt9000-ui14-alignment-context-v1", "m32-cpt9000-ui14-neg11-alignment-crops-v1"):
             formal_exact.update(INIT_CPT_STEP=9000, EVAL_AT_START=1, EVAL_FAIL_POLICY="stop", EVAL_INFERENCE_WORKERS_PER_GPU=2,
                                 ATTN_IMPLEMENTATION="sdpa", UI_NUM_TASKS="14", LOCANY_CPT_MODE="0")
             machine_resource_config(machine_type, resource_group=resolved["RESOURCE_GROUP"], config_path=config_path)

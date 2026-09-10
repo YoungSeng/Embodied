@@ -5,6 +5,9 @@ from ui14_common import *
 
 def profile_environment(*, project_root=None, data_root=None, profile="m32-cpt9000-ui14-v1"):
     from ui14_alignment_common import PROFILE, PROJECT, DATA, OUTPUT
+    from ui14_alignment_crops_common import PROFILE as CROPS_PROFILE, PROJECT as CROPS_PROJECT, DATA as CROPS_DATA, OUTPUT as CROPS_OUTPUT
+    if profile == CROPS_PROFILE:
+        data_root, project_root = data_root or CROPS_DATA, project_root or CROPS_PROJECT
     alignment = profile == PROFILE
     if alignment:
         data_root, project_root = data_root or DATA, project_root or PROJECT
@@ -33,6 +36,9 @@ def profile_environment(*, project_root=None, data_root=None, profile="m32-cpt90
         env.update(UI_TRAIN_PROFILE=profile, VERSION=profile, OUTPUT_DIR=OUTPUT,
                    RUN_NAME="locany-m32-cpt9000-ui14-alignment-context-a800x4-v1",
                    UI_EVAL_ANSWER_GRAMMAR="ui14_answer_v1")
+    if profile == CROPS_PROFILE:
+        env.update(UI_TRAIN_PROFILE=profile, VERSION=profile, OUTPUT_DIR=CROPS_OUTPUT,
+                   RUN_NAME=Path(CROPS_OUTPUT).name, UI_EVAL_ANSWER_GRAMMAR="legacy")
     return env
 
 

@@ -5,7 +5,7 @@ Only UI5 supports implicit prompt routing; new sources require an explicit ID.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 from pathlib import Path
 
@@ -84,6 +84,8 @@ def validate_registry(value, expected_count=None):
     for index, row in enumerate(rows):
         task = UI_TASKS[index]
         for key in ("task_id", "task_key", "relation_family", "view_policy", "prompt_label", "class_id"):
+            if key == "view_policy" and task.task_key == "ui_alignment" and row.get(key) in ("full_image", "crops"):
+                continue  # Explicit, checkpoint-bound view experiment; task identity is unchanged.
             if row.get(key) != getattr(task, key):
                 raise ValueError(f"UI registry routing drift at {index}.{key}: {row.get(key)!r}")
         for key in ("source_dataset", "defect_type", "train", "test"):
@@ -94,6 +96,15 @@ def validate_registry(value, expected_count=None):
 
 def load_registry(path):
     return validate_registry(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def task_from_spec(spec):
+    """Use the saved input policy, including the explicit alignment ablation."""
+    task = get_task(spec["task_id"])
+    policy = spec.get("view_policy", task.view_policy)
+    if policy != task.view_policy and not (task.task_key == "ui_alignment" and policy == "crops"):
+        raise ValueError(f"Unsupported task input policy: {task.task_key}={policy}")
+    return replace(task, view_policy=policy)
 
 
 def configure_task_registry(config, registry=None, num_tasks=None):

@@ -142,6 +142,38 @@ class StageSeparationTests(unittest.TestCase):
         with mock.patch.object(pipeline.subprocess, "run", side_effect=AssertionError("CPU started a subprocess")):
             pipeline.run(self.args)
 
+    def test_frozen_alignment_local_handoff_prepares_only_two_splits_and_gpu_never_scans(self):
+        import shutil
+        parent = self.data
+        self.data = self.root / "new-alignment-crops"
+        shutil.copytree(parent, self.data)
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in parent.rglob("*") if p.is_file()}
+        registry = read_json(self.data / "task_registry.json")
+        registry["tasks"][5]["view_policy"] = "crops"
+        write_json(self.data / "task_registry.json", registry)
+        self.args.data_root, self.args.tasks, self.args.local_task_inputs = self.data, ["ui_alignment"], True
+        self.prepare()
+        self.assertEqual(read_json(self.data / "cache_preparation/summary.json")["splits"], 2)
+        self.assertEqual({p.name for p in (self.data / "cache").iterdir()}, {"ui_alignment"})
+        for split in ("train", "test"):
+            paths = paths_for(self.data, "ui_alignment", split)
+            self.assertEqual(read_json(paths["cache"] / "task_input_manifest.json"), {"ui_alignment": str(paths["detector_input"])})
+            self.assertEqual(read_json(paths["detector_inputs"]), {"ui_alignment": str(paths_for(parent, "ui_alignment", split)["detector_input"])})
+        with mock.patch.object(Image, "open", side_effect=AssertionError("resume decoded image")):
+            self.prepare()
+        self.args.stage = "detect"
+        with mock.patch.object(Image, "open", side_effect=AssertionError("GPU handoff decoded image")), \
+                mock.patch.object(detector, "prepare_manifest", side_effect=AssertionError("GPU handoff prepared images")), \
+                mock.patch.object(pipeline.subprocess, "run") as worker:
+            pipeline.run(self.args)
+        self.assertEqual([c.args[0][c.args[0].index("--stage") + 1] for c in worker.call_args_list], ["text", "text", "icon", "icon"])
+        self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in before})
+        paths = paths_for(self.data, "ui_alignment", "test")
+        (paths["cache"] / "task_input_manifest.json").unlink()
+        with mock.patch.object(pipeline.subprocess, "run") as worker:
+            with self.assertRaisesRegex(ValueError, "CPU cache-prepare"): pipeline.run(self.args)
+            worker.assert_not_called()
+
     def test_prepare_needs_no_detector_environment_and_resumes_every_image(self):
         self.args.text_python = "unavailable-paddle-python"
         self.args.icon_python = "unavailable-icon-python"

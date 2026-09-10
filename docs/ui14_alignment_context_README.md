@@ -154,8 +154,10 @@ available selection、normalization、eval_set 与真实正负数；七项 synth
 没有给旧 JSON、done 标记或报告建立可写硬链接。父摘要或输入变化会拒绝混入本目录。
 旧 repair-v2 Excel 是历史定位材料，不混入 neg11 新 test 的指标历史。
 
-新增生成策略为 `UI_EVAL_ANSWER_GRAMMAR=ui14_answer_v1`，只在新 profile 和独立补评启用；
-旧 profile 默认 legacy。它逐 token 校验完整答案前缀：
+历史 alignment-context profile 的生成策略为 `UI_EVAL_ANSWER_GRAMMAR=ui14_answer_v1`。
+按本次用户要求，独立补评默认切回原正式 `legacy + hybrid`；如需明确重现结构约束版本，
+对 eval-prepare/eval-existing 同时传 `--answer-grammar ui14_answer_v1`。
+两种策略使用不同的比较身份和预测目录。结构约束策略逐 token 校验完整答案前缀：
 
 - 正例沿用 `<ref>任务 prompt_label</ref><box><x1><y1><x2><y2></box>`，可以有多个框。
 - 负例沿用训练标签 `<box>none</box>`，结束后只允许 EOS，不再接坐标。

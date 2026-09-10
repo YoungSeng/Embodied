@@ -69,7 +69,7 @@ def fixture(root, workers_per_gpu=2):
     return ["parallel", "--checkpoint", str(root / "checkpoint"), "--processor-path", str(root / "checkpoint"),
             "--input-dir", str(root), "--output-dir", str(root / "pred"), "--gpu-devices", "0,1,2,3",
             "--workers-per-gpu", str(workers_per_gpu), "--attn-implementation", "sdpa", "--inference-script", str(worker),
-            "--eval-manifest", str(root / "evaluation_manifest.json")]
+            "--eval-manifest", str(root / "evaluation_manifest.json"), "--exclusive-gpu-tasks"]
 
 
 class InferenceWorkersTests(unittest.TestCase):

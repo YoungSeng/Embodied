@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from locany_ui5_common import TASK_JSONL, TASKS, parse_gpu_devices
+from locany_ui5_common import TASK_JSONL, TASKS, parse_gpu_devices, UI14_EXCLUSIVE_GPU_TASKS
 from ui14_common import UI_TASKS, read_json
 from ui5_eval_detector_cache import validate_eval_detector_cache
 
@@ -30,7 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-devices", required=True)
     parser.add_argument("--workers-per-gpu", type=int, choices=(1, 2), default=1,
                         help="Independent inference processes per physical GPU; tasks share one queue")
-    parser.add_argument("--exclusive-gpu-tasks", nargs="*", choices=[t.task_key for t in UI_TASKS], default=[],
+    parser.add_argument("--exclusive-gpu-tasks", nargs="*", choices=[t.task_key for t in UI_TASKS],
+                        default=list(UI14_EXCLUSIVE_GPU_TASKS),
                         help="Tasks that occupy a whole GPU until their subprocess exits; other GPUs remain parallel")
     parser.add_argument(
         "--attn-implementation",
@@ -38,6 +39,8 @@ def parse_args() -> argparse.Namespace:
         required=True,
     )
     parser.add_argument("--inference-script", type=Path, required=True)
+    parser.add_argument("--ui-answer-grammar", choices=("legacy", "ui14_answer_v1"),
+                        default=os.environ.get("UI_EVAL_ANSWER_GRAMMAR", "legacy"))
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--runtime-profile", type=Path, default=None)
     parser.add_argument("--tasks", nargs="+", choices=[t.task_key for t in UI_TASKS], default=None)
@@ -257,6 +260,8 @@ def build_command(
         "flash_attention_2",
         "--generation-mode",
         "hybrid",
+        "--ui-answer-grammar",
+        getattr(args, "ui_answer_grammar", "legacy"),
         "--tasks",
         task,
         "--skip-figma",

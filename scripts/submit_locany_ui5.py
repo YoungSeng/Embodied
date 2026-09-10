@@ -28,7 +28,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Render and submit a LocateAnything UI5 v4 A800/H20 4/8-GPU job"
     )
-    parser.add_argument("--profile", choices=("m32-cpt9000-ui14-v1", "m32-cpt9000-ui14-neg11-v1", "m32-cpt9000-ui14-alignment-context-v1"), default=None)
+    parser.add_argument("--profile", choices=("m32-cpt9000-ui14-v1", "m32-cpt9000-ui14-neg11-v1", "m32-cpt9000-ui14-alignment-context-v1", "m32-cpt9000-ui14-neg11-alignment-crops-v1"), default=None)
     parser.add_argument("--ui14-data-root", default=None)
     parser.add_argument("--machine", choices=("a800", "h20"), required=True)
     parser.add_argument(
@@ -542,6 +542,7 @@ def render_job(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         "CUDA_DEVICES",
         "EVAL_GPU_DEVICES",
         "EVAL_INFERENCE_WORKERS_PER_GPU",
+        "EVAL_EXCLUSIVE_GPU_TASKS",
         "EVAL_ENABLE_PBD",
         "DATA_VERSION",
         "VERSION",

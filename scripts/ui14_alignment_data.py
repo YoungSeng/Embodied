@@ -45,7 +45,10 @@ def copy_verified(source, target, expected):
     return "copied"
 
 
-def prepare_frozen_data(parent, root, output):
+def prepare_frozen_data(parent, root, output, *, profile=PROFILE):
+    from ui14_alignment_crops_common import PROFILE as CROPS_PROFILE, protect_context
+    alignment_crops_run = profile == CROPS_PROFILE
+    if alignment_crops_run: protect_context(root, output)
     parent = require_neg11_parent(parent)
     root = alignment_destination(root, parent, output=output)
     independent_output(output, root, parent, NEG_OUTPUT, OLD_OUTPUT)
@@ -63,11 +66,22 @@ def prepare_frozen_data(parent, root, output):
     binding = {"parent": str(parent), "normalization_id": snapshot["normalization_id"],
                "selection_sha256": extension["selection_sha256"], "eval_set_id": evaluation["eval_set_id"],
                "source_report_sha256": file_digest(source_report_path), "negative_quota_policy": "available"}
+    if alignment_crops_run: binding["experiment_profile"] = profile
     root.mkdir(parents=True, exist_ok=True)
     marker = root / "frozen_parent.json"
     if marker.is_file() and read_json(marker) != binding:
         raise ValueError("This alignment directory is already bound to a different frozen selection/test set")
     write_json(marker, binding)
+    if alignment_crops_run and (root / "cpu_check_report.json").is_file():
+        previous = read_json(root / "cpu_check_report.json")
+        if previous.get("profile") == profile and previous.get("alignment_crop_check"):
+            from ui14_repair import validate_normalization
+            validate_normalization(root)
+            if previous.get("ready"):
+                from ui14_profile import validate_prepared_profile
+                validate_prepared_profile({"UI14_DATA_ROOT": str(root), "INIT_CHECKPOINT": source_report["init_checkpoint"]})
+            print("[alignment prepare] reused frozen manifests; existing alignment crops remain untouched", flush=True)
+            return previous
     if any(Path(output).glob("checkpoint-*")):
         if not (root / "cpu_check_report.json").is_file(): raise ValueError("Training output exists without a complete frozen data report")
         from ui14_profile import validate_prepared_profile
@@ -103,15 +117,21 @@ def prepare_frozen_data(parent, root, output):
             spec["detector_input"] = str(paths_for(parent, spec["task_key"], "test")["detector_input"])
     evaluation["frozen_parent_manifest"] = str(parent / "evaluation_manifest.json")
     evaluation["frozen_parent_manifest_sha256"] = file_digest(parent / "evaluation_manifest.json")
+    crop_check = None
+    if alignment_crops_run:
+        from ui14_alignment_crops_data import prepare_crop_registry
+        crop_check = prepare_crop_registry(root, evaluation)
     # IDs, test membership, records, and per-task sampler ratios are untouched.
     write_json(root / "evaluation_manifest.json", evaluation)
     from ui14_repair import validate_normalization
     current = validate_normalization(root)
     if current["normalization_id"] != binding["normalization_id"]: raise ValueError("Frozen normalization changed")
-    label_contract = training_answer_contract(read_json(root / "training_recipe.json"))
+    # The new crop annotation is deliberately absent until cache-finalize.
+    # Check the frozen source labels now; finalize checks the actual crop labels.
+    label_contract = training_answer_contract(read_json((parent if alignment_crops_run else root) / "training_recipe.json"))
     write_json(root / "alignment_answer_contract.json", label_contract)
     from ui14_checks import render_formal_yaml
-    render_formal_yaml(root, profile=PROFILE)
+    render_formal_yaml(root, profile=profile)
     artifacts = {name: file_digest(root / name) for name in bound_files}
     artifacts["frozen_parent.json"] = file_digest(marker)
     artifacts["alignment_answer_contract.json"] = file_digest(root / "alignment_answer_contract.json")
@@ -119,11 +139,15 @@ def prepare_frozen_data(parent, root, output):
     external.update({str(parent / name): h for name, h in bound_files.items()})
     external[str(source_report_path)] = binding["source_report_sha256"]
     result = {**source_report, "artifact_digests": artifacts, "external_digests": external,
-              "profile": PROFILE, "frozen_parent": binding, "manifest_copy_counts": counts,
+              "profile": profile, "frozen_parent": binding, "manifest_copy_counts": counts,
               "data_policy": "frozen available; immutable annotations/images/cache referenced read-only",
-              "source_report": str(source_report_path), "ready": True}
+              "source_report": str(source_report_path), "ready": not alignment_crops_run}
     result["training_answer_contract"] = label_contract
+    if crop_check: result.update(alignment_crop_check=crop_check, stage="alignment_cache_pending")
     write_json(root / "cpu_check_report.json", result)
+    if alignment_crops_run:
+        print(f"[alignment prepare] frozen available data reused: {counts}; next: cache-prepare (ui_alignment train/test only)", flush=True)
+        return result
     from ui14_profile import validate_prepared_profile
     try:
         validate_prepared_profile({"UI14_DATA_ROOT": str(root), "INIT_CHECKPOINT": source_report["init_checkpoint"]})

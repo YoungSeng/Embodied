@@ -66,7 +66,8 @@ def snapshot_checkpoint(source, target):
     return receipt
 
 
-def prepare_comparisons(old_run, manifest, tasks, steps, root):
+def prepare_comparisons(old_run, manifest, tasks, steps, root, *, grammar="legacy"):
+    if grammar not in ("legacy", VERSION): raise ValueError("Unsupported comparison answer grammar")
     old_run, root = Path(old_run).resolve(), Path(root).resolve()
     independent_output(root, old_run, Path(manifest).parent)
     document = read_json(manifest)
@@ -94,7 +95,7 @@ def prepare_comparisons(old_run, manifest, tasks, steps, root):
                    "model_snapshot": str(model), "source_manifest": str(Path(manifest).resolve()),
                    "manifest_sha256": file_digest(manifest), "tasks": list(tasks), "task_files": task_files,
                    "image_files": image_files,
-                   "decoder_contract": decode_contract(VERSION), "eval_set_id": document.get("eval_set_id"),
+                   "decoder_contract": decode_contract(grammar), "eval_set_id": document.get("eval_set_id"),
                    "snapshot_record_sha256": file_digest(model / "snapshot.json"),
                    "prediction_reuse": "only this exact weight/test/prompt/view/decode identity; no old prediction import"}
         comparison_id = digest(binding)
@@ -112,7 +113,8 @@ def prepare_comparisons(old_run, manifest, tasks, steps, root):
 def run_comparison(destination, *, gpus="0"):
     destination = Path(destination)
     binding = read_json(destination / "binding.json")
-    if binding["decoder_contract"] != decode_contract(VERSION):
+    grammar = binding["decoder_contract"]["policy"]
+    if binding["decoder_contract"] != decode_contract(grammar):
         raise ValueError("Decoder code changed; run CPU eval-prepare to create a new prediction identity")
     model = Path(binding["model_snapshot"])
     if file_digest(model / "snapshot.json") != binding["snapshot_record_sha256"]: raise ValueError("Model snapshot receipt changed")
@@ -136,9 +138,10 @@ def run_comparison(destination, *, gpus="0"):
                "--checkpoint", str(model), "--processor-path", str(model), "--eval-manifest", str(manifest),
                "--input-dir", str(destination), "--output-dir", str(prediction), "--gpu-devices", gpus,
                "--workers-per-gpu", "2", "--attn-implementation", "sdpa",
+               "--ui-answer-grammar", grammar,
                "--inference-script", str(PROJECT_ROOT / "scripts/inference_ui_defect_locany.py"),
                "--tasks", *binding["tasks"], "--save-raw-answer"]
-    env = {**os.environ, "UI_EVAL_ANSWER_GRAMMAR": VERSION, "PYTHONUNBUFFERED": "1"}
+    env = {**os.environ, "UI_EVAL_ANSWER_GRAMMAR": grammar, "PYTHONUNBUFFERED": "1"}
     subprocess.run(command, env=env, check=True)
     from run_ui14_eval import score_ui9
     metrics = {}

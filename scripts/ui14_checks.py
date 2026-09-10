@@ -54,6 +54,13 @@ def validate_formal_yaml(rendered, runtime, *, config_path=None):
     if runtime.get("UI_TRAIN_PROFILE") == PROFILE:
         expected_project = PROJECT
         if runtime.get("UI_EVAL_ANSWER_GRAMMAR") != "ui14_answer_v1": raise ValueError("Alignment answer grammar drift")
+    from ui14_alignment_crops_common import PROFILE as CROPS_PROFILE, PROJECT as CROPS_PROJECT, OUTPUT as CROPS_OUTPUT
+    if runtime.get("UI_TRAIN_PROFILE") == CROPS_PROFILE:
+        expected_project = CROPS_PROJECT
+        if runtime.get("UI_EVAL_ANSWER_GRAMMAR") != "legacy": raise ValueError("Production answer grammar drift")
+        if runtime["OUTPUT_DIR"] != CROPS_OUTPUT: raise ValueError("Independent alignment-crops run output drift")
+        if runtime.get("EVAL_EXCLUSIVE_GPU_TASKS", "").split() != ["synth_loneword", "change_line_illegal_v3"]:
+            raise ValueError("Alignment-crops run must reserve a physical GPU for both line-break tasks")
     if runtime["PROJECT_ROOT"] != expected_project: raise ValueError("Formal project path drift")
 
 

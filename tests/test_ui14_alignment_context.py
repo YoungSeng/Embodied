@@ -90,7 +90,7 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(done["status"], "success")
             command = launched.call_args.args[0]
             self.assertIn(str(model), command)
-            self.assertEqual(launched.call_args.kwargs["env"]["UI_EVAL_ANSWER_GRAMMAR"], VERSION)
+            self.assertEqual(launched.call_args.kwargs["env"]["UI_EVAL_ANSWER_GRAMMAR"], "legacy")
             with mock.patch("ui14_alignment_eval.subprocess.run", side_effect=AssertionError("repeat inference")):
                 self.assertEqual(run_comparison(targets[0]), done)
             with mock.patch("ui14_alignment_eval.decode_contract", return_value={"changed": True}):
