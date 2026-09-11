@@ -2,12 +2,14 @@
 """Full UI14 evaluation using a shared inference queue and the UI5 scorer."""
 from __future__ import annotations
 import os
+import shutil
 import subprocess
 import sys
 from uuid import uuid4
 from pathlib import Path
 from datetime import datetime, timezone
 from ui14_common import *
+from ui14_incremental_eval import run_incremental_inference, score_ui5_task
 
 
 def validate_evaluation_manifest(path):
@@ -111,7 +113,7 @@ def _run(args):
     from run_ui5_eval import build_score_command, run_checked
     from collect_ui5_metrics import (load_history, write_history, build_best_checkpoints_document,
                                      collect_gate_metrics, ui_model_signature, print_metric_summary)
-    from eaglevl.train.ui5_excel_logger import UI5ExcelLogger, build_eval_rows
+    from eaglevl.train.ui5_excel_logger import UI5ExcelLogger, build_eval_rows, build_task_eval_rows
     manifest = Path(os.environ["UI_EVAL_MANIFEST"])
     output = Path(args.output_dir)
     workbook = UI5ExcelLogger(output / "diagnostics" / "ui5_training_evaluation.xlsx", [t.task_key for t in UI_TASKS])
@@ -152,8 +154,8 @@ def _run(args):
     state_path = history_dir / f"ui14-step-{args.step}.json"
     started = datetime.now(timezone.utc).isoformat()
     workers_per_gpu = getattr(args, "eval_inference_workers_per_gpu", 2)
-    from locany_ui5_common import UI14_EXCLUSIVE_GPU_TASKS
-    exclusive_gpu_tasks = os.environ.get("EVAL_EXCLUSIVE_GPU_TASKS", " ".join(UI14_EXCLUSIVE_GPU_TASKS)).split()
+    from locany_ui5_common import ui14_exclusive_gpu_tasks
+    exclusive_gpu_tasks = ui14_exclusive_gpu_tasks(os.environ.get("EVAL_EXCLUSIVE_GPU_TASKS"))
     state = {"status": "running", "sft_step": args.step, "init_checkpoint": str(args.base_model),
              "init_cpt_step": 9000, "identity": identity, "tasks": {}, "started": started,
              "eval_gpu_devices": args.eval_gpu_devices, "inference_workers_per_gpu": workers_per_gpu,
@@ -161,6 +163,58 @@ def _run(args):
     repair_metadata = {k: read_json(manifest).get(k) for k in ("repair_run_id", "normalization_id")}
     state.update(repair_metadata)
     write_json(state_path, state)
+    partial_dir = history_dir / "partial" / score_run_name
+    audit_context = {"evaluation_split": "test", "cache_scope": "full_test",
+        "eval_inference_crop_mode": "task_registry", "recipe_digest": file_digest(args.recipe_path),
+        "cache_digest": file_digest(manifest), "crop_train_mode": "crop_only",
+        "ui_sampling_mode": "task_source_balanced_rotating", "scan_name": SCAN_NAME}
+    partial_metadata = {**identity, "data_digest": identity["manifest_digest"],
+        "init_checkpoint": str(args.base_model), "init_cpt_step": 9000,
+        "run_name": os.environ.get("RUN_NAME"), "tc_msed_stage": "m32", "checkpoint_kept": True}
+    task_gates = {}
+    specs_by_key = {s["task_key"]: s for s in specs}
+
+    def completed(event):
+        key = event["task"]
+        spec = specs_by_key[key]
+        state.setdefault("inference_tasks", {})[key] = event
+        write_json(state_path, state)
+        if event["return_code"] != 0:
+            return
+        try:
+            if spec["task_id"] < 5:
+                value = score_ui5_task(spec, prediction, partial_dir / key, Path(args.scorer_root))
+                gates = collect_gate_metrics(prediction, Path(spec["test"]).parent, Path(args.scorer_root),
+                                             selected_tasks=[key])
+                gate = gates.get(key, {})
+            else:
+                value, gate = score_ui9(spec, prediction, partial_dir / key)
+                gate.update(collect_gate_metrics(prediction, None,
+                    task_files={key: Path(spec["test"])}).get(key, {}))
+            value.update(source_dataset=spec["source_dataset"], source_version=spec["source_version"],
+                         view_policy=spec["view_policy"], task_id=spec["task_id"])
+            counts = value["image"]
+            if all(counts.get(k) is not None for k in ("tp", "fp", "fn", "tn")):
+                value.update(positive_count=counts["tp"]+counts["fn"], negative_count=counts["tn"]+counts["fp"])
+            receipt = {"identity": identity, "sft_step": args.step, "task": key, "status": "success",
+                       "metrics": value, "gate_metrics": gate, "inference": event}
+            write_json(partial_dir / key / "metrics.json", receipt)
+            task_rows = build_task_eval_rows(task_key=key, step=args.step, checkpoint=str(checkpoint),
+                metrics={"tasks": {key: value}}, gate_metrics={key: gate},
+                metadata=partial_metadata, audit_context=audit_context)
+            workbook.append_eval_tasks(args.step, task_rows)
+            task_gates[key] = gate
+            state["tasks"][key] = value
+            state.setdefault("task_reports", {})[key] = str(partial_dir / key / "metrics.json")
+            state["completed_tasks"] = len(state["tasks"])
+            write_json(state_path, state)
+            print(f"[UI14 eval] saved task={key} step={args.step}: {len(state['tasks'])}/14 tasks | "
+                  f"image F1={value['image']['f1']:.6f} bbox F1={value['bbox']['f1']:.6f} | "
+                  f"Excel: {workbook.path}", flush=True)
+        except Exception as exc:
+            state.setdefault("scoring_errors", {})[key] = str(exc)
+            write_json(state_path, state)
+            raise
     command = [sys.executable, str(PROJECT_ROOT / "scripts" / "run_ui5_parallel_inference.py"),
         "--checkpoint", str(checkpoint), "--processor-path", str(checkpoint),
         "--input-dir", str(manifest.parent), "--output-dir", str(prediction),
@@ -173,7 +227,10 @@ def _run(args):
         "--tile-nms-iou", str(args.tile_nms_iou),
         "--runtime-profile", str(history_dir / "task_runtime_profile.json")]
     try:
-        run_checked(command, cwd=Path(args.project_root), stage="ui14_parallel_inference")
+        run_incremental_inference(command, cwd=Path(args.project_root),
+                                  completion_dir=partial_dir / "completions", on_complete=completed)
+        if set(state["tasks"]) != set(specs_by_key):
+            raise RuntimeError("Incomplete task completion events/metrics; refusing full-round commit")
         # UI5 goes through its unmodified scorer entrypoint and frozen test files.
         args.input_dir = Path(specs[0]["test"]).parent
         print(f"[UI14 eval] scoring attempt: {destination} | existing reports preserved; "
@@ -189,13 +246,12 @@ def _run(args):
         if metrics is None:
             from collect_ui5_metrics import parse_markdown_report
             metrics = parse_markdown_report(destination / "all_tasks_evaluation.txt")
-        gate_metrics = collect_gate_metrics(prediction, args.input_dir, Path(args.scorer_root))
+        gate_metrics = dict(task_gates)
         for spec in specs[5:]:
-            result, gate = score_ui9(spec, prediction, destination)
-            metrics["tasks"][spec["task_key"]] = result
-            gate_metrics[spec["task_key"]] = gate
-        gate_metrics.update(collect_gate_metrics(prediction, None,
-            task_files={s["task_key"]: Path(s["test"]) for s in specs[5:]}))
+            key = spec["task_key"]
+            metrics["tasks"][key] = state["tasks"][key]
+            # Preserve the historical merged-file layout without rescoring/rereading predictions.
+            shutil.copyfile(partial_dir / key / f"{key}.merged.jsonl", destination / f"{key}.merged.jsonl")
         for spec in specs:
             metrics["tasks"][spec["task_key"]].update(source_dataset=spec["source_dataset"],
                 source_version=spec["source_version"], view_policy=spec["view_policy"], task_id=spec["task_id"])
@@ -249,6 +305,9 @@ def _run(args):
     except Exception as exc:
         state.update(status="failed", error=str(exc))
         write_json(state_path, state)
+        workbook.mark_eval_failed(args.step)
+        print(f"[UI14 eval] failed step={args.step}; preserved {len(state['tasks'])}/14 scored tasks | "
+              f"checkpoint={checkpoint} | Excel={workbook.path}", flush=True)
         raise
 
 

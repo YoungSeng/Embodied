@@ -14,7 +14,15 @@ from typing import Any, Mapping
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "locany_ui5_machines.json"
-UI14_EXCLUSIVE_GPU_TASKS = ("synth_loneword", "change_line_illegal_v3")
+UI14_EXCLUSIVE_GPU_TASKS = ("synth_loneword", "change_line_illegal_v3", "synth_inner_margin")
+
+
+def ui14_exclusive_gpu_tasks(value=None):
+    """Keep known OOM tasks exclusive even with an older rendered environment."""
+    configured = str(value or "").split()
+    return list(dict.fromkeys((*UI14_EXCLUSIVE_GPU_TASKS, *configured)))
+
+
 TASKS = (
     "occlusion",
     "cropping",
@@ -408,7 +416,7 @@ def resolve_runtime_config(
         "CUDA_DEVICES": cuda_devices,
         "EVAL_GPU_DEVICES": eval_gpu_devices,
         "EVAL_INFERENCE_WORKERS_PER_GPU": int(_env_value(env, "EVAL_INFERENCE_WORKERS_PER_GPU", 1)),
-        "EVAL_EXCLUSIVE_GPU_TASKS": str(_env_value(env, "EVAL_EXCLUSIVE_GPU_TASKS", " ".join(UI14_EXCLUSIVE_GPU_TASKS))),
+        "EVAL_EXCLUSIVE_GPU_TASKS": " ".join(ui14_exclusive_gpu_tasks(env.get("EVAL_EXCLUSIVE_GPU_TASKS"))),
         "EVAL_ENABLE_PBD": int(_env_value(env, "EVAL_ENABLE_PBD", 1)),
         "WORKSPACE": workspace,
         "PROJECT_ROOT": project_root,

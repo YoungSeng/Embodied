@@ -372,6 +372,7 @@ def collect_gate_metrics(
     gt_dir: Path | None,
     scorer_root: Path | None = None,
     task_files: dict[str, Path] | None = None,
+    selected_tasks: list[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Join per-image gate sidecars with the same GT parser used by scoring."""
 
@@ -415,7 +416,7 @@ def collect_gate_metrics(
         if extract_bboxes_for_issue is not None and get_gt_payload is not None:
             from locany_ui5_common import TASK_JSONL
 
-            for task in TASKS:
+            for task in (selected_tasks if selected_tasks is not None else TASKS):
                 source = gt_dir / TASK_JSONL[task]
                 labels: dict[str, bool] = {}
                 boxes_by_path: dict[str, list[Any]] = {}
@@ -443,7 +444,7 @@ def collect_gate_metrics(
                 ground_truth_boxes[task] = boxes_by_path
 
     result: dict[str, dict[str, Any]] = {}
-    for task in (task_files if task_files is not None else TASKS):
+    for task in (task_files if task_files is not None else (selected_tasks if selected_tasks is not None else TASKS)):
         gate_dir = prediction_dir / task / "gate"
         records = []
         if gate_dir.is_dir():

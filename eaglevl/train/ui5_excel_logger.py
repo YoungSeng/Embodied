@@ -226,6 +226,7 @@ TRAIN_COLUMNS = (
 
 EVAL_COLUMNS = (
     "step",
+    "evaluation_status",
     "task_id", "task_key", "source_dataset", "source_version", "view_policy", "positive_count", "negative_count",
     "eval_set_id", "data_digest",
     "checkpoint",
@@ -591,7 +592,7 @@ class UI5ExcelLogger:
                 if row[0] is not None and int(row[0]) == int(step)
             ]
             expected_pairs = self._expected_eval_pairs()
-            return len(rows) == len(expected_pairs) and {
+            return all(row.get("evaluation_status") in (None, "success") for row in rows) and len(rows) == len(expected_pairs) and {
                 (row.get("task"), row.get("granularity")) for row in rows
             } == expected_pairs
         finally:
@@ -647,6 +648,8 @@ class UI5ExcelLogger:
                 for old in existing_rows
                 if old.get("task") == row.get("task")
                 and old.get("granularity") == row.get("granularity")
+                and old.get("eval_set_id") == row.get("eval_set_id")
+                and old.get("data_digest") == row.get("data_digest")
                 and int(old.get("step", -1)) < int(row["step"])
                 and old.get("f1") is not None
             ]
@@ -668,11 +671,68 @@ class UI5ExcelLogger:
             row["raw_best_f1_so_far"] = raw_best.get("raw_f1") if raw_best else None
             row["raw_best_step_so_far"] = raw_best.get("step") if raw_best else None
 
+    def append_eval_tasks(self, step: int, task_metrics: Sequence[Mapping[str, Any]]) -> bool:
+        """Atomically upsert complete task pairs; partial rounds never contain aggregates."""
+        rows = [dict(row, step=int(step), evaluation_status="partial") for row in task_metrics]
+        pairs = {(r.get("task"), r.get("granularity")) for r in rows}
+        allowed = {(t.diagnostic_name, g) for t in UI_TASKS for g in ("image", "bbox")}
+        names = {r.get("task") for r in rows}
+        if not rows or len(pairs) != len(rows) or not pairs.issubset(allowed) or len(rows) != 2 * len(names):
+            raise ValueError("Partial evaluation requires complete image/bbox pairs for registered tasks")
+        identity_keys = ("eval_set_id", "data_digest", "model_signature", "git_commit", "config_hash",
+                         "recipe_digest", "cache_digest", "eval_inference_crop_mode")
+        # XLSX reads empty strings back as None; use its scalar representation.
+        def identity_of(row):
+            return tuple(None if _value(row.get(k)) == "" else _value(row.get(k)) for k in identity_keys)
+        identity = identity_of(rows[0])
+        if any(identity_of(r) != identity for r in rows):
+            raise ValueError("Partial task rows must share one evaluation identity")
+        workbook = self._load_or_create()
+        sheet = workbook[SHEET_EVAL]
+        existing = [dict(zip(EVAL_COLUMNS, values)) for values in sheet.iter_rows(min_row=2, values_only=True)]
+        same_step = [r for r in existing if r.get("step") == int(step)]
+        if any((r.get("eval_set_id"), r.get("data_digest")) !=
+               (rows[0].get("eval_set_id"), rows[0].get("data_digest")) for r in same_step):
+            workbook.close()
+            raise ValueError("Different evaluation data must use a separate output directory")
+        same_identity = all(identity_of(r) == identity for r in same_step)
+        if (same_identity and len(same_step) == len(self._expected_eval_pairs())
+                and {(r.get("task"), r.get("granularity")) for r in same_step} == self._expected_eval_pairs()
+                and all(r.get("evaluation_status") in (None, "success") for r in same_step)):
+            workbook.close()
+            return False
+        retained = [r for r in existing if r.get("step") != int(step) or
+                    (same_identity and (r.get("task"), r.get("granularity")) in allowed
+                     and (r.get("task"), r.get("granularity")) not in pairs)]
+        self._decorate_eval_rows(retained, rows)
+        sheet.delete_rows(2, max(0, sheet.max_row - 1))
+        for row in [*retained, *rows]:
+            sheet.append([_value(row.get(column)) for column in EVAL_COLUMNS])
+        sheet.auto_filter.ref = sheet.dimensions
+        self._atomic_save(workbook)
+        return True
+
+    def mark_eval_failed(self, step: int) -> None:
+        """Retain completed task metrics when inference/scoring of another task fails."""
+        workbook = self._load_or_create()
+        sheet = workbook[SHEET_EVAL]
+        column = EVAL_COLUMNS.index("evaluation_status") + 1
+        changed = False
+        for row in sheet.iter_rows(min_row=2):
+            if row[0].value == int(step) and row[column - 1].value == "partial":
+                row[column - 1].value = "failed"
+                changed = True
+        if changed:
+            self._atomic_save(workbook)
+        else:
+            workbook.close()
+
     def append_eval(self, step: int, task_metrics: Sequence[Mapping[str, Any]]) -> bool:
         step = int(step)
         rows = [dict(row) for row in task_metrics]
         for row in rows:
             row["step"] = step
+            row["evaluation_status"] = "success"
         expected_pairs = self._expected_eval_pairs()
         actual_pairs = {(row.get("task"), row.get("granularity")) for row in rows}
         if len(rows) != len(expected_pairs) or actual_pairs != expected_pairs:
@@ -1070,7 +1130,7 @@ def _build_group_eval_rows(
                     "task_key": scorer_task,
                     "source_dataset": task_values.get("source_dataset", next(t.source_dataset for t in task_specs if t.task_key == scorer_task)),
                     "source_version": task_values.get("source_version"),
-                    "view_policy": next(t.view_policy for t in task_specs if t.task_key == scorer_task),
+                    "view_policy": task_values.get("view_policy", next(t.view_policy for t in task_specs if t.task_key == scorer_task)),
                     "positive_count": task_values.get("positive_count", gate.get("positive_count")),
                     "negative_count": task_values.get("negative_count", gate.get("negative_count")),
                     "granularity": granularity,
@@ -1450,6 +1510,13 @@ def _build_group_eval_rows(
             }
         )
     return rows
+
+
+def build_task_eval_rows(*, task_key, **kwargs):
+    """Use identical count/diagnostic conversion without creating premature group metrics."""
+    task = next(t for t in UI_TASKS if t.task_key == task_key)
+    rows = _build_group_eval_rows(task_specs=(task,), group_prefix="_partial", **kwargs)
+    return [row for row in rows if row["task"] == task.diagnostic_name]
 
 
 def build_eval_rows(*, step, checkpoint, metrics, gate_metrics=None, raw_metrics=None, metadata=None, audit_context=None):

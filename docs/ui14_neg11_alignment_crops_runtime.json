@@ -5,7 +5,7 @@
   "CUDA_DEVICES": "0,1,2,3",
   "EVAL_GPU_DEVICES": "0,1,2,3",
   "EVAL_INFERENCE_WORKERS_PER_GPU": 2,
-  "EVAL_EXCLUSIVE_GPU_TASKS": "synth_loneword change_line_illegal_v3",
+  "EVAL_EXCLUSIVE_GPU_TASKS": "synth_loneword change_line_illegal_v3 synth_inner_margin",
   "EVAL_ENABLE_PBD": 1,
   "WORKSPACE": "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace",
   "PROJECT_ROOT": "/mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui14-neg11-alignment-crops",

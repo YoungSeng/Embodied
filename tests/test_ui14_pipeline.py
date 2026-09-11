@@ -231,7 +231,10 @@ class UI14EvaluationTests(unittest.TestCase):
     def test_real_scorer_retries_preserve_step_1000_reports_and_predictions(self):
         self._exercise_full_evaluation(1000, real_scorer=True)
 
-    def _exercise_full_evaluation(self, step, real_scorer=False, eval_set_id=None, external=False):
+    def test_partial_oom_results_survive_and_resume_commits_full_36_rows(self):
+        self._exercise_full_evaluation(1000, real_scorer=True, partial_failure=True)
+
+    def _exercise_full_evaluation(self, step, real_scorer=False, eval_set_id=None, external=False, partial_failure=False):
         import run_ui14_eval as evaluate
         from openpyxl import load_workbook
         from eaglevl.train.ui5_excel_logger import UI5ExcelLogger
@@ -270,12 +273,32 @@ class UI14EvaluationTests(unittest.TestCase):
                 if stage == "ui14_parallel_inference":
                     return  # Fixtures already contain predictions; no GPU/model calls.
                 self.assertEqual(stage, "ui5_score")
+                if not real_scorer:
+                    folder = Path(command[command.index("--output_root")+1]) / command[command.index("--run_name")+1]
+                    folder.mkdir(parents=True)
+                    return
                 result = subprocess.run(command, cwd=cwd, capture_output=True, text=True,
                                         encoding="utf-8", errors="replace", timeout=60)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+            def incremental(command, *, cwd, completion_dir, on_complete):
+                from run_ui5_eval import run_checked
+                run_checked(command, cwd=cwd, stage="ui14_parallel_inference")
+                for index, spec in enumerate(specs):
+                    on_complete({"task": spec["task_key"], "return_code": 0})
+                    if partial_failure and index == 5:
+                        partial = read_json(output/f"evaluation/ui14-step-{step}.json")
+                        self.assertEqual(len(partial["tasks"]), 6)
+                        self.assertFalse(evaluate.is_complete(output, step, manifest, checkpoint))
+                        book = load_workbook(output/"diagnostics/ui5_training_evaluation.xlsx")
+                        try: self.assertEqual(book["eval_1000steps"].max_row, 13)
+                        finally: book.close()
+                        on_complete({"task": "synth_inner_margin", "return_code": 1})
+                        raise RuntimeError("fixture OOM")
+
             with mock.patch.dict("os.environ",{"UI_EVAL_MANIFEST":str(manifest),"INIT_CPT_STEP":"9000"}), \
                  mock.patch.object(evaluate,"validate_evaluation_manifest",return_value=specs), \
+                 mock.patch.object(evaluate, "run_incremental_inference", side_effect=incremental), \
                  mock.patch("run_ui5_eval.run_checked") as runner, \
                  (contextlib.nullcontext() if real_scorer else
                   mock.patch("collect_ui5_metrics.parse_markdown_report",side_effect=lambda *a: json.loads(json.dumps(ui5)))):
@@ -292,7 +315,21 @@ class UI14EvaluationTests(unittest.TestCase):
                         empty.close()
                     runner.side_effect = None
                     runner.reset_mock()
-                runner.side_effect = execute_score if real_scorer else None
+                runner.side_effect = execute_score
+                if partial_failure:
+                    with self.assertRaisesRegex(RuntimeError, "fixture OOM"): evaluate.run(args)
+                    state = read_json(output/f"evaluation/ui14-step-{step}.json")
+                    self.assertEqual(state["status"], "failed")
+                    self.assertEqual(len(state["tasks"]), 6)
+                    self.assertFalse((output/"evaluation/best_checkpoints.json").exists())
+                    book = load_workbook(output/"diagnostics/ui5_training_evaluation.xlsx")
+                    try:
+                        sheet = book["eval_1000steps"]
+                        columns = [c.value for c in sheet[1]]
+                        self.assertEqual({r[columns.index("evaluation_status")] for r in sheet.iter_rows(min_row=2, values_only=True)}, {"failed"})
+                    finally: book.close()
+                    partial_failure = False
+                    runner.reset_mock()
                 evaluate.run(args)
                 inference_command=runner.call_args_list[0].args[0]
                 self.assertEqual(inference_command[inference_command.index("--workers-per-gpu")+1],"2")
@@ -348,12 +385,12 @@ class UI14EvaluationTests(unittest.TestCase):
                     failed_state = read_json(state_path)
                     self.assertEqual(failed_state["status"], "failed")
                     self.assertFalse(evaluate.is_complete(output, step, manifest, checkpoint))
-                    self.assertTrue((Path(failed_state["evaluation_run_dir"])/"all_tasks_evaluation.txt").is_file())
+                    self.assertTrue(failed_state["task_reports"])
                     self.assertEqual(workbook_path.read_bytes(), saved_workbook)
                     self.assertEqual((output/"evaluation/evaluation_history.json").read_bytes(), saved_history)
                     evaluate.run(args)
                     self.assertTrue(evaluate.is_complete(output, step, manifest, checkpoint))
-                    self.assertEqual(runner.call_count, 10)
+                    self.assertEqual(runner.call_count, 9)
                 commands = [c.args[0] for c in runner.call_args_list if c.kwargs["stage"] == "ui5_score"]
                 attempts = [c[c.index("--run_name")+1] for c in commands]
                 self.assertEqual(len(attempts), len(set(attempts)))

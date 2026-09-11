@@ -43,6 +43,8 @@ def parse_args() -> argparse.Namespace:
                         default=os.environ.get("UI_EVAL_ANSWER_GRAMMAR", "legacy"))
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--runtime-profile", type=Path, default=None)
+    parser.add_argument("--completion-dir", type=Path, default=None,
+                        help="Fresh attempt directory for atomic per-task completion events")
     parser.add_argument("--tasks", nargs="+", choices=[t.task_key for t in UI_TASKS], default=None)
     parser.add_argument("--max-images-per-task", type=int, default=0)
     parser.add_argument(
@@ -627,6 +629,8 @@ def main() -> int:
         }
         with lock:
             results[task] = result
+        if args.completion_dir is not None and not args.dry_run:
+            atomic_write_json(args.completion_dir / f"{task}.json", result)
         if return_code != 0:
             print(
                 f"[FAILED] task={task} GPU={gpu} worker={worker_id} exit_code={return_code} "
@@ -657,6 +661,8 @@ def main() -> int:
                         "gpu_slots_reserved": args.workers_per_gpu if task in exclusive_tasks else 1,
                     }
                 print(f"[FAILED] task={task} GPU={gpu} worker={slot} scheduler error: {exc}", file=sys.stderr, flush=True)
+                if args.completion_dir is not None:
+                    atomic_write_json(args.completion_dir / f"{task}.json", results[task])
             finally:
                 # Wake blocked sibling slots on success, failure and launch errors.
                 work_queue.finish(gpu, slot, failed=failed)

@@ -59,8 +59,9 @@ def validate_formal_yaml(rendered, runtime, *, config_path=None):
         expected_project = CROPS_PROJECT
         if runtime.get("UI_EVAL_ANSWER_GRAMMAR") != "legacy": raise ValueError("Production answer grammar drift")
         if runtime["OUTPUT_DIR"] != CROPS_OUTPUT: raise ValueError("Independent alignment-crops run output drift")
-        if runtime.get("EVAL_EXCLUSIVE_GPU_TASKS", "").split() != ["synth_loneword", "change_line_illegal_v3"]:
-            raise ValueError("Alignment-crops run must reserve a physical GPU for both line-break tasks")
+        from locany_ui5_common import UI14_EXCLUSIVE_GPU_TASKS
+        if not set(UI14_EXCLUSIVE_GPU_TASKS).issubset(runtime.get("EVAL_EXCLUSIVE_GPU_TASKS", "").split()):
+            raise ValueError("Alignment-crops run must reserve a physical GPU for known OOM tasks")
     if runtime["PROJECT_ROOT"] != expected_project: raise ValueError("Formal project path drift")
 
 

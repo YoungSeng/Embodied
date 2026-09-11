@@ -10,8 +10,38 @@
 4×A800、每 100 步训练记录、step 0 和每 1000 步 14 项评测/36 行、4k 正式保存、
 UI5 best 口径和 EVAL_FAIL_POLICY=stop 保持原值。
 生成使用旧正式配置 `legacy + hybrid`，SDPA、视觉 flash_attention_2、PBD、observe gate。
-`change_line_illegal_v3`、`synth_loneword` 各自独占一张物理卡；其余任务每卡两个槽位。
+`change_line_illegal_v3`、`synth_loneword`、`synth_inner_margin` 各自独占一张物理卡；其余任务每卡两个槽位。
 独占卡消除本调度器内的同卡 worker 竞争，不是对任意超大单样本不会 OOM 的保证。
+
+## 评测中断后的更新与续跑
+
+等本次失败作业及它的评测 worker 退出后，在原 alignment-crops checkout 更新并重新提交。
+其他仍在运行的对照实验继续使用自己的目录。此次只调整评测调度和日志，无需重做数据准备：
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-ui14-neg11-alignment-crops
+git pull --ff-only origin codex/ui14-neg11-alignment-crops-v1 &&
+bash shell/ui14_neg11_alignment_crops_a800.sh submit --resource-group aiai_locate
+```
+
+继续使用相同 OUTPUT_DIR、checkpoint 和预测目录，不传 --overwrite。入口检查最新完整
+checkpoint 的 optimizer/scheduler/rank 状态，再补齐该步评测后继续训练。
+正常保存的 checkpoint-1000 不因评测 OOM 被清理；不需要重训前 1000 步。
+任务内已完成图片仍按原推理身份核对后跳过，OOM/缺失图片重试；全部图片完成的任务不加载模型。
+旧 YAML 中仅有前两项独占任务时，UI14 入口也会自动补充 synth_inner_margin。
+
+每个 task 的推理子进程成功退出后立即评分，由唯一 CPU 协调进程原子写入
+`diagnostics/ui5_training_evaluation.xlsx` 的 `eval_1000steps`：
+每任务 image/bbox 两行；`evaluation_status=partial` 表示整轮未齐，失败时保留这些行并标为 failed。
+UI5 的原 no_figma/class_id 评分器、UI9 的原 IoU=0.1/非法输出处理均不变，bbox 没有 TN。
+其他任务失败后仍在执行的 worker 完成时，其结果也会保存。
+
+逐任务明细在输出目录的
+`evaluation/partial/ui14-step-<step>-<attempt>/<task>/metrics.json`，包含本轮身份、真实计数及 gate 指标；
+该 attempt 下的 `completions/` 保存调度器完成记录。
+`evaluation/ui14-step-<step>.json` 持续更新已评分任务和失败原因。
+只有完整 14 项成功后才写入全部 36 行及 UI5/UI9 macro/micro、best/history 并允许继续训练。
+部分任务不能代表完整评测；续跑按任务行更新，不累加重复行。各次评分报告分别保留。
 
 | 内容 | 路径（前缀均为 `/mnt/bn/intelligent-service-yg/logging/sicheng_workspace`） |
 | --- | --- |
