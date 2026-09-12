@@ -14,6 +14,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 from typing import Any, Iterable
@@ -130,6 +131,11 @@ def load_training_apps(
         found.add(normalized)
         evidence["explicit"].append(normalized)
     if apps_file is not None:
+        if not apps_file.is_file():
+            raise FileNotFoundError(
+                f"Training app list does not exist: {apps_file}. Create it, omit "
+                "--train-apps-file to scan --training-data-dir, or repeat --train-app-name."
+            )
         raw = apps_file.read_text(encoding="utf-8-sig")
         try:
             parsed = json.loads(raw)
@@ -271,6 +277,7 @@ def prediction_audit(prediction_dir: Path, records: dict[str, list[dict[str, Any
         report["tasks"][task] = {"expected": len(rows), "present": len(rows) - len(missing),
                                   "missing": len(missing), "invalid": len(invalid), "ambiguous": len(ambiguous),
                                   "missing_examples": missing[:5], "invalid_examples": invalid[:5],
+                                  "invalid_files": invalid,
                                   "ambiguous_examples": ambiguous[:3]}
         if missing or invalid or ambiguous:
             report["reasons"].append(f"{task}: missing={len(missing)} invalid={len(invalid)} ambiguous={len(ambiguous)}")
@@ -324,6 +331,59 @@ def resumable_audit(audit: dict[str, Any]) -> bool:
         return False
     non_task_reasons = [reason for reason in audit.get("reasons", []) if not re.match(r"^[a-z_]+: missing=", reason)]
     return not non_task_reasons
+
+
+def repairable_audit(audit: dict[str, Any]) -> bool:
+    """Return true when only missing/invalid per-image outputs prevent reuse."""
+    if not isinstance(audit.get("manifest"), dict):
+        return False
+    if any(task.get("ambiguous") for task in audit.get("tasks", {}).values()):
+        return False
+    non_task_reasons = [
+        reason for reason in audit.get("reasons", [])
+        if not re.match(r"^[a-z_]+: missing=\d+ invalid=\d+ ambiguous=0$", reason)
+    ]
+    return not non_task_reasons
+
+
+def quarantine_invalid_predictions(prediction_dir: Path, audit: dict[str, Any]) -> Path | None:
+    invalid = [
+        (task, Path(filename))
+        for task, task_audit in audit.get("tasks", {}).items()
+        for filename in task_audit.get("invalid_files", [])
+    ]
+    if not invalid:
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = prediction_dir / "_invalid_before_app_eval" / stamp
+    manifest = {"schema_version": 1, "created_at": datetime.now(timezone.utc).isoformat(),
+                "prediction_dir": str(prediction_dir), "files": []}
+    # Resolve and validate every source before moving the first file.
+    checked = []
+    for task, source in invalid:
+        source = source.resolve(strict=True)
+        expected_parent = (prediction_dir / task).resolve(strict=True)
+        if source.parent != expected_parent:
+            raise ValueError(f"Refusing to quarantine prediction outside its task directory: {source}")
+        target = backup / task / source.name
+        checked.append((task, source, target))
+    moved = []
+    try:
+        for task, source, target in checked:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(target))
+            moved.append((source, target))
+            manifest["files"].append({"task": task, "source": str(source), "backup": str(target)})
+            print(f"QUARANTINED INVALID PREDICTION: {source} -> {target}", flush=True)
+    except Exception:
+        for source, target in reversed(moved):
+            if target.is_file() and not source.exists():
+                shutil.move(str(target), str(source))
+        raise
+    (backup / "quarantine_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return backup
 
 
 def score_subset(args: argparse.Namespace, gt_dir: Path, prediction_dir: Path, output_root: Path, run_name: str) -> dict[str, Any]:
@@ -380,6 +440,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--crop-mode", default="detector_scan", choices=("detector_scan", "full_image", "lossless_tiling"))
     parser.add_argument("--iou-threshold", type=float, default=0.1)
     parser.add_argument("--run-if-missing", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--retry-invalid-predictions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--per-app", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--list-ui-apps", action="store_true")
     return parser.parse_args(argv)
@@ -426,7 +487,12 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("No complete matching predictions; rerun without --no-run-if-missing on a GPU node")
     else:
         print("No complete matching prediction set; starting/resuming full inference.")
-        if prediction_dir.exists() and not resumable_audit(search["selected"]):
+        selected_audit = search["selected"]
+        if prediction_dir.exists() and repairable_audit(selected_audit) and args.retry_invalid_predictions:
+            backup = quarantine_invalid_predictions(prediction_dir, selected_audit)
+            if backup is not None:
+                print(f"Only invalid/missing samples will be inferred again; backup={backup}")
+        elif prediction_dir.exists() and not resumable_audit(selected_audit):
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             prediction_dir = prediction_dir.with_name(prediction_dir.name + f"-retry-{stamp}")
             print(f"Existing directory is not safely resumable; using fresh prediction directory: {prediction_dir}")

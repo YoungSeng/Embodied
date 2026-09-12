@@ -813,8 +813,11 @@ python -u scripts/evaluate_ui_lens_app_generalization.py \
 旧 `full_image` 结果、其他 checkpoint、缺少运行清单、解析失败或文件混杂的结果不会复用。
 
 若没有完整结果，默认调用 `run_ui5_parallel_inference.py`，需要 GPU；四卡编号可用
-`--gpu-devices 0,1,2,3` 修改。相同配置的中断结果会续跑；身份不一致或存在非法预测时使用新的
-`-retry-时间` 目录，不覆盖旧结果。只想在 CPU 开发机检查、不允许启动推理时，加
+`--gpu-devices 0,1,2,3` 修改。相同配置的中断结果会续跑；身份不一致或同一图片存在多个结果文件时使用新的
+`-retry-时间` 目录，不覆盖旧结果。若 checkpoint 和切图身份一致且只是少量 `_parse_error`/非法 JSON，
+默认先将这些文件移到预测目录内的 `_invalid_before_app_eval/时间/`，然后仅续跑缺失和非法样本；
+隔离清单保留原路径与备份路径。`--no-retry-invalid-predictions` 可关闭这一行为。
+只想在 CPU 开发机检查、不允许启动推理时，加
 `--no-run-if-missing`。
 
 输出默认位于：

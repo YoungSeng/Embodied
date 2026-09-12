@@ -15,6 +15,8 @@ from evaluate_ui_lens_app_generalization import (
     path_mentions_app,
     prediction_audit,
     main,
+    quarantine_invalid_predictions,
+    repairable_audit,
     resumable_audit,
     ui_lens_rows,
     write_partitions,
@@ -103,6 +105,12 @@ class AppGeneralizationTest(unittest.TestCase):
         self.assertFalse(audit["usable"])
         self.assertEqual(audit["tasks"]["occlusion"]["invalid"], 1)
         self.assertFalse(resumable_audit(audit))
+        self.assertTrue(repairable_audit(audit))
+        backup = quarantine_invalid_predictions(pred, audit)
+        self.assertIsNotNone(backup)
+        self.assertFalse((pred / "occlusion/1_parse_error.json").exists())
+        self.assertTrue((backup / "occlusion/1_parse_error.json").is_file())
+        self.assertTrue((backup / "quarantine_manifest.json").is_file())
 
     def test_end_to_end_reuses_predictions_and_writes_both_and_per_app_metrics(self):
         for task, filename in TASK_JSONL.items():
