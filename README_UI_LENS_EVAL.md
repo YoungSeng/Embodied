@@ -774,3 +774,60 @@ python scripts/export_ui_lens_bbox_pdf.py
 预览 PNG 用于快速检查；清单保存任务、框坐标、原图 SHA256、标注文件和行号、输出绝对路径。
 原图不修改，已有输出不覆盖；再次导出请指定新的 `--output-dir`。
 如果转换结果在其他目录，使用 `--eval-dir /实际转换目录`。
+
+## 11. 训练来源应用 vs 其他应用
+
+`scripts/evaluate_ui_lens_app_generalization.py` 完成一次可复现的跨 App 评测：
+
+1. 从 `extra_info.original_infos.app_name` 统计 UI-Lens 的应用；
+2. 从显式名单或训练标注提取训练来源应用，保存提取证据；
+3. 检查指定目录以及 `work_dirs` 下的已有预测，逐图片核对完整性，并核验 checkpoint 与切图模式；
+4. 结果完整时直接复用同一份全量预测；缺失时才用四卡继续或重新推理；
+5. 在训练来源应用、其他应用两个互斥子集上计算五任务 Image F1 / Bbox F1，并额外输出每个 App 的结果。
+
+先在 CPU 节点查看 UI-Lens 实际 App 名称：
+
+```bash
+cd /mnt/bn/intelligent-service-yg/logging/sicheng_workspace/code/Eagle_LocateUI5_v4/Embodied-m32-cpt-sft-croponly-v1
+git pull --ff-only
+python scripts/evaluate_ui_lens_app_generalization.py --list-ui-apps
+```
+
+checkpoint 名称本身不能证明训练见过哪些应用。脚本默认扫描 `$PROJECT/data` 下文件名含 `train` 的 JSONL：
+优先读取 `app_name` 元数据；旧转换格式若只保留图片路径，则只接受与 UI-Lens App 名完全一致的路径分段。
+如果训练数据没有保留任何可用来源字段，请用训练数据说明中的真实名单显式传入；中英文别名要分别列出：
+
+```bash
+python -u scripts/evaluate_ui_lens_app_generalization.py \
+  --train-app-name douyin \
+  --train-app-name 抖音
+```
+
+也可以用 `--train-apps-file train_apps.json`，文件内容为 JSON 数组或 `{"apps": [...]}`；
+或者重复传 `--training-jsonl /原始训练标注.jsonl`。不要根据 UI-Lens 正负标签或模型结果反推应用归属。
+
+默认路径已绑定本指南的 checkpoint-9000、UI-Lens 转换目录、detector-scan 缓存和预测目录。
+如果完整预测已经位于
+`$PROJECT/work_dirs/ui-lens-checkpoint9000-detectorscan-clip-v1/predictions`，脚本打印
+`REUSE COMPLETE PREDICTIONS` 并仅做 CPU 评分。它也会搜索 `work_dirs` 中其他具有运行清单的结果。
+旧 `full_image` 结果、其他 checkpoint、缺少运行清单、解析失败或文件混杂的结果不会复用。
+
+若没有完整结果，默认调用 `run_ui5_parallel_inference.py`，需要 GPU；四卡编号可用
+`--gpu-devices 0,1,2,3` 修改。相同配置的中断结果会续跑；身份不一致或存在非法预测时使用新的
+`-retry-时间` 目录，不覆盖旧结果。只想在 CPU 开发机检查、不允许启动推理时，加
+`--no-run-if-missing`。
+
+输出默认位于：
+
+```text
+$PROJECT/work_dirs/ui-lens-checkpoint9000-app-generalization-v1/
+├── app_generalization_report.md       # 两组宏平均、五任务结果、每 App 结果和泛化差值
+├── app_generalization_summary.json    # 名单证据、预测审计、完整指标与路径
+├── subsets/                            # 两个互斥 GT 子集，不复制图片
+├── evaluation/                         # 两组及每 App 的原评分器完整输出
+└── per_app_subsets/                    # 每个 App 的 GT
+```
+
+泛化差值定义为“训练来源应用 F1 − 其他应用 F1”；正值表示模型在其他应用上更低。
+两个部分复用同一模型、推理设置和 IoU=0.1，只改变评测样本集合。输出目录已有内容时脚本拒绝覆盖，
+复现实验请指定新的 `--output-dir`。
