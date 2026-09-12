@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from locany_ui5_common import DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES, PROJECT_ROOT
+from locany_ui5_common import DEFAULT_UI5_FULL_TEST_UNIQUE_IMAGES, PROJECT_ROOT, inference_workers_per_gpu
 from ui5_eval_detector_cache import validate_eval_detector_cache
 
 
@@ -125,7 +125,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-patch", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.eval_inference_workers_per_gpu = inference_workers_per_gpu(args.eval_inference_workers_per_gpu)
+    return args
 
 
 def utc_now() -> str:
@@ -198,7 +200,7 @@ def build_inference_command(
         "--gpu-devices",
         args.eval_gpu_devices,
         "--workers-per-gpu",
-        str(getattr(args, "eval_inference_workers_per_gpu", 1)),
+        str(inference_workers_per_gpu(getattr(args, "eval_inference_workers_per_gpu", 1))),
         "--attn-implementation",
         args.attn_implementation,
         "--inference-script",

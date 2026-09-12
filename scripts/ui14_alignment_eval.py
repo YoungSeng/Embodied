@@ -137,7 +137,7 @@ def run_comparison(destination, *, gpus="0"):
     command = [sys.executable, str(PROJECT_ROOT / "scripts/run_ui5_parallel_inference.py"),
                "--checkpoint", str(model), "--processor-path", str(model), "--eval-manifest", str(manifest),
                "--input-dir", str(destination), "--output-dir", str(prediction), "--gpu-devices", gpus,
-               "--workers-per-gpu", "2", "--attn-implementation", "sdpa",
+               "--workers-per-gpu", "1", "--attn-implementation", "sdpa",
                "--ui-answer-grammar", grammar,
                "--inference-script", str(PROJECT_ROOT / "scripts/inference_ui_defect_locany.py"),
                "--tasks", *binding["tasks"], "--save-raw-answer"]

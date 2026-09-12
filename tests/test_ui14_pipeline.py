@@ -210,7 +210,7 @@ class UI14EvaluationTests(unittest.TestCase):
                 "--eval-manifest",str(manifest),"--save-raw-answer"]
             with mock.patch.object(sys,"argv",argv): args=parallel.parse_args()
             self.assertEqual(len(args.tasks),14)
-            self.assertEqual(args.workers_per_gpu,2)
+            self.assertEqual(args.workers_per_gpu,1)
             for task in UI_TASKS:
                 command=parallel.build_command(args,task.task_key,str(task.task_id%4),root/"summary.json")
                 self.assertEqual(command[command.index("--tasks")+1],task.task_key)
@@ -332,8 +332,10 @@ class UI14EvaluationTests(unittest.TestCase):
                     runner.reset_mock()
                 evaluate.run(args)
                 inference_command=runner.call_args_list[0].args[0]
-                self.assertEqual(inference_command[inference_command.index("--workers-per-gpu")+1],"2")
-                self.assertEqual(inference_command[inference_command.index("--exclusive-gpu-tasks")+1], "synth_loneword")
+                self.assertEqual(inference_command[inference_command.index("--workers-per-gpu")+1],"1")
+                start = inference_command.index("--exclusive-gpu-tasks") + 1
+                end = inference_command.index("--inference-script")
+                self.assertEqual(set(inference_command[start:end]), {t.task_key for t in UI_TASKS})
                 self.assertTrue(evaluate.is_complete(output,step,manifest,checkpoint))
                 self.assertEqual(read_json(output/"evaluation/best_checkpoints.json")["current_best"]["image"]["image_macro_f1"],1. if real_scorer else .8)
                 first_state = read_json(output/f"evaluation/ui14-step-{step}.json")
@@ -518,7 +520,7 @@ class UI14EvaluationTests(unittest.TestCase):
             self.assertEqual(str(env["GRADIENT_ACCUMULATION_STEPS"]),"2")
             self.assertEqual(str(env["MAX_STEPS"]),"16000")
             self.assertEqual(env["EVAL_FAIL_POLICY"],"stop")
-            self.assertEqual(env["EVAL_INFERENCE_WORKERS_PER_GPU"],2)
+            self.assertEqual(env["EVAL_INFERENCE_WORKERS_PER_GPU"],1)
             self.assertEqual(env["EVAL_AT_START"],1)
 
 

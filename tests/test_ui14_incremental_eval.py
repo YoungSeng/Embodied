@@ -9,7 +9,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from ui14_incremental_eval import run_incremental_inference
+from ui14_incremental_eval import run_incremental_inference, progress_message
 from ui14_common import UI_TASKS, write_json
 from eaglevl.train.ui5_excel_logger import UI5ExcelLogger, build_eval_rows, build_task_eval_rows
 from openpyxl import load_workbook
@@ -31,7 +31,17 @@ class IncrementalEvalTests(unittest.TestCase):
     def test_old_rendered_environment_cannot_remove_inner_margin_exclusivity(self):
         from locany_ui5_common import ui14_exclusive_gpu_tasks
         self.assertEqual(ui14_exclusive_gpu_tasks("synth_loneword change_line_illegal_v3"),
-                         ["synth_loneword", "change_line_illegal_v3", "synth_inner_margin"])
+                         ["synth_loneword", "change_line_illegal_v3", "synth_inner_margin", "content_missing"])
+
+    def test_progress_names_failed_task_and_active_workers_without_counting_failure_as_success(self):
+        event = {"task": "synth_radius", "physical_gpu": "2", "return_code": 1,
+                 "failure_reason": "OutOfMemoryError: CUDA out of memory", "log_path": "radius.log"}
+        message = progress_message([{"task": "occlusion", "return_code": 0}, event],
+                                  {"running": {"3": {"0": "synth_occlusion"}},
+                                   "pending": ["content_missing"], "stopped": True})
+        for fragment in ("succeeded=1 failed=1", "synth_radius", "CUDA out of memory", "radius.log",
+                         "synth_occlusion@GPU3", "queue stopped", "content_missing"):
+            self.assertIn(fragment, message)
 
     def test_excel_is_visible_before_other_process_fails_and_late_success_is_saved(self):
         # This real CPU subprocess waits for Excel publication before it emits an OOM event.
@@ -73,7 +83,7 @@ raise SystemExit(1)
                 finally: current.close()
                 self.assertFalse(book.has_eval_step(1000))
                 (root / "ack").touch()
-            with self.assertRaises(subprocess.CalledProcessError):
+            with self.assertRaisesRegex(subprocess.CalledProcessError, "synth_inner_margin"):
                 run_incremental_inference([sys.executable, str(worker), "--ack", str(root/"ack")],
                     cwd=root, completion_dir=root/"events", on_complete=completed)
             self.assertEqual({e["task"] for e in events}, {"ui_alignment", "synth_inner_margin", "synth_small_margin"})

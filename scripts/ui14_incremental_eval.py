@@ -10,12 +10,45 @@ from types import SimpleNamespace
 from ui14_common import read_json
 
 
+def describe_failure(event):
+    return (f"task={event.get('task')} GPU={event.get('physical_gpu')} "
+            f"exclusive={event.get('exclusive_gpu')} exit={event.get('return_code')} "
+            f"reason={event.get('failure_reason') or event.get('error') or 'worker failed; inspect log'} "
+            f"log={event.get('log_path')}")
+
+
+class InferenceFailure(subprocess.CalledProcessError):
+    def __init__(self, returncode, command, failures, progress):
+        super().__init__(returncode, command)
+        self.failures, self.progress = failures, progress
+
+    def __str__(self):
+        details = " | ".join(describe_failure(e) for e in self.failures) or "No failed task event; inspect scheduler log"
+        return (f"UI14 inference failed (exit={self.returncode}): {details}; "
+                f"not_started={self.progress.get('pending', [])}")
+
+
+def progress_message(events, progress):
+    successes = sum(e.get("return_code") == 0 for e in events)
+    failures = [e for e in events if e.get("return_code") != 0]
+    running = [f"{task}@GPU{gpu}" for gpu, slots in progress.get("running", {}).items()
+               for task in slots.values()]
+    message = (f"inference succeeded={successes} failed={len(failures)} | "
+               f"running={running} | pending={progress.get('pending', [])}")
+    if progress.get("stopped"):
+        message += " | queue stopped; waiting for active workers and saving their results"
+    if failures:
+        message += " | " + " | ".join(describe_failure(e) for e in failures)
+    return message
+
+
 def run_incremental_inference(command, *, cwd, completion_dir, on_complete):
     """Drain atomic task events, including successes after another worker failed."""
     completion_dir = Path(completion_dir)
     completion_dir.mkdir(parents=True, exist_ok=False)
     command = [*command, "--completion-dir", str(completion_dir)]
     seen, errors = set(), []
+    events, progress = [], {}
     started = last_progress = time.monotonic()
     with subprocess.Popen(command, cwd=cwd) as process:
         while True:
@@ -25,16 +58,22 @@ def run_incremental_inference(command, *, cwd, completion_dir, on_complete):
                     continue
                 event = read_json(path)
                 seen.add(path.name)
+                events.append(event)
+                if event.get("return_code") != 0:
+                    print(f"[UI14 eval] inference failure: {describe_failure(event)}", flush=True)
                 try:
                     on_complete(event)
                 except Exception as exc:
                     # Do not lose other finished tasks because one scorer failed.
                     errors.append(exc)
                     print(f"[UI14 eval] task scoring failed: {event.get('task')}: {exc}", flush=True)
+            progress_path = completion_dir / "_scheduler/status.json"
+            if progress_path.is_file():
+                progress = read_json(progress_path)
             if finished:
                 break
             if time.monotonic() - last_progress >= 10:
-                print(f"[UI14 eval] consumed {len(seen)} task completions | "
+                print(f"[UI14 eval] {progress_message(events, progress)} | "
                       f"elapsed={time.monotonic()-started:.0f}s | scoring failures={len(errors)} | "
                       f"events={completion_dir}", flush=True)
                 last_progress = time.monotonic()
@@ -42,7 +81,8 @@ def run_incremental_inference(command, *, cwd, completion_dir, on_complete):
     if errors:
         raise errors[0]
     if process.returncode:
-        raise subprocess.CalledProcessError(process.returncode, command)
+        raise InferenceFailure(process.returncode, command,
+                               [e for e in events if e.get('return_code') != 0], progress)
 
 
 def score_ui5_task(spec, prediction, destination, scorer_root):

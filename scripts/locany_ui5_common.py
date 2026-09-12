@@ -14,13 +14,20 @@ from typing import Any, Mapping
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "locany_ui5_machines.json"
-UI14_EXCLUSIVE_GPU_TASKS = ("synth_loneword", "change_line_illegal_v3", "synth_inner_margin")
+UI14_EXCLUSIVE_GPU_TASKS = ("synth_loneword", "change_line_illegal_v3", "synth_inner_margin", "content_missing")
 
 
 def ui14_exclusive_gpu_tasks(value=None):
     """Keep known OOM tasks exclusive even with an older rendered environment."""
     configured = str(value or "").split()
     return list(dict.fromkeys((*UI14_EXCLUSIVE_GPU_TASKS, *configured)))
+
+
+def inference_workers_per_gpu(value=1):
+    """Accept old two-slot configs but run one model process per physical GPU."""
+    if int(value) not in (1, 2):
+        raise ValueError("EVAL_INFERENCE_WORKERS_PER_GPU must be 1 or legacy 2")
+    return 1
 
 
 TASKS = (
@@ -415,7 +422,7 @@ def resolve_runtime_config(
         "GPU_COUNT": gpu_count,
         "CUDA_DEVICES": cuda_devices,
         "EVAL_GPU_DEVICES": eval_gpu_devices,
-        "EVAL_INFERENCE_WORKERS_PER_GPU": int(_env_value(env, "EVAL_INFERENCE_WORKERS_PER_GPU", 1)),
+        "EVAL_INFERENCE_WORKERS_PER_GPU": inference_workers_per_gpu(_env_value(env, "EVAL_INFERENCE_WORKERS_PER_GPU", 1)),
         "EVAL_EXCLUSIVE_GPU_TASKS": " ".join(ui14_exclusive_gpu_tasks(env.get("EVAL_EXCLUSIVE_GPU_TASKS"))),
         "EVAL_ENABLE_PBD": int(_env_value(env, "EVAL_ENABLE_PBD", 1)),
         "WORKSPACE": workspace,
@@ -768,10 +775,11 @@ def resolve_runtime_config(
             "INSTALL_SYSTEM_RUNTIME_DEPS": 1,
         }
         if env.get("UI_TRAIN_PROFILE") in ("m32-cpt9000-ui14-v1", "m32-cpt9000-ui14-neg11-v1", "m32-cpt9000-ui14-alignment-context-v1", "m32-cpt9000-ui14-neg11-alignment-crops-v1"):
-            formal_exact.update(INIT_CPT_STEP=9000, EVAL_AT_START=1, EVAL_FAIL_POLICY="stop", EVAL_INFERENCE_WORKERS_PER_GPU=2,
+            formal_exact.update(INIT_CPT_STEP=9000, EVAL_AT_START=1, EVAL_FAIL_POLICY="stop", EVAL_INFERENCE_WORKERS_PER_GPU=1,
                                 ATTN_IMPLEMENTATION="sdpa", UI_NUM_TASKS="14", LOCANY_CPT_MODE="0")
             machine_resource_config(machine_type, resource_group=resolved["RESOURCE_GROUP"], config_path=config_path)
-            from ui14_common import INIT_CHECKPOINT as UI14_INIT_CHECKPOINT
+            from ui14_common import INIT_CHECKPOINT as UI14_INIT_CHECKPOINT, UI_TASKS
+            resolved["EVAL_EXCLUSIVE_GPU_TASKS"] = " ".join(t.task_key for t in UI_TASKS)
             formal_exact.update(BASE_MODEL=UI14_INIT_CHECKPOINT, MODEL_PATH=UI14_INIT_CHECKPOINT, INIT_CHECKPOINT=UI14_INIT_CHECKPOINT)
         drift = {
             name: {"expected": expected, "actual": resolved.get(name)}

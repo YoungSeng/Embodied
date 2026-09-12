@@ -153,9 +153,10 @@ def _run(args):
     destination = history_dir / "raw" / score_run_name
     state_path = history_dir / f"ui14-step-{args.step}.json"
     started = datetime.now(timezone.utc).isoformat()
-    workers_per_gpu = getattr(args, "eval_inference_workers_per_gpu", 2)
-    from locany_ui5_common import ui14_exclusive_gpu_tasks
-    exclusive_gpu_tasks = ui14_exclusive_gpu_tasks(os.environ.get("EVAL_EXCLUSIVE_GPU_TASKS"))
+    from locany_ui5_common import inference_workers_per_gpu
+    workers_per_gpu = inference_workers_per_gpu(getattr(args, "eval_inference_workers_per_gpu", 1))
+    print(f"[UI14 eval] one inference process per physical GPU; GPUs={args.eval_gpu_devices}", flush=True)
+    exclusive_gpu_tasks = [spec["task_key"] for spec in specs]
     state = {"status": "running", "sft_step": args.step, "init_checkpoint": str(args.base_model),
              "init_cpt_step": 9000, "identity": identity, "tasks": {}, "started": started,
              "eval_gpu_devices": args.eval_gpu_devices, "inference_workers_per_gpu": workers_per_gpu,

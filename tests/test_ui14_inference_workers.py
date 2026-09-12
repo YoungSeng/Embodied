@@ -65,7 +65,7 @@ def fixture(root, workers_per_gpu=2):
         target.mkdir(parents=True, exist_ok=True)
         (target / 'sample.json').write_text(json.dumps(info), encoding='utf-8')
         args.summary_path.write_text(json.dumps(info), encoding='utf-8')
-    ''').replace('FIRST_WAVE_SIZE', str(4 * workers_per_gpu)), encoding="utf-8")
+    ''').replace('FIRST_WAVE_SIZE', '4'), encoding="utf-8")
     return ["parallel", "--checkpoint", str(root / "checkpoint"), "--processor-path", str(root / "checkpoint"),
             "--input-dir", str(root), "--output-dir", str(root / "pred"), "--gpu-devices", "0,1,2,3",
             "--workers-per-gpu", str(workers_per_gpu), "--attn-implementation", "sdpa", "--inference-script", str(worker),
@@ -73,21 +73,32 @@ def fixture(root, workers_per_gpu=2):
 
 
 class InferenceWorkersTests(unittest.TestCase):
-    def test_four_gpus_run_eight_processes_and_drain_all_14_tasks_once(self):
+    def test_current_failure_tail_does_not_inherit_old_oom_from_appended_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "worker.log"
+            path.write_text("torch.OutOfMemoryError: CUDA out of memory\n", encoding="utf-8")
+            offset = path.stat().st_size
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write("ValueError: missing test image\n")
+            tail = parallel.read_log_tail(path, 160, start_offset=offset)
+            self.assertNotIn("CUDA out of memory", tail)
+            self.assertEqual(parallel.failure_reason(tail, "exit 1"), "ValueError: missing test image")
+
+    def test_legacy_two_slots_run_four_processes_and_drain_all_14_tasks_once(self):
         self._exercise_queue(2)
 
     def test_four_gpus_run_one_process_each_and_drain_all_14_tasks_once(self):
         self._exercise_queue(1)
 
     def _exercise_queue(self, workers_per_gpu):
-        slots = 4 * workers_per_gpu
+        slots = 4
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
             root = Path(tmp)
             with mock.patch.object(sys, "argv", fixture(root, workers_per_gpu)):
                 self.assertEqual(parallel.main(), 0)
             status = read_json(root / "pred/parallel_inference_status.json")
             self.assertTrue(status["success"])
-            self.assertEqual(status["workers_per_gpu"], workers_per_gpu)
+            self.assertEqual(status["workers_per_gpu"], 1)
             self.assertEqual(status["worker_count"], slots)
             self.assertEqual(set(status["tasks"]), {t.task_key for t in UI_TASKS})
             self.assertEqual(len({r["worker_id"] for r in status["tasks"].values()}), slots)
@@ -97,9 +108,14 @@ class InferenceWorkersTests(unittest.TestCase):
             first_wave = read_json(root / "pred/first_wave.json")
             self.assertEqual(len(first_wave), slots)
             self.assertEqual(len({r["pid"] for r in first_wave}), slots)
-            self.assertEqual(Counter(r["gpu"] for r in first_wave), dict.fromkeys("0123", workers_per_gpu))
+            self.assertEqual(Counter(r["gpu"] for r in first_wave), dict.fromkeys("0123", 1))
             self.assertEqual({(r["physical_gpu"], r["worker_slot"]) for r in status["tasks"].values()},
-                             {(gpu, slot) for gpu in "0123" for slot in range(workers_per_gpu)})
+                             {(gpu, 0) for gpu in "0123"})
+            self.assertTrue(all(r["exclusive_gpu"] and r["gpu_slots_reserved"] == 1 for r in status["tasks"].values()))
+            # Real subprocess intervals on each card must never overlap.
+            for gpu in "0123":
+                intervals = sorted((r["started"], r["finished"]) for r in rows if r["gpu"] == gpu)
+                self.assertTrue(all(left[1] <= right[0] for left, right in zip(intervals, intervals[1:])))
             for task, result in status["tasks"].items():
                 self.assertEqual(result["physical_gpu"], read_json(root / "pred" / task / "sample.json")["gpu"])
                 self.assertEqual(result["logical_device"], "cuda:0")
@@ -110,7 +126,7 @@ class InferenceWorkersTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             root = Path(tmp)
             argv = fixture(root)
-            barrier = threading.Barrier(8, timeout=5)
+            barrier = threading.Barrier(4, timeout=5)
 
             def failed_child(*args, **kwargs):
                 barrier.wait()
@@ -120,48 +136,32 @@ class InferenceWorkersTests(unittest.TestCase):
                 self.assertEqual(parallel.main(), 1)
             status = read_json(root / "pred/parallel_inference_status.json")
             self.assertFalse(status["success"])
-            self.assertEqual(child.call_count, 8)
-            self.assertEqual(len(status["missing_tasks"]), 6)
+            self.assertEqual(child.call_count, 4)
+            self.assertEqual(len(status["missing_tasks"]), 10)
             self.assertTrue(all(r["return_code"] == 17 for r in status["tasks"].values()))
 
-    def test_loneword_exclusivity_keeps_other_gpus_parallel_then_restores_both_slots(self):
+    def test_old_exclusive_list_still_reserves_a_card_for_every_task(self):
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
             root = Path(tmp)
             argv = fixture(root) + ["--exclusive-gpu-tasks", "synth_loneword"]
-            barrier = threading.Barrier(7, timeout=10)
-            refilled = threading.Event()
+            barrier = threading.Barrier(4, timeout=10)
             guard = threading.Lock()
             active = {gpu: set() for gpu in "0123"}
             arrivals = []
             first_wave = []
-            exclusive_gpu = None
-            refilled_tasks = []
 
             def child(command, **kwargs):
-                nonlocal exclusive_gpu
                 task = command[command.index("--tasks") + 1]
                 gpu = kwargs["env"]["CUDA_VISIBLE_DEVICES"]
                 with guard:
                     active[gpu].add(task)
                     arrivals.append((task, gpu))
-                    wave_one = len(arrivals) <= 7
-                    if task == "synth_loneword":
-                        exclusive_gpu = gpu
-                    if "synth_loneword" in active[gpu]:
-                        self.assertEqual(active[gpu], {"synth_loneword"})
-                    self.assertLessEqual(len(active[gpu]), 2)
-                    if len(arrivals) == 7:
+                    wave_one = len(arrivals) <= 4
+                    self.assertEqual(active[gpu], {task})
+                    if len(arrivals) == 4:
                         first_wave.extend(arrivals)
-                    if not wave_one and gpu == exclusive_gpu:
-                        refilled_tasks.append(task)
-                        if len(active[gpu]) == 2:
-                            refilled.set()
                 if wave_one:
                     barrier.wait()
-                if task != "synth_loneword":
-                    # Keep all other cards busy while the exclusive task exits.
-                    # Both slots of its card must then accept ordinary tasks.
-                    self.assertTrue(refilled.wait(10), "exclusive GPU failed to resume two slots")
                 path = root / "pred" / task / "sample.json"
                 write_json(path, {"task": task, "gpu": gpu})
                 with guard:
@@ -173,12 +173,11 @@ class InferenceWorkersTests(unittest.TestCase):
             status = read_json(root / "pred/parallel_inference_status.json")
             self.assertEqual(run.call_count, 14)
             self.assertTrue(status["success"])
-            self.assertEqual(status["exclusive_gpu_tasks"], ["synth_loneword"])
-            self.assertEqual(Counter(gpu for _, gpu in first_wave), {gpu: 1 if gpu == exclusive_gpu else 2 for gpu in "0123"})
-            self.assertGreaterEqual(len(refilled_tasks), 2)
+            self.assertEqual(status["exclusive_gpu_tasks"], sorted(t.task_key for t in UI_TASKS))
+            self.assertEqual(Counter(gpu for _, gpu in first_wave), dict.fromkeys("0123", 1))
             for task, result in status["tasks"].items():
-                self.assertEqual(result["exclusive_gpu"], task == "synth_loneword")
-                self.assertEqual(result["gpu_slots_reserved"], 2 if task == "synth_loneword" else 1)
+                self.assertTrue(result["exclusive_gpu"])
+                self.assertEqual(result["gpu_slots_reserved"], 1)
 
     def test_failed_exclusive_task_wakes_blocked_sibling_without_claiming_more(self):
         queue = parallel.GpuTaskQueue(["synth_loneword", "cropping"], ["synth_loneword"])
@@ -202,7 +201,7 @@ class InferenceWorkersTests(unittest.TestCase):
     def test_launch_error_releases_exclusive_gpu_and_returns_failure(self):
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             root = Path(tmp)
-            argv = fixture(root) + ["--exclusive-gpu-tasks", "synth_loneword"]
+            argv = fixture(root) + ["--tasks", "synth_loneword"]
             with mock.patch.object(sys, "argv", argv), mock.patch.object(parallel.subprocess, "run", side_effect=OSError("fixture launch failure")):
                 self.assertEqual(parallel.main(), 1)
             status = read_json(root / "pred/parallel_inference_status.json")
@@ -210,7 +209,7 @@ class InferenceWorkersTests(unittest.TestCase):
             self.assertEqual(status["tasks"]["synth_loneword"]["return_code"], 91)
             self.assertIn("fixture launch failure", status["tasks"]["synth_loneword"]["error"])
 
-    def test_profile_and_yaml_bind_two_inference_workers(self):
+    def test_profile_and_yaml_bind_one_inference_worker_even_with_old_env(self):
         from ui14_checks import render_formal_yaml
         from ui14_profile import profile_environment
         import yaml
@@ -218,15 +217,15 @@ class InferenceWorkersTests(unittest.TestCase):
             path, runtime_path = render_formal_yaml(Path(tmp))
             runtime = read_json(runtime_path)
             document = yaml.safe_load(path.read_text(encoding="utf-8"))
-            self.assertEqual(runtime["EVAL_INFERENCE_WORKERS_PER_GPU"], 2)
-            self.assertEqual(str(document["jobRunParams"]["envsList"]["EVAL_INFERENCE_WORKERS_PER_GPU"]), "2")
+            self.assertEqual(runtime["EVAL_INFERENCE_WORKERS_PER_GPU"], 1)
+            self.assertEqual(str(document["jobRunParams"]["envsList"]["EVAL_INFERENCE_WORKERS_PER_GPU"]), "1")
             self.assertEqual(runtime["GPU_COUNT"], 4)
             self.assertEqual(runtime["PER_DEVICE_TRAIN_BATCH_SIZE"], 1)
             self.assertEqual(runtime["EVAL_DETECTOR_WORKERS_PER_GPU"], 1)
             self.assertEqual(runtime["EVAL_FAIL_POLICY"], "stop")
             env = {**profile_environment(), "GPU_COUNT": "4", "RESOURCE_GROUP": "aiai_locate"}
-            with self.assertRaisesRegex(ValueError, "EVAL_INFERENCE_WORKERS_PER_GPU"):
-                common.resolve_runtime_config({**env, "EVAL_INFERENCE_WORKERS_PER_GPU": "1"})
+            for old_value in ("1", "2"):
+                self.assertEqual(common.resolve_runtime_config({**env, "EVAL_INFERENCE_WORKERS_PER_GPU": old_value})["EVAL_INFERENCE_WORKERS_PER_GPU"], 1)
         self.assertEqual(common.resolve_runtime_config({"MACHINE_TYPE": "a800", "GPU_COUNT": "4"})["EVAL_INFERENCE_WORKERS_PER_GPU"], 1)
         for value in ("0", "3"):
             with self.assertRaisesRegex(ValueError, "EVAL_INFERENCE_WORKERS_PER_GPU"):

@@ -142,9 +142,9 @@ class CropAlignmentTests(unittest.TestCase):
         self.assertEqual(runtime["OUTPUT_DIR"], OUTPUT)
         self.assertEqual(runtime["UI_EVAL_ANSWER_GRAMMAR"], "legacy")
         self.assertEqual(runtime["EVAL_FAIL_POLICY"], "stop")
-        self.assertEqual(runtime["EVAL_EXCLUSIVE_GPU_TASKS"].split(), ["synth_loneword", "change_line_illegal_v3", "synth_inner_margin"])
+        self.assertEqual(runtime["EVAL_EXCLUSIVE_GPU_TASKS"].split(), [t.task_key for t in UI_TASKS])
         self.assertEqual(yaml.safe_load(rendered)["jobRunParams"]["envsList"]["EVAL_EXCLUSIVE_GPU_TASKS"], runtime["EVAL_EXCLUSIVE_GPU_TASKS"])
-        for key, value in dict(MAX_STEPS=16000, INIT_CPT_STEP=9000, EVAL_AT_START=1, EVAL_INFERENCE_WORKERS_PER_GPU=2,
+        for key, value in dict(MAX_STEPS=16000, INIT_CPT_STEP=9000, EVAL_AT_START=1, EVAL_INFERENCE_WORKERS_PER_GPU=1,
                                EVAL_INTERVAL_STEPS=1000, SAMPLE_LOG_INTERVAL=100).items(): self.assertEqual(int(runtime[key]), value)
 
     def test_independent_comparison_selects_legacy_even_with_stale_grammar_env(self):
@@ -166,24 +166,24 @@ class CropAlignmentTests(unittest.TestCase):
             self.assertEqual(child.call_args.kwargs["env"]["UI_EVAL_ANSWER_GRAMMAR"], "legacy")
             self.assertEqual(old_before, {p: p.read_bytes() for p in old_before})
 
-    def test_three_oom_tasks_reserve_physical_cards_and_other_tasks_stay_parallel(self):
+    def test_all_tasks_reserve_physical_cards_and_four_gpus_stay_parallel(self):
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
             root = Path(tmp)
             argv = fixture(root)[:-1]  # Use the production default exclusive set.
-            guard, barrier = threading.Lock(), threading.Barrier(5, timeout=10)
+            guard, barrier = threading.Lock(), threading.Barrier(4, timeout=10)
             active = {g: set() for g in "0123"}
             arrivals = []
-            exclusive = {"synth_loneword", "change_line_illegal_v3", "synth_inner_margin"}
+            exclusive = {t.task_key for t in UI_TASKS}
             first_wave = []
             def child(command, **kwargs):
                 task, gpu = command[command.index("--tasks")+1], kwargs["env"]["CUDA_VISIBLE_DEVICES"]
                 with guard:
                     active[gpu].add(task)
                     arrivals.append(task)
-                    first = len(arrivals) <= 5
+                    first = len(arrivals) <= 4
                     if first: first_wave.append((task, gpu))
                     if active[gpu] & exclusive: self.assertEqual(len(active[gpu]), 1)
-                    self.assertLessEqual(len(active[gpu]), 2)
+                    self.assertLessEqual(len(active[gpu]), 1)
                 if first: barrier.wait()
                 with guard: active[gpu].remove(task)
                 write_json(root / "pred" / task / "sample.json", {"task": task})
@@ -192,8 +192,8 @@ class CropAlignmentTests(unittest.TestCase):
                 self.assertEqual(parallel.main(), 0)
             status = read_json(root / "pred/parallel_inference_status.json")
             self.assertEqual(len(arrivals), 14)
-            self.assertEqual(len({g for t, g in first_wave if t in exclusive}), 3)
-            for t, row in status["tasks"].items(): self.assertEqual(row["gpu_slots_reserved"], 2 if t in exclusive else 1)
+            self.assertEqual(len({g for t, g in first_wave if t in exclusive}), 4)
+            for t, row in status["tasks"].items(): self.assertEqual(row["gpu_slots_reserved"], 1)
 
 
 if __name__ == "__main__": unittest.main()

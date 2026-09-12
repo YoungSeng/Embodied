@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from locany_ui5_common import TASK_JSONL, TASKS, parse_gpu_devices, UI14_EXCLUSIVE_GPU_TASKS
+from locany_ui5_common import TASK_JSONL, TASKS, parse_gpu_devices, UI14_EXCLUSIVE_GPU_TASKS, inference_workers_per_gpu
 from ui14_common import UI_TASKS, read_json
 from ui5_eval_detector_cache import validate_eval_detector_cache
 
@@ -29,10 +29,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--gpu-devices", required=True)
     parser.add_argument("--workers-per-gpu", type=int, choices=(1, 2), default=1,
-                        help="Independent inference processes per physical GPU; tasks share one queue")
+                        help="One inference process per physical GPU; legacy 2 is accepted and reduced to 1")
     parser.add_argument("--exclusive-gpu-tasks", nargs="*", choices=[t.task_key for t in UI_TASKS],
                         default=list(UI14_EXCLUSIVE_GPU_TASKS),
-                        help="Tasks that occupy a whole GPU until their subprocess exits; other GPUs remain parallel")
+                        help="Legacy compatibility option; all selected tasks now occupy a whole GPU")
     parser.add_argument(
         "--attn-implementation",
         choices=("sdpa", "magi", "flash_attention_2", "eager", "auto"),
@@ -102,6 +102,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
+    if args.workers_per_gpu != 1:
+        print("[UI14 scheduler] legacy --workers-per-gpu=2 -> 1; all tasks occupy a whole physical GPU", flush=True)
+    args.workers_per_gpu = inference_workers_per_gpu(args.workers_per_gpu)
     args.evaluation_tasks = {r["task_key"]: r for r in read_json(args.eval_manifest)["tasks"]} if args.eval_manifest else {}
     args.tasks = args.tasks or list(args.evaluation_tasks or TASKS)
     return args
@@ -137,6 +140,11 @@ class GpuTaskQueue:
             if failed:
                 self.stopped = True
             self.condition.notify_all()
+
+    def snapshot(self):
+        with self.condition:
+            return {"running": {g: dict(slots) for g, slots in self.active.items() if slots},
+                    "pending": list(self.pending), "stopped": self.stopped}
 
 
 def count_jsonl_records(path: Path) -> int:
@@ -311,7 +319,7 @@ def build_command(
     return command
 
 
-def read_log_tail(path: Path, line_count: int) -> str:
+def read_log_tail(path: Path, line_count: int, *, start_offset: int = 0) -> str:
     """Read a bounded log tail without loading a potentially huge inference log."""
     if line_count <= 0 or not path.is_file():
         return ""
@@ -320,22 +328,29 @@ def read_log_tail(path: Path, line_count: int) -> str:
         with path.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
             size = handle.tell()
-            handle.seek(max(0, size - max_bytes), os.SEEK_SET)
+            handle.seek(max(start_offset, size - max_bytes), os.SEEK_SET)
             payload = handle.read()
         text = payload.decode("utf-8", errors="replace")
-        if size > max_bytes:
+        if size - start_offset > max_bytes:
             text = text.split("\n", 1)[-1]
         return "\n".join(text.splitlines()[-line_count:])
     except OSError as exc:
         return f"<failed to read log tail: {type(exc).__name__}: {exc}>"
 
 
-def print_failure_log(label: str, path: Path, line_count: int) -> str:
-    tail = read_log_tail(path, line_count)
+def print_failure_log(label: str, path: Path, line_count: int, *, start_offset: int = 0) -> str:
+    tail = read_log_tail(path, line_count, start_offset=start_offset)
     print(f"===== BEGIN FAILURE LOG: {label} ({path}) =====", file=sys.stderr, flush=True)
     print(tail or "<log is empty or missing>", file=sys.stderr, flush=True)
     print(f"===== END FAILURE LOG: {label} =====", file=sys.stderr, flush=True)
     return tail
+
+
+def failure_reason(tail: str, fallback: str) -> str:
+    for line in reversed(tail.splitlines()):
+        if "CUDA out of memory" in line or "[ERROR]" in line or "Error:" in line:
+            return line.strip()[:1200]
+    return fallback
 
 
 def main() -> int:
@@ -444,10 +459,9 @@ def main() -> int:
         else:
             estimates[task] = float(count)
 
-    exclusive_tasks = set(args.exclusive_gpu_tasks) & set(args.tasks)
-    # Start exclusive work on an empty card first, leaving all other cards free
-    # to fill both slots. It must not wait for a stream of ordinary work to end.
-    ordered = sorted(args.tasks, key=lambda task: (task not in exclusive_tasks, -estimates[task], task))
+    exclusive_tasks = set(args.tasks)  # Every worker reserves its physical GPU.
+    # Start the longest estimated tasks first to reduce the final idle tail.
+    ordered = sorted(args.tasks, key=lambda task: (-estimates[task], task))
     print("===== UI5 parallel inference scheduler =====")
     print(f"physical GPUs       : {','.join(gpus)}")
     print(f"workers per GPU     : {args.workers_per_gpu} ({len(worker_slots)} inference process slots total)")
@@ -563,11 +577,19 @@ def main() -> int:
     lock = threading.Lock()
     results: dict[str, dict[str, Any]] = {}
 
+    def publish_progress():
+        with lock:
+            progress = {**work_queue.snapshot(), "tasks": dict(results)}
+            atomic_write_json(args.output_dir / "parallel_inference_progress.json", progress)
+            if args.completion_dir is not None:
+                atomic_write_json(args.completion_dir / "_scheduler/status.json", progress)
+
     def run_task(gpu: str, slot: int, task: str) -> int:
         worker_id = f"gpu-{gpu}-worker-{slot}"
         summary_path = summaries_dir / f"{task}.json"
         log_path = logs_dir / f"{task}.log"
         command = build_command(args, task, gpu, summary_path)
+        publish_progress()
         print(
             f"[START] task={task} worker={worker_id} physical_gpu={gpu} logical_device=cuda:0 "
             f"exclusive_gpu={task in exclusive_tasks} slots_reserved={args.workers_per_gpu if task in exclusive_tasks else 1} "
@@ -577,6 +599,7 @@ def main() -> int:
         started = time.time()
         return_code = 0
         error = ""
+        start_offset = log_path.stat().st_size if log_path.is_file() else 0
         if not args.dry_run:
             child_env = dict(os.environ)
             child_env["CUDA_VISIBLE_DEVICES"] = gpu
@@ -609,6 +632,7 @@ def main() -> int:
                 f"task={task} GPU={gpu}",
                 log_path,
                 args.failure_log_lines,
+                start_offset=start_offset,
             )
         result = {
             "task": task,
@@ -626,6 +650,7 @@ def main() -> int:
             "summary_path": str(summary_path),
             "error": error,
             "log_tail": log_tail,
+            "failure_reason": failure_reason(log_tail, error) if return_code else "",
         }
         with lock:
             results[task] = result
@@ -666,6 +691,7 @@ def main() -> int:
             finally:
                 # Wake blocked sibling slots on success, failure and launch errors.
                 work_queue.finish(gpu, slot, failed=failed)
+                publish_progress()
 
     threads = [
         threading.Thread(target=run_worker, args=(gpu, slot), name=f"gpu-{gpu}-worker-{slot}", daemon=False)
@@ -717,6 +743,11 @@ def main() -> int:
         )
 
     if failures or missing_tasks:
+        for result in failures:
+            print(f"[FINAL FAILURE] task={result['task']} GPU={result['physical_gpu']} "
+                  f"exclusive={result.get('exclusive_gpu')} "
+                  f"reason={result.get('failure_reason') or result.get('error')} "
+                  f"log={result.get('log_path')}", file=sys.stderr, flush=True)
         print(
             f"[ERROR] parallel inference failed: failures={len(failures)}, "
             f"not_started={missing_tasks}",

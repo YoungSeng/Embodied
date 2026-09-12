@@ -10,7 +10,9 @@
 4×A800、每 100 步训练记录、step 0 和每 1000 步 14 项评测/36 行、4k 正式保存、
 UI5 best 口径和 EVAL_FAIL_POLICY=stop 保持原值。
 生成使用旧正式配置 `legacy + hybrid`，SDPA、视觉 flash_attention_2、PBD、observe gate。
-`change_line_illegal_v3`、`synth_loneword`、`synth_inner_margin` 各自独占一张物理卡；其余任务每卡两个槽位。
+全部 14 项评测任务每张物理 GPU 只有一个推理进程，四卡最多同时运行四个任务，完成后继续领取。
+正式配置为 `EVAL_INFERENCE_WORKERS_PER_GPU=1`；旧 YAML/环境/命令中的值 2 兼容接收并按 1 执行。
+直接调用并行推理脚本和旧 checkpoint 独立补评也遵循同一限制。
 独占卡消除本调度器内的同卡 worker 竞争，不是对任意超大单样本不会 OOM 的保证。
 
 ## 评测中断后的更新与续跑
@@ -26,15 +28,24 @@ bash shell/ui14_neg11_alignment_crops_a800.sh submit --resource-group aiai_locat
 
 继续使用相同 OUTPUT_DIR、checkpoint 和预测目录，不传 --overwrite。入口检查最新完整
 checkpoint 的 optimizer/scheduler/rank 状态，再补齐该步评测后继续训练。
-正常保存的 checkpoint-1000 不因评测 OOM 被清理；不需要重训前 1000 步。
+本次 checkpoint-3000 不因评测 OOM 被清理；通过完整恢复校验后，无需重训前 3000 步。
 任务内已完成图片仍按原推理身份核对后跳过，OOM/缺失图片重试；全部图片完成的任务不加载模型。
-旧 YAML 中仅有前两项独占任务时，UI14 入口也会自动补充 synth_inner_margin。
+所有任务均独占卡，旧 `EVAL_EXCLUSIVE_GPU_TASKS` 子集不会使其他任务恢复共卡。
+这只是推理并发变更，不改变图片、权重、prompt、输入策略和解码身份。不要传 `--overwrite`，
+不要删除 checkpoint、预测目录或 Excel，无需重跑 prepare/cache/finalize。
 
 每个 task 的推理子进程成功退出后立即评分，由唯一 CPU 协调进程原子写入
 `diagnostics/ui5_training_evaluation.xlsx` 的 `eval_1000steps`：
 每任务 image/bbox 两行；`evaluation_status=partial` 表示整轮未齐，失败时保留这些行并标为 failed。
 UI5 的原 no_figma/class_id 评分器、UI9 的原 IoU=0.1/非法输出处理均不变，bbox 没有 TN。
 其他任务失败后仍在执行的 worker 完成时，其结果也会保存。
+
+每 10 秒显示成功/失败数、仍在运行的 task/GPU、尚未启动任务、失败原因和日志路径。
+若已发生终止性失败，明确打印队列停止派发、正在等待其他 worker 完成；任务失败事件不算成功数。
+末尾异常再次带上失败 task/原因，不再只显示 subprocess exit 1。
+`parallel_inference_progress.json` 位于本步预测目录，包含当前 running/pending/stopped/tasks；
+评分 attempt 的 `completions/_scheduler/status.json` 保存同一状态。
+`EVAL_FAIL_POLICY=stop` 继续生效，未齐 14 项不得继续训练，不自动放宽评分或忽略失败。
 
 逐任务明细在输出目录的
 `evaluation/partial/ui14-step-<step>-<attempt>/<task>/metrics.json`，包含本轮身份、真实计数及 gate 指标；
