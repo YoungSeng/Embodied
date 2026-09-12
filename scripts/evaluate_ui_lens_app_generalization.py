@@ -396,6 +396,16 @@ def main(argv: list[str] | None = None) -> int:
     print("UI-Lens apps (image-task records):", json.dumps(dict(sorted(inventory.items())), ensure_ascii=False))
     if args.list_ui_apps:
         return 0
+    preferred = (args.prediction_dir or args.project_root / "work_dirs/ui-lens-checkpoint9000-detectorscan-clip-v1/predictions").expanduser().resolve(strict=False)
+    prediction_dir, search = find_reusable_predictions(
+        args.project_root, preferred, records, args.checkpoint, args.crop_mode
+    )
+    if search["selected"]["usable"]:
+        print(f"FOUND COMPLETE MATCHING PREDICTIONS: {prediction_dir}")
+    else:
+        print("NO COMPLETE MATCHING PREDICTIONS:")
+        for reason in search["selected"]["reasons"]:
+            print(f"  - {reason}")
     training_data_dir = args.training_data_dir or args.project_root / "data"
     training_jsonls = list(args.training_jsonl) or discover_training_jsonls(training_data_dir)
     train_apps, evidence = load_training_apps(args.train_app_name, args.train_apps_file, training_jsonls, inventory)
@@ -408,8 +418,6 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("No other apps remain after applying the training app list")
     print("TRAIN-SOURCE APPS:", json.dumps(sorted(train_apps), ensure_ascii=False))
     print("OTHER APPS:", json.dumps(sorted(other_apps), ensure_ascii=False))
-    preferred = (args.prediction_dir or args.project_root / "work_dirs/ui-lens-checkpoint9000-detectorscan-clip-v1/predictions").expanduser().resolve(strict=False)
-    prediction_dir, search = find_reusable_predictions(args.project_root, preferred, records, args.checkpoint, args.crop_mode)
     reused_predictions = bool(search["selected"]["usable"])
     if reused_predictions:
         print(f"REUSE COMPLETE PREDICTIONS: {prediction_dir}")
