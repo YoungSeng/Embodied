@@ -723,6 +723,19 @@ def merge_gt_and_yolo_dir_preds(
                 print(f"未找到 YOLO 预测：{file_id}")
                 continue
 
+            # LocateAnything deliberately tags model-output parse failures with
+            # this suffix.  The compatibility payload is usually [], but that
+            # must not turn an invalid model answer into a valid negative.
+            if Path(pred_file_path).stem.endswith("_parse_error"):
+                parse_errors += 1
+                data["pred_ans"] = None
+                data["pred_parse_info"] = {
+                    "parse_status": "model_output_parse_error",
+                    "prediction_file": pred_file_path,
+                }
+                f_out.write(json.dumps(data, ensure_ascii=False) + "\n")
+                continue
+
             try:
                 with open(pred_file_path, "r", encoding="utf-8") as f_pred:
                     raw_pred = json.load(f_pred)
@@ -1682,6 +1695,8 @@ def write_all_tasks_summary(
                     key: (float(value) if isinstance(value, (float, np.floating)) else int(value))
                     for key, value in summary["image"].items()
                 },
+                "total_samples": int(summary.get("total_samples", 0)),
+                "invalid_pred": int(summary.get("invalid_pred", 0)),
             }
             for task_key, summary in task_summaries.items()
         },

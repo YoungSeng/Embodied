@@ -432,8 +432,8 @@ JSON 的 `macro` 是各任务比例指标的算术平均，对应文本报告中
 - image F1：按任务判断该图是否有至少一个缺陷框，与框是否定位准确无关。
 - bbox F1：每张图内对 GT 和预测框做 Hungarian 匹配，再以 IoU ≥ 0.1 计 TP，与原分支口径一致。
 - 两者均为 `2TP / (2TP + FP + FN)`。五类的汇总 image 指标以“图片 × 任务”为单位，并非去重后的“任意一种缺陷”指标。
-- 检查每类 `total_samples` 与转换器 `rows` 一致，`invalid_pred` 应为 0；评分日志的 `missing_files`、`parse_errors` 应为 0。
-  旧评分器会惩罚缺失/非法预测，不能将未跑完的结果当作正式分数。
+- 检查每类 `total_samples` 与转换器 `rows` 一致，`missing_files` 应为 0。`invalid_pred` / `parse_errors` 理想值为 0；
+  若同一样本重跑后仍无法解析，应作为模型失败保留、处罚并披露，不能改成合法空预测。不能将缺失文件或未跑完的结果当作正式分数。
 
 需要更严格的定位指标时，对同一批预测再算 IoU 0.5，无需重新推理：
 
@@ -816,7 +816,9 @@ python -u scripts/evaluate_ui_lens_app_generalization.py \
 `--gpu-devices 0,1,2,3` 修改。相同配置的中断结果会续跑；身份不一致或同一图片存在多个结果文件时使用新的
 `-retry-时间` 目录，不覆盖旧结果。若 checkpoint 和切图身份一致且只是少量 `_parse_error`/非法 JSON，
 默认先将这些文件移到预测目录内的 `_invalid_before_app_eval/时间/`，然后仅续跑缺失和非法样本；
-隔离清单保留原路径与备份路径。`--no-retry-invalid-predictions` 可关闭这一行为。
+隔离清单保留原路径与备份路径。若重跑后仍然是 `_parse_error`，判定为稳定的模型输出失败，不再循环推理；
+评分器将其作为 `invalid_pred` 处罚，而不是把兼容文件中的空列表误当成合法负预测。两组、五任务和逐 App
+表格均单列 `Invalid pred`。`--no-retry-invalid-predictions` 可关闭首次重试。
 只想在 CPU 开发机检查、不允许启动推理时，加
 `--no-run-if-missing`。
 

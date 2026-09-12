@@ -237,7 +237,8 @@ def output_stems(rows: list[dict[str, Any]]) -> dict[str, str]:
 def prediction_audit(prediction_dir: Path, records: dict[str, list[dict[str, Any]]], checkpoint: Path,
                      crop_mode: str) -> dict[str, Any]:
     report: dict[str, Any] = {"prediction_dir": str(prediction_dir), "exists": prediction_dir.is_dir(),
-                              "tasks": {}, "manifest": None, "usable": False, "reasons": []}
+                              "tasks": {}, "manifest": None, "identity_valid": False,
+                              "scoreable": False, "usable": False, "reasons": []}
     if not prediction_dir.is_dir():
         report["reasons"].append("prediction directory does not exist")
         return report
@@ -248,11 +249,14 @@ def prediction_audit(prediction_dir: Path, records: dict[str, list[dict[str, Any
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             report["manifest"] = manifest
+            report["identity_valid"] = True
             if Path(str(manifest.get("checkpoint", ""))).resolve(strict=False) != checkpoint.resolve(strict=False):
                 report["reasons"].append("checkpoint in manifest does not match requested checkpoint")
+                report["identity_valid"] = False
             actual_mode = (manifest.get("inference_crop") or {}).get("mode")
             if actual_mode != crop_mode:
                 report["reasons"].append(f"inference crop mode is {actual_mode!r}, expected {crop_mode!r}")
+                report["identity_valid"] = False
         except (OSError, json.JSONDecodeError, TypeError) as exc:
             report["reasons"].append(f"invalid run manifest: {exc}")
     for task, rows in records.items():
@@ -281,7 +285,12 @@ def prediction_audit(prediction_dir: Path, records: dict[str, list[dict[str, Any
                                   "ambiguous_examples": ambiguous[:3]}
         if missing or invalid or ambiguous:
             report["reasons"].append(f"{task}: missing={len(missing)} invalid={len(invalid)} ambiguous={len(ambiguous)}")
-    report["usable"] = not report["reasons"]
+    report["scoreable"] = report["identity_valid"] and all(
+        not task["missing"] and not task["ambiguous"] for task in report["tasks"].values()
+    )
+    report["usable"] = report["scoreable"] and all(
+        not task["invalid"] for task in report["tasks"].values()
+    )
     return report
 
 
@@ -296,6 +305,9 @@ def find_reusable_predictions(project: Path, preferred: Path, records: dict[str,
     audits = [prediction_audit(path, records, checkpoint, crop_mode) for path in candidates]
     for path, audit in zip(candidates, audits):
         if audit["usable"]:
+            return path, {"selected": audit, "checked": audits}
+    for path, audit in zip(candidates, audits):
+        if audit["scoreable"]:
             return path, {"selected": audit, "checked": audits}
     return preferred, {"selected": audits[0], "checked": audits}
 
@@ -386,6 +398,15 @@ def quarantine_invalid_predictions(prediction_dir: Path, audit: dict[str, Any]) 
     return backup
 
 
+def invalid_prediction_count(audit: dict[str, Any]) -> int:
+    return sum(int(task.get("invalid", 0)) for task in audit.get("tasks", {}).values())
+
+
+def has_prior_invalid_retry(prediction_dir: Path) -> bool:
+    root = prediction_dir / "_invalid_before_app_eval"
+    return root.is_dir() and any(root.glob("*/quarantine_manifest.json"))
+
+
 def score_subset(args: argparse.Namespace, gt_dir: Path, prediction_dir: Path, output_root: Path, run_name: str) -> dict[str, Any]:
     command = [sys.executable, str(args.project_root / "qwen3vl_merge_and_score_fixed_5tasks.py"),
                "--all_tasks", "--input_mode", "yolo_dir", "--gt_dir", str(gt_dir),
@@ -398,26 +419,29 @@ def score_subset(args: argparse.Namespace, gt_dir: Path, prediction_dir: Path, o
 def make_report(summary: dict[str, Any]) -> str:
     lines = ["# UI-Lens 跨应用评测（Ours）", "", f"- checkpoint: `{summary['checkpoint']}`",
              f"- predictions: `{summary['prediction_dir']}`", f"- IoU threshold: {summary['iou_threshold']}", "",
-             "| 分组 | Apps | 图片×任务 | Image F1 | Bbox F1 |", "|---|---:|---:|---:|---:|"]
+             "| 分组 | Apps | 图片×任务 | Invalid pred | Image F1 | Bbox F1 |", "|---|---:|---:|---:|---:|---:|"]
     for group in ("train_source_apps", "other_apps"):
         split, metric = summary["splits"][group], summary["metrics"][group]
-        lines.append(f"| {group} | {len(split['apps'])} | {split['image_task_records']} | "
+        invalid = sum(int(task.get("invalid_pred", 0)) for task in metric["tasks"].values())
+        lines.append(f"| {group} | {len(split['apps'])} | {split['image_task_records']} | {invalid} | "
                      f"{metric['macro']['image']['f1']:.4f} | {metric['macro']['bbox']['f1']:.4f} |")
     gap = summary["generalization_gap_train_minus_other"]
     lines += ["", f"训练来源 − 其他应用：Image F1 `{gap['image_f1']:+.4f}`，"
               f"Bbox F1 `{gap['bbox_f1']:+.4f}`。正值表示其他应用更低。"]
     lines += ["", "## 两组的五任务结果", "",
-              "| 分组 | 任务 | 样本 | 正样本 | Image F1 | Bbox F1 |",
-              "|---|---|---:|---:|---:|---:|"]
+              "| 分组 | 任务 | 样本 | 正样本 | Invalid pred | Image F1 | Bbox F1 |",
+              "|---|---|---:|---:|---:|---:|---:|"]
     for group in ("train_source_apps", "other_apps"):
         for task, values in summary["metrics"][group]["tasks"].items():
             population = summary["splits"][group]["tasks"][task]
             lines.append(f"| {group} | {values['issue_name']} | {population['records']} | "
-                         f"{population['positive']} | {values['image']['f1']:.4f} | {values['bbox']['f1']:.4f} |")
-    lines += ["", "## 每个 App", "", "| App | 分组 | 图片×任务 | Image F1 | Bbox F1 |",
-              "|---|---|---:|---:|---:|"]
+                         f"{population['positive']} | {values.get('invalid_pred', 0)} | "
+                         f"{values['image']['f1']:.4f} | {values['bbox']['f1']:.4f} |")
+    lines += ["", "## 每个 App", "", "| App | 分组 | 图片×任务 | Invalid pred | Image F1 | Bbox F1 |",
+              "|---|---|---:|---:|---:|---:|"]
     for name, item in sorted(summary.get("per_app", {}).items()):
-        lines.append(f"| {name} | {item['group']} | {item['image_task_records']} | "
+        invalid = sum(int(task.get("invalid_pred", 0)) for task in item["metrics"]["tasks"].values())
+        lines.append(f"| {name} | {item['group']} | {item['image_task_records']} | {invalid} | "
                      f"{item['metrics']['macro']['image']['f1']:.4f} | {item['metrics']['macro']['bbox']['f1']:.4f} |")
     return "\n".join(lines) + "\n"
 
@@ -463,6 +487,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     if search["selected"]["usable"]:
         print(f"FOUND COMPLETE MATCHING PREDICTIONS: {prediction_dir}")
+    elif search["selected"]["scoreable"]:
+        print(
+            f"FOUND COMPLETE PREDICTION COVERAGE WITH "
+            f"{invalid_prediction_count(search['selected'])} INVALID MODEL OUTPUTS: {prediction_dir}"
+        )
     else:
         print("NO COMPLETE MATCHING PREDICTIONS:")
         for reason in search["selected"]["reasons"]:
@@ -479,15 +508,20 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("No other apps remain after applying the training app list")
     print("TRAIN-SOURCE APPS:", json.dumps(sorted(train_apps), ensure_ascii=False))
     print("OTHER APPS:", json.dumps(sorted(other_apps), ensure_ascii=False))
-    reused_predictions = bool(search["selected"]["usable"])
-    if reused_predictions:
+    selected_audit = search["selected"]
+    invalid_count = invalid_prediction_count(selected_audit)
+    stable_invalid = selected_audit["scoreable"] and invalid_count > 0 and has_prior_invalid_retry(prediction_dir)
+    reused_predictions = bool(selected_audit["usable"] or stable_invalid)
+    if selected_audit["usable"]:
         print(f"REUSE COMPLETE PREDICTIONS: {prediction_dir}")
+    elif selected_audit["scoreable"] and (stable_invalid or not args.retry_invalid_predictions or not args.run_if_missing):
+        reused_predictions = True
+        print(f"SCORE WITH INVALID_PRED={invalid_count}; these outputs remain formal model failures.")
     elif not args.run_if_missing:
         print(json.dumps(search, ensure_ascii=False, indent=2))
         raise RuntimeError("No complete matching predictions; rerun without --no-run-if-missing on a GPU node")
     else:
         print("No complete matching prediction set; starting/resuming full inference.")
-        selected_audit = search["selected"]
         if prediction_dir.exists() and repairable_audit(selected_audit) and args.retry_invalid_predictions:
             backup = quarantine_invalid_predictions(prediction_dir, selected_audit)
             if backup is not None:
@@ -498,8 +532,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Existing directory is not safely resumable; using fresh prediction directory: {prediction_dir}")
         run_inference(args, prediction_dir)
         audit = prediction_audit(prediction_dir, records, args.checkpoint, args.crop_mode)
-        if not audit["usable"]:
+        if not audit["scoreable"]:
             raise RuntimeError("Inference returned but predictions are incomplete: " + "; ".join(audit["reasons"]))
+        if audit["usable"]:
+            print("RETRY CLEARED ALL INVALID PREDICTIONS.")
+        else:
+            print(f"RETRY FINISHED WITH STABLE INVALID_PRED={invalid_prediction_count(audit)}; scoring them as failures.")
         search["selected"] = audit
     output = (args.output_dir or args.project_root / "work_dirs/ui-lens-checkpoint9000-app-generalization-v1").expanduser().resolve(strict=False)
     split_stats = write_partitions(records, output, train_apps)
